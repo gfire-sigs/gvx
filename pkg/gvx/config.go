@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"runtime"
 
+	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/netbackend"
 )
@@ -135,8 +136,13 @@ type Resources struct {
 	MemoryBytes int64
 
 	// CPUMillis is the CPU quota in thousandths of a CPU. The guest sees that
-	// many CPUs rounded up. Windows also caps the CPU time of the host process.
+	// many CPUs rounded up and the Sentry enforces a tamper-proof CFS bandwidth
+	// cap per sandbox. Windows also caps the host process job CPU rate.
 	CPUMillis int64
+
+	// PidsLimit caps the total number of guest tasks (threads/processes) inside
+	// the sandbox via the root cgroup2 pids controller. Zero means unlimited.
+	PidsLimit int64
 }
 
 // ErrInvalidConfig marks a Config that New rejects before it opens any host
@@ -330,6 +336,14 @@ type Config struct {
 	// rules in PortForwards keep precedence. It needs the nat network mode.
 	AutoPublishPorts bool
 
+	// DynamicPorts enables runtime loopback port publishing (`port add`) under
+	// host lockdown without automatic guest port polling. It needs nat mode.
+	DynamicPorts bool
+
+	// AllowVolumeAttach enables POSIX Unix SCM_RIGHTS ext4lite volume attachment
+	// over the control socket under Linux seccomp lockdown.
+	AllowVolumeAttach bool
+
 	// WorkDir is the initial guest working directory (defaults to "/workspace"
 	// when WorkspacePath is set, or "/").
 	WorkDir string
@@ -358,11 +372,26 @@ type Config struct {
 	CheckpointDir string
 
 	// CheckpointListener is an optional pre-bound listener for external
-	// checkpoint control requests. When set, New and Restore count it as a
-	// pre-bound listener in the host lockdown profile and Close closes it.
-	// New and Restore also close it when they fail, so the caller never closes
-	// a listener after it passed it to them.
+	// checkpoint control requests. Retained for backward compatibility; prefer
+	// ControlListener for full gvx-ctrl/2 runtime control.
 	CheckpointListener net.Listener
+
+	// ControlListener is an optional pre-bound listener for gvx-ctrl/2 control
+	// socket RPCs (and legacy v1 JSON checkpoint requests). New and Restore take
+	// ownership of this listener and close it on failure or Sandbox.Close.
+	ControlListener net.Listener
+
+	// ControlToken is an optional secret required in v2 HELLO and legacy v1
+	// checkpoint requests. Required on TCP and Windows listeners.
+	ControlToken string
+
+	// ControlPolicy selects the baseline capability set ("default", "readonly",
+	// or "checkpoint-only"). Empty defaults to control.PolicyDefault.
+	ControlPolicy control.Policy
+
+	// ControlDisable disables specific capability names or groups (such as
+	// "exec", "fs.import", "mount", "net.dial").
+	ControlDisable []string
 
 	// DisableHostLockdown skips pkg/hostlockdown. New applies the lockdown
 	// (Windows RestrictedToken and JobObject, or macOS Seatbelt) by default,
@@ -475,6 +504,12 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if q := c.Resources.CPUMillis; q < 0 || q > int64(runtime.NumCPU())*1000 {
 		return fmt.Errorf("%w: CPU quota %d is invalid: use 0 to %d thousandths of a CPU", ErrInvalidConfig, q, runtime.NumCPU()*1000)
 	}
+	if p := c.Resources.PidsLimit; p < 0 {
+		return fmt.Errorf("%w: pids limit %d must be non-negative", ErrInvalidConfig, p)
+	}
+	if _, err := control.ParsePolicy(string(c.ControlPolicy)); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
 	if c.AllowPacketSocketWrite && !c.NetRaw {
 		return fmt.Errorf("%w: packet socket writes need NetRaw", ErrInvalidConfig)
 	}
@@ -483,6 +518,9 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	}
 	if c.AutoPublishPorts && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: auto-publishing guest ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+	}
+	if c.DynamicPorts && c.NetworkMode != NetModeNAT {
+		return fmt.Errorf("%w: dynamic port publishing needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
 	}
 	if err := c.validateMounts(); err != nil {
 		return err

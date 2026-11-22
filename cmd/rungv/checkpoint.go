@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 )
 
 func init() {
@@ -38,7 +39,7 @@ func init() {
 		aliases: []string{"snapshot"},
 		summary: "Checkpoint a running sandbox over its control socket (alias: snapshot).",
 		usage: []string{
-			"rungv checkpoint -control-socket=<path> [-checkpoint-dir=<dir>] [-leave-running]",
+			"rungv checkpoint -S <socket>|-n <name> [-checkpoint-dir=<dir>|-o <dir|file.tar|->] [-leave-running] [-z] [--force]",
 		},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return checkpointSubcommand(ctx, args, streams.stdout, streams.stderr)
@@ -63,9 +64,13 @@ type checkpointControlResponse struct {
 
 // checkpointArgs holds the parsed flags of `rungv checkpoint`.
 type checkpointArgs struct {
+	target        *controlTargetFlags
 	controlSocket string
 	checkpointDir string
+	output        string
 	leaveRunning  bool
+	compress      bool
+	force         bool
 }
 
 func parseCheckpointArgs(args []string, stderr io.Writer) (checkpointArgs, int, bool) {
@@ -76,10 +81,18 @@ func parseCheckpointArgs(args []string, stderr io.Writer) (checkpointArgs, int, 
 		return checkpointArgs{}, 2, true
 	}
 
-	var controlSocket, checkpointDir string
-	fs.StringVar(&controlSocket, "control-socket", "", "Control socket path or loopback address")
+	target := addControlFlags(fs, 0)
+	var checkpointDir, output string
+	var leaveRunning, compress, force bool
 	fs.StringVar(&checkpointDir, "checkpoint-dir", "", "Checkpoint bundle directory (validated against pre-opened -checkpoint-dir)")
-	leaveRunningFlag := fs.Bool("leave-running", false, "Keep the sandbox running after the checkpoint completes")
+	registerAlias([]string{"o", "output"}, func(n string) {
+		fs.StringVar(&output, n, "", "Stream checkpoint bundle to host directory, .tar archive, or '-' stdout")
+	})
+	fs.BoolVar(&leaveRunning, "leave-running", false, "Keep the sandbox running after the checkpoint completes")
+	registerAlias([]string{"z", "compress"}, func(n string) {
+		fs.BoolVar(&compress, n, false, "Compress streamed checkpoint frames with zstd")
+	})
+	fs.BoolVar(&force, "force", false, "Force checkpoint even while exec sessions are active")
 
 	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -90,14 +103,23 @@ func parseCheckpointArgs(args []string, stderr io.Writer) (checkpointArgs, int, 
 	if fs.NArg() > 0 {
 		return usageError("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
 	}
-	sock := strings.TrimSpace(controlSocket)
-	if sock == "" {
-		return usageError("specify -control-socket=<path>")
+	sock, err := target.resolveEndpoint("")
+	if err != nil {
+		return usageError("%v", err)
+	}
+	ckptDir := strings.TrimSpace(checkpointDir)
+	outSpec := strings.TrimSpace(output)
+	if ckptDir != "" && outSpec != "" {
+		return usageError("-checkpoint-dir and -o/--output are mutually exclusive")
 	}
 	return checkpointArgs{
+		target:        target,
 		controlSocket: sock,
-		checkpointDir: strings.TrimSpace(checkpointDir),
-		leaveRunning:  *leaveRunningFlag,
+		checkpointDir: ckptDir,
+		output:        outSpec,
+		leaveRunning:  leaveRunning,
+		compress:      compress,
+		force:         force,
 	}, 0, false
 }
 
@@ -107,6 +129,10 @@ func checkpointSubcommand(ctx context.Context, args []string, stdout, stderr io.
 		return exitCode
 	}
 
+	if ca.output != "" {
+		return checkpointStreamCLI(ctx, ca, stdout, stderr)
+	}
+
 	reqDir := ca.checkpointDir
 	if reqDir != "" {
 		if abs, err := filepath.Abs(reqDir); err == nil {
@@ -114,6 +140,81 @@ func checkpointSubcommand(ctx context.Context, args []string, stdout, stderr io.
 		}
 	}
 
+	client, err := ca.target.dial(ctx, "")
+	if err == nil {
+		defer client.Close()
+		callCtx, cancel := ca.target.callContext(ctx)
+		defer cancel()
+		err = client.Call(callCtx, control.MethodCheckpoint, control.CheckpointRequest{
+			Dir:          reqDir,
+			LeaveRunning: ca.leaveRunning,
+			Force:        ca.force,
+		}, nil)
+		if err != nil {
+			return controlFail(stderr, "checkpoint", err)
+		}
+		return 0
+	}
+	// If the server explicitly rejected authentication/policy, do not fall back.
+	var pe *control.ProtoError
+	if errors.As(err, &pe) || ca.force {
+		return controlFail(stderr, "checkpoint", err)
+	}
+	// Fall back to legacy v1 JSON checkpoint for older servers/tests.
+	return checkpointLegacyV1(ctx, ca, reqDir, stderr)
+}
+
+func checkpointStreamCLI(ctx context.Context, ca checkpointArgs, stdout, stderr io.Writer) int {
+	client, err := ca.target.dial(ctx, "")
+	if err != nil {
+		return controlFail(stderr, "checkpoint", err)
+	}
+	defer client.Close()
+
+	callCtx, cancel := ca.target.callContext(ctx)
+	defer cancel()
+
+	stream, err := client.OpenStream(callCtx, control.MethodCheckpointStream, control.CheckpointStreamRequest{
+		LeaveRunning: ca.leaveRunning,
+		Force:        ca.force,
+		Compress:     ca.compress,
+	})
+	if err != nil {
+		return controlFail(stderr, "checkpoint", err)
+	}
+	defer stream.Close()
+
+	var resp control.CheckpointStreamResponse
+	if err := stream.WaitResponse(callCtx, &resp); err != nil {
+		return controlFail(stderr, "checkpoint", err)
+	}
+
+	tarReader := stream.ChannelReader(callCtx, control.ChannelGeneric)
+	if ca.output == "-" {
+		if _, err := io.Copy(stdout, tarReader); err != nil {
+			return controlFail(stderr, "checkpoint", err)
+		}
+		return 0
+	}
+	if strings.HasSuffix(strings.ToLower(ca.output), ".tar") {
+		f, err := os.OpenFile(ca.output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return controlFail(stderr, "checkpoint", err)
+		}
+		_, copyErr := io.Copy(f, tarReader)
+		closeErr := f.Close()
+		if err := errors.Join(copyErr, closeErr); err != nil {
+			return controlFail(stderr, "checkpoint", err)
+		}
+		return 0
+	}
+	if err := extractTarToHostDir(tarReader, ca.output, hostExtractOptions{}); err != nil {
+		return controlFail(stderr, "checkpoint", err)
+	}
+	return 0
+}
+
+func checkpointLegacyV1(ctx context.Context, ca checkpointArgs, reqDir string, stderr io.Writer) int {
 	conn, err := dialCheckpointSocket(ctx, ca.controlSocket)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: connect control socket: %v\n", err)
@@ -126,13 +227,16 @@ func checkpointSubcommand(ctx context.Context, args []string, stdout, stderr io.
 	req := checkpointControlRequest{
 		Dir:          reqDir,
 		LeaveRunning: ca.leaveRunning,
+		Token:        ca.target.resolveToken(),
 	}
-	if network, address, perr := parseCheckpointEndpoint(ca.controlSocket); perr == nil {
-		token, tErr := readControlToken(network, address)
-		if tErr != nil {
-			_, _ = fmt.Fprintf(stderr, "rungv checkpoint: warning: %v\n", tErr)
+	if req.Token == "" {
+		if network, address, perr := parseCheckpointEndpoint(ca.controlSocket); perr == nil {
+			token, tErr := control.ReadToken(network, address, strings.TrimSpace(ca.target.tokenFile))
+			if tErr != nil {
+				_, _ = fmt.Fprintf(stderr, "rungv checkpoint: warning: %v\n", tErr)
+			}
+			req.Token = token
 		}
-		req.Token = token
 	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: send request: %v\n", err)

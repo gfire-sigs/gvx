@@ -35,6 +35,7 @@ type kernelExtState struct {
 	hasReportedMemory bool
 	reportedMemory    uint64
 	logEntry          *kernelLogEntry
+	sandboxCPU        *CPUBandwidth
 	values            map[string]any
 }
 
@@ -50,6 +51,9 @@ func (e *kernelExtState) afterLoad(context.Context) {
 			e.logEntry.log.now = kernelUptimeFunc(weak.Make(e.kernel))
 		}
 		kernelLogs.Store(e.kernel, e.logEntry)
+	}
+	if e.sandboxCPU != nil {
+		bandwidthCountersOf(e.kernel).sandboxRoot.Store(e.sandboxCPU)
 	}
 }
 

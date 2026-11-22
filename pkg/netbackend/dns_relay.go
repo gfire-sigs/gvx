@@ -231,7 +231,7 @@ func (w *WireGuardEndpoint) dnsSemaphore() chan struct{} {
 }
 
 func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
-	timeout := nf.cfg.Tuning.Duration(tuning.DNSTimeout)
+	timeout := nf.dnsTimeout()
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
@@ -279,7 +279,7 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 }
 
 func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
-	serveTCPDNSConn(ctx, conn, nf.cfg.Tuning.Duration(tuning.DNSTimeout), nf.handleTCPDNSQuery)
+	serveTCPDNSConn(ctx, conn, nf.dnsTimeout(), nf.handleTCPDNSQuery)
 }
 
 func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, answer func(context.Context, []byte) []byte) {
@@ -319,15 +319,16 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, 
 }
 
 type dnsRelay struct {
-	gvxAddrs    []netip.Addr
-	hasGateway  bool
-	ipv6Enabled bool
-	isolateLAN  bool
-	lookupHost  func(ctx context.Context, host string) ([]netip.Addr, error)
-	servers     []string
-	dials       []func(ctx context.Context, network, addr string) (net.Conn, error)
-	log         *slog.Logger
-	tune        tuning.Values
+	gvxAddrs        []netip.Addr
+	hasGateway      bool
+	ipv6Enabled     bool
+	isolateLAN      bool
+	lookupHost      func(ctx context.Context, host string) ([]netip.Addr, error)
+	servers         []string
+	dials           []func(ctx context.Context, network, addr string) (net.Conn, error)
+	log             *slog.Logger
+	timeout         time.Duration
+	upstreamTimeout time.Duration
 }
 
 func (nf *NATForwarder) hasGuestIPv6() bool {
@@ -344,15 +345,16 @@ func (nf *NATForwarder) dnsRelay() dnsRelay {
 		dialFn = d.DialContext
 	}
 	return dnsRelay{
-		gvxAddrs:    []netip.Addr{netip.MustParseAddr(DefaultGuestIPv4)},
-		hasGateway:  true,
-		ipv6Enabled: nf.hasGuestIPv6(),
-		isolateLAN:  nf.cfg.IsolateLAN,
-		lookupHost:  nf.cfg.LookupHost,
-		servers:     nf.upstreamDNS,
-		dials:       []func(context.Context, string, string) (net.Conn, error){dialFn},
-		log:         nf.log,
-		tune:        nf.cfg.Tuning,
+		gvxAddrs:        []netip.Addr{netip.MustParseAddr(DefaultGuestIPv4)},
+		hasGateway:      true,
+		ipv6Enabled:     nf.hasGuestIPv6(),
+		isolateLAN:      nf.IsolateLAN(),
+		lookupHost:      nf.cfg.LookupHost,
+		servers:         nf.upstreamDNS,
+		dials:           []func(context.Context, string, string) (net.Conn, error){dialFn},
+		log:             nf.log,
+		timeout:         nf.dnsTimeout(),
+		upstreamTimeout: nf.dnsUpstreamTimeout(),
 	}
 }
 
@@ -374,13 +376,14 @@ func (w *WireGuardEndpoint) dnsRelay(log *slog.Logger) dnsRelay {
 		dials[0], dials[1] = stackDial, hostDialer.DialContext
 	}
 	return dnsRelay{
-		gvxAddrs:    gvxAddrs,
-		ipv6Enabled: w.cfg.GuestIPv6.IsValid(),
-		lookupHost:  w.cfg.LookupHost,
-		servers:     w.upstreamDNS,
-		dials:       dials,
-		log:         log,
-		tune:        w.cfg.Tuning,
+		gvxAddrs:        gvxAddrs,
+		ipv6Enabled:     w.cfg.GuestIPv6.IsValid(),
+		lookupHost:      w.cfg.LookupHost,
+		servers:         w.upstreamDNS,
+		dials:           dials,
+		log:             log,
+		timeout:         w.cfg.Tuning.Duration(tuning.DNSTimeout),
+		upstreamTimeout: w.cfg.Tuning.Duration(tuning.DNSUpstreamTimeout),
 	}
 }
 
@@ -492,7 +495,7 @@ func (r dnsRelay) lookupOwnName(qname string) (addrs []netip.Addr, found, owned 
 // lookupHookAddrs resolves qname through the configured LookupHost hook.
 func (r dnsRelay) lookupHookAddrs(ctx context.Context, qname string) (addrs []netip.Addr, found, handled bool, err error) {
 	clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
-	rctx, cancel := context.WithTimeout(ctx, r.tune.Duration(tuning.DNSTimeout))
+	rctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
 	addrs, err = r.lookupHost(rctx, clean)
@@ -560,11 +563,11 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, viaTCP boo
 				respHdr dnsmessage.Header
 			)
 			if viaTCP {
-				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.upstreamTimeout)
 			} else {
-				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.upstreamTimeout)
 				if err == nil && respHdr.Truncated {
-					resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+					resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.upstreamTimeout)
 				}
 			}
 			if err != nil {

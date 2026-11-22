@@ -25,8 +25,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 )
 
 func init() {
@@ -50,6 +53,8 @@ type runConfig struct {
 	autoPlatform bool
 	// controlSocket is the host path or loopback address for the control listener.
 	controlSocket string
+	// controlTokenFile overrides the default authentication token file path.
+	controlTokenFile string
 }
 
 // parseRunArgs converts `rungv run` arguments into a gvx.Config. It returns
@@ -86,14 +91,19 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	if err != nil {
 		return usageError("%v", err)
 	}
+	ctrlSock, err := flags.resolveControlSocket()
+	if err != nil {
+		return usageError("%v", err)
+	}
 	cfg.OCIImage = imageRef
 	cfg.BinaryPath = binPath
 	applyGuestCommand(&cfg, fs, flags.entrypoint, binPath, guestArgs)
 
 	return runConfig{
-		autoPlatform:  autoPlatform,
-		cfg:           cfg,
-		controlSocket: strings.TrimSpace(flags.controlSocket),
+		autoPlatform:     autoPlatform,
+		cfg:              cfg,
+		controlSocket:    ctrlSock,
+		controlTokenFile: strings.TrimSpace(flags.controlTokenFile),
 	}, 0, false
 }
 
@@ -155,16 +165,15 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		return exitCode
 	}
 
-	cleanCkptDir, absCkptDir := resolveCheckpointDirs(rc.cfg.CheckpointDir)
-	control, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv run", stderr)
+	ctrlEp, ok := bindControlSocket(&rc.cfg, rc.controlSocket, rc.controlTokenFile, "rungv run", stderr)
 	if !ok {
 		return 1
 	}
 	var sb *gvx.Sandbox
-	if control != nil {
+	if ctrlEp != nil {
 		defer func() {
 			if sb == nil || !sb.LockdownStatus().Applied {
-				control.Cleanup()
+				ctrlEp.Cleanup()
 			}
 		}()
 	}
@@ -172,8 +181,8 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	var err error
 	sb, err = gvx.New(ctx, rc.cfg)
 	if err != nil {
-		if rc.cfg.CheckpointListener != nil {
-			_ = rc.cfg.CheckpointListener.Close()
+		if rc.cfg.ControlListener != nil {
+			_ = rc.cfg.ControlListener.Close()
 		}
 		_, _ = fmt.Fprintf(stderr, "rungv run: init sandbox: %v\n", err)
 		if errors.Is(err, gvx.ErrInvalidConfig) {
@@ -188,26 +197,29 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	if rc.cfg.Stderr != nil {
 		errOut = rc.cfg.Stderr
 	}
-	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv run", errOut)
+	return executeSandboxWithControl(ctx, sb, &rc.cfg, rc.autoPlatform, "rungv run", errOut)
 }
 
 // bindControlSocket opens the control listener before host lockdown when requested.
-func bindControlSocket(cfg *gvx.Config, socketSpec, cmdPrefix string, stderr io.Writer) (*controlEndpoint, bool) {
+func bindControlSocket(cfg *gvx.Config, socketSpec, tokenFile, cmdPrefix string, stderr io.Writer) (*control.Endpoint, bool) {
 	if socketSpec == "" {
 		return nil, true
 	}
-	ep, err := listenCheckpointSocket(socketSpec)
+	ep, err := control.Listen(socketSpec, control.ListenOptions{TokenFile: tokenFile})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: listen control socket: %v\n", cmdPrefix, err)
 		return nil, false
 	}
+	cfg.ControlListener = ep.Listener
 	cfg.CheckpointListener = ep.Listener
+	cfg.ControlToken = ep.Token
 	return ep, true
 }
 
-// executeSandboxWithControl emits startup warnings, starts checkpoint control, and runs the sandbox.
-func executeSandboxWithControl(ctx context.Context, sb *gvx.Sandbox, cfg *gvx.Config, controlToken string, autoPlatform bool, cleanCkptDir, absCkptDir, cmdPrefix string, stderr io.Writer) int {
-	stopControl := startCheckpointControl(ctx, sb, cfg.CheckpointListener, controlToken, cleanCkptDir, absCkptDir)
+// executeSandboxWithControl emits startup warnings, starts the v2/v1 control
+// server, and runs the sandbox.
+func executeSandboxWithControl(ctx context.Context, sb *gvx.Sandbox, cfg *gvx.Config, autoPlatform bool, cmdPrefix string, stderr io.Writer) int {
+	stopControl := startSandboxControl(ctx, sb, cfg)
 	defer stopControl()
 
 	reportSandboxStartup(stderr, sb, cfg, autoPlatform)
@@ -225,6 +237,25 @@ func executeSandboxWithControl(ctx context.Context, sb *gvx.Sandbox, cfg *gvx.Co
 		return exitCode
 	}
 	return exitCode
+}
+
+func startSandboxControl(ctx context.Context, sb *gvx.Sandbox, cfg *gvx.Config) func() {
+	if cfg.ControlListener == nil && cfg.CheckpointListener == nil {
+		return func() {}
+	}
+	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = sb.ServeControl(ctrlCtx)
+	}()
+	return sync.OnceFunc(func() {
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer drainCancel()
+		_ = sb.ShutdownControl(drainCtx)
+		ctrlCancel()
+		<-done
+	})
 }
 
 // reportSandboxStartup logs platform selection, security posture warnings, and published ports.

@@ -379,7 +379,19 @@ func (s *Sandbox) initKernelInstance(k *kernel.Kernel, tk *kernel.Timekeeper, cr
 		return errors.New("gvx: the kernel log exists before its size is set")
 	}
 	k.KernelLog().WriteBootMessages()
+	s.applyInitialKernelLimits(k)
 	return nil
+}
+
+func (s *Sandbox) applyInitialKernelLimits(k *kernel.Kernel) {
+	if s.cfg.Resources.CPUMillis > 0 {
+		period := 100 * time.Millisecond
+		quota := max(time.Duration(s.cfg.Resources.CPUMillis)*100*time.Microsecond, time.Millisecond)
+		k.SetSandboxCPULimit(quota, period)
+	}
+	if s.cfg.Resources.PidsLimit > 0 {
+		_ = cgroup2fs.SetRootPidsMax(k, s.cfg.Resources.PidsLimit)
+	}
 }
 
 // createInitialGuestProcess resolves the target executable, user credentials,
@@ -520,6 +532,7 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 	cleanupStdio := s.activateRestoredStdio(ctx, tg, collector)
 	defer cleanupStdio()
 
+	s.applyInitialKernelLimits(k)
 	hostRAM, _ := hostMemory()
 	return s.executeActiveKernel(ctx, k, tg, mf, hostRAM, "gvx: start restored Sentry kernel")
 }
@@ -536,40 +549,97 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	dog.Start()
 	defer dog.Stop()
 
+	s.mu.Lock()
+	s.startedAt = time.Now()
+	s.mu.Unlock()
 	s.setActiveKernel(k, dog)
 	defer s.clearActiveKernel()
+	s.emitEvent("sandbox", "started", nil)
 
 	doneCh := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
+			s.unpauseForShutdown(k, dog)
 			_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+			s.killActiveExecSessions(k)
 		case <-doneCh:
 		}
 	}()
 
 	var memoryExceeded atomic.Bool
-	stopGuard := s.startKernelMemoryGuard(ctx, k, tg, mf, hostRAM, &memoryExceeded)
+	stopGuard := s.startKernelMemoryGuard(ctx, k, tg, dog, mf, hostRAM, &memoryExceeded)
 	defer stopGuard()
 
 	tg.WaitExited()
+	s.killActiveExecSessions(k)
 	s.ckptMu.Lock()
 	s.clearActiveKernel()
 	k.WaitExited()
 	s.ckptMu.Unlock()
 	close(doneCh)
 	k.Pause()
+	s.emitEvent("sandbox", "exited", nil)
 
 	return s.collectKernelExitStatus(ctx, k, tg, &memoryExceeded)
 }
 
-func (s *Sandbox) startKernelMemoryGuard(ctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, mf *pgalloc.MemoryFile, hostRAM uint64, memoryExceeded *atomic.Bool) func() {
-	limit, interval := effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM, s.cfg.Tuning)
-	if limit == 0 {
+func (s *Sandbox) killActiveExecSessions(k *kernel.Kernel) {
+	s.execMu.Lock()
+	sessions := make([]*execSession, 0, len(s.execSessions))
+	for _, sess := range s.execSessions {
+		sessions = append(sessions, sess)
+	}
+	s.execMu.Unlock()
+	for _, sess := range sessions {
+		if sess.tg != nil {
+			_ = k.SendExternalSignalThreadGroup(sess.tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+		}
+	}
+}
+
+func (s *Sandbox) unpauseForShutdown(k *kernel.Kernel, dog *watchdog.Watchdog) {
+	s.ckptMu.Lock()
+	defer s.ckptMu.Unlock()
+	s.mu.Lock()
+	wasPaused := s.userPaused
+	wasQuiesced := s.userPauseQuiesced
+	s.userPaused = false
+	s.userPauseQuiesced = false
+	quiescers := s.saveQuiescersLocked()
+	s.mu.Unlock()
+	if !wasPaused {
+		return
+	}
+	if wasQuiesced {
+		for _, q := range quiescers {
+			_ = q.ResumeAfterSave()
+		}
+	}
+	if dog != nil {
+		dog.Start()
+	}
+	k.Unpause()
+}
+
+func (s *Sandbox) startKernelMemoryGuard(ctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, dog *watchdog.Watchdog, mf *pgalloc.MemoryFile, hostRAM uint64, memoryExceeded *atomic.Bool) func() {
+	s.mu.Lock()
+	memBytes := s.cfg.Resources.MemoryBytes
+	curTune := s.cfg.Tuning
+	hasCtrl := s.controlListener() != nil
+	s.mu.Unlock()
+	limit, interval := effectiveMemoryLimit(memBytes, hostRAM, curTune)
+	s.liveMemoryBytes.Store(memBytes)
+	s.liveMemoryLimit.Store(limit)
+	s.liveMemoryIntNS.Store(int64(interval))
+	if limit == 0 && !hasCtrl {
 		return func() {}
 	}
 	guard := memoryGuard{
 		limit: limit,
+		limitFn: func() uint64 {
+			return s.liveMemoryLimit.Load()
+		},
 		// The accounting counts a committed page only after a scan of the
 		// memory file. UpdateUsage limits its own scan rate. The accounting
 		// belongs to this memory file (see createKernelMemoryFile), so it
@@ -581,8 +651,14 @@ func (s *Sandbox) startKernelMemoryGuard(ctx context.Context, k *kernel.Kernel, 
 		flushScan:    mf.FlushCommitScan,
 		idleActivity: k.IdleTaskActivityChan,
 		interval:     interval,
+		intervalFn: func() time.Duration {
+			return time.Duration(s.liveMemoryIntNS.Load())
+		},
+		wakeCh: s.liveMemoryWake,
 		kill: func() {
 			memoryExceeded.Store(true)
+			s.emitEvent("resource", "oom", nil)
+			s.unpauseForShutdown(k, dog)
 			_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		},
 	}

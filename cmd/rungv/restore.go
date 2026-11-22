@@ -41,10 +41,11 @@ func init() {
 
 // restoreConfig holds the parsed flags of `rungv restore`.
 type restoreConfig struct {
-	dir           string
-	cfg           gvx.Config
-	autoPlatform  bool
-	controlSocket string
+	dir              string
+	cfg              gvx.Config
+	autoPlatform     bool
+	controlSocket    string
+	controlTokenFile string
 }
 
 // parseRestoreArgs converts `rungv restore` arguments into a restoreConfig.
@@ -79,11 +80,16 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	if err != nil {
 		return usageError("%v", err)
 	}
+	ctrlSock, err := flags.resolveControlSocket()
+	if err != nil {
+		return usageError("%v", err)
+	}
 	return restoreConfig{
-		dir:           dir,
-		cfg:           cfg,
-		autoPlatform:  autoPlatform,
-		controlSocket: strings.TrimSpace(flags.controlSocket),
+		dir:              dir,
+		cfg:              cfg,
+		autoPlatform:     autoPlatform,
+		controlSocket:    ctrlSock,
+		controlTokenFile: strings.TrimSpace(flags.controlTokenFile),
 	}, 0, false
 }
 
@@ -93,16 +99,15 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 		return exitCode
 	}
 
-	cleanCkptDir, absCkptDir := resolveCheckpointDirs(rc.cfg.CheckpointDir)
-	control, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv restore", stderr)
+	ctrlEp, ok := bindControlSocket(&rc.cfg, rc.controlSocket, rc.controlTokenFile, "rungv restore", stderr)
 	if !ok {
 		return 1
 	}
 	var sb *gvx.Sandbox
-	if control != nil {
+	if ctrlEp != nil {
 		defer func() {
 			if sb == nil || !sb.LockdownStatus().Applied {
-				control.Cleanup()
+				ctrlEp.Cleanup()
 			}
 		}()
 	}
@@ -110,8 +115,8 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	var err error
 	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir})
 	if err != nil {
-		if rc.cfg.CheckpointListener != nil {
-			_ = rc.cfg.CheckpointListener.Close()
+		if rc.cfg.ControlListener != nil {
+			_ = rc.cfg.ControlListener.Close()
 		}
 		_, _ = fmt.Fprintf(stderr, "rungv restore: %v\n", err)
 		if errors.Is(err, gvx.ErrInvalidConfig) {
@@ -126,5 +131,5 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	if rc.cfg.Stderr != nil {
 		errOut = rc.cfg.Stderr
 	}
-	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv restore", errOut)
+	return executeSandboxWithControl(ctx, sb, &rc.cfg, rc.autoPlatform, "rungv restore", errOut)
 }
