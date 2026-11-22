@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -1408,4 +1410,123 @@ func writeCTSQA(w io.Writer, rec *ctsRecord, modeResults map[string]*ctsModeResu
 
 	_, err := io.WriteString(w, sb.String())
 	return err
+}
+
+const venusMesaBuildCmd = "scripts/gpu/build-renderer.sh --driver-source mesa-source"
+
+// verifyVenusMesaPatches verifies that the renderer bundle holding
+// rendererPath declares SOURCE=mesa-source in BUILDINFO and lists matching
+// MESA_PATCH digests for every *.patch file in patchesDir.
+func verifyVenusMesaPatches(rendererPath, patchesDir string) error {
+	entries, err := os.ReadDir(patchesDir)
+	if err != nil {
+		return fmt.Errorf("read Mesa patch directory %s: %w", patchesDir, err)
+	}
+	var wantNames []string
+	wantDigests := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".patch") {
+			continue
+		}
+		p := filepath.Join(patchesDir, e.Name())
+		data, readErr := os.ReadFile(p)
+		if readErr != nil {
+			return fmt.Errorf("read Mesa patch %s: %w", p, readErr)
+		}
+		wantNames = append(wantNames, e.Name())
+		wantDigests[e.Name()] = sha256Hex(data)
+	}
+	if len(wantNames) == 0 {
+		return fmt.Errorf("no *.patch files found in %s", patchesDir)
+	}
+
+	if strings.TrimSpace(rendererPath) == "" {
+		return fmt.Errorf("renderer path is empty; build the patched driver with: %s", venusMesaBuildCmd)
+	}
+	absRenderer, err := filepath.Abs(rendererPath)
+	if err != nil {
+		return fmt.Errorf("resolve renderer path %s: %w; build the patched driver with: %s", rendererPath, err, venusMesaBuildCmd)
+	}
+	resolvedRenderer, err := filepath.EvalSymlinks(absRenderer)
+	if err != nil {
+		return fmt.Errorf("resolve renderer symlink %s: %w; build the patched driver with: %s", rendererPath, err, venusMesaBuildCmd)
+	}
+	resolvedRenderer, err = filepath.Abs(resolvedRenderer)
+	if err != nil {
+		return fmt.Errorf("resolve absolute renderer path %s: %w; build the patched driver with: %s", resolvedRenderer, err, venusMesaBuildCmd)
+	}
+	binDir := filepath.Dir(resolvedRenderer)
+	if filepath.Base(binDir) != "bin" {
+		return fmt.Errorf("renderer executable %s must reside in a bin directory (got %s); build the patched driver with: %s", resolvedRenderer, binDir, venusMesaBuildCmd)
+	}
+	bundleDir := filepath.Dir(binDir)
+	if bundleDir == binDir || bundleDir == string(filepath.Separator) {
+		return fmt.Errorf("renderer bundle root for %s cannot be filesystem root; build the patched driver with: %s", resolvedRenderer, venusMesaBuildCmd)
+	}
+
+	buildInfoPath := filepath.Join(bundleDir, "BUILDINFO")
+	raw, err := os.ReadFile(buildInfoPath)
+	if err != nil {
+		return fmt.Errorf("read renderer BUILDINFO %s: %w; build the patched driver with: %s", buildInfoPath, err, venusMesaBuildCmd)
+	}
+
+	source := ""
+	gotDigests := map[string]string{}
+	sc := bufio.NewScanner(strings.NewReader(string(raw)))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if val, ok := strings.CutPrefix(line, "SOURCE="); ok {
+			if source != "" && source != val {
+				return fmt.Errorf("%s declares conflicting SOURCE values (%q and %q); rebuild with: %s", buildInfoPath, source, val, venusMesaBuildCmd)
+			}
+			source = val
+			continue
+		}
+		if val, ok := strings.CutPrefix(line, "MESA_PATCH="); ok {
+			fields := strings.Fields(val)
+			if len(fields) != 2 {
+				return fmt.Errorf("%s has malformed MESA_PATCH line %q; rebuild with: %s", buildInfoPath, line, venusMesaBuildCmd)
+			}
+			name, digest := fields[0], fields[1]
+			if prev, dup := gotDigests[name]; dup {
+				return fmt.Errorf("%s lists duplicate MESA_PATCH %s (%s and %s); rebuild with: %s", buildInfoPath, name, prev, digest, venusMesaBuildCmd)
+			}
+			gotDigests[name] = digest
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("scan %s: %w", buildInfoPath, err)
+	}
+
+	if source != "mesa-source" {
+		return fmt.Errorf("venus WebGL CTS requires SOURCE=mesa-source in %s (got %q); rebuild with: %s", buildInfoPath, source, venusMesaBuildCmd)
+	}
+
+	var mismatches []string
+	for _, name := range wantNames {
+		want := wantDigests[name]
+		got, ok := gotDigests[name]
+		if !ok {
+			mismatches = append(mismatches, fmt.Sprintf("missing MESA_PATCH %s", name))
+			continue
+		}
+		if got != want {
+			mismatches = append(mismatches, fmt.Sprintf("MESA_PATCH %s digest mismatch (got %s, want %s)", name, got, want))
+		}
+	}
+	var extraNames []string
+	for name := range gotDigests {
+		if _, ok := wantDigests[name]; !ok {
+			extraNames = append(extraNames, name)
+		}
+	}
+	slices.Sort(extraNames)
+	for _, name := range extraNames {
+		mismatches = append(mismatches, fmt.Sprintf("unexpected MESA_PATCH %s", name))
+	}
+	if len(mismatches) > 0 {
+		return fmt.Errorf("renderer BUILDINFO %s does not match %s: %s; rebuild with: %s",
+			buildInfoPath, patchesDir, strings.Join(mismatches, "; "), venusMesaBuildCmd)
+	}
+	return nil
 }

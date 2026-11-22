@@ -247,6 +247,18 @@ func TestE2EGateGPUWebGLCTS(t *testing.T) {
 		rec.Failures = append(rec.Failures, msg)
 	}
 
+	venusEnabled := gpuModeEnabled("venus")
+	virglEnabled := gpuModeEnabled("virgl")
+	if venusEnabled {
+		if err := verifyVenusMesaPatches(os.Getenv(gpuRendererEnv), filepath.Join("..", "gpurenderer", "patches", "mesa")); err != nil {
+			fail("venus: %v", err)
+			venusEnabled = false
+			if !virglEnabled {
+				t.FailNow()
+			}
+		}
+	}
+
 	exps, err := parseCTSExpectations(bytes.NewReader(expectBytes))
 	if err != nil {
 		fail("parse webgl-cts-expectations.txt: %v", err)
@@ -319,7 +331,7 @@ func TestE2EGateGPUWebGLCTS(t *testing.T) {
 	}
 
 	var probeDir string
-	if gpuModeEnabled("venus") || gpuModeEnabled("virgl") {
+	if venusEnabled || virglEnabled {
 		probeDir = ctsDeviceProbeDir(t, hostArch())
 	}
 
@@ -333,7 +345,7 @@ func TestE2EGateGPUWebGLCTS(t *testing.T) {
 	modes := []modeSpec{
 		{name: "swiftshader", gpuMode: "off", flags: swFlags, readOnly: baseRO},
 	}
-	if gpuModeEnabled("venus") {
+	if venusEnabled {
 		debs := acceptprog.FetchGPUGuestDebs(t, hostArch())
 		ro := map[string]string{
 			pwcore:   playwrightCoreGuestPath,
@@ -343,7 +355,7 @@ func TestE2EGateGPUWebGLCTS(t *testing.T) {
 		}
 		modes = append(modes, modeSpec{name: "venus", gpuMode: "venus", flags: venusFlags, probeBin: webglCTSProbeGuestBin, readOnly: ro})
 	}
-	if gpuModeEnabled("virgl") {
+	if virglEnabled {
 		ro := map[string]string{
 			pwcore:   playwrightCoreGuestPath,
 			cts:      webglCTSGuestPath,

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -968,4 +969,200 @@ func TestCTSEmbeddedRuleFilesParse(t *testing.T) {
 	if len(exps) == 0 {
 		t.Fatalf("expectations file has no rule")
 	}
+}
+
+func TestVerifyVenusMesaPatches(t *testing.T) {
+	patchDir := t.TempDir()
+	p1Data := []byte("diff --git a/a.c b/a.c\n")
+	p2Data := []byte("diff --git a/b.c b/b.c\n")
+	if err := os.WriteFile(filepath.Join(patchDir, "0001-a.patch"), p1Data, 0o644); err != nil {
+		t.Fatalf("write patch 1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(patchDir, "0002-b.patch"), p2Data, 0o644); err != nil {
+		t.Fatalf("write patch 2: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(patchDir, "README.md"), []byte("# ignored\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	p1SHA := sha256Hex(p1Data)
+	p2SHA := sha256Hex(p2Data)
+
+	makeBundle := func(t *testing.T, buildInfo string, writeFile bool) string {
+		t.Helper()
+		bundleDir := filepath.Join(t.TempDir(), "gvx-gpu-renderer")
+		binDir := filepath.Join(bundleDir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", binDir, err)
+		}
+		binPath := filepath.Join(binDir, "gvx-gpu-renderer")
+		if err := os.WriteFile(binPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("write %s: %v", binPath, err)
+		}
+		if writeFile {
+			if err := os.WriteFile(filepath.Join(bundleDir, "BUILDINFO"), []byte(buildInfo), 0o644); err != nil {
+				t.Fatalf("write BUILDINFO: %v", err)
+			}
+		}
+		return binPath
+	}
+
+	validBuildInfo := strings.Join([]string{
+		"RENDERER_VERSION=0.1.0",
+		"DRIVER=KosmicKrisp",
+		"BOTTLE_TAG=mesa-source",
+		"SOURCE=mesa-source",
+		"MESA=26.3.0 sha256:0000",
+		"MESA_PATCH=0001-a.patch " + p1SHA,
+		"MESA_PATCH=0002-b.patch " + p2SHA,
+		"MIN_MACOS=27.2",
+	}, "\n") + "\n"
+
+	t.Run("accepts matching mesa-source bundle", func(t *testing.T) {
+		renderer := makeBundle(t, validBuildInfo, true)
+		if err := verifyVenusMesaPatches(renderer, patchDir); err != nil {
+			t.Fatalf("verifyVenusMesaPatches() = %v, want nil", err)
+		}
+	})
+
+	cases := []struct {
+		name        string
+		buildInfo   string
+		writeFile   bool
+		wantContain []string
+	}{
+		{
+			name:        "missing BUILDINFO",
+			writeFile:   false,
+			wantContain: []string{"BUILDINFO", venusMesaBuildCmd},
+		},
+		{
+			name:        "pinned bottle bundle",
+			buildInfo:   "SOURCE=pinned\nMIN_MACOS=27.2\n",
+			writeFile:   true,
+			wantContain: []string{"SOURCE=mesa-source", "pinned", venusMesaBuildCmd},
+		},
+		{
+			name:        "missing patch entry",
+			buildInfo:   "SOURCE=mesa-source\nMESA_PATCH=0001-a.patch " + p1SHA + "\n",
+			writeFile:   true,
+			wantContain: []string{"missing MESA_PATCH 0002-b.patch", venusMesaBuildCmd},
+		},
+		{
+			name:        "digest mismatch",
+			buildInfo:   "SOURCE=mesa-source\nMESA_PATCH=0001-a.patch " + p1SHA + "\nMESA_PATCH=0002-b.patch deadbeef\n",
+			writeFile:   true,
+			wantContain: []string{"0002-b.patch digest mismatch", venusMesaBuildCmd},
+		},
+		{
+			name:        "unexpected extra patch",
+			buildInfo:   validBuildInfo + "MESA_PATCH=0003-extra.patch abcdef\n",
+			writeFile:   true,
+			wantContain: []string{"unexpected MESA_PATCH 0003-extra.patch", venusMesaBuildCmd},
+		},
+		{
+			name:        "malformed MESA_PATCH line",
+			buildInfo:   "SOURCE=mesa-source\nMESA_PATCH=0001-a.patch\n",
+			writeFile:   true,
+			wantContain: []string{"malformed MESA_PATCH", venusMesaBuildCmd},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			renderer := makeBundle(t, tc.buildInfo, tc.writeFile)
+			err := verifyVenusMesaPatches(renderer, patchDir)
+			if err == nil {
+				t.Fatalf("verifyVenusMesaPatches() = nil, want error")
+			}
+			for _, sub := range tc.wantContain {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error %q does not contain %q", err.Error(), sub)
+				}
+			}
+		})
+	}
+
+	t.Run("symlink resolution", func(t *testing.T) {
+		// False rejection case: symlink outside bin/ pointing to a valid bundle binary.
+		validTarget := makeBundle(t, validBuildInfo, true)
+		externalLink := filepath.Join(t.TempDir(), "gvx-gpu-renderer-link")
+		if err := os.Symlink(validTarget, externalLink); err != nil {
+			t.Fatalf("symlink %s to %s: %v", externalLink, validTarget, err)
+		}
+		if err := verifyVenusMesaPatches(externalLink, patchDir); err != nil {
+			t.Fatalf("verifyVenusMesaPatches(external symlink) = %v, want nil", err)
+		}
+
+		// Bypass case: symlink inside a fake valid bundle pointing to a pinned bundle binary.
+		pinnedTarget := makeBundle(t, "SOURCE=pinned\nMIN_MACOS=27.2\n", true)
+		fakeBundle := filepath.Join(t.TempDir(), "fake-bundle")
+		fakeBinDir := filepath.Join(fakeBundle, "bin")
+		if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", fakeBinDir, err)
+		}
+		if err := os.WriteFile(filepath.Join(fakeBundle, "BUILDINFO"), []byte(validBuildInfo), 0o644); err != nil {
+			t.Fatalf("write fake BUILDINFO: %v", err)
+		}
+		bypassLink := filepath.Join(fakeBinDir, "gvx-gpu-renderer")
+		if err := os.Symlink(pinnedTarget, bypassLink); err != nil {
+			t.Fatalf("symlink %s to %s: %v", bypassLink, pinnedTarget, err)
+		}
+		err := verifyVenusMesaPatches(bypassLink, patchDir)
+		if err == nil {
+			t.Fatalf("verifyVenusMesaPatches(bypass symlink) = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "SOURCE=mesa-source") {
+			t.Errorf("error %q does not contain SOURCE=mesa-source", err.Error())
+		}
+
+		// Non-bin parent directory rejection.
+		nonBinBundle := filepath.Join(t.TempDir(), "nonbin-bundle")
+		otherDir := filepath.Join(nonBinBundle, "libexec")
+		if err := os.MkdirAll(otherDir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", otherDir, err)
+		}
+		if err := os.WriteFile(filepath.Join(nonBinBundle, "BUILDINFO"), []byte(validBuildInfo), 0o644); err != nil {
+			t.Fatalf("write BUILDINFO: %v", err)
+		}
+		nonBinPath := filepath.Join(otherDir, "gvx-gpu-renderer")
+		if err := os.WriteFile(nonBinPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("write %s: %v", nonBinPath, err)
+		}
+		err = verifyVenusMesaPatches(nonBinPath, patchDir)
+		if err == nil {
+			t.Fatalf("verifyVenusMesaPatches(non-bin dir) = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "bin directory") {
+			t.Errorf("error %q does not mention bin directory", err.Error())
+		}
+	})
+
+	t.Run("matches repository Mesa patches", func(t *testing.T) {
+		repoPatches := filepath.Join("..", "gpurenderer", "patches", "mesa")
+		entries, err := os.ReadDir(repoPatches)
+		if err != nil {
+			t.Fatalf("read %s: %v", repoPatches, err)
+		}
+		var lines []string
+		lines = append(lines, "SOURCE=mesa-source")
+		patchCount := 0
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".patch") {
+				continue
+			}
+			data, readErr := os.ReadFile(filepath.Join(repoPatches, e.Name()))
+			if readErr != nil {
+				t.Fatalf("read %s: %v", e.Name(), readErr)
+			}
+			lines = append(lines, "MESA_PATCH="+e.Name()+" "+sha256Hex(data))
+			patchCount++
+		}
+		if patchCount == 0 {
+			t.Fatalf("expected Mesa patches in %s", repoPatches)
+		}
+		renderer := makeBundle(t, strings.Join(lines, "\n")+"\n", true)
+		if err := verifyVenusMesaPatches(renderer, repoPatches); err != nil {
+			t.Fatalf("verifyVenusMesaPatches(repo) = %v, want nil", err)
+		}
+	})
 }
