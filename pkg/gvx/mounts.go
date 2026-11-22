@@ -788,11 +788,13 @@ func (c Config) volumeRoot() (string, error) {
 // otherwise. An ext4lite volume holds its open volume.
 type sandboxMount struct {
 	Mount
-	hostPath    string
-	hostFile    bool
-	workspace   *hostfs.Workspace
-	volume      *ext4lite.Volume
-	upperVolume *ext4lite.Volume
+	hostPath        string
+	hostFile        bool
+	backingReadOnly bool
+	dynamic         bool
+	workspace       *hostfs.Workspace
+	volume          *ext4lite.Volume
+	upperVolume     *ext4lite.Volume
 }
 
 // mountList returns every guest mount: the WorkspacePath mount first, then
@@ -926,7 +928,9 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 		sm := sandboxMount{Mount: m}
 		switch {
 		case m.Kind == MountTmpfs:
+			sm.backingReadOnly = false
 		case m.Kind == MountOverlay:
+			sm.backingReadOnly = m.ReadOnly
 			lowerImg, err := s.cfg.volumeImagePath(m)
 			if err != nil {
 				return err
@@ -959,6 +963,7 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 			}
 			sm.volume = lowerVol
 		case m.Kind == MountVolume && m.Driver == DriverExt4lite:
+			sm.backingReadOnly = m.ReadOnly
 			if m.ReadOnly {
 				vol, err := openRO(m)
 				if err != nil {
@@ -998,6 +1003,7 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 				s.workspaces = append(s.workspaces, ws)
 			}
 			sm.workspace = ws
+			sm.backingReadOnly = ws.ReadOnly()
 		}
 		s.mounts = append(s.mounts, sm)
 		if m.GuestPath == workspaceGuestPath {

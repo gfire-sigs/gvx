@@ -100,7 +100,7 @@ func execSubcommand(ctx context.Context, args []string, streams cliIO) int {
 	}
 
 	var detachSeq []byte
-	if tty && strings.TrimSpace(detachKeys) != "" {
+	if tty && interactive && strings.TrimSpace(detachKeys) != "" {
 		var err error
 		detachSeq, err = parseDetachKeys(detachKeys)
 		if err != nil {
@@ -165,7 +165,7 @@ func execSubcommand(ctx context.Context, args []string, streams cliIO) int {
 		return 0
 	}
 
-	if tty && gvx.IsHostTerminal(streams.stdin) {
+	if tty && interactive && gvx.IsHostTerminal(streams.stdin) {
 		if restore, ok := gvx.EnterHostRawMode(streams.stdin, streams.stdout); ok {
 			defer restore()
 		}
@@ -248,23 +248,32 @@ func execSubcommand(ctx context.Context, args []string, streams cliIO) int {
 	case <-detachedCh:
 		execCancel()
 		stream.Close()
+		outWG.Wait()
 		return 0
 	case res := <-exitCh:
 		outWG.Wait()
 		if res.err != nil {
-			if errors.Is(res.err, io.EOF) {
-				return 0
-			}
 			return controlFail(streams.stderr, cmdName, res.err)
 		}
 		return res.ev.ExitCode
 	case <-ctx.Done():
-		if !tty {
-			sigCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-			_ = stream.SendEvent(sigCtx, "exec.signal", control.ExecSignalEvent{Signal: "SIGINT"})
-			cancel()
+		sigCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = stream.SendEvent(sigCtx, "exec.signal", control.ExecSignalEvent{Signal: "SIGINT"})
+		cancel()
+		// Wait briefly for the guest process to exit cleanly after receiving the signal.
+		select {
+		case res := <-exitCh:
+			execCancel()
+			stream.Close()
+			outWG.Wait()
+			if res.err == nil {
+				return res.ev.ExitCode
+			}
+		case <-time.After(150 * time.Millisecond):
+			execCancel()
+			stream.Close()
+			outWG.Wait()
 		}
-		execCancel()
 		return 130
 	}
 }
@@ -295,12 +304,13 @@ func parseDetachKeys(spec string) ([]byte, error) {
 	parts := strings.Split(spec, ",")
 	seq := make([]byte, 0, len(parts))
 	for _, raw := range parts {
-		tok := strings.ToLower(strings.TrimSpace(raw))
-		if tok == "" {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
 			continue
 		}
-		if strings.HasPrefix(tok, "ctrl-") && len(tok) == len("ctrl-")+1 {
-			ch := tok[len(tok)-1]
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "ctrl-") && len(lower) == len("ctrl-")+1 {
+			ch := lower[len(lower)-1]
 			switch {
 			case ch >= 'a' && ch <= 'z':
 				seq = append(seq, ch-'a'+1)
@@ -321,8 +331,8 @@ func parseDetachKeys(spec string) ([]byte, error) {
 			}
 			continue
 		}
-		if len(tok) == 1 {
-			seq = append(seq, tok[0])
+		if len(trimmed) == 1 {
+			seq = append(seq, trimmed[0])
 			continue
 		}
 		return nil, fmt.Errorf("unsupported detach key %q", raw)
@@ -332,6 +342,20 @@ func parseDetachKeys(spec string) ([]byte, error) {
 
 // copyWithDetach forwards r to w and returns true if detachSeq is observed.
 func copyWithDetach(w io.Writer, r io.Reader, detachSeq []byte) bool {
+	// Precompute KMP longest proper prefix-suffix table for exact partial-match rollback.
+	lps := make([]int, len(detachSeq))
+	for i, k := 1, 0; i < len(detachSeq); {
+		if detachSeq[i] == detachSeq[k] {
+			k++
+			lps[i] = k
+			i++
+		} else if k > 0 {
+			k = lps[k-1]
+		} else {
+			lps[i] = 0
+			i++
+		}
+	}
 	buf := make([]byte, 4096)
 	matched := 0
 	for {
@@ -339,6 +363,11 @@ func copyWithDetach(w io.Writer, r io.Reader, detachSeq []byte) bool {
 		if n > 0 {
 			out := make([]byte, 0, n+len(detachSeq))
 			for _, b := range buf[:n] {
+				for matched > 0 && b != detachSeq[matched] {
+					nextMatched := lps[matched-1]
+					out = append(out, detachSeq[:matched-nextMatched]...)
+					matched = nextMatched
+				}
 				if b == detachSeq[matched] {
 					matched++
 					if matched == len(detachSeq) {
@@ -348,14 +377,6 @@ func copyWithDetach(w io.Writer, r io.Reader, detachSeq []byte) bool {
 						return true
 					}
 					continue
-				}
-				if matched > 0 {
-					out = append(out, detachSeq[:matched]...)
-					matched = 0
-					if b == detachSeq[0] {
-						matched = 1
-						continue
-					}
 				}
 				out = append(out, b)
 			}

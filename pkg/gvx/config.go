@@ -504,10 +504,14 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if q := c.Resources.CPUMillis; q < 0 || q > int64(runtime.NumCPU())*1000 {
 		return fmt.Errorf("%w: CPU quota %d is invalid: use 0 to %d thousandths of a CPU", ErrInvalidConfig, q, runtime.NumCPU()*1000)
 	}
-	if p := c.Resources.PidsLimit; p < 0 {
-		return fmt.Errorf("%w: pids limit %d must be non-negative", ErrInvalidConfig, p)
+	const maxPidsLimit = 4 * 1024 * 1024
+	if p := c.Resources.PidsLimit; p < 0 || p > maxPidsLimit {
+		return fmt.Errorf("%w: pids limit %d out of range [0, %d]", ErrInvalidConfig, p, maxPidsLimit)
 	}
 	if _, err := control.ParsePolicy(string(c.ControlPolicy)); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	if err := control.ValidateDisableList(c.ControlDisable); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	if c.AllowPacketSocketWrite && !c.NetRaw {

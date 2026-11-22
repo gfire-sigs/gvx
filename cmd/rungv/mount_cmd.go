@@ -170,11 +170,11 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 		ReadOnly: readOnly,
 	}
 	if strings.TrimSpace(sizeStr) != "" {
-		sz, err := gvx.ParseMemory(sizeStr)
+		tmpMnt, err := gvx.ParseTmpfs("/x:size=" + strings.TrimSpace(sizeStr))
 		if err != nil {
 			return controlUsageError(stderr, cmdName, "--size: %v", err)
 		}
-		req.TmpfsSizeBytes = sz
+		req.TmpfsSizeBytes = tmpMnt.TmpfsSizeBytes
 	}
 
 	var sendFDs []int
@@ -381,6 +381,12 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 	}
 	_, _ = fmt.Fprintf(stdout, "Serving %s at %s (%s)\n", absHost, resp.Target, mode)
 
+	// Bound raw read payload so base64 + JSON envelope stays below max_frame_bytes.
+	maxReadBytes := int64((client.MaxFrameBytes()*3)/4 - 4096)
+	if maxReadBytes < 4096 {
+		maxReadBytes = 4096
+	}
+
 	for {
 		ev, err := stream.RecvEvent(ctx)
 		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
@@ -396,7 +402,7 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 		if err := json.Unmarshal(ev.Data, &req); err != nil {
 			continue
 		}
-		rpcResp := serveRPCFSRequest(root, readOnly, req)
+		rpcResp := serveRPCFSRequest(root, readOnly, maxReadBytes, req)
 		if err := stream.SendEvent(ctx, "rpcfs.resp", rpcResp); err != nil {
 			if ctx.Err() != nil {
 				return 0
@@ -407,13 +413,19 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 }
 
 func cleanRPCFSRelPath(raw string) (string, bool) {
-	p := path.Clean("/" + strings.ReplaceAll(raw, `\`, "/"))
+	if strings.ContainsRune(raw, 0) {
+		return "", false
+	}
+	norm := strings.ReplaceAll(raw, `\`, "/")
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == ".." {
+			return "", false
+		}
+	}
+	p := path.Clean("/" + norm)
 	rel := strings.TrimPrefix(p, "/")
 	if rel == "" {
 		return ".", true
-	}
-	if rel == ".." || strings.HasPrefix(rel, "../") {
-		return "", false
 	}
 	return rel, true
 }
@@ -444,11 +456,11 @@ func osModeToLinuxMode(m os.FileMode) uint32 {
 	}
 	switch {
 	case m.IsDir():
-		return 0o040000 | perm
+		return control.LinuxSIFDIR | perm
 	case m&os.ModeSymlink != 0:
-		return 0o120000 | perm
+		return control.LinuxSIFLNK | perm
 	default:
-		return 0o100000 | perm
+		return control.LinuxSIFREG | perm
 	}
 }
 
@@ -477,12 +489,15 @@ func entryFromFileInfo(rel, name string, fi os.FileInfo, root *os.Root) control.
 	}
 }
 
-func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) control.RPCFSResponse {
+func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req control.RPCFSRequest) control.RPCFSResponse {
 	resp := control.RPCFSResponse{ID: req.ID}
 	rel, ok := cleanRPCFSRelPath(req.Path)
 	if !ok {
 		resp.Errno = control.LinuxEINVAL
 		return resp
+	}
+	if maxReadBytes <= 0 {
+		maxReadBytes = 128 << 10
 	}
 
 	switch req.Op {
@@ -524,12 +539,16 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) c
 		return resp
 
 	case "read":
+		if req.Offset < 0 {
+			resp.Errno = control.LinuxEINVAL
+			return resp
+		}
 		length := req.Length
 		if length <= 0 {
 			return resp
 		}
-		if length > 256<<10 {
-			length = 256 << 10
+		if length > maxReadBytes {
+			length = maxReadBytes
 		}
 		f, err := root.Open(rel)
 		if err != nil {
@@ -549,6 +568,10 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) c
 	case "write":
 		if readOnly {
 			resp.Errno = control.LinuxEROFS
+			return resp
+		}
+		if req.Offset < 0 {
+			resp.Errno = control.LinuxEINVAL
 			return resp
 		}
 		f, err := root.OpenFile(rel, os.O_WRONLY, 0)
@@ -575,11 +598,8 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) c
 			return resp
 		}
 		perm := os.FileMode(req.Mode & 0o777)
-		if perm == 0 {
-			perm = 0o644
-		}
 		flags := os.O_CREATE | os.O_RDWR
-		if req.Flags&0o200 != 0 { // O_EXCL
+		if req.Flags&control.LinuxOExcl != 0 {
 			flags |= os.O_EXCL
 		}
 		f, err := root.OpenFile(rel, flags, perm)
@@ -603,9 +623,6 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) c
 			return resp
 		}
 		perm := os.FileMode(req.Mode & 0o777)
-		if perm == 0 {
-			perm = 0o755
-		}
 		if err := root.Mkdir(rel, perm); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 			return resp
@@ -619,9 +636,37 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) c
 		resp.Entry = &entry
 		return resp
 
-	case "unlink", "rmdir":
+	case "unlink":
 		if readOnly {
 			resp.Errno = control.LinuxEROFS
+			return resp
+		}
+		fi, err := root.Lstat(rel)
+		if err != nil {
+			resp.Errno = control.HostErrorToLinuxErrno(err)
+			return resp
+		}
+		if fi.IsDir() {
+			resp.Errno = control.LinuxEISDIR
+			return resp
+		}
+		if err := root.Remove(rel); err != nil {
+			resp.Errno = control.HostErrorToLinuxErrno(err)
+		}
+		return resp
+
+	case "rmdir":
+		if readOnly {
+			resp.Errno = control.LinuxEROFS
+			return resp
+		}
+		fi, err := root.Lstat(rel)
+		if err != nil {
+			resp.Errno = control.HostErrorToLinuxErrno(err)
+			return resp
+		}
+		if !fi.IsDir() {
+			resp.Errno = control.LinuxENOTDIR
 			return resp
 		}
 		if err := root.Remove(rel); err != nil {
@@ -678,8 +723,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) c
 			resp.Errno = control.LinuxEROFS
 			return resp
 		}
-		now := time.Now()
-		atime, mtime := now, now
+		var atime, mtime time.Time
 		if req.SetAtime {
 			atime = time.Unix(0, req.AtimeNS)
 		}
@@ -703,6 +747,14 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, req control.RPCFSRequest) c
 	case "symlink":
 		if readOnly {
 			resp.Errno = control.LinuxEROFS
+			return resp
+		}
+		if err := validateSafeSymlinkTarget(rel, req.Target); err != nil {
+			resp.Errno = control.LinuxEPERM
+			return resp
+		}
+		if err := verifyExistingAncestorsInRoot(root, path.Dir(rel)); err != nil {
+			resp.Errno = control.LinuxEPERM
 			return resp
 		}
 		if err := root.Symlink(req.Target, rel); err != nil {

@@ -45,9 +45,9 @@ Every `gvx-ctrl/2` message begins with a 12-byte big-endian header followed by `
 
 Each stream maintains a credit-based flow-control window starting at `1 MiB`. Receivers emit `WINDOW_UPDATE` frames once a reader consumes `256 KiB` or more.
 
-When `COMPRESSED_ZSTD` is set on a `DATA` frame, the sender compresses the payload with `zstd`. The receiver bounds both the wire length and the decompressed length by `max_frame_bytes`.
+When the sender sets `COMPRESSED_ZSTD` on a `DATA` frame, it compresses the payload with `zstd`. The receiver rejects `COMPRESSED_ZSTD` on non-`DATA` frames and bounds both wire length and decompressed length by `max_frame_bytes`.
 
-When `HAS_FDS` is set on a Unix domain socket frame, the sender transmits ancillary file descriptors with `SCM_RIGHTS` immediately after the frame bytes.
+When the sender sets `HAS_FDS` on a `REQUEST` frame on a Unix domain socket, it transmits ancillary file descriptors with `SCM_RIGHTS` immediately after the frame bytes. The server rejects `HAS_FDS` unless `mount.volume_attach` is active on a Unix socket.
 
 ---
 
@@ -63,7 +63,7 @@ Every control endpoint restricts access to the local owner account.
 | :--- | :--- | :--- |
 | Unix domain socket | Linux, macOS | Mode `0600` socket file inside an owner-only directory plus peer UID verification via `SO_PEERCRED` (Linux) or `LOCAL_PEERCRED` (macOS). Optional token file via `--control-token-file`. |
 | Unix domain socket | Windows | Per-run 256-bit hexadecimal token in a `0600` token file (`<socket>.token`) verified in constant time during `HELLO`. |
-| Loopback TCP (`127.0.0.1` or `[::1]`) | Linux, macOS, Windows | Loopback-only bind validation plus mandatory per-run 256-bit token in `<cache>/gvx/control/tcp-<port>.token`. |
+| Loopback TCP (`127.0.0.1` or `[::1]`) | Linux, macOS, Windows | Loopback-only bind validation plus mandatory per-run 256-bit token in `<cache>/gvx/control/tcp-<port>.token` (IPv4) or `tcp6-<port>.token` (IPv6). |
 
 ### 2.2 Capability Policies
 
@@ -72,7 +72,7 @@ Every control endpoint restricts access to the local owner account.
 | Policy | Permitted Capabilities |
 | :--- | :--- |
 | `default` | All capabilities compatible with the active host lockdown and runtime flags. |
-| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log`. |
+| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log` (excludes `kernel.log_clear`). |
 | `checkpoint-only` | `system.ping`, `sandbox.inspect`, `checkpoint.local`, `checkpoint.stream`. |
 
 ### 2.3 Lockdown Compatibility Matrix
@@ -87,7 +87,7 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | `port-forward` (`net.dial`) | Allowed; the unlocked client binds host sockets and tunnels TCP streams into the guest stack. | None. |
 | `port add` | Allowed on `127.0.0.1` or `[::1]` only when loopback binds are pre-authorized; non-loopback and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports` or `--auto-publish`. |
 | `mount add --type tmpfs`, `mount rm` | Allowed; no host path opens occur. | None. |
-| `mount remount` | `rw` to `ro` is always allowed; `ro` to `rw` succeeds only when the host backing opened writable before lockdown. | Original writable mount. |
+| `mount remount` | The server always allows remounting `rw` to `ro`; remounting `ro` to `rw` succeeds only when the host backing opened writable before lockdown. | Original writable mount. |
 | `mount add --type volume` | Allowed over POSIX `AF_UNIX` via `SCM_RIGHTS` FD transfer; server verifies `S_IFREG` before opening `ext4lite`. | `--allow-volume-attach` (Linux seccomp rule). |
 | `mount serve` (`rpcfs`) | Allowed on all host OSes; the unlocked client serves an `os.Root`-pinned directory over stream events. | None. |
 | `mount add --type bind` | Always rejected with `LOCKDOWN_DENIED` under lockdown. | `-lockdown=false` (debugging only). |
@@ -152,7 +152,7 @@ Failed RPCs return a `ProtoError` object with a stable `code`, a diagnostic `mes
 
 ## 4. Control Operations Procedure (Procedural Module)
 
-Run these steps to start a named sandbox with a control socket and manage it from a second terminal.
+Run these steps to start a named sandbox with a control socket and control it from a second terminal.
 
 > [!IMPORTANT]
 > Never expose a control socket on a non-loopback address or a world-writable directory. On Linux and macOS, keep the socket inside a mode `0700` directory.
@@ -170,5 +170,6 @@ rungv exec -n app -it -- /bin/sh
 rungv update -n app -m 512m --cpus 1.0 --pids-limit 128
 rungv port-forward -n app 18080:80
 rungv mount serve -n app "$PWD":/mnt/host
-rungv checkpoint -n app -z -o ./app-ckpt
+rungv checkpoint -n app -z -o ./app-ckpt --leave-running
+rungv stop -n app
 ```

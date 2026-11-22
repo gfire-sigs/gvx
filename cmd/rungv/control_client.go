@@ -125,7 +125,7 @@ func controlFail(stderr io.Writer, cmdName string, err error) int {
 }
 
 func controlUsageError(stderr io.Writer, cmdName, format string, args ...any) int {
-	_, _ = fmt.Fprintf(stderr, "rungv %s: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(stderr, "rungv %s: %s\n", cmdName, fmt.Sprintf(format, args...))
 	return 2
 }
 

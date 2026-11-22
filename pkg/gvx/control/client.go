@@ -59,7 +59,7 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 	}
 	timeout := opts.HandshakeTimeout
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = 10 * time.Second
 	}
 	var dialer net.Dialer
 	nc, err := dialer.DialContext(ctx, network, address)
@@ -123,7 +123,7 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 	if maxFrame <= 0 || maxFrame > AbsoluteMaxFrameBytes {
 		maxFrame = DefaultMaxFrameBytes
 	}
-	c := newConn(nc, nil, maxFrame, false, nil)
+	c := newConn(nc, nil, maxFrame, false, false, nil)
 	c.startReadLoop()
 	return &Client{
 		conn:         c,
@@ -159,6 +159,16 @@ func (c *Client) HasFeature(feature string) bool {
 // Network returns the transport network ("unix" or "tcp").
 func (c *Client) Network() string {
 	return c.network
+}
+
+// MaxFrameBytes returns the negotiated maximum payload length per wire frame.
+func (c *Client) MaxFrameBytes() int {
+	return c.maxFrame
+}
+
+// Done returns a channel closed when the underlying control connection ends.
+func (c *Client) Done() <-chan struct{} {
+	return c.conn.Done()
 }
 
 // Ping executes a wire-level ping/pong round-trip.

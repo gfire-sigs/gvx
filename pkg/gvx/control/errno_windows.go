@@ -23,12 +23,18 @@ import (
 )
 
 const (
-	winErrDirNotEmpty  syscall.Errno = 145
-	winErrDiskFull     syscall.Errno = 112
-	winErrWriteProtect syscall.Errno = 19
-	winErrInvalidParam syscall.Errno = 87
-	winErrDirectory    syscall.Errno = 267
-	winErrNotSupported syscall.Errno = 50
+	winErrNotSameDevice syscall.Errno = 17
+	winErrWriteProtect  syscall.Errno = 19
+	winErrSharingViol   syscall.Errno = 32
+	winErrLockViol      syscall.Errno = 33
+	winErrNotSupported  syscall.Errno = 50
+	winErrInvalidParam  syscall.Errno = 87
+	winErrDiskFull      syscall.Errno = 112
+	winErrDirNotEmpty   syscall.Errno = 145
+	winErrBusy          syscall.Errno = 170
+	winErrNameTooLong   syscall.Errno = 206
+	winErrDirectory     syscall.Errno = 267
+	winErrCantResolve   syscall.Errno = 1921
 )
 
 // HostErrorToLinuxErrno translates a Windows filesystem error into a canonical
@@ -46,12 +52,20 @@ func HostErrorToLinuxErrno(err error) int {
 		return LinuxEACCES
 	case errors.Is(err, syscall.EPERM):
 		return LinuxEPERM
+	case errors.Is(err, winErrBusy), errors.Is(err, winErrSharingViol), errors.Is(err, winErrLockViol):
+		return LinuxEBUSY
+	case errors.Is(err, winErrNotSameDevice):
+		return LinuxEXDEV
 	case errors.Is(err, winErrDirectory), errors.Is(err, syscall.ENOTDIR):
 		return LinuxENOTDIR
 	case errors.Is(err, syscall.EISDIR):
 		return LinuxEISDIR
+	case errors.Is(err, winErrNameTooLong):
+		return LinuxENAMETOOLONG
 	case errors.Is(err, winErrDirNotEmpty):
 		return LinuxENOTEMPTY
+	case errors.Is(err, winErrCantResolve):
+		return LinuxELOOP
 	case errors.Is(err, winErrInvalidParam), errors.Is(err, syscall.EINVAL):
 		return LinuxEINVAL
 	case errors.Is(err, winErrWriteProtect):

@@ -24,7 +24,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,6 +66,30 @@ func TestParseControlRunFlags(t *testing.T) {
 	_, badCode, badDone, badErr := parse(t, "--control", "alpine:3.20")
 	if !badDone || badCode != 2 || !strings.Contains(badErr, "--control requires --name") {
 		t.Fatalf("--control without --name = (code=%d done=%v stderr=%q)", badCode, badDone, badErr)
+	}
+
+	// Unknown --control-disable capability typo must fail with exit code 2.
+	_, typoCode, typoDone, typoErr := parse(t, "--name", "web1", "--control", "--control-disable", "exce", "alpine:3.20")
+	if !typoDone || typoCode != 2 || !strings.Contains(typoErr, "unknown") {
+		t.Fatalf("--control-disable=exce = (code=%d done=%v stderr=%q), want exit 2", typoCode, typoDone, typoErr)
+	}
+}
+
+func TestControlUsageErrorFormatting(t *testing.T) {
+	var buf bytes.Buffer
+	if code := controlUsageError(&buf, "exec", "specify a command to execute"); code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if got := buf.String(); got != "rungv exec: specify a command to execute\n" {
+		t.Fatalf("formatted = %q, want %q", got, "rungv exec: specify a command to execute\n")
+	}
+
+	buf.Reset()
+	if code := controlUsageError(&buf, "pause", "unexpected argument %q", "foo"); code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if got := buf.String(); got != "rungv pause: unexpected argument \"foo\"\n" {
+		t.Fatalf("formatted = %q, want %q", got, "rungv pause: unexpected argument \"foo\"\n")
 	}
 }
 
@@ -106,6 +132,25 @@ func TestParseDetachKeysAndCopyWithDetach(t *testing.T) {
 	if !bytes.Equal(out.Bytes(), []byte{'a', 0x10, 'b'}) {
 		t.Fatalf("forwarded bytes = %x, want 611062", out.Bytes())
 	}
+
+	// Single uppercase character must preserve case.
+	upperSeq, err := parseDetachKeys("Q")
+	if err != nil || !bytes.Equal(upperSeq, []byte{'Q'}) {
+		t.Fatalf("parseDetachKeys(Q) = (%x, %v), want 51", upperSeq, err)
+	}
+
+	// Repeating prefix (a,a,b on "aaab") requires KMP prefix fallback.
+	repSeq, err := parseDetachKeys("a,a,b")
+	if err != nil {
+		t.Fatalf("parseDetachKeys(a,a,b): %v", err)
+	}
+	out.Reset()
+	if !copyWithDetach(&out, strings.NewReader("aaabZ"), repSeq) {
+		t.Fatal("copyWithDetach missed repeating prefix a,a,b in aaab")
+	}
+	if out.String() != "a" {
+		t.Fatalf("forwarded bytes = %q, want \"a\"", out.String())
+	}
 }
 
 func TestParseTunnelAndServeMountSpecs(t *testing.T) {
@@ -117,21 +162,461 @@ func TestParseTunnelAndServeMountSpecs(t *testing.T) {
 	if err != nil || ts2.listenAddr != "0.0.0.0:9090" || ts2.guestIP != "172.17.0.2" || ts2.guestPort != 8080 {
 		t.Fatalf("parseTunnelSpec(4-part) = (%+v, %v)", ts2, err)
 	}
+	ts6, err := parseTunnelSpec("[::1]:8080:80", "127.0.0.1", "")
+	if err != nil || ts6.listenAddr != "[::1]:8080" || ts6.guestPort != 80 {
+		t.Fatalf("parseTunnelSpec(ipv6 3-part) = (%+v, %v)", ts6, err)
+	}
+	ts6Four, err := parseTunnelSpec("[::1]:8080:[::1]:9090", "127.0.0.1", "")
+	if err != nil || ts6Four.listenAddr != "[::1]:8080" || ts6Four.guestIP != "::1" || ts6Four.guestPort != 9090 {
+		t.Fatalf("parseTunnelSpec(ipv6 4-part) = (%+v, %v)", ts6Four, err)
+	}
 	hostDir, guestTarget, err := parseServeMountSpec(`C:\src\proj:/mnt/proj`)
 	if err != nil || hostDir != `C:\src\proj` || guestTarget != "/mnt/proj" {
 		t.Fatalf("parseServeMountSpec(win) = (%q, %q, %v)", hostDir, guestTarget, err)
 	}
 }
 
-func TestExtractTarToHostDirRejectsPathTraversal(t *testing.T) {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	_ = tw.WriteHeader(&tar.Header{Name: "../escape.txt", Mode: 0o644, Size: 3})
-	_, _ = tw.Write([]byte("bad"))
-	_ = tw.Close()
+func TestExtractTarToHostDirSecurity(t *testing.T) {
+	makeTar := func(entries ...tar.Header) []byte {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for _, h := range entries {
+			if err := tw.WriteHeader(&h); err != nil {
+				t.Fatal(err)
+			}
+			if h.Typeflag == tar.TypeReg && h.Size > 0 {
+				if _, err := tw.Write(bytes.Repeat([]byte("x"), int(h.Size))); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
 
-	if err := extractTarToHostDir(&buf, t.TempDir(), hostExtractOptions{}); err == nil {
-		t.Fatal("extractTarToHostDir accepted ../escape.txt, want error")
+	// 1. Classic ../ traversal rejected.
+	if err := extractTarToHostDir(bytes.NewReader(makeTar(
+		tar.Header{Name: "../escape.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 3},
+	)), t.TempDir(), hostExtractOptions{}); err == nil {
+		t.Fatal("accepted ../escape.txt")
+	}
+
+	// 2. Chained relative symlink escape rejected.
+	if runtime.GOOS != "windows" {
+		chained := makeTar(
+			tar.Header{Name: "a/b/", Typeflag: tar.TypeDir, Mode: 0o755},
+			tar.Header{Name: "a/b/up", Typeflag: tar.TypeSymlink, Linkname: "../.."},
+			tar.Header{Name: "a/b/up/escape", Typeflag: tar.TypeSymlink, Linkname: "../../outside"},
+		)
+		if err := extractTarToHostDir(bytes.NewReader(chained), t.TempDir(), hostExtractOptions{}); err == nil {
+			t.Fatal("accepted chained relative symlink escape")
+		}
+	}
+
+	// 3. Windows drive / UNC / backslash symlink targets rejected on all OSes.
+	for _, badTarget := range []string{`C:\Windows\win.ini`, `\\server\share\x`, `..\..\outside`} {
+		badTar := makeTar(tar.Header{Name: "sub/link", Typeflag: tar.TypeSymlink, Linkname: badTarget})
+		if err := extractTarToHostDir(bytes.NewReader(badTar), t.TempDir(), hostExtractOptions{}); err == nil {
+			t.Fatalf("accepted unsafe symlink target %q", badTarget)
+		}
+	}
+
+	// 4. Symlink clobber on TypeReg: replacing symlink "a -> b" with regular file "a" must not clobber "b".
+	if runtime.GOOS != "windows" {
+		dest := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dest, "b"), []byte("keep-me"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		_ = tw.WriteHeader(&tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "b"})
+		_ = tw.WriteHeader(&tar.Header{Name: "a", Typeflag: tar.TypeReg, Mode: 0o644, Size: 3})
+		_, _ = tw.Write([]byte("new"))
+		_ = tw.Close()
+		if err := extractTarToHostDir(&buf, dest, hostExtractOptions{}); err != nil {
+			t.Fatalf("extract symlink replace: %v", err)
+		}
+		gotB, err := os.ReadFile(filepath.Join(dest, "b"))
+		if err != nil || string(gotB) != "keep-me" {
+			t.Fatalf("file b was clobbered via symlink: (%q, %v)", gotB, err)
+		}
+		gotA, err := os.ReadFile(filepath.Join(dest, "a"))
+		if err != nil || string(gotA) != "new" {
+			t.Fatalf("file a = (%q, %v), want new", gotA, err)
+		}
+	}
+
+	// 5. renameSingleTo rejects multi-entry tar, TypeLink, and invalid names.
+	multiTar := makeTar(
+		tar.Header{Name: "one.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1},
+		tar.Header{Name: "two.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1},
+	)
+	if err := extractTarToHostDir(bytes.NewReader(multiTar), t.TempDir(), hostExtractOptions{renameSingleTo: "out.txt"}); err == nil {
+		t.Fatal("renameSingleTo accepted multi-entry tar")
+	}
+	linkTar := makeTar(tar.Header{Name: "h", Typeflag: tar.TypeLink, Linkname: "target"})
+	if err := extractTarToHostDir(bytes.NewReader(linkTar), t.TempDir(), hostExtractOptions{renameSingleTo: "out.txt"}); err == nil {
+		t.Fatal("renameSingleTo accepted TypeLink")
+	}
+	if err := extractTarToHostDir(bytes.NewReader(makeTar(tar.Header{Name: "a", Typeflag: tar.TypeReg, Size: 1})), t.TempDir(), hostExtractOptions{renameSingleTo: "../bad"}); err == nil {
+		t.Fatal("renameSingleTo accepted ../bad")
+	}
+
+	// 6. Regular file preserves non-zero ModTime via root.Chtimes.
+	wantTime := time.Date(2024, 3, 14, 15, 9, 26, 0, time.UTC)
+	dest := t.TempDir()
+	singleTar := makeTar(tar.Header{Name: "ts.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2, ModTime: wantTime})
+	if err := extractTarToHostDir(bytes.NewReader(singleTar), dest, hostExtractOptions{}); err != nil {
+		t.Fatalf("extract ts.txt: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(dest, "ts.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.ModTime().Unix() != wantTime.Unix() {
+		t.Fatalf("ModTime = %v, want %v", fi.ModTime(), wantTime)
+	}
+}
+
+func TestServeRPCFSRequestSecurityAndSemantics(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	// 1. Path traversal rejected with EINVAL.
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "stat", Path: "../../etc/passwd"}); resp.Errno != control.LinuxEINVAL {
+		t.Fatalf("stat ../../etc/passwd errno = %d, want EINVAL (%d)", resp.Errno, control.LinuxEINVAL)
+	}
+
+	// 2. Escaping / absolute / backslash symlink targets rejected with EPERM.
+	for _, target := range []string{"/etc/passwd", "../secret", `C:\win.ini`, `a\b`} {
+		resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "symlink", Path: "/badlink", Target: target})
+		if resp.Errno != control.LinuxEPERM {
+			t.Fatalf("symlink %q errno = %d, want EPERM (%d)", target, resp.Errno, control.LinuxEPERM)
+		}
+	}
+
+	// 3. Create dir + file, verify unlink rejects dir (EISDIR) and rmdir rejects file (ENOTDIR).
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "mkdir", Path: "/sub", Mode: 0o755}); resp.Errno != 0 {
+		t.Fatalf("mkdir /sub errno = %d", resp.Errno)
+	}
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "create", Path: "/f.txt", Mode: 0o644}); resp.Errno != 0 {
+		t.Fatalf("create /f.txt errno = %d", resp.Errno)
+	}
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "unlink", Path: "/sub"}); resp.Errno != control.LinuxEISDIR {
+		t.Fatalf("unlink dir errno = %d, want EISDIR (%d)", resp.Errno, control.LinuxEISDIR)
+	}
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "rmdir", Path: "/f.txt"}); resp.Errno != control.LinuxENOTDIR {
+		t.Fatalf("rmdir file errno = %d, want ENOTDIR (%d)", resp.Errno, control.LinuxENOTDIR)
+	}
+
+	// 4. Negative read offset rejected; oversized read length capped to maxReadBytes.
+	if resp := serveRPCFSRequest(root, false, 16, control.RPCFSRequest{Op: "write", Path: "/f.txt", Offset: 0, Data: bytes.Repeat([]byte("A"), 64)}); resp.Errno != 0 {
+		t.Fatalf("write /f.txt errno = %d", resp.Errno)
+	}
+	if resp := serveRPCFSRequest(root, false, 16, control.RPCFSRequest{Op: "read", Path: "/f.txt", Offset: -1, Length: 4}); resp.Errno != control.LinuxEINVAL {
+		t.Fatalf("read negative offset errno = %d, want EINVAL", resp.Errno)
+	}
+	if resp := serveRPCFSRequest(root, false, 16, control.RPCFSRequest{Op: "read", Path: "/f.txt", Offset: 0, Length: 100}); resp.Errno != 0 || len(resp.Data) != 16 {
+		t.Fatalf("bounded read = (errno=%d, len=%d), want (0, 16)", resp.Errno, len(resp.Data))
+	}
+
+	// 5. utimens preserves omitted mtime instead of overwriting with time.Now().
+	oldMtime := time.Date(2022, 1, 2, 3, 4, 5, 0, time.UTC)
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{
+		Op: "utimens", Path: "/f.txt", SetMtime: true, MtimeNS: oldMtime.UnixNano(),
+	}); resp.Errno != 0 {
+		t.Fatalf("utimens set mtime errno = %d", resp.Errno)
+	}
+	newAtime := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{
+		Op: "utimens", Path: "/f.txt", SetAtime: true, AtimeNS: newAtime.UnixNano(), SetMtime: false,
+	}); resp.Errno != 0 {
+		t.Fatalf("utimens set atime only errno = %d", resp.Errno)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "f.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.ModTime().Unix() != oldMtime.Unix() {
+		t.Fatalf("mtime after atime-only utimens = %v, want preserved %v", fi.ModTime(), oldMtime)
+	}
+
+	// 6. Mode 0000 is preserved rather than widened to 0644 on Unix.
+	if runtime.GOOS != "windows" {
+		if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "create", Path: "/zero.txt", Mode: 0o000}); resp.Errno != 0 {
+			t.Fatalf("create mode 0000 errno = %d", resp.Errno)
+		}
+		zfi, err := os.Lstat(filepath.Join(dir, "zero.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if zfi.Mode().Perm() != 0o000 {
+			t.Fatalf("mode 0000 file got perm %#o, want 0000", zfi.Mode().Perm())
+		}
+		_ = os.Chmod(filepath.Join(dir, "zero.txt"), 0o600)
+	}
+}
+
+type mockCLIControlHandler struct {
+	onStream func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error
+}
+
+func (m *mockCLIControlHandler) HandleStream(ctx context.Context, stream *control.Stream, req control.RequestEnvelope, fds []int) error {
+	for _, fd := range fds {
+		_ = os.NewFile(uintptr(fd), "unused").Close()
+	}
+	return m.onStream(ctx, stream, req)
+}
+
+func (m *mockCLIControlHandler) HandleLegacyCheckpoint(context.Context, control.LegacyCheckpointRequest) error {
+	return nil
+}
+
+func startMockCLIServer(t *testing.T, caps []string, fn func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error) *control.Endpoint {
+	t.Helper()
+	isolateControlTokenDir(t)
+	addr := freeLoopbackAddr(t)
+	ep, err := control.Listen("tcp://"+addr, control.ListenOptions{})
+	if err != nil {
+		t.Fatalf("control.Listen: %v", err)
+	}
+	t.Cleanup(ep.Cleanup)
+	srv := control.NewServer(ep.Listener, control.ServerConfig{
+		SandboxID:    "mock-sbx",
+		Token:        ep.Token,
+		Capabilities: caps,
+		Handler:      &mockCLIControlHandler{onStream: fn},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = srv.Close()
+		<-done
+	})
+	return ep
+}
+
+func TestCPHostToGuestEarlyRejectionLargeUploadNoDeadlock(t *testing.T) {
+	ep := startMockCLIServer(t, []string{control.CapFSExport, control.CapFSImport}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+		if req.Method == control.MethodFSStat {
+			return stream.Reply(control.FSStatResponse{Exists: true, Type: "dir"})
+		}
+		// Immediately reject fs.import without consuming any channel data.
+		return control.NewError(control.CodeForbiddenByPolicy, "upload denied")
+	})
+
+	bigFile := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(bigFile, bytes.Repeat([]byte("X"), 1536<<10), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var outB, errB bytes.Buffer
+	code := executeCLI(ctx, []string{"cp", "-S", "tcp://" + ep.Address, bigFile, ":/tmp/"}, nil, &outB, &errB)
+	if ctx.Err() != nil {
+		t.Fatalf("cp deadlocked on rejected >1 MiB upload (stderr=%q)", errB.String())
+	}
+	if code != 126 {
+		t.Fatalf("cp exit code = %d (stderr=%q), want 126", code, errB.String())
+	}
+}
+
+func TestPortForwardCancelAndUnixSocketSafety(t *testing.T) {
+	ep := startMockCLIServer(t, []string{control.CapNetDial}, func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+		if err := stream.SendResponse(control.NetDialResponse{RemoteAddr: "127.0.0.1:80"}); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	// 1. Refuses to delete an existing regular host file when given unix:<file>:80.
+	if runtime.GOOS != "windows" {
+		regFile := filepath.Join(t.TempDir(), "important.db")
+		if err := os.WriteFile(regFile, []byte("precious"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var outB, errB bytes.Buffer
+		code := executeCLI(context.Background(), []string{"port-forward", "-S", "tcp://" + ep.Address, "unix:" + regFile + ":80"}, nil, &outB, &errB)
+		if code == 0 {
+			t.Fatal("port-forward unix: succeeded on existing regular file, want failure")
+		}
+		got, err := os.ReadFile(regFile)
+		if err != nil || string(got) != "precious" {
+			t.Fatalf("regular file was damaged/deleted: (%q, %v)", got, err)
+		}
+	}
+
+	// 2. Canceling port-forward while an idle TCP client is connected must exit promptly.
+	localPort := func() int {
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		return p
+	}()
+
+	pfCtx, pfCancel := context.WithCancel(context.Background())
+	pfOut := newSyncNotifyBuffer()
+	pfErr := newSyncNotifyBuffer()
+	pfDone := make(chan int, 1)
+	go func() {
+		pfDone <- executeCLI(pfCtx, []string{
+			"port-forward", "-S", "tcp://" + ep.Address,
+			"127.0.0.1:" + strconv.Itoa(localPort) + ":80",
+		}, nil, pfOut, pfErr)
+	}()
+	t.Cleanup(func() {
+		pfCancel()
+		select {
+		case <-pfDone:
+		case <-time.After(3 * time.Second):
+		}
+	})
+	pfOut.waitForSubstring(t, "Forwarding ", 5*time.Second)
+
+	idleConn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(localPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial port-forward listener: %v", err)
+	}
+	defer idleConn.Close()
+	// Give accept loop a moment to attach the tunnel.
+	time.Sleep(50 * time.Millisecond)
+
+	pfCancel()
+	select {
+	case <-pfDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("port-forward hung on cancel while an idle TCP connection was open")
+	}
+}
+
+func TestControlCLIFlagValidationAndV1Fallback(t *testing.T) {
+	var gotStopTimeout atomic.Int64
+	gotStopTimeout.Store(-999)
+	var gotCPUQuota atomic.Int64
+	gotCPUQuota.Store(-999)
+
+	ep := startMockCLIServer(t, []string{control.CapStop, control.CapResourceMemory, control.CapResourceCPU, control.CapPing}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+		switch req.Method {
+		case control.MethodStop:
+			var p control.StopRequest
+			_ = json.Unmarshal(req.Params, &p)
+			if p.TimeoutMS != nil {
+				gotStopTimeout.Store(*p.TimeoutMS)
+			}
+			return stream.Reply(control.StopResponse{Signaled: "SIGKILL", Killed: true})
+		case control.MethodResourceUpdate:
+			var p control.ResourceUpdateRequest
+			_ = json.Unmarshal(req.Params, &p)
+			if p.CPUQuotaUSec != nil {
+				gotCPUQuota.Store(*p.CPUQuotaUSec)
+			}
+			return stream.Reply(control.ResourceSnapshot{})
+		}
+		return stream.Reply(control.PingResponse{Version: control.ProtocolVersion, SandboxID: "mock", State: "running"})
+	})
+
+	runCLI := func(args ...string) (int, string, string) {
+		var outB, errB bytes.Buffer
+		c := executeCLI(context.Background(), args, nil, &outB, &errB)
+		return c, outB.String(), errB.String()
+	}
+
+	// stop -t 0 sends TimeoutMS == 0; -t -1 returns exit 2.
+	if code, _, errS := runCLI("stop", "-S", "tcp://"+ep.Address, "-t", "0"); code != 0 || gotStopTimeout.Load() != 0 {
+		t.Fatalf("stop -t 0 = (code=%d, timeout=%d, stderr=%q), want (0, 0)", code, gotStopTimeout.Load(), errS)
+	}
+	if code, _, _ := runCLI("stop", "-S", "tcp://"+ep.Address, "-t", "-1"); code != 2 {
+		t.Fatalf("stop -t -1 exit = %d, want 2", code)
+	}
+
+	// update --cpu-quota=max sends CPUQuotaUSec == 0.
+	if code, _, errS := runCLI("update", "-S", "tcp://"+ep.Address, "--cpu-quota=max"); code != 0 || gotCPUQuota.Load() != 0 {
+		t.Fatalf("update --cpu-quota=max = (code=%d, quota=%d, stderr=%q), want (0, 0)", code, gotCPUQuota.Load(), errS)
+	}
+
+	// kill --pid 5 --all and --pid -1 return exit 2.
+	if code, _, _ := runCLI("kill", "-S", "tcp://"+ep.Address, "--pid", "5", "--all"); code != 2 {
+		t.Fatalf("kill --pid 5 --all exit = %d, want 2", code)
+	}
+	if code, _, _ := runCLI("kill", "-S", "tcp://"+ep.Address, "--pid", "-1"); code != 2 {
+		t.Fatalf("kill --pid -1 exit = %d, want 2", code)
+	}
+
+	// dmesg --level 9 and --tail -1 return exit 2.
+	if code, _, _ := runCLI("dmesg", "-S", "tcp://"+ep.Address, "--level", "9"); code != 2 {
+		t.Fatalf("dmesg --level 9 exit = %d, want 2", code)
+	}
+	if code, _, _ := runCLI("dmesg", "-S", "tcp://"+ep.Address, "--tail", "-1"); code != 2 {
+		t.Fatalf("dmesg --tail -1 exit = %d, want 2", code)
+	}
+
+	// checkpoint -z without -o returns exit 2.
+	if code, _, _ := runCLI("checkpoint", "-S", "tcp://"+ep.Address, "-z"); code != 2 {
+		t.Fatalf("checkpoint -z without -o exit = %d, want 2", code)
+	}
+
+	// ping --wait 5s without -S/-n fails immediately (<1s) with exit 2.
+	start := time.Now()
+	if code, _, _ := runCLI("ping", "--wait", "5s"); code != 2 || time.Since(start) > time.Second {
+		t.Fatalf("ping --wait 5s without target = (code=%d, elapsed=%v), want exit 2 immediately", code, time.Since(start))
+	}
+
+	// Real legacy v1-only TCP server: checkpoint falls back to v1 cleanly when v2 preface fails.
+	v1Ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v1Ln.Close()
+	var v1Hits atomic.Int32
+	v1Done := make(chan struct{})
+	go func() {
+		defer close(v1Done)
+		for {
+			c, err := v1Ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				var req control.LegacyCheckpointRequest
+				if err := json.NewDecoder(conn).Decode(&req); err != nil {
+					// v2 client wrote "GVX2..." -> fail JSON decode and close so client falls back.
+					return
+				}
+				v1Hits.Add(1)
+				_ = json.NewEncoder(conn).Encode(control.LegacyCheckpointResponse{OK: true})
+			}(c)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = v1Ln.Close()
+		<-v1Done
+	})
+
+	// Passing a nonexistent --token-file must NOT fall back to v1.
+	if code, _, _ := runCLI("checkpoint", "-S", "tcp://"+v1Ln.Addr().String(), "--token-file", filepath.Join(t.TempDir(), "missing.token"), "-checkpoint-dir=ckpt"); code == 0 || v1Hits.Load() != 0 {
+		t.Fatalf("checkpoint with missing token-file = (code=%d, v1Hits=%d), want non-zero and 0", code, v1Hits.Load())
+	}
+
+	// With explicit token (no local error), v2 handshake fails on wire and falls back to v1.
+	if code, _, errS := runCLI("checkpoint", "-S", "tcp://"+v1Ln.Addr().String(), "--token", "tok123", "-checkpoint-dir=ckpt"); code != 0 || v1Hits.Load() != 1 {
+		t.Fatalf("checkpoint v1 fallback = (code=%d, v1Hits=%d, stderr=%q), want (0, 1)", code, v1Hits.Load(), errS)
 	}
 }
 
@@ -174,13 +659,14 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 	cacheDir := t.TempDir()
 	sockPath := filepath.Join(shortSocketDir(t), "cli.sock")
 	stdinR, stdinW := net.Pipe()
-	defer stdinR.Close()
-	defer stdinW.Close()
+	t.Cleanup(func() {
+		_ = stdinW.Close()
+		_ = stdinR.Close()
+	})
 	stdout := newSyncNotifyBuffer()
 	stderr := newSyncNotifyBuffer()
 
 	runCtx, runCancel := context.WithCancel(context.Background())
-	defer runCancel()
 	runDone := make(chan int, 1)
 	go func() {
 		runDone <- executeCLI(runCtx, []string{
@@ -195,6 +681,18 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 			"clictrl:latest",
 		}, stdinR, stdout, stderr)
 	}()
+	var runJoined atomic.Bool
+	t.Cleanup(func() {
+		_ = stdinW.Close()
+		runCancel()
+		if !runJoined.Load() {
+			select {
+			case <-runDone:
+			case <-time.After(10 * time.Second):
+				t.Errorf("rungv run goroutine did not exit within 10s during cleanup")
+			}
+		}
+	})
 	stdout.waitForSubstring(t, "cli-ready\n", 15*time.Second)
 
 	runCmd := func(stdin io.Reader, args ...string) (int, string, string) {
@@ -253,7 +751,7 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 		t.Fatalf("cp roundtrip content = (%q, %v)", gotCP, err)
 	}
 
-	// update live limits
+	// update live limits (and --cpu-quota=max reset)
 	if code, out, errS := runCmd(nil, "update", "-S", sockPath, "-m", "300m", "--cpus", "0.5", "--pids-limit", "40", "-f", "json"); code != 0 {
 		t.Fatalf("update = (%d, %q, %q)", code, out, errS)
 	} else {
@@ -262,13 +760,24 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 			t.Fatalf("update snap = (%+v, %v)", snap, err)
 		}
 	}
+	if code, out, errS := runCmd(nil, "update", "-S", sockPath, "--cpu-quota=max", "-f", "json"); code != 0 {
+		t.Fatalf("update --cpu-quota=max = (%d, %q, %q)", code, out, errS)
+	} else {
+		var snap control.ResourceSnapshot
+		if err := json.Unmarshal([]byte(out), &snap); err != nil || snap.CPUQuotaUSec != 0 {
+			t.Fatalf("update --cpu-quota=max snap = (%+v, %v)", snap, err)
+		}
+	}
 
-	// mount add tmpfs -> remount ro -> rm
-	if code, _, errS := runCmd(nil, "mount", "add", "-S", sockPath, "--type", "tmpfs", "--dst", "/mnt/dyn", "--size", "8m"); code != 0 {
-		t.Fatalf("mount add = (%d, %q)", code, errS)
+	// mount add tmpfs (small size < 6m allowed!) -> remount ro -> rw -> rm
+	if code, _, errS := runCmd(nil, "mount", "add", "-S", sockPath, "--type", "tmpfs", "--dst", "/mnt/dyn", "--size", "1m"); code != 0 {
+		t.Fatalf("mount add 1m = (%d, %q)", code, errS)
 	}
 	if code, _, errS := runCmd(nil, "mount", "remount", "-S", sockPath, "--ro", "/mnt/dyn"); code != 0 {
-		t.Fatalf("mount remount = (%d, %q)", code, errS)
+		t.Fatalf("mount remount ro = (%d, %q)", code, errS)
+	}
+	if code, _, errS := runCmd(nil, "mount", "remount", "-S", sockPath, "--rw", "/mnt/dyn"); code != 0 {
+		t.Fatalf("mount remount rw = (%d, %q)", code, errS)
 	}
 	if code, _, errS := runCmd(nil, "mount", "rm", "-S", sockPath, "/mnt/dyn"); code != 0 {
 		t.Fatalf("mount rm = (%d, %q)", code, errS)
@@ -286,6 +795,17 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 	go func() {
 		serveDone <- executeCLI(serveCtx, []string{"mount", "serve", "-S", sockPath, serveHostDir + ":/mnt/srv"}, nil, serveOut, serveErr)
 	}()
+	var serveJoined atomic.Bool
+	t.Cleanup(func() {
+		serveCancel()
+		if !serveJoined.Load() {
+			select {
+			case <-serveDone:
+			case <-time.After(5 * time.Second):
+				t.Errorf("mount serve goroutine did not exit within 5s during cleanup")
+			}
+		}
+	})
 	serveOut.waitForSubstring(t, "Serving ", 10*time.Second)
 
 	if code, out, errS := runCmd(nil, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/srv/msg.txt"); code != 0 || out != "served-by-cli\n" {
@@ -293,14 +813,20 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 	}
 	serveCancel()
 	<-serveDone
+	serveJoined.Store(true)
 
 	// Wait for the server to finish auto-unmounting /mnt/srv after client disconnect.
+	unmounted := false
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if code, out, _ := runCmd(nil, "mount", "ls", "-S", sockPath, "-q"); code == 0 && !strings.Contains(out, "/mnt/srv") {
+			unmounted = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if !unmounted {
+		t.Fatal("/mnt/srv was not unmounted within 5s after mount serve stopped")
 	}
 
 	// checkpoint -o streaming bundle (no -checkpoint-dir on run!) -> stop sandbox -> restore
@@ -308,7 +834,9 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 	if code, _, errS := runCmd(nil, "checkpoint", "-S", sockPath, "-z", "-o", ckptOutDir); code != 0 {
 		t.Fatalf("checkpoint -o = (%d, %q)", code, errS)
 	}
-	if exitCode := <-runDone; exitCode != 0 {
+	exitCode := <-runDone
+	runJoined.Store(true)
+	if exitCode != 0 {
 		t.Fatalf("run exited with %d (stderr=%q)", exitCode, stderr.String())
 	}
 

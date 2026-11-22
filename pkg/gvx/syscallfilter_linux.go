@@ -223,6 +223,7 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 		// pre-bound control listener, verifies Unix peer UID via SO_PEERCRED,
 		// and configures keepalive / TCP_NODELAY on TCP sockets.
 		rules.Add(unix.SYS_ACCEPT4, seccomp.MatchAll{})
+		rules.Add(unix.SYS_GETEUID, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETSOCKNAME, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETPEERNAME, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETSOCKOPT, seccomp.PerArg{

@@ -194,7 +194,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:     "pkg/gvx/control",
 		tier:    Tier1Additive,
-		allowed: []string{"pkg/gvx/tuning", "github.com/klauspost/compress/*", xSysUnix},
+		allowed: []string{"pkg/gvx/tuning", "github.com/klauspost/compress/*", xSysUnix, xSysWindows},
 		forbidden: append([]string{
 			"pkg/gvx",
 			"pkg/gvx/hostcerts/*",

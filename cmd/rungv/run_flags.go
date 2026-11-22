@@ -513,6 +513,9 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		DynamicPorts:           f.dynamicPorts,
 		AllowVolumeAttach:      f.allowVolumeAttach,
 	}
+	if err := control.ValidateDisableList(cfg.ControlDisable); err != nil {
+		return gvx.Config{}, false, fmt.Errorf("--control-disable: %w", err)
+	}
 	return cfg, backend == gvx.PlatformAuto, nil
 }
 

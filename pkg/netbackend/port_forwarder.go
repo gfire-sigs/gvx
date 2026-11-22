@@ -59,6 +59,10 @@ var ErrPortRuleExists = errors.New("netbackend: port forward rule already exists
 // ErrPortRuleNotFound reports that no active port forward matched a remove spec.
 var ErrPortRuleNotFound = errors.New("netbackend: port forward rule not found")
 
+// ErrDynamicPortLimit reports that binding another dynamic rule would exceed
+// net.forward.max_dynamic_ports.
+var ErrDynamicPortLimit = errors.New("netbackend: dynamic port limit reached")
+
 // BoundPortRule pairs an active PortForwardRule with its origin ("static",
 // "auto", or "dynamic").
 type BoundPortRule struct {
@@ -386,8 +390,9 @@ type PortForwarder struct {
 	dynFailed  map[dynPortKey]struct{}
 
 	// Control-socket dynamic rules (precedence: static > dynamic > auto).
-	manualTCP []*boundTCPForward
-	manualUDP []*boundUDPForward
+	maxDynamicPorts int
+	manualTCP       []*boundTCPForward
+	manualUDP       []*boundUDPForward
 }
 
 // NewPortForwarder constructs an empty PortForwarder ready for PreBind. The
@@ -403,6 +408,7 @@ func NewPortForwarder(t tuning.Values) *PortForwarder {
 		udpMaxSessions:    t.Int(tuning.ForwardUDPSessions),
 		guestDialWindow:   t.Duration(tuning.ForwardGuestDialWindow),
 		guestDialInterval: t.Duration(tuning.ForwardGuestDialInterval),
+		maxDynamicPorts:   t.Int(tuning.ForwardMaxDynamicPorts),
 		log:               discardLogger,
 	}
 }

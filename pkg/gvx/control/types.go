@@ -87,8 +87,68 @@ const (
 	CapProcList            = "proc.list"
 	CapProcSignal          = "proc.signal"
 	CapKernelLog           = "kernel.log"
+	CapKernelLogClear      = "kernel.log_clear"
 	CapDebug               = "debug"
 )
+
+var allKnownCapabilities = []string{
+	CapPing,
+	CapInspect,
+	CapStats,
+	CapEvents,
+	CapPause,
+	CapStop,
+	CapCheckpointLocal,
+	CapCheckpointStream,
+	CapExec,
+	CapExecTTY,
+	CapFSExport,
+	CapFSImport,
+	CapResourceMemory,
+	CapResourceCPU,
+	CapResourcePids,
+	CapResourceNetwork,
+	CapResourceTuning,
+	CapPortList,
+	CapPortRemove,
+	CapPortDynamicLoopback,
+	CapPortAnyBind,
+	CapNetDial,
+	CapMountList,
+	CapMountTmpfs,
+	CapMountRemount,
+	CapMountRemove,
+	CapMountVolumeAttach,
+	CapMountBind,
+	CapMountServe,
+	CapProcList,
+	CapProcSignal,
+	CapKernelLog,
+	CapKernelLogClear,
+	CapDebug,
+}
+
+// ValidateDisableList verifies that every entry in disabled names a known
+// capability or capability group prefix.
+func ValidateDisableList(disabled []string) error {
+	for _, raw := range disabled {
+		d := strings.ToLower(strings.TrimSpace(raw))
+		if d == "" {
+			continue
+		}
+		matched := false
+		for _, capName := range allKnownCapabilities {
+			if capName == d || strings.HasPrefix(capName, d+".") {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("unknown control capability or group %q in disable list", raw)
+		}
+	}
+	return nil
+}
 
 // Policy selects the baseline set of control capabilities exposed by a sandbox.
 type Policy string
@@ -297,7 +357,7 @@ type PauseRequest struct {
 // StopRequest configures MethodStop.
 type StopRequest struct {
 	Signal    string `json:"signal,omitempty"`
-	TimeoutMS int64  `json:"timeout_ms,omitempty"`
+	TimeoutMS *int64 `json:"timeout_ms,omitempty"`
 }
 
 // StopResponse reports how the sandbox terminated.
@@ -577,21 +637,31 @@ type RPCFSResponse struct {
 	Written int64        `json:"written,omitempty"`
 }
 
-// Canonical Linux errno numbers transmitted in RPCFSResponse.Errno across
-// heterogeneous host operating systems (Linux, macOS, Windows).
+// Canonical Linux open(2) flags, mode_t file-type bits, and errno numbers
+// transmitted in rpcfs wire payloads across heterogeneous host OSes.
 const (
-	LinuxEPERM      = 1
-	LinuxENOENT     = 2
-	LinuxEIO        = 5
-	LinuxEACCES     = 13
-	LinuxEEXIST     = 17
-	LinuxENOTDIR    = 20
-	LinuxEISDIR     = 21
-	LinuxEINVAL     = 22
-	LinuxENOSPC     = 28
-	LinuxEROFS      = 30
-	LinuxENOTEMPTY  = 39
-	LinuxEOPNOTSUPP = 95
+	LinuxOExcl  uint32 = 0o200
+	LinuxSIFMT  uint32 = 0o170000
+	LinuxSIFDIR uint32 = 0o040000
+	LinuxSIFREG uint32 = 0o100000
+	LinuxSIFLNK uint32 = 0o120000
+
+	LinuxEPERM        = 1
+	LinuxENOENT       = 2
+	LinuxEIO          = 5
+	LinuxEACCES       = 13
+	LinuxEBUSY        = 16
+	LinuxEEXIST       = 17
+	LinuxEXDEV        = 18
+	LinuxENOTDIR      = 20
+	LinuxEISDIR       = 21
+	LinuxEINVAL       = 22
+	LinuxENOSPC       = 28
+	LinuxEROFS        = 30
+	LinuxENAMETOOLONG = 36
+	LinuxENOTEMPTY    = 39
+	LinuxELOOP        = 40
+	LinuxEOPNOTSUPP   = 95
 )
 
 // ProcessInfo describes one guest thread group.

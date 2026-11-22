@@ -193,21 +193,31 @@ func getZstdDecoder() (*zstd.Decoder, error) {
 }
 
 // WriteFrame encodes and writes one frame to w. When FlagCompressedZstd is set
-// and payload is non-empty, WriteFrame compresses payload before writing.
+// on a FrameData payload, WriteFrame compresses payload before writing.
 func WriteFrame(w io.Writer, f Frame, maxPayload int) error {
 	if maxPayload <= 0 || maxPayload > AbsoluteMaxFrameBytes {
 		maxPayload = DefaultMaxFrameBytes
 	}
 	payload := f.Payload
 	flags := f.Flags
-	if flags&FlagCompressedZstd != 0 && len(payload) > 0 {
-		enc, err := getZstdEncoder()
-		if err != nil {
-			return fmt.Errorf("control: init zstd encoder: %w", err)
+	if len(payload) > maxPayload {
+		return fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, len(payload), maxPayload)
+	}
+	if flags&FlagCompressedZstd != 0 {
+		if f.Type != FrameData {
+			return errors.New("control: zstd compression is only permitted on DATA frames")
 		}
-		compressed := enc.EncodeAll(payload, nil)
-		if len(compressed) < len(payload) {
-			payload = compressed
+		if len(payload) > 0 {
+			enc, err := getZstdEncoder()
+			if err != nil {
+				return fmt.Errorf("control: init zstd encoder: %w", err)
+			}
+			compressed := enc.EncodeAll(payload, nil)
+			if len(compressed) < len(payload) {
+				payload = compressed
+			} else {
+				flags &^= FlagCompressedZstd
+			}
 		} else {
 			flags &^= FlagCompressedZstd
 		}
@@ -242,6 +252,11 @@ func ReadFrame(r io.Reader, maxPayload int) (Frame, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return Frame{}, err
 	}
+	frameType := FrameType(hdr[0])
+	flags := FrameFlags(hdr[1])
+	if flags&FlagCompressedZstd != 0 && frameType != FrameData {
+		return Frame{}, errors.New("control: zstd compression is only permitted on DATA frames")
+	}
 	length := int(binary.BigEndian.Uint32(hdr[8:12]))
 	if length < 0 || length > maxPayload {
 		return Frame{}, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, length, maxPayload)
@@ -253,7 +268,6 @@ func ReadFrame(r io.Reader, maxPayload int) (Frame, error) {
 			return Frame{}, err
 		}
 	}
-	flags := FrameFlags(hdr[1])
 	if flags&FlagCompressedZstd != 0 && len(payload) > 0 {
 		dec, err := getZstdDecoder()
 		if err != nil {
@@ -270,7 +284,7 @@ func ReadFrame(r io.Reader, maxPayload int) (Frame, error) {
 		flags &^= FlagCompressedZstd
 	}
 	return Frame{
-		Type:     FrameType(hdr[0]),
+		Type:     frameType,
 		Flags:    flags,
 		Channel:  Channel(binary.BigEndian.Uint16(hdr[2:4])),
 		StreamID: binary.BigEndian.Uint32(hdr[4:8]),

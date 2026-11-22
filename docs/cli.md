@@ -8,7 +8,7 @@
 
 By default, guest writes go to an ephemeral memory-backed layer above the read-only image layers. Data persists after exit only in a bind mount, a named volume, a `-rootfs-volume` image, or the host image store.
 
-The host process locks itself down before the guest starts. After lockdown, it cannot open unbound host files, spawn child processes, or bind arbitrary sockets (unless `--auto-publish` or `--dynamic-ports` opts into host `127.0.0.1` loopback binds). When started with `-S`/`--control-socket` or `--control`, a sandbox exposes an authenticated control socket (`gvx-ctrl/2`) for runtime `exec`, `pause`, `unpause`, `cp`, `export`, `update`, `port`, `port-forward`, `mount`, `status`, `stats`, `top`, `kill`, `stop`, `dmesg`, `events`, `ping`, `debug`, and `checkpoint` operations without a background daemon. See [`control-protocol.md`](control-protocol.md) for the wire protocol and lockdown matrix.
+The host process locks itself down before the guest starts. After lockdown, it cannot open unbound host files, spawn child processes, or bind arbitrary sockets. Passing `--auto-publish` or `--dynamic-ports` relaxes socket lockdown only for host `127.0.0.1` loopback binds. Starting `rungv run` with `-S`, `--control-socket`, or `--control` exposes an authenticated `gvx-ctrl/2` control socket without a background daemon. That socket serves runtime inspection, `exec`, pause, file transfer, resource update, port, mount, signal, log, and checkpoint commands. See [`control-protocol.md`](control-protocol.md) for the wire protocol and lockdown matrix.
 
 ## 2. Commands
 
@@ -74,7 +74,7 @@ The table below lists the `rungv run` flags that match the Docker CLI.
 | `-u`, `--user USER[:GROUP]` | Run as a guest user by name or numeric ID. |
 | `-h`, `--hostname NAME` | Set the guest hostname (default: `gvx`). |
 | `-w`, `--workdir DIR` | Set the guest working directory (also supported on `restore`). |
-| `--name NAME` | Set the kernel container ID; has no other lifecycle effect. |
+| `--name NAME` | Set the kernel container ID, and derive the control socket path when the caller passes `--control`. |
 | `--rm` | Accepted for compatibility; every run cleans up on exit. |
 | `-i` | Accepted for compatibility; the guest always reads `rungv` stdin. |
 | `-t` | Allocate a pseudo-terminal. |
@@ -273,7 +273,7 @@ The guest kernel reports `MemTotal` in `/proc/meminfo` and `totalram` in `sysinf
 
 Inside the guest, nested cgroups also enforce `memory.max` (as `docker run -m` sets in `docker:dind`). The Sentry polls finite cgroups at least every `5 ms` above half their limit and every `25 ms` otherwise (`memory.cgroup.poll_interval`, `memory.cgroup.idle_poll_interval`). It compares subtree anonymous memory plus `tmpfs` data against the limit and kills the highest-scoring process with `SIGKILL` (skipping guest PID 1 and `oom_score_adj=-1000`, or killing the whole subtree when `memory.oom.group` is set). `memory.events` increments `oom` and `oom_kill` and notifies `inotify` watchers. Nested cgroups also enforce `cpu.max` on every engine; `memory.high`, `cpu.weight`, and `memory.swap.*` are accepted and stored without enforcement. See [`recipes/docker-engine.md`](recipes/docker-engine.md) Sections 7.4 and 7.5 for full details.
 
-`--cpus` sets the online guest CPU count (rounded up) and enforces a tamper-proof per-sandbox CFS bandwidth quota inside the Sentry kernel on Linux, macOS, Windows, and Android. On Windows under lockdown, it also configures the containment Job Object CPU rate cap. `--pids-limit` sets the root `cgroup2` `pids` maximum so guest root cannot raise the process cap.
+`--cpus` sets the online guest CPU count (rounded up). It also enforces a tamper-proof per-sandbox CFS bandwidth quota inside the Sentry kernel on Linux, macOS, Windows, and Android. On Windows under lockdown, it also configures the containment Job Object CPU rate cap. `--pids-limit` sets the root `cgroup2` `pids` maximum so guest root cannot raise the process cap.
 
 ### 4.6 Guest kernel
 
@@ -359,20 +359,6 @@ A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.me
 | `rungv checkpoint -S SPEC [-checkpoint-dir DIR \| -o DIR\|FILE\|-] [-leave-running] [-z] [--force]` | Connect to `SPEC` and trigger a checkpoint (`rungv snapshot` alias). `-o` streams a tar bundle over the control socket without `-checkpoint-dir`. `-z` compresses streamed frames with `zstd`. `--force` detaches active `exec` sessions before saving. |
 | `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `--auto-publish`, `--dynamic-ports`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-S`/`--control` to reattach mounts, networking, or a new control listener. |
 
-### 4.12 Control socket subcommands
-
-Every control subcommand accepts `-S`/`--control-socket SPEC` (or `GVX_CONTROL_SOCKET`), `-n`/`--name NAME` (for `--control` sandboxes), `--token` (or `GVX_CONTROL_TOKEN`), `--token-file`, and `--timeout`. See [`control-protocol.md`](control-protocol.md) for the complete protocol and lockdown rules.
-
-| Command | Synopsis and behavior |
-| :--- | :--- |
-| `exec` | `rungv exec [-i] [-t] [-d] [-e KEY=VAL] [--env-file FILE] [-w DIR] [-u USER] [--privileged=BOOL] [--detach-keys KEYS] [--pid-file FILE] [--] CMD [ARG...]`. Closes guest stdin (`/dev/null`) unless `-i` is set. |
-| `pause` / `unpause` | `rungv pause [--quiesce-net=true\|false]` and `rungv unpause`. Pauses and resumes all guest tasks. |
-| `cp` / `export` | `rungv cp [-a] [-L] [-z] [--no-overwrite-dir] [--user U:G] SRC DST` and `rungv export [--upper-only] [-z] [-o FILE\|-] [PATH]`. Streams tar archives while the unlocked client handles all host disk I/O with `os.Root`. |
-| `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
-| `port` / `port-forward` | `rungv port <ls\|add\|rm>` manages host-to-guest NAT rules (requiring `--dynamic-ports` or `--auto-publish` under lockdown). `rungv port-forward` (alias `pf`) listens on the client and tunnels TCP connections via `net.dial` with zero lockdown relaxation. |
-| `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, unmounts targets, or serves a host directory via `rpcfs` (`mount serve HOST_DIR:GUEST_PATH`). |
-| `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect sandbox metadata, stream resource counters and kernel logs, send signals, stop PID 1 cleanly, or adjust Sentry log verbosity. |
-
 > [!IMPORTANT]
 > Pass the same workspace, volume mounts, and `-rootfs-volume` flag to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the `root_volume` setting, the layer digests, the platform, or the network mode do not match `manifest.json`.
 
@@ -385,6 +371,20 @@ rungv run -checkpoint-dir=./ckpt -control-socket=./ckpt.sock -workspace=./work a
 rungv checkpoint -control-socket=./ckpt.sock -checkpoint-dir=./ckpt
 rungv restore -checkpoint-dir=./ckpt -workspace=./work
 ```
+
+### 4.12 Control socket subcommands
+
+Every control subcommand accepts `-S`/`--control-socket SPEC` (or `GVX_CONTROL_SOCKET`), `-n`/`--name NAME` (for `--control` sandboxes), `--token` (or `GVX_CONTROL_TOKEN`), `--token-file`, and `--timeout`. See [`control-protocol.md`](control-protocol.md) for the complete protocol and lockdown rules.
+
+| Command | Synopsis and behavior |
+| :--- | :--- |
+| `exec` | `rungv exec [-i] [-t] [-d] [-e KEY=VAL] [--env-file FILE] [-w DIR] [-u USER] [--privileged=BOOL] [--detach-keys KEYS] [--pid-file FILE] [--] CMD [ARG...]`. Closes guest stdin (`/dev/null`) unless the caller passes `-i`. |
+| `pause` / `unpause` | `rungv pause [--quiesce-net=true\|false]` and `rungv unpause`. Pauses and resumes all guest tasks. |
+| `cp` / `export` | `rungv cp [-a] [-L] [-q] [-z] [--no-overwrite-dir] [--user U:G] SRC DST` and `rungv export [--upper-only] [-z] [-o FILE\|-] [PATH]`. Streams tar archives while the unlocked client performs all host disk I/O with `os.Root`. |
+| `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
+| `port` / `port-forward` | `rungv port <ls\|add\|rm>` lists, adds, and removes host-to-guest NAT rules (requiring `--dynamic-ports` or `--auto-publish` under lockdown). `rungv port-forward` (alias `pf`) listens on the client and tunnels TCP connections via `net.dial` with zero lockdown relaxation. |
+| `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, unmounts targets, or serves a host directory via `rpcfs` (`mount serve HOST_DIR:GUEST_PATH`). |
+| `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect sandbox metadata, stream resource counters and kernel logs, send signals, stop PID 1 cleanly, or adjust Sentry log verbosity. |
 
 ## 5. Images and registries
 
@@ -492,7 +492,7 @@ The table below lists Docker CLI features that differ or do not exist in `rungv`
 | `--network host` | Refused. The guest has its own network stack. |
 | `-p HOST-RANGE:PORT` | Refused. Publish ranges of the same length. |
 | `--privileged` | On by default. Its privileges stay inside the sandbox. |
-| `--name` | Sets the kernel container ID and nothing else. |
+| `--name` | Sets the kernel container ID, and derives the default control socket path with `--control`. |
 | Image with Docker manifest schema 1 | Refused with an error. Docker 28 and later also refuse it; rebuild or re-push the image. |
 | `docker save` of any image | Requires the origin registry to fetch verified compressed layer blobs. |
 | Cgroup limits | `--memory` uses a polling guard. `--cpus` enforces a cross-platform Sentry root CPU bandwidth quota (plus a Windows Job Object cap under lockdown). `--pids-limit` caps total guest tasks through the root `cgroup2` `pids` controller. Inside the guest, nested cgroups enforce `memory.max` (polling) and `cpu.max` (on every engine); `memory.high` and `cpu.weight` are not enforced. |

@@ -219,6 +219,13 @@ func (g memoryGuard) run(ctx context.Context) bool {
 				case <-ctx.Done():
 					return false
 				case <-g.wakeCh:
+					if g.flushScan != nil {
+						g.flushScan()
+					}
+					if curLim := g.currentLimit(); curLim > 0 && g.used() > curLim {
+						g.kill()
+						return true
+					}
 				case <-idleCh:
 				}
 			}

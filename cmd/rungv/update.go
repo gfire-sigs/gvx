@@ -108,7 +108,7 @@ func updateSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 		qRaw := strings.ToLower(strings.TrimSpace(cpuQuotaStr))
 		var q int64
 		if qRaw == "max" || qRaw == "-1" || qRaw == "0" {
-			q = -1
+			q = 0
 		} else {
 			parsed, err := strconv.ParseInt(qRaw, 10, 64)
 			if err != nil || parsed < 1000 {

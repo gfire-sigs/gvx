@@ -38,7 +38,7 @@ const (
 	maxUnixSunPath = 100
 )
 
-var sandboxNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+var sandboxNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // Endpoint holds a bound control listener, its request token, and pre-lockdown cleanup.
 type Endpoint struct {
@@ -114,7 +114,7 @@ func validateLoopbackTCPAddr(addr string) error {
 func NamedSocketPath(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if !sandboxNamePattern.MatchString(name) {
-		return "", fmt.Errorf("invalid sandbox name %q (want [a-zA-Z0-9][a-zA-Z0-9_.-]+)", name)
+		return "", fmt.Errorf("invalid sandbox name %q (want [a-zA-Z0-9][a-zA-Z0-9_.-]*)", name)
 	}
 	dir, err := runtimeSocketDir()
 	if err != nil {
@@ -158,7 +158,10 @@ func controlTokenDir() (string, error) {
 	if base, err := os.UserCacheDir(); err == nil && base != "" {
 		return filepath.Join(base, "gvx", "control"), nil
 	}
-	return filepath.Join(os.TempDir(), "gvx-control-"+strconv.Itoa(os.Getuid())), nil
+	if runtime.GOOS == "windows" {
+		return filepath.Join(os.TempDir(), "gvx-control"), nil
+	}
+	return filepath.Join(os.TempDir(), "gvx-control-"+strconv.Itoa(os.Geteuid())), nil
 }
 
 // DefaultTokenPath returns the default token file path for an endpoint.
@@ -166,7 +169,7 @@ func DefaultTokenPath(network, address string) (string, error) {
 	if network == "unix" {
 		return address + ".token", nil
 	}
-	_, port, err := net.SplitHostPort(address)
+	host, port, err := net.SplitHostPort(address)
 	if err != nil || port == "" {
 		return "", fmt.Errorf("invalid TCP control address %q", address)
 	}
@@ -174,7 +177,11 @@ func DefaultTokenPath(network, address string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "tcp-"+port+".token"), nil
+	prefix := "tcp-"
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		prefix = "tcp6-"
+	}
+	return filepath.Join(dir, prefix+port+".token"), nil
 }
 
 // NewToken generates a random 256-bit hexadecimal token.
@@ -186,28 +193,22 @@ func NewToken() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
+func isManagedControlDir(clean string) bool {
+	if dir, err := runtimeSocketDir(); err == nil && filepath.Clean(dir) == clean {
+		return true
+	}
+	if dir, err := controlTokenDir(); err == nil && filepath.Clean(dir) == clean {
+		return true
+	}
+	return false
+}
+
 func writeTokenFile(path, token string) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensureSecureSocketDir(dir); err != nil {
 		return fmt.Errorf("create control token directory %q: %w", dir, err)
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove stale control token %q: %w", path, err)
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return fmt.Errorf("create control token %q: %w", path, err)
-	}
-	if _, err := f.WriteString(token + "\n"); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return fmt.Errorf("write control token %q: %w", path, err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return fmt.Errorf("close control token %q: %w", path, err)
-	}
-	return nil
+	return writeTokenFilePlatform(path, token)
 }
 
 // ReadToken reads a control token from overridePath when set, or from the
@@ -224,6 +225,14 @@ func ReadToken(network, address, overridePath string) (string, error) {
 		}
 	}
 	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) && !explicit && network == "tcp" {
+		if host, port, splitErr := net.SplitHostPort(address); splitErr == nil && host == "localhost" {
+			alt := filepath.Join(filepath.Dir(path), "tcp6-"+port+".token")
+			if altF, altErr := os.Open(alt); altErr == nil {
+				f, err = altF, nil
+			}
+		}
+	}
 	if errors.Is(err, os.ErrNotExist) && !explicit {
 		return "", nil
 	}
@@ -281,6 +290,11 @@ func Listen(raw string, opts ListenOptions) (*Endpoint, error) {
 		ln, err := net.Listen("tcp", address)
 		if err != nil {
 			return nil, err
+		}
+		tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+		if !ok || !tcpAddr.IP.IsLoopback() {
+			_ = ln.Close()
+			return nil, fmt.Errorf("control TCP socket bound non-loopback address %q", ln.Addr().String())
 		}
 		actualAddr := ln.Addr().String()
 		if tokenPath != "" && strings.TrimSpace(opts.TokenFile) == "" {
@@ -355,29 +369,4 @@ func Listen(raw string, opts ListenOptions) (*Endpoint, error) {
 		TokenPath: tokenPath,
 		Cleanup:   cleanup,
 	}, nil
-}
-
-func ensureSecureSocketDir(dir string) error {
-	clean := filepath.Clean(dir)
-	if info, err := os.Lstat(clean); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			// On macOS, /tmp is a system symlink to private/tmp.
-			if clean != "/tmp" {
-				return fmt.Errorf("control socket directory %q must not be a symlink", dir)
-			}
-			resolved, statErr := os.Stat(clean)
-			if statErr != nil || !resolved.IsDir() {
-				return fmt.Errorf("control socket directory %q is not a directory", dir)
-			}
-			return nil
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("control socket directory %q is not a directory", dir)
-		}
-		return nil
-	}
-	if err := os.MkdirAll(clean, 0o700); err != nil {
-		return fmt.Errorf("create control socket directory %q: %w", dir, err)
-	}
-	return nil
 }

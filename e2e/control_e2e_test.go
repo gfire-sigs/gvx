@@ -21,10 +21,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,10 +38,55 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx/control"
 )
 
+func controlSocketSpecForE2E(t *testing.T, name string) string {
+	t.Helper()
+	sockDir := shortCheckpointSocketDir(t)
+	if !canBindUnixControlSocket(sockDir) {
+		return "tcp://" + freeLoopbackControlSocketAddr(t)
+	}
+	return filepath.Join(sockDir, name)
+}
+
+func freeLoopbackPortForE2E(t *testing.T) uint16 {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate free loopback port: %v", err)
+	}
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	_ = ln.Close()
+	return port
+}
+
+func httpGetWithRetry(t *testing.T, url string, timeout time.Duration) string {
+	t.Helper()
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err != nil {
+			lastErr = err
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		data, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr == nil && resp.StatusCode == http.StatusOK {
+			return string(data)
+		}
+		lastErr = readErr
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("GET %s failed within %v: %v", url, timeout, lastErr)
+	return ""
+}
+
 func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	requireAutoPlatform(t)
 	rungv := toolPath(t, rungvPkg)
 
+	const guestHTTPPort uint16 = 18088
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {
 		t.Fatalf("BuildGuestCatELF64: %v", err)
@@ -54,12 +103,17 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildGuestWriteFileELF64: %v", err)
 	}
+	httpELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, guestHTTPPort, "/etc/ready.txt", "", "")
+	if err != nil {
+		t.Fatalf("BuildGuestHTTPServerELF64: %v", err)
+	}
 
 	layer, err := testimage.Tar(
 		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
 		testimage.File{Name: "bin/hello", Data: helloELF, Mode: 0o755},
 		testimage.File{Name: "bin/exit42", Data: exit42ELF, Mode: 0o755},
 		testimage.File{Name: "bin/writeproxy", Data: writeProxyELF, Mode: 0o755},
+		testimage.File{Name: "bin/httpserver", Data: httpELF, Mode: 0o755},
 		testimage.File{Name: "etc/ready.txt", Data: []byte("e2e-ready\n"), Mode: 0o644},
 		testimage.File{Name: "tmp/", Type: tar.TypeDir, Mode: 0o1777},
 		testimage.File{Name: "mnt/", Type: tar.TypeDir, Mode: 0o755},
@@ -82,13 +136,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wsDir, "ro.txt"), []byte("ro-data\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sockDir, err := os.MkdirTemp("/tmp", "gvx-e2e-c-")
-	if err != nil {
-		sockDir = t.TempDir()
-	} else {
-		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
-	}
-	sockPath := filepath.Join(sockDir, "ctrl.sock")
+	sockPath := controlSocketSpecForE2E(t, "ctrl.sock")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -203,6 +251,47 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 		t.Fatalf("mount add bind under lockdown = (%d, %q), want exit 126", code, errS)
 	}
 
+	// 6b. port-forward tunnels TCP into the locked-down sandbox WITHOUT --dynamic-ports!
+	{
+		if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
+			t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
+		}
+		localPort := freeLoopbackPortForE2E(t)
+		pfCtx, pfCancel := context.WithCancel(ctx)
+		pfOut := newCheckpointNotifyBuffer()
+		pfErr := newCheckpointNotifyBuffer()
+		pfCmd := exec.CommandContext(pfCtx, rungv, "port-forward", "-S", sockPath,
+			"127.0.0.1:"+strconv.Itoa(int(localPort))+":"+strconv.Itoa(int(guestHTTPPort)))
+		pfCmd.Stdout = pfOut
+		pfCmd.Stderr = pfErr
+		if err := pfCmd.Start(); err != nil {
+			pfCancel()
+			t.Fatalf("start port-forward: %v", err)
+		}
+		pfDone := make(chan error, 1)
+		go func() { pfDone <- pfCmd.Wait() }()
+		t.Cleanup(func() {
+			pfCancel()
+			select {
+			case <-pfDone:
+			case <-time.After(5 * time.Second):
+				_ = pfCmd.Process.Kill()
+			}
+		})
+		pfOut.waitForSubstring(t, "Forwarding ", 15*time.Second, pfErr)
+
+		gotBody := httpGetWithRetry(t, "http://127.0.0.1:"+strconv.Itoa(int(localPort))+"/", 15*time.Second)
+		if gotBody != "e2e-ready\n" {
+			t.Fatalf("port-forward HTTP body = %q, want e2e-ready", gotBody)
+		}
+		pfCancel()
+		select {
+		case <-pfDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("port-forward did not exit promptly on cancel")
+		}
+	}
+
 	// 7. mount add tmpfs + mount serve (rpcfs) work under full lockdown!
 	if _, errS, code := runTool(t, rungv, "mount", "add", "-S", sockPath, "--type", "tmpfs", "--dst", "/mnt/tmp", "--size", "8m"); code != 0 {
 		t.Fatalf("mount add tmpfs = (%d, %q)", code, errS)
@@ -219,10 +308,19 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	serveCmd.Stdout = serveOut
 	serveCmd.Stderr = serveErr
 	if err := serveCmd.Start(); err != nil {
+		serveCancel()
 		t.Fatalf("start mount serve: %v", err)
 	}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- serveCmd.Wait() }()
+	t.Cleanup(func() {
+		serveCancel()
+		select {
+		case <-serveDone:
+		case <-time.After(5 * time.Second):
+			_ = serveCmd.Process.Kill()
+		}
+	})
 	serveOut.waitForSubstring(t, "Serving ", 15*time.Second, serveErr)
 
 	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/proxy/host.txt"); code != 0 || out != "locked-rpcfs-read\n" {
@@ -236,15 +334,24 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 		t.Fatalf("guest rpcfs write = (%q, %v)", written, err)
 	}
 	serveCancel()
-	<-serveDone
+	select {
+	case <-serveDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mount serve did not exit promptly on cancel")
+	}
 
 	// Wait for the server to finish auto-unmounting /mnt/proxy after client disconnect.
+	unmounted := false
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if out, _, code := runTool(t, rungv, "mount", "ls", "-S", sockPath, "-q"); code == 0 && !strings.Contains(out, "/mnt/proxy") {
+			unmounted = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if !unmounted {
+		t.Fatal("/mnt/proxy was not unmounted within 5s after mount serve exited")
 	}
 
 	// 8. Streaming checkpoint (-o without -checkpoint-dir) + restore under lockdown.
@@ -278,4 +385,97 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	if resOut.String() != "resumed-under-lockdown\n" {
 		t.Fatalf("restored stdout = %q, want resumed-under-lockdown", resOut.String())
 	}
+}
+
+func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
+	requireAutoPlatform(t)
+	rungv := toolPath(t, rungvPkg)
+
+	const guestPort uint16 = 18089
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	httpELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, guestPort, "/etc/ready.txt", "", "")
+	if err != nil {
+		t.Fatalf("BuildGuestHTTPServerELF64: %v", err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "bin/httpserver", Data: httpELF, Mode: 0o755},
+		testimage.File{Name: "etc/ready.txt", Data: []byte("dyn-port-ok\n"), Mode: 0o644},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+	regURL := testimage.NewRegistry(t, "e2edynport", "latest", testimage.Image{
+		Arch:       runtime.GOARCH,
+		Layers:     [][]byte{layer},
+		Entrypoint: []string{"/bin/cat"},
+		Cmd:        []string{"/etc/ready.txt", "/proc/self/fd/0"},
+	})
+
+	sockPath := controlSocketSpecForE2E(t, "dyn.sock")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	sbStdout := newCheckpointNotifyBuffer()
+	sbStderr := newCheckpointNotifyBuffer()
+	sbCmd := exec.CommandContext(ctx, rungv,
+		"run",
+		"-platform="+string(resolvedAutoPlatform()),
+		"-net=nat",
+		"--dynamic-ports",
+		"-cache-dir="+t.TempDir(),
+		"-registry-url="+regURL,
+		"--name=e2e-dynport",
+		"-S", sockPath,
+		"e2edynport:latest",
+	)
+	sbStdin, err := sbCmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbCmd.Stdout = sbStdout
+	sbCmd.Stderr = sbStderr
+	if err := sbCmd.Start(); err != nil {
+		t.Fatalf("start rungv: %v", err)
+	}
+	sbDone := make(chan error, 1)
+	go func() { sbDone <- sbCmd.Wait() }()
+	t.Cleanup(func() {
+		_ = sbStdin.Close()
+		cancel()
+		select {
+		case <-sbDone:
+		case <-time.After(10 * time.Second):
+			_ = sbCmd.Process.Kill()
+		}
+	})
+
+	sbStdout.waitForSubstring(t, "dyn-port-ok\n", 30*time.Second, sbStderr)
+
+	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
+		t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
+	}
+	hostPort := freeLoopbackPortForE2E(t)
+	spec := "127.0.0.1:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
+	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, spec); code != 0 {
+		t.Fatalf("port add = (%d, %q)", code, errS)
+	}
+	// Non-loopback bind must still be refused under host lockdown even with --dynamic-ports.
+	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "0.0.0.0:0:80"); code != 126 {
+		t.Fatalf("port add non-loopback = (%d, %q), want 126", code, errS)
+	}
+	gotBody := httpGetWithRetry(t, "http://127.0.0.1:"+strconv.Itoa(int(hostPort))+"/", 15*time.Second)
+	if gotBody != "dyn-port-ok\n" {
+		t.Fatalf("dynamic port HTTP body = %q, want dyn-port-ok", gotBody)
+	}
+	if _, errS, code := runTool(t, rungv, "port", "rm", "-S", sockPath, spec); code != 0 {
+		t.Fatalf("port rm = (%d, %q)", code, errS)
+	}
+	if _, errS, code := runTool(t, rungv, "stop", "-S", sockPath, "-t", "0"); code != 0 {
+		t.Fatalf("stop -t 0 = (%d, %q)", code, errS)
+	}
+	_ = <-sbDone
 }

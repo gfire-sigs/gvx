@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
@@ -38,15 +39,19 @@ type execSession struct {
 	tg     *kernel.ThreadGroup
 	tty    *ttyState
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func (s *Sandbox) activeExecCount() int {
 	s.execMu.Lock()
 	defer s.execMu.Unlock()
-	return len(s.execSessions)
+	return len(s.execSessions) + s.execReserved
 }
 
-func (s *Sandbox) forceStopExecSessions(k *kernel.Kernel) {
+// forceStopExecSessions sends SIGKILL to every active exec session and waits
+// until each session finishes exiting and tearing down its temporary stdio
+// devices before returning.
+func (s *Sandbox) forceStopExecSessions(ctx context.Context, k *kernel.Kernel) error {
 	s.execMu.Lock()
 	sessions := make([]*execSession, 0, len(s.execSessions))
 	for _, sess := range s.execSessions {
@@ -61,6 +66,19 @@ func (s *Sandbox) forceStopExecSessions(k *kernel.Kernel) {
 			_ = k.SendExternalSignalThreadGroup(sess.tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		}
 	}
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for _, sess := range sessions {
+		if sess.done == nil {
+			continue
+		}
+		select {
+		case <-sess.done:
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	}
+	return nil
 }
 
 func (s *Sandbox) resolveExecCredentials(
@@ -172,23 +190,45 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	if req.TTY && !slices.Contains(s.ControlCapabilities(), control.CapExecTTY) {
 		return control.NewError(control.CodeForbiddenByPolicy, "exec TTY allocation is disabled by policy")
 	}
+
+	s.opMu.RLock()
+	opLocked := true
+	unlockOp := func() {
+		if opLocked {
+			opLocked = false
+			s.opMu.RUnlock()
+		}
+	}
+	defer unlockOp()
+
 	s.mu.Lock()
 	paused := s.userPaused
+	maxSessions := s.cfg.Tuning.Int(tuning.ControlMaxExecSessions)
 	s.mu.Unlock()
 	if paused {
 		return control.NewError(control.CodeAlreadyPaused, "cannot exec while sandbox is paused")
 	}
 
-	maxSessions := s.cfg.Tuning.Int(tuning.ControlMaxExecSessions)
 	if maxSessions <= 0 {
 		maxSessions = 32
 	}
 	s.execMu.Lock()
-	if len(s.execSessions) >= maxSessions {
+	if len(s.execSessions)+s.execReserved >= maxSessions {
 		s.execMu.Unlock()
 		return control.NewErrorf(control.CodeLimitExceeded, "active exec session limit (%d) reached", maxSessions)
 	}
+	s.execReserved++
 	s.execMu.Unlock()
+	reserved := true
+	releaseReserved := func() {
+		if reserved {
+			reserved = false
+			s.execMu.Lock()
+			s.execReserved--
+			s.execMu.Unlock()
+		}
+	}
+	defer releaseReserved()
 
 	k, _, err := s.activeKernelChecked(ctx)
 	if err != nil {
@@ -199,8 +239,11 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	if err != nil {
 		return err
 	}
-	defer root.DecRef(sctx)
-	defer mntns.DecRef(sctx)
+	releaseVFS := sync.OnceFunc(func() {
+		root.DecRef(sctx)
+		mntns.DecRef(sctx)
+	})
+	defer releaseVFS()
 
 	sctxWithRoot := withGuestVFS(sctx, root, mntns)
 	rootCreds := auth.NewRootCredentials(k.RootUserNamespace())
@@ -325,6 +368,7 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 
 	tg, tid, err := k.CreateProcess(procArgs)
 	fdTable.DecRef(sctx)
+	releaseVFS()
 	if err != nil {
 		execCancel()
 		runCleanup()
@@ -336,10 +380,25 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	}
 
 	pid := int32(tid)
-	sess := &execSession{pid: pid, tg: tg, tty: tty, cancel: execCancel}
+	sessDone := make(chan struct{})
+	sess := &execSession{pid: pid, tg: tg, tty: tty, cancel: execCancel, done: sessDone}
 	s.execMu.Lock()
+	if reserved {
+		reserved = false
+		s.execReserved--
+	}
 	s.execSessions[pid] = sess
 	s.execMu.Unlock()
+	unlockOp()
+
+	finishSession := sync.OnceFunc(func() {
+		s.execMu.Lock()
+		delete(s.execSessions, pid)
+		s.execMu.Unlock()
+		execCancel()
+		runCleanup()
+		close(sessDone)
+	})
 
 	s.emitEvent("exec", "start", map[string]string{
 		"pid":  strconv.Itoa(int(pid)),
@@ -349,19 +408,13 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	if req.Detach {
 		// Reap detached exec resources asynchronously on exit.
 		go func() {
-			defer func() {
-				s.execMu.Lock()
-				delete(s.execSessions, pid)
-				s.execMu.Unlock()
-				execCancel()
-				runCleanup()
-				ws := tg.ExitStatus()
-				s.emitEvent("exec", "exit", map[string]string{
-					"pid":       strconv.Itoa(int(pid)),
-					"exit_code": strconv.Itoa(int(ws.ExitStatus())),
-				})
-			}()
 			tg.WaitExited()
+			ws := tg.ExitStatus()
+			finishSession()
+			s.emitEvent("exec", "exit", map[string]string{
+				"pid":       strconv.Itoa(int(pid)),
+				"exit_code": strconv.Itoa(int(ws.ExitStatus())),
+			})
 		}()
 		return stream.Reply(control.ExecStartResponse{PID: pid})
 	}
@@ -376,11 +429,7 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 		}
 		go func() {
 			tg.WaitExited()
-			s.execMu.Lock()
-			delete(s.execSessions, pid)
-			s.execMu.Unlock()
-			execCancel()
-			runCleanup()
+			finishSession()
 		}()
 		return err
 	}
@@ -425,19 +474,17 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 
 	select {
 	case <-exitedCh:
-		// Process exited cleanly.
+		// Process exited cleanly. Read exit status before closing sessDone so
+		// checkpoint/save never races with kernel task reads.
 		execCancel()
 		<-evDone
-		s.execMu.Lock()
-		delete(s.execSessions, pid)
-		s.execMu.Unlock()
-		runCleanup()
+		ws := tg.ExitStatus()
+		finishSession()
 
 		_ = stream.CloseChannel(control.ChannelStdout)
 		if !req.TTY {
 			_ = stream.CloseChannel(control.ChannelStderr)
 		}
-		ws := tg.ExitStatus()
 		exitEv := control.ExecExitEvent{}
 		if ws.Signaled() {
 			exitEv.Signal = int32(ws.TerminationSignal())
@@ -470,11 +517,8 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 		}
 		go func() {
 			<-exitedCh
-			s.execMu.Lock()
-			delete(s.execSessions, pid)
-			s.execMu.Unlock()
-			runCleanup()
 			ws := tg.ExitStatus()
+			finishSession()
 			s.emitEvent("exec", "exit", map[string]string{
 				"pid":       strconv.Itoa(int(pid)),
 				"exit_code": strconv.Itoa(int(ws.ExitStatus())),

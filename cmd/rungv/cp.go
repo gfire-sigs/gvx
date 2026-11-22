@@ -202,13 +202,16 @@ func cpGuestToHost(ctx context.Context, client *control.Client, guestSrc string,
 		}
 	} else {
 		// Directory export: if dst exists and is a dir, extract inside it;
-		// otherwise create dst and strip the single leading component.
+		// otherwise create dst and strip the single leading component (except
+		// when exporting "/" which has no leading directory component).
 		if st, statErr := os.Stat(dst.path); statErr == nil && st.IsDir() {
 			if err := extractTarToHostDir(tarReader, dst.path, extractOpts); err != nil {
 				return controlFail(streams.stderr, cmdName, err)
 			}
 		} else {
-			extractOpts.stripTopDir = true
+			if path.Clean("/"+strings.TrimPrefix(guestSrc, "/")) != "/" {
+				extractOpts.stripTopDir = true
+			}
 			if err := extractTarToHostDir(tarReader, dst.path, extractOpts); err != nil {
 				return controlFail(streams.stderr, cmdName, err)
 			}
@@ -260,9 +263,11 @@ func cpHostToGuest(ctx context.Context, client *control.Client, src cpEndpoint, 
 	}
 	defer stream.Close()
 
+	writeCtx, writeCancel := context.WithCancel(ctx)
+	defer writeCancel()
 	writeErrCh := make(chan error, 1)
 	go func() {
-		w := stream.ChannelWriter(ctx, control.ChannelGeneric, compress)
+		w := stream.ChannelWriter(writeCtx, control.ChannelGeneric, compress)
 		var sendErr error
 		if src.isPipe {
 			if streams.stdin != nil {
@@ -277,10 +282,15 @@ func cpHostToGuest(ctx context.Context, client *control.Client, src cpEndpoint, 
 
 	var resp control.FSImportResponse
 	respErr := stream.WaitResponse(ctx, &resp)
-	sendErr := <-writeErrCh
 	if respErr != nil {
+		// Unblock writer goroutine immediately if server rejected early (e.g.
+		// >1 MiB upload exceeding InitialStreamWindow).
+		writeCancel()
+		stream.Close()
+		<-writeErrCh
 		return controlFail(streams.stderr, cmdName, respErr)
 	}
+	sendErr := <-writeErrCh
 	if sendErr != nil {
 		return controlFail(streams.stderr, cmdName, sendErr)
 	}
@@ -318,37 +328,59 @@ func packHostToTar(w io.Writer, srcPath, renameTop string, followLink bool) erro
 	topPrefix := filepath.Base(clean)
 	if renameTop != "" {
 		topPrefix = renameTop
-	}
-	if contentsOnly {
+	} else if contentsOnly {
 		topPrefix = ""
 	}
-	err = filepath.WalkDir(clean, func(cur string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(clean, cur)
+	activeDirs := make(map[string]bool)
+	var walkDir func(cur, rel string) error
+	walkDir = func(cur, rel string) error {
+		fi, err := statHostSource(cur, followLink)
 		if err != nil {
 			return err
 		}
-		rel = filepath.ToSlash(rel)
 		var tarName string
 		if rel == "." {
-			if topPrefix == "" {
-				return nil
-			}
 			tarName = topPrefix
 		} else if topPrefix == "" {
 			tarName = rel
 		} else {
 			tarName = path.Join(topPrefix, rel)
 		}
-		fi, err := statHostSource(cur, followLink)
+		if tarName != "" {
+			if err := writeHostEntryToTar(tw, cur, tarName, fi, followLink); err != nil {
+				return err
+			}
+		}
+		if !fi.IsDir() {
+			return nil
+		}
+		if followLink {
+			realDir, rErr := filepath.EvalSymlinks(cur)
+			if rErr == nil {
+				if activeDirs[realDir] {
+					return nil
+				}
+				activeDirs[realDir] = true
+				defer delete(activeDirs, realDir)
+			}
+		}
+		entries, err := os.ReadDir(cur)
 		if err != nil {
 			return err
 		}
-		return writeHostEntryToTar(tw, cur, tarName, fi, followLink)
-	})
-	if err != nil {
+		for _, de := range entries {
+			childCur := filepath.Join(cur, de.Name())
+			childRel := de.Name()
+			if rel != "." {
+				childRel = rel + "/" + de.Name()
+			}
+			if err := walkDir(childCur, childRel); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walkDir(clean, "."); err != nil {
 		return err
 	}
 	return tw.Close()
@@ -391,8 +423,37 @@ type hostExtractOptions struct {
 	stripTopDir    bool
 }
 
+func validateSafeSymlinkTarget(rel, linkTarget string) error {
+	if linkTarget == "" || strings.ContainsRune(linkTarget, 0) {
+		return fmt.Errorf("refuse invalid symlink target %q -> %q", rel, linkTarget)
+	}
+	if strings.ContainsRune(linkTarget, '\\') {
+		return fmt.Errorf("refuse symlink target with backslash %q -> %q", rel, linkTarget)
+	}
+	if strings.HasPrefix(linkTarget, "/") || path.IsAbs(linkTarget) || hasWindowsDrivePrefix(linkTarget) {
+		return fmt.Errorf("refuse absolute symlink target %q -> %q", rel, linkTarget)
+	}
+	resolved := path.Clean(path.Join(path.Dir(rel), linkTarget))
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		return fmt.Errorf("refuse symlink escaping destination root: %q -> %q", rel, linkTarget)
+	}
+	return nil
+}
+
+func validateRenameSingleSegment(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) || hasWindowsDrivePrefix(name) {
+		return fmt.Errorf("invalid destination filename %q", name)
+	}
+	return validateHostFilename(name)
+}
+
 // extractTarToHostDir safely extracts a tar stream into destDir pinned by os.Root.
 func extractTarToHostDir(r io.Reader, destDir string, opts hostExtractOptions) error {
+	if opts.renameSingleTo != "" {
+		if err := validateRenameSingleSegment(opts.renameSingleTo); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create destination directory %q: %w", destDir, err)
 	}
@@ -403,6 +464,7 @@ func extractTarToHostDir(r io.Reader, destDir string, opts hostExtractOptions) e
 	defer root.Close()
 
 	tr := tar.NewReader(r)
+	extractedCount := 0
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -418,19 +480,31 @@ func extractTarToHostDir(r io.Reader, destDir string, opts hostExtractOptions) e
 		if skip {
 			continue
 		}
+		if opts.renameSingleTo != "" && extractedCount >= 1 {
+			return fmt.Errorf("single-file copy received multiple tar entries (extra %q)", hdr.Name)
+		}
 		if err := validateHostFilename(rel); err != nil {
 			return err
 		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
+			if opts.renameSingleTo != "" {
+				return fmt.Errorf("single-file copy refuses directory tar entry %q", hdr.Name)
+			}
 			if err := mkdirAllInRoot(root, rel); err != nil {
 				return err
 			}
+			extractedCount++
 		case tar.TypeReg, tar.TypeRegA:
 			if parent := path.Dir(rel); parent != "." && parent != "" {
 				if err := mkdirAllInRoot(root, parent); err != nil {
 					return err
+				}
+			}
+			if fi, lErr := root.Lstat(rel); lErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+				if rmErr := root.Remove(rel); rmErr != nil {
+					return fmt.Errorf("replace symlink %q: %w", rel, rmErr)
 				}
 			}
 			perm := os.FileMode(hdr.Mode & 0o777)
@@ -446,14 +520,13 @@ func extractTarToHostDir(r io.Reader, destDir string, opts hostExtractOptions) e
 			if err := errors.Join(copyErr, closeErr); err != nil {
 				return fmt.Errorf("write %q: %w", rel, err)
 			}
-			_ = os.Chtimes(filepath.Join(destDir, filepath.FromSlash(rel)), time.Now(), hdr.ModTime)
-		case tar.TypeSymlink:
-			if path.IsAbs(hdr.Linkname) {
-				return fmt.Errorf("refuse absolute symlink target %q -> %q", rel, hdr.Linkname)
+			if !hdr.ModTime.IsZero() {
+				_ = root.Chtimes(rel, time.Now(), hdr.ModTime)
 			}
-			resolved := path.Clean(path.Join(path.Dir(rel), hdr.Linkname))
-			if resolved == ".." || strings.HasPrefix(resolved, "../") {
-				return fmt.Errorf("refuse symlink escaping destination root: %q -> %q", rel, hdr.Linkname)
+			extractedCount++
+		case tar.TypeSymlink:
+			if err := validateSafeSymlinkTarget(rel, hdr.Linkname); err != nil {
+				return err
 			}
 			if parent := path.Dir(rel); parent != "." && parent != "" {
 				if err := mkdirAllInRoot(root, parent); err != nil {
@@ -464,10 +537,18 @@ func extractTarToHostDir(r io.Reader, destDir string, opts hostExtractOptions) e
 			if err := root.Symlink(hdr.Linkname, rel); err != nil {
 				return fmt.Errorf("symlink %q: %w", rel, err)
 			}
+			extractedCount++
 		case tar.TypeLink:
-			linkRel, linkSkip, err := sanitizeHostTarPath(hdr.Linkname, opts)
+			if opts.renameSingleTo != "" {
+				return fmt.Errorf("single-file copy refuses hard link tar entry %q", hdr.Name)
+			}
+			linkOpts := hostExtractOptions{stripTopDir: opts.stripTopDir}
+			linkRel, linkSkip, err := sanitizeHostTarPath(hdr.Linkname, linkOpts)
 			if err != nil || linkSkip {
 				return fmt.Errorf("invalid hard link target %q", hdr.Linkname)
+			}
+			if err := verifyExistingAncestorsInRoot(root, path.Dir(linkRel)); err != nil {
+				return err
 			}
 			if parent := path.Dir(rel); parent != "." && parent != "" {
 				if err := mkdirAllInRoot(root, parent); err != nil {
@@ -478,12 +559,25 @@ func extractTarToHostDir(r io.Reader, destDir string, opts hostExtractOptions) e
 			if err := root.Link(linkRel, rel); err != nil {
 				return fmt.Errorf("hardlink %q -> %q: %w", rel, linkRel, err)
 			}
+			extractedCount++
 		}
 	}
 }
 
 func sanitizeHostTarPath(raw string, opts hostExtractOptions) (string, bool, error) {
-	p := strings.TrimPrefix(strings.ReplaceAll(raw, `\`, "/"), "/")
+	if strings.ContainsRune(raw, 0) {
+		return "", false, fmt.Errorf("unsafe tar path %q contains NUL", raw)
+	}
+	norm := strings.ReplaceAll(raw, `\`, "/")
+	if hasWindowsDrivePrefix(norm) {
+		return "", false, fmt.Errorf("unsafe tar path %q contains drive prefix", raw)
+	}
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == ".." {
+			return "", false, fmt.Errorf("unsafe tar path %q escapes destination", raw)
+		}
+	}
+	p := strings.TrimPrefix(norm, "/")
 	p = path.Clean(p)
 	if p == "." || p == "" {
 		return "", true, nil
@@ -507,6 +601,31 @@ func sanitizeHostTarPath(raw string, opts hostExtractOptions) (string, bool, err
 	return p, false, nil
 }
 
+func verifyExistingAncestorsInRoot(root *os.Root, rel string) error {
+	if rel == "" || rel == "." {
+		return nil
+	}
+	cur := ""
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		if cur == "" {
+			cur = part
+		} else {
+			cur += "/" + part
+		}
+		fi, err := root.Lstat(cur)
+		if err != nil {
+			return fmt.Errorf("stat parent %q: %w", cur, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return fmt.Errorf("refuse traversing non-directory component %q", cur)
+		}
+	}
+	return nil
+}
+
 func mkdirAllInRoot(root *os.Root, rel string) error {
 	parts := strings.Split(rel, "/")
 	cur := ""
@@ -519,8 +638,17 @@ func mkdirAllInRoot(root *os.Root, rel string) error {
 		} else {
 			cur += "/" + part
 		}
-		if err := root.Mkdir(cur, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("mkdir %q: %w", cur, err)
+		if err := root.Mkdir(cur, 0o755); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return fmt.Errorf("mkdir %q: %w", cur, err)
+			}
+			fi, stErr := root.Lstat(cur)
+			if stErr != nil {
+				return fmt.Errorf("stat %q: %w", cur, stErr)
+			}
+			if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+				return fmt.Errorf("refuse traversing non-directory component %q", cur)
+			}
 		}
 	}
 	return nil

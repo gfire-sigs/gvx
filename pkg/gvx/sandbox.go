@@ -83,11 +83,15 @@ type Sandbox struct {
 	hostCARoots [][]byte
 	// forwards holds the port forwards that initNetstack bound, in rule order:
 	// the caller list, then the ports that PublishAll added.
-	forwards          []PortForward
-	ckptFiles         *checkpointBundleFiles
-	cleanCkptDir      string
-	absCkptDir        string
+	forwards     []PortForward
+	ckptFiles    *checkpointBundleFiles
+	cleanCkptDir string
+	absCkptDir   string
+	// Lock order: opMu -> mountOpMu / ckptMu -> resourceMu -> mu -> execMu / rpcMountsMu.
+	opMu              sync.RWMutex
+	mountOpMu         sync.Mutex
 	ckptMu            sync.Mutex
+	resourceMu        sync.Mutex
 	kernelReady       chan struct{}
 	kernelReadyOnce   sync.Once
 	runDone           chan struct{}
@@ -102,6 +106,7 @@ type Sandbox struct {
 	events            *eventHub
 	controlSrv        *control.Server
 	execMu            sync.Mutex
+	execReserved      int
 	execSessions      map[int32]*execSession
 	nextStdioMinor    atomic.Uint32
 	userPaused        bool
@@ -113,6 +118,7 @@ type Sandbox struct {
 	rpcMountsMu       sync.Mutex
 	rpcMounts         map[string]*rpcMountEntry
 	closed            bool
+	closeDone         chan struct{}
 	closeErr          error
 }
 
@@ -614,11 +620,24 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 // the hypervisor platform.
 func (s *Sandbox) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
-		return s.closeErr
+		done := s.closeDone
+		s.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		s.mu.Lock()
+		err := s.closeErr
+		s.mu.Unlock()
+		return err
 	}
 	s.closed = true
+	done := make(chan struct{})
+	s.closeDone = done
+	defer func() {
+		s.mu.Unlock()
+		close(done)
+	}()
 
 	if s.restoredKernel != nil {
 		if tk := s.restoredKernel.Timekeeper(); tk != nil {

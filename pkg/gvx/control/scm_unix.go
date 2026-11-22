@@ -57,27 +57,51 @@ func RecvFDs(conn net.Conn, maxFDs int) ([]int, error) {
 	}
 	var sentinel [1]byte
 	oob := make([]byte, unix.CmsgSpace(4*maxFDs))
-	n, oobn, _, _, err := uc.ReadMsgUnix(sentinel[:], oob)
-	if err != nil {
-		return nil, fmt.Errorf("recv SCM_RIGHTS: %w", err)
+	n, oobn, flags, _, readErr := uc.ReadMsgUnix(sentinel[:], oob)
+
+	// Always parse any ancillary control messages returned by the kernel so
+	// received descriptors are closed on every error path.
+	var fds []int
+	var parseErr error
+	if oobn > 0 {
+		cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+		if err != nil {
+			parseErr = fmt.Errorf("parse SCM_RIGHTS control message: %w", err)
+		} else {
+			for i := range cmsgs {
+				parsed, err := unix.ParseUnixRights(&cmsgs[i])
+				if err != nil {
+					parseErr = fmt.Errorf("parse SCM_RIGHTS fds: %w", err)
+					continue
+				}
+				fds = append(fds, parsed...)
+			}
+		}
+	}
+	closeAll := func() {
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
+	}
+	if readErr != nil {
+		closeAll()
+		return nil, fmt.Errorf("recv SCM_RIGHTS: %w", readErr)
+	}
+	if flags&unix.MSG_CTRUNC != 0 {
+		closeAll()
+		return nil, errors.New("truncated SCM_RIGHTS control message")
 	}
 	if n != 1 {
+		closeAll()
 		return nil, errors.New("short SCM_RIGHTS read")
 	}
-	cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return nil, fmt.Errorf("parse SCM_RIGHTS control message: %w", err)
+	if parseErr != nil {
+		closeAll()
+		return nil, parseErr
 	}
-	var fds []int
-	for i := range cmsgs {
-		parsed, err := unix.ParseUnixRights(&cmsgs[i])
-		if err != nil {
-			for _, fd := range fds {
-				_ = unix.Close(fd)
-			}
-			return nil, fmt.Errorf("parse SCM_RIGHTS fds: %w", err)
-		}
-		fds = append(fds, parsed...)
+	if len(fds) > maxFDs {
+		closeAll()
+		return nil, fmt.Errorf("received %d SCM_RIGHTS fds (max %d)", len(fds), maxFDs)
 	}
 	for _, fd := range fds {
 		unix.CloseOnExec(fd)

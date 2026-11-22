@@ -40,11 +40,12 @@ import (
 )
 
 type rpcMountEntry struct {
-	target   string
-	label    string
-	readOnly bool
-	cancel   context.CancelFunc
-	client   *streamRPCFSClient
+	target          string
+	label           string
+	readOnly        bool
+	backingReadOnly bool
+	cancel          context.CancelFunc
+	client          *streamRPCFSClient
 }
 
 func (s *Sandbox) hasActiveRPCMounts() bool {
@@ -102,21 +103,21 @@ func (s *Sandbox) listMountInfos() []control.MountInfo {
 		case MountOverlay:
 			info.Type = "overlay"
 			info.Source = sm.Mount.volumeLabel()
-			info.Mutable = !sm.ReadOnly
+			info.Mutable = !sm.backingReadOnly
 		case MountVolume:
 			if sm.volume != nil {
 				info.Type = "ext4lite"
 				info.Source = cmp.Or(sm.VolumeName, sm.ImagePath, "volume")
-				info.Mutable = !sm.ReadOnly
+				info.Mutable = !sm.backingReadOnly
 			} else {
 				info.Type = "hostfs"
 				info.Source = cmp.Or(sm.VolumeName, sm.hostPath)
-				info.Mutable = sm.workspace != nil && !sm.workspace.ReadOnly()
+				info.Mutable = !sm.backingReadOnly && sm.workspace != nil && !sm.workspace.ReadOnly()
 			}
 		default:
 			info.Type = "hostfs"
 			info.Source = cmp.Or(sm.hostPath, sm.HostPath)
-			info.Mutable = sm.workspace != nil && !sm.workspace.ReadOnly()
+			info.Mutable = !sm.backingReadOnly && sm.workspace != nil && !sm.workspace.ReadOnly()
 		}
 		out = append(out, info)
 	}
@@ -128,7 +129,7 @@ func (s *Sandbox) listMountInfos() []control.MountInfo {
 			Type:     rpcfs.Name,
 			Source:   cmp.Or(rm.label, "client-proxy"),
 			ReadOnly: rm.readOnly,
-			Mutable:  !rm.readOnly,
+			Mutable:  !rm.backingReadOnly,
 		})
 	}
 	s.rpcMountsMu.Unlock()
@@ -170,8 +171,14 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 	if err != nil {
 		return err
 	}
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	s.mountOpMu.Lock()
+	defer s.mountOpMu.Unlock()
+
 	s.mu.Lock()
 	locked := s.lockdown.Applied
+	mf := s.runMemFile
 	if s.mountTargetExistsLocked(target) {
 		s.mu.Unlock()
 		return control.NewErrorf(control.CodeAlreadyExists, "mount target %q already exists", target)
@@ -226,6 +233,7 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 				ReadOnly:       req.ReadOnly,
 				TmpfsSizeBytes: req.TmpfsSizeBytes,
 			},
+			dynamic: true,
 		})
 		sortMountsByDepth(s.mounts)
 		s.mu.Unlock()
@@ -260,6 +268,9 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 			}
 			return control.NewErrorf(control.CodeInternal, "open attached ext4lite volume: %v", volErr)
 		}
+		if sharedChunkMemory && mf != nil {
+			vol.SetChunkMemory(&memoryFileChunks{MemoryFile: mf})
+		}
 		if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
 			_ = vol.Close()
 			return control.NewErrorf(control.CodeInternal, "prepare mount point %q: %v", target, err)
@@ -288,7 +299,9 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 				GuestPath: target,
 				ReadOnly:  req.ReadOnly,
 			},
-			volume: vol,
+			backingReadOnly: req.ReadOnly,
+			dynamic:         true,
+			volume:          vol,
 		})
 		sortMountsByDepth(s.mounts)
 		s.mu.Unlock()
@@ -320,6 +333,9 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 		if err != nil {
 			return control.NewErrorf(control.CodeInternal, "open bind mount %q: %v", hostPath, err)
 		}
+		if sharedChunkMemory && mf != nil {
+			ws.SetChunkMemory(&memoryFileChunks{MemoryFile: mf})
+		}
 		if isFile {
 			if err := vfsEnsureEmptyFile(sctxWithRoot, vfsObj, creds, root, target, 0o644); err != nil {
 				_ = ws.Close()
@@ -349,10 +365,12 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 		s.mu.Lock()
 		s.workspaces = append(s.workspaces, ws)
 		s.mounts = append(s.mounts, sandboxMount{
-			Mount:     m,
-			hostPath:  hostPath,
-			hostFile:  isFile,
-			workspace: ws,
+			Mount:           m,
+			hostPath:        hostPath,
+			hostFile:        isFile,
+			backingReadOnly: ws.ReadOnly(),
+			dynamic:         true,
+			workspace:       ws,
 		})
 		sortMountsByDepth(s.mounts)
 		s.mu.Unlock()
@@ -376,14 +394,28 @@ func (s *Sandbox) handleMountRemount(ctx context.Context, stream *control.Stream
 	if err != nil {
 		return err
 	}
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	s.mountOpMu.Lock()
+	defer s.mountOpMu.Unlock()
 
-	// Refuse remount rw when the host backing store was opened read-only.
-	if !req.ReadOnly {
-		for _, info := range s.listMountInfos() {
-			if info.Target == target && !info.Mutable {
-				return control.NewErrorf(control.CodeLockdownDenied, "mount %q was opened read-only on the host and cannot be remounted read-write", target)
-			}
+	var (
+		matched control.MountInfo
+		found   bool
+	)
+	for _, info := range s.listMountInfos() {
+		if info.Target == target {
+			matched = info
+			found = true
+			break
 		}
+	}
+	if !found {
+		return control.NewErrorf(control.CodeNotFound, "mount target %q is not a managed mount point", target)
+	}
+	// Refuse remount rw when the host backing store was opened read-only.
+	if !req.ReadOnly && !matched.Mutable {
+		return control.NewErrorf(control.CodeLockdownDenied, "mount %q was opened read-only on the host and cannot be remounted read-write", target)
 	}
 
 	sctx := k.SupervisorContext()
@@ -397,12 +429,16 @@ func (s *Sandbox) handleMountRemount(ctx context.Context, stream *control.Stream
 	creds := auth.NewRootCredentials(k.RootUserNamespace())
 	vfsObj := k.VFS()
 
-	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target), FollowFinalSymlink: true}
+	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target), FollowFinalSymlink: false}
 	vd, err := vfsObj.GetDentryAt(sctxWithRoot, creds, &pop, &vfs.GetDentryOptions{})
 	if err != nil {
 		return control.NewErrorf(control.CodeNotFound, "mount target %q not found: %v", target, err)
 	}
 	defer vd.DecRef(sctxWithRoot)
+
+	if vd.Dentry() != vd.Mount().Root() {
+		return control.NewErrorf(control.CodeInvalidArgument, "path %q is not a mount root", target)
+	}
 
 	if err := vfsObj.SetMountReadOnly(vd.Mount(), req.ReadOnly); err != nil {
 		return control.NewErrorf(control.CodeBusy, "remount %q (ro=%t): %v", target, req.ReadOnly, err)
@@ -419,6 +455,11 @@ func (s *Sandbox) handleMountRemount(ctx context.Context, stream *control.Stream
 		}
 	}
 	s.mu.Unlock()
+	s.rpcMountsMu.Lock()
+	if rm, ok := s.rpcMounts[target]; ok {
+		rm.readOnly = req.ReadOnly
+	}
+	s.rpcMountsMu.Unlock()
 	s.emitEvent("mount", "remount", map[string]string{
 		"target":    target,
 		"read_only": strconv.FormatBool(req.ReadOnly),
@@ -439,6 +480,10 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 	if err != nil {
 		return err
 	}
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	s.mountOpMu.Lock()
+	defer s.mountOpMu.Unlock()
 
 	sctx := k.SupervisorContext()
 	root, mntns, err := s.guestRoot(sctx, k)
@@ -463,9 +508,34 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 		return control.NewErrorf(control.CodeNotFound, "unmount %q: %v", target, err)
 	}
 
+	var closeVol *ext4lite.Volume
+	var closeWS *hostfs.Workspace
 	s.mu.Lock()
-	s.mounts = slices.DeleteFunc(s.mounts, func(m sandboxMount) bool { return m.GuestPath == target })
+	kept := s.mounts[:0]
+	for _, m := range s.mounts {
+		if m.GuestPath == target {
+			if m.dynamic && !req.Detach {
+				if m.volume != nil {
+					closeVol = m.volume
+					s.volumes = slices.DeleteFunc(s.volumes, func(v *ext4lite.Volume) bool { return v == closeVol })
+				}
+				if m.workspace != nil {
+					closeWS = m.workspace
+					s.workspaces = slices.DeleteFunc(s.workspaces, func(w *hostfs.Workspace) bool { return w == closeWS })
+				}
+			}
+			continue
+		}
+		kept = append(kept, m)
+	}
+	s.mounts = kept
 	s.mu.Unlock()
+	if closeVol != nil {
+		_ = closeVol.Close()
+	}
+	if closeWS != nil {
+		_ = closeWS.Close()
+	}
 
 	s.rpcMountsMu.Lock()
 	rm := s.rpcMounts[target]
@@ -557,12 +627,20 @@ func errnoToLinuxErr(errno int) error {
 		return linuxerr.EACCES
 	case control.LinuxEPERM:
 		return linuxerr.EPERM
+	case control.LinuxEBUSY:
+		return linuxerr.EBUSY
+	case control.LinuxEXDEV:
+		return linuxerr.EXDEV
 	case control.LinuxENOTDIR:
 		return linuxerr.ENOTDIR
 	case control.LinuxEISDIR:
 		return linuxerr.EISDIR
+	case control.LinuxENAMETOOLONG:
+		return linuxerr.ENAMETOOLONG
 	case control.LinuxENOTEMPTY:
 		return linuxerr.ENOTEMPTY
+	case control.LinuxELOOP:
+		return linuxerr.ELOOP
 	case control.LinuxEINVAL:
 		return linuxerr.EINVAL
 	case control.LinuxEROFS:
@@ -753,8 +831,30 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	if err != nil {
 		return err
 	}
+
+	s.opMu.RLock()
+	opLocked := true
+	unlockOp := func() {
+		if opLocked {
+			opLocked = false
+			s.opMu.RUnlock()
+		}
+	}
+	defer unlockOp()
+
+	s.mountOpMu.Lock()
+	mountLocked := true
+	unlockMount := func() {
+		if mountLocked {
+			mountLocked = false
+			s.mountOpMu.Unlock()
+		}
+	}
+	defer unlockMount()
+
 	s.mu.Lock()
 	dupStatic := s.mountTargetExistsLocked(target)
+	doneCh := s.runDone
 	s.mu.Unlock()
 	if dupStatic {
 		return control.NewErrorf(control.CodeAlreadyExists, "mount target %q already exists", target)
@@ -785,7 +885,7 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
 		return control.NewErrorf(control.CodeInternal, "create rpcfs mount point %q: %v", target, err)
 	}
-	fs, rootD, err := rpcfs.NewFilesystem(sctxWithRoot, vfsObj, rpcClient, req.Label)
+	fs, rootD, err := rpcfs.NewFilesystem(sctxWithRoot, vfsObj, rpcClient, req.Label, req.ReadOnly)
 	if err != nil {
 		return control.NewErrorf(control.CodeInternal, "init rpcfs at %q: %v", target, err)
 	}
@@ -801,11 +901,12 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	mnt.DecRef(sctxWithRoot)
 
 	entry := &rpcMountEntry{
-		target:   target,
-		label:    req.Label,
-		readOnly: req.ReadOnly,
-		cancel:   serveCancel,
-		client:   rpcClient,
+		target:          target,
+		label:           req.Label,
+		readOnly:        req.ReadOnly,
+		backingReadOnly: req.ReadOnly,
+		cancel:          serveCancel,
+		client:          rpcClient,
 	}
 	s.rpcMountsMu.Lock()
 	s.rpcMounts[target] = entry
@@ -821,6 +922,8 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
 		return err
 	}
+	unlockMount()
+	unlockOp()
 
 	s.emitEvent("mount", "serve", map[string]string{
 		"target":    target,
@@ -830,20 +933,23 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 
 	// Hold the mount active until the client disconnects, sandbox exits, or
 	// mount.remove cancels serveCtx.
-	<-serveCtx.Done()
+	var sandboxExited bool
+	select {
+	case <-serveCtx.Done():
+	case <-doneCh:
+		sandboxExited = true
+	}
 
 	s.rpcMountsMu.Lock()
 	stillMounted := s.rpcMounts[target] == entry
+	if stillMounted {
+		delete(s.rpcMounts, target)
+	}
 	s.rpcMountsMu.Unlock()
 
-	if stillMounted {
+	if stillMounted && !sandboxExited {
 		umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
 		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
-		s.rpcMountsMu.Lock()
-		if s.rpcMounts[target] == entry {
-			delete(s.rpcMounts, target)
-		}
-		s.rpcMountsMu.Unlock()
 		s.emitEvent("mount", "remove", map[string]string{"target": target, "reason": "client_disconnected"})
 	}
 	return nil

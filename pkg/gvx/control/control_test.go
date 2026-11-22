@@ -165,20 +165,15 @@ func TestLegacyV1CheckpointCompatibility(t *testing.T) {
 			t.Fatalf("dial legacy: %v", err)
 		}
 		defer conn.Close()
-		b, _ := json.Marshal(req)
-		if _, err := conn.Write(b); err != nil {
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		// Real v1 clients send one JSON object without calling CloseWrite()
+		// and immediately read the JSON reply.
+		if err := json.NewEncoder(conn).Encode(req); err != nil {
 			t.Fatalf("write legacy: %v", err)
 		}
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		raw, err := io.ReadAll(conn)
-		if err != nil {
-			t.Fatalf("read legacy: %v", err)
-		}
 		var resp LegacyCheckpointResponse
-		if err := json.Unmarshal(raw, &resp); err != nil {
-			t.Fatalf("decode legacy %q: %v", string(raw), err)
+		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+			t.Fatalf("decode legacy: %v", err)
 		}
 		return resp
 	}
@@ -386,6 +381,7 @@ func TestUnixSocketSCMRightsAndLiveConflict(t *testing.T) {
 	_, _, _ = startTestServer(t, sockPath, ListenOptions{}, ServerConfig{
 		SandboxID:    "sbx-unix",
 		Capabilities: []string{CapMountVolumeAttach},
+		AllowFDs:     true,
 		Handler:      handler,
 	})
 
@@ -469,7 +465,7 @@ func TestShutdownDrainsInFlightAndClosesIdle(t *testing.T) {
 
 	// Idle connection should be closed promptly while busy call is still running.
 	select {
-	case <-idleClient.conn.Done():
+	case <-idleClient.Done():
 	case <-time.After(time.Second):
 		t.Fatalf("idle connection was not closed during Shutdown")
 	}
@@ -483,5 +479,179 @@ func TestShutdownDrainsInFlightAndClosesIdle(t *testing.T) {
 	}
 	if err := <-shutdownDone; err != nil {
 		t.Fatalf("Shutdown returned error: %v", err)
+	}
+}
+
+func TestControlFrameSecurityAndLimits(t *testing.T) {
+	// WriteFrame must reject an uncompressed payload exceeding maxPayload even when zstd could shrink it.
+	var wire bytes.Buffer
+	big := bytes.Repeat([]byte("Z"), 128<<10)
+	if err := WriteFrame(&wire, Frame{
+		Type:     FrameData,
+		Flags:    FlagCompressedZstd,
+		StreamID: 1,
+		Payload:  big,
+	}, 64<<10); !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("WriteFrame oversized compressible payload = %v, want ErrFrameTooLarge", err)
+	}
+
+	// ReadFrame must reject FlagCompressedZstd on non-DATA frames (such as pre-auth HELLO).
+	var badHello bytes.Buffer
+	hdr := make([]byte, FrameHeaderSize)
+	hdr[0] = byte(FrameHello)
+	hdr[1] = byte(FlagCompressedZstd)
+	hdr[11] = 2
+	badHello.Write(hdr)
+	badHello.WriteString("{}")
+	if _, err := ReadFrame(&badHello, HandshakeMaxFrameBytes); err == nil {
+		t.Fatal("ReadFrame accepted FlagCompressedZstd on FrameHello, want error")
+	}
+
+	// Server with AllowFDs=false must reject FlagHasFDs frames cleanly without calling RecvFDs.
+	ep, _, _ := startTestServer(t, "127.0.0.1:0", ListenOptions{}, ServerConfig{
+		SandboxID:    "sbx-nofd",
+		Capabilities: []string{CapPing},
+		AllowFDs:     false,
+		Handler:      &testHandler{},
+	})
+	rawConn, err := net.DialTimeout("tcp", ep.Address, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer rawConn.Close()
+	_ = rawConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := rawConn.Write([]byte(Preface)); err != nil {
+		t.Fatal(err)
+	}
+	helloPayload, _ := json.Marshal(HelloRequest{Version: ProtocolVersion, Token: ep.Token})
+	if err := WriteFrame(rawConn, Frame{Type: FrameHello, Payload: helloPayload}, HandshakeMaxFrameBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFrame(rawConn, HandshakeMaxFrameBytes); err != nil {
+		t.Fatalf("read HELLO reply: %v", err)
+	}
+	// Send FramePing with FlagHasFDs set; server must close connection cleanly.
+	if err := WriteFrame(rawConn, Frame{Type: FramePing, Flags: FlagHasFDs}, DefaultMaxFrameBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFrame(rawConn, DefaultMaxFrameBytes); err == nil {
+		t.Fatal("expected server to reject FlagHasFDs when AllowFDs=false")
+	}
+}
+
+func TestControlMaxConnectionsHandshakeTimeoutAndCancel(t *testing.T) {
+	ctxCanceled := make(chan struct{})
+	started := make(chan struct{})
+	handler := &testHandler{
+		streamHandler: func(ctx context.Context, stream *Stream, req RequestEnvelope, fds []int) error {
+			closeFDs(fds)
+			if req.Method == MethodEvents {
+				close(started)
+				<-ctx.Done()
+				close(ctxCanceled)
+				return ctx.Err()
+			}
+			return stream.Reply(PingResponse{Version: ProtocolVersion, SandboxID: "sbx-lim", State: "running"})
+		},
+	}
+
+	ep, _, _ := startTestServer(t, "127.0.0.1:0", ListenOptions{}, ServerConfig{
+		SandboxID:        "sbx-lim",
+		Capabilities:     []string{CapPing, CapInspect, CapEvents},
+		MaxConnections:   1,
+		HandshakeTimeout: 200 * time.Millisecond,
+		Handler:          handler,
+	})
+
+	// 1. Stalled raw connection times out after HandshakeTimeout and frees the slot.
+	stalled, err := net.DialTimeout("tcp", ep.Address, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalled.Close()
+	_ = stalled.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := stalled.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected stalled handshake connection to be closed")
+	}
+
+	// 2. First active client occupies MaxConnections=1; second client fails to connect.
+	c1, err := Dial(context.Background(), DialOptions{Endpoint: ep.Address})
+	if err != nil {
+		t.Fatalf("Dial c1: %v", err)
+	}
+	defer c1.Close()
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), time.Second)
+	defer dialCancel()
+	if c2, err := Dial(dialCtx, DialOptions{Endpoint: ep.Address}); err == nil {
+		_ = c2.Close()
+		t.Fatal("second client succeeded while MaxConnections=1 was occupied")
+	}
+
+	// 3. Stream.Cancel propagates FrameCancel to cancel the server handler context.
+	st, err := c1.OpenStream(context.Background(), MethodEvents, nil)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server handler did not start for MethodEvents")
+	}
+	st.Cancel(errors.New("client stop"))
+	select {
+	case <-ctxCanceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server handler context was not canceled after FrameCancel")
+	}
+}
+
+func TestControlEndpointsTokensAndValidation(t *testing.T) {
+	// Single-character sandbox name must be accepted by NamedSocketPath.
+	if p, err := NamedSocketPath("a"); err != nil || p == "" {
+		t.Fatalf("NamedSocketPath(\"a\") = (%q, %v), want valid path", p, err)
+	}
+	if _, err := NamedSocketPath("../bad"); err == nil {
+		t.Fatal("NamedSocketPath accepted traversal name")
+	}
+
+	// IPv4 and IPv6 loopback tokens on the same port must use distinct token files.
+	p4, err := DefaultTokenPath("tcp", "127.0.0.1:4567")
+	if err != nil {
+		t.Fatalf("DefaultTokenPath ipv4: %v", err)
+	}
+	p6, err := DefaultTokenPath("tcp", "[::1]:4567")
+	if err != nil {
+		t.Fatalf("DefaultTokenPath ipv6: %v", err)
+	}
+	if p4 == p6 {
+		t.Fatalf("IPv4 and IPv6 token paths collided: %q", p4)
+	}
+
+	// ValidateDisableList accepts known groups/capabilities and rejects typos.
+	if err := ValidateDisableList([]string{"exec", "net.dial", "mount", CapKernelLogClear}); err != nil {
+		t.Fatalf("ValidateDisableList valid: %v", err)
+	}
+	if err := ValidateDisableList([]string{"exce"}); err == nil {
+		t.Fatal("ValidateDisableList accepted unknown capability typo")
+	}
+
+	// FilterCapabilities under readonly must exclude kernel.log_clear.
+	ro := FilterCapabilities([]string{CapKernelLog, CapKernelLogClear, CapPing}, PolicyReadOnly, nil)
+	for _, c := range ro {
+		if c == CapKernelLogClear {
+			t.Fatalf("PolicyReadOnly unexpectedly kept %q", CapKernelLogClear)
+		}
+	}
+
+	// Portable HostErrorToLinuxErrno checks.
+	if got := HostErrorToLinuxErrno(os.ErrNotExist); got != LinuxENOENT {
+		t.Fatalf("HostErrorToLinuxErrno(ErrNotExist) = %d, want %d", got, LinuxENOENT)
+	}
+	if got := HostErrorToLinuxErrno(os.ErrExist); got != LinuxEEXIST {
+		t.Fatalf("HostErrorToLinuxErrno(ErrExist) = %d, want %d", got, LinuxEEXIST)
+	}
+	if got := HostErrorToLinuxErrno(os.ErrPermission); got != LinuxEACCES {
+		t.Fatalf("HostErrorToLinuxErrno(ErrPermission) = %d, want %d", got, LinuxEACCES)
 	}
 }

@@ -34,6 +34,8 @@ import (
 
 // Pause pauses all guest vCPUs/tasks and optionally quiesces host network traffic.
 func (s *Sandbox) Pause(ctx context.Context, quiesceNet bool) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 	s.ckptMu.Lock()
 	defer s.ckptMu.Unlock()
 
@@ -74,6 +76,8 @@ func (s *Sandbox) Pause(ctx context.Context, quiesceNet bool) error {
 
 // Unpause resumes a sandbox previously paused with Pause.
 func (s *Sandbox) Unpause(ctx context.Context) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 	s.ckptMu.Lock()
 	defer s.ckptMu.Unlock()
 
@@ -144,8 +148,11 @@ func (s *Sandbox) handleStop(ctx context.Context, stream *control.Stream, raw js
 		return control.NewError(control.CodeInvalidArgument, err.Error())
 	}
 	timeout := 10 * time.Second
-	if req.TimeoutMS > 0 {
-		timeout = time.Duration(req.TimeoutMS) * time.Millisecond
+	if req.TimeoutMS != nil {
+		if *req.TimeoutMS < 0 {
+			return control.NewError(control.CodeInvalidArgument, "stop timeout_ms must be non-negative")
+		}
+		timeout = time.Duration(*req.TimeoutMS) * time.Millisecond
 	}
 
 	k, tg, err := s.activeKernelChecked(ctx)
@@ -166,6 +173,10 @@ func (s *Sandbox) handleStop(ctx context.Context, stream *control.Stream, raw js
 	s.emitEvent("lifecycle", "stop", map[string]string{"signal": sigName})
 
 	if sig == linux.SIGKILL {
+		return stream.Reply(control.StopResponse{Signaled: sigName, Killed: true})
+	}
+	if timeout == 0 {
+		_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		return stream.Reply(control.StopResponse{Signaled: sigName, Killed: true})
 	}
 
@@ -204,39 +215,28 @@ func (s *Sandbox) handleCheckpointStream(ctx context.Context, stream *control.St
 	if err := decodeParams(raw, &req); err != nil {
 		return err
 	}
-	manifestBytes, stateBytes, pagesMetaBytes, pagesBytes, doneCh, err := s.captureCheckpointStreamBuffers(ctx, CheckpointOptions{
+	err := s.checkpointStreamRun(ctx, CheckpointOptions{
 		LeaveRunning: req.LeaveRunning,
 		Force:        req.Force,
-	})
-	if err != nil {
-		return mapControlErr(err)
-	}
-	if err := stream.SendResponse(control.CheckpointStreamResponse{
-		Files: []string{
-			checkpointManifestFileName,
-			checkpointStateFileName,
-			checkpointPagesMetaFileName,
-			checkpointPagesFileName,
-		},
-	}); err != nil {
-		return err
-	}
-	w := stream.ChannelWriter(ctx, control.ChannelGeneric, req.Compress)
-	if err := writeCheckpointTar(w, manifestBytes, stateBytes, pagesMetaBytes, pagesBytes); err != nil {
-		_ = w.Close()
-		return mapControlErr(err)
-	}
-	if err := w.Close(); err != nil {
-		return err
-	}
-	if !req.LeaveRunning {
-		select {
-		case <-doneCh:
-		case <-ctx.Done():
-			return ctx.Err()
+	}, func(manifestBytes, stateBytes, pagesMetaBytes, pagesBytes []byte) error {
+		if err := stream.SendResponse(control.CheckpointStreamResponse{
+			Files: []string{
+				checkpointManifestFileName,
+				checkpointStateFileName,
+				checkpointPagesMetaFileName,
+				checkpointPagesFileName,
+			},
+		}); err != nil {
+			return err
 		}
-	}
-	return nil
+		w := stream.ChannelWriter(ctx, control.ChannelGeneric, req.Compress)
+		if err := writeCheckpointTar(w, manifestBytes, stateBytes, pagesMetaBytes, pagesBytes); err != nil {
+			_ = w.Close()
+			return err
+		}
+		return w.Close()
+	})
+	return mapControlErr(err)
 }
 
 func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stream, raw json.RawMessage) error {
@@ -248,6 +248,9 @@ func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stre
 	if err != nil {
 		return err
 	}
+	s.resourceMu.Lock()
+	defer s.resourceMu.Unlock()
+
 	caps := s.ControlCapabilities()
 	hasCap := func(c string) bool { return slices.Contains(caps, c) }
 
@@ -269,7 +272,7 @@ func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stre
 				_ = mf.UpdateUsage(nil)
 				used := mf.Accounting().Total()
 				if uint64(m) < used {
-					return control.NewErrorf(control.CodeInvalidArgument, "requested memory limit %d bytes is below current usage %d bytes (pass --force-memory to allow immediate OOM)", m, used)
+					return control.NewErrorf(control.CodeLimitExceeded, "requested memory limit %d bytes is below current usage %d bytes (pass --force-memory to allow immediate OOM)", m, used)
 				}
 			}
 		}
@@ -294,8 +297,8 @@ func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stre
 			if period < 1000 || period > 1000000 {
 				return control.NewErrorf(control.CodeInvalidArgument, "cpu period %d us out of range [1000, 1000000]", period)
 			}
-			if req.CPUQuotaUSec != nil && *req.CPUQuotaUSec != 0 && *req.CPUQuotaUSec < 1000 {
-				return control.NewErrorf(control.CodeInvalidArgument, "cpu quota %d us must be 0 (unlimited) or >= 1000", *req.CPUQuotaUSec)
+			if req.CPUQuotaUSec != nil && *req.CPUQuotaUSec > 0 && *req.CPUQuotaUSec < 1000 {
+				return control.NewErrorf(control.CodeInvalidArgument, "cpu quota %d us must be <= 0 (unlimited) or >= 1000", *req.CPUQuotaUSec)
 			}
 		}
 	}
@@ -303,8 +306,9 @@ func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stre
 		if !hasCap(control.CapResourcePids) {
 			return control.NewError(control.CodeForbiddenByPolicy, "pids limit updates are disabled by policy")
 		}
-		if *req.PidsLimit < 0 {
-			return control.NewError(control.CodeInvalidArgument, "pids limit must be non-negative")
+		const maxPidsLimit = 4 * 1024 * 1024
+		if *req.PidsLimit < 0 || *req.PidsLimit > maxPidsLimit {
+			return control.NewErrorf(control.CodeInvalidArgument, "pids limit %d out of range [0, %d]", *req.PidsLimit, maxPidsLimit)
 		}
 	}
 	if req.IsolateLAN != nil {

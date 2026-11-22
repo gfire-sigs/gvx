@@ -37,12 +37,20 @@ func HostErrorToLinuxErrno(err error) int {
 		return LinuxEACCES
 	case errors.Is(err, syscall.EPERM):
 		return LinuxEPERM
+	case errors.Is(err, syscall.EBUSY):
+		return LinuxEBUSY
+	case errors.Is(err, syscall.EXDEV):
+		return LinuxEXDEV
 	case errors.Is(err, syscall.ENOTDIR):
 		return LinuxENOTDIR
 	case errors.Is(err, syscall.EISDIR):
 		return LinuxEISDIR
+	case errors.Is(err, syscall.ENAMETOOLONG):
+		return LinuxENAMETOOLONG
 	case errors.Is(err, syscall.ENOTEMPTY):
 		return LinuxENOTEMPTY
+	case errors.Is(err, syscall.ELOOP):
+		return LinuxELOOP
 	case errors.Is(err, syscall.EINVAL):
 		return LinuxEINVAL
 	case errors.Is(err, syscall.EROFS):

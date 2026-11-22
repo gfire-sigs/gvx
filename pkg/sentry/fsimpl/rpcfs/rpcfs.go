@@ -79,6 +79,35 @@ type Client interface {
 	Close() error
 }
 
+// callRPC bridges Sentry task interruption (signals, SIGKILL, Pause) to a
+// cancelable Go context for remote filesystem RPCs.
+func callRPC[T any](ctx context.Context, fn func(goContext.Context) (T, error)) (T, error) {
+	rpcCtx, cancel := goContext.WithCancel(goContext.Background())
+	done := make(chan struct{})
+	var (
+		val     T
+		callErr error
+	)
+	go func() {
+		val, callErr = fn(rpcCtx)
+		close(done)
+	}()
+	if err := ctx.Block(done); err != nil {
+		cancel()
+		var zero T
+		return zero, linuxerr.EINTR
+	}
+	cancel()
+	return val, callErr
+}
+
+func callRPCErr(ctx context.Context, fn func(goContext.Context) error) error {
+	_, err := callRPC(ctx, func(c goContext.Context) (struct{}, error) {
+		return struct{}{}, fn(c)
+	})
+	return err
+}
+
 // FilesystemType implements vfs.FilesystemType for rpcfs.
 type FilesystemType struct{}
 
@@ -94,9 +123,11 @@ func (FilesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *au
 	return nil, nil, linuxerr.EPERM
 }
 
-// NewFilesystem constructs an rpcfs filesystem backed by client. The caller
-// owns one reference on both the returned Filesystem and root Dentry.
-func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, client Client, label string) (*vfs.Filesystem, *vfs.Dentry, error) {
+// NewFilesystem constructs an rpcfs filesystem backed by client. When readOnly
+// is true, all mutating operations fail with EROFS regardless of VFS mount
+// flags. The caller owns one reference on both the returned Filesystem and root
+// Dentry.
+func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, client Client, label string, readOnly bool) (*vfs.Filesystem, *vfs.Dentry, error) {
 	if client == nil {
 		return nil, nil, linuxerr.EINVAL
 	}
@@ -112,10 +143,11 @@ func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, client Cl
 	fs := &filesystem{
 		client:   client,
 		label:    label,
+		readOnly: readOnly,
 		devMinor: devMinor,
 	}
 	fs.vfsfs.Init(vfsObj, FilesystemType{}, fs)
-	fs.root = fs.newDentry(nil, "", ".", rootEntry)
+	fs.root = fs.newDentry(nil, "", rootEntry)
 	// One ref for fs.root, one ref returned to the caller for the mount.
 	fs.root.refs.Store(2)
 	return &fs.vfsfs, &fs.root.vfsd, nil
@@ -125,14 +157,19 @@ type filesystem struct {
 	vfsfs    vfs.Filesystem
 	client   Client
 	label    string
+	readOnly bool
 	devMinor uint32
 
-	// mu protects the dentry child map. Lock order: fs.mu before fs.ancestryMu.
+	// mu protects the dentry child maps. Lock order: fs.mu before fs.ancestryMu.
 	mu sync.Mutex
-	// ancestryMu is a leaf lock protecting parent/name/relPath/dead for VFS
-	// callbacks (PrependPath, IsDescendant, InotifyWithParent).
+	// ancestryMu is a leaf lock protecting parent/name/dead for VFS callbacks
+	// (PrependPath, IsDescendant, InotifyWithParent) and dynamic path() walks.
 	ancestryMu sync.RWMutex
 	root       *dentry
+}
+
+func (fs *filesystem) isReadOnly(mnt *vfs.Mount) bool {
+	return fs.readOnly || (mnt != nil && mnt.ReadOnly())
 }
 
 // MountSource implements vfs.MountSourceProvider.
@@ -144,9 +181,34 @@ func (fs *filesystem) MountSource() string {
 }
 
 func (fs *filesystem) Release(ctx context.Context) {
-	if fs.root != nil {
-		fs.root.DecRef(ctx)
-		fs.root = nil
+	var toDecRef []*dentry
+	fs.mu.Lock()
+	root := fs.root
+	fs.root = nil
+	if root != nil {
+		var collect func(d *dentry)
+		collect = func(d *dentry) {
+			for name, child := range d.children {
+				delete(d.children, name)
+				collect(child)
+				toDecRef = append(toDecRef, child)
+			}
+			d.children = nil
+		}
+		collect(root)
+		fs.ancestryMu.Lock()
+		for _, child := range toDecRef {
+			child.dead = true
+		}
+		fs.ancestryMu.Unlock()
+	}
+	fs.mu.Unlock()
+
+	for _, child := range toDecRef {
+		child.DecRef(ctx)
+	}
+	if root != nil {
+		root.DecRef(ctx)
 	}
 	_ = fs.client.Close()
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
@@ -163,15 +225,16 @@ type dentry struct {
 	fs   *filesystem
 
 	// Protected by fs.ancestryMu (writers hold both fs.mu and fs.ancestryMu).
-	parent  *dentry
-	name    string
-	relPath string
-	dead    bool
+	parent *dentry
+	name   string
+	dead   bool
 
 	// Protected by fs.mu.
 	children map[string]*dentry
 
 	mode    atomicbitops.Uint32
+	uid     atomicbitops.Uint32
+	gid     atomicbitops.Uint32
 	ino     atomicbitops.Uint64
 	watches vfs.Watches
 	locks   vfs.FileLocks
@@ -187,21 +250,39 @@ func synthIno(rel string) uint64 {
 	return v
 }
 
-func (fs *filesystem) newDentry(parent *dentry, name, rel string, e Entry) *dentry {
+func (fs *filesystem) newDentry(parent *dentry, name string, e Entry) *dentry {
+	rel := "."
+	if parent != nil {
+		rel = joinRel(parent.path(), name)
+	}
 	ino := e.Ino
 	if ino == 0 {
 		ino = synthIno(rel)
 	}
 	d := &dentry{
-		fs:      fs,
-		parent:  parent,
-		name:    name,
-		relPath: rel,
+		fs:     fs,
+		parent: parent,
+		name:   name,
 	}
 	d.mode.Store(e.Mode)
+	d.uid.Store(e.UID)
+	d.gid.Store(e.GID)
 	d.ino.Store(ino)
 	d.vfsd.Init(d)
 	return d
+}
+
+func (d *dentry) updateAttr(e Entry) {
+	d.mode.Store(e.Mode)
+	d.uid.Store(e.UID)
+	d.gid.Store(e.GID)
+	if e.Ino != 0 {
+		d.ino.Store(e.Ino)
+	}
+}
+
+func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
+	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), nil, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load()))
 }
 
 func (d *dentry) IncRef() {
@@ -253,9 +334,18 @@ func (d *dentry) isSymlink() bool {
 
 func (d *dentry) path() string {
 	d.fs.ancestryMu.RLock()
-	p := d.relPath
-	d.fs.ancestryMu.RUnlock()
-	return p
+	defer d.fs.ancestryMu.RUnlock()
+	if d.parent == nil {
+		return "."
+	}
+	var parts []string
+	for cur := d; cur != nil && cur.parent != nil; cur = cur.parent {
+		parts = append(parts, cur.name)
+	}
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return strings.Join(parts, "/")
 }
 
 func joinRel(parentRel, name string) string {
@@ -296,38 +386,60 @@ func (fs *filesystem) statxFor(e Entry, rel string) linux.Statx {
 	}
 }
 
-func (fs *filesystem) lookupChild(parent *dentry, name string) (*dentry, Entry, error) {
+func (fs *filesystem) lookupChild(ctx context.Context, parent *dentry, name string) (*dentry, Entry, error) {
 	rel := joinRel(parent.path(), name)
-	e, err := fs.client.Stat(goContext.Background(), rel)
+	e, err := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+		return fs.client.Stat(c, rel)
+	})
 	if err != nil {
 		if err == linuxerr.ENOENT {
+			var evicted *dentry
 			fs.mu.Lock()
 			if parent.children != nil {
-				delete(parent.children, name)
+				if old := parent.children[name]; old != nil {
+					evicted = old
+					delete(parent.children, name)
+					fs.ancestryMu.Lock()
+					old.dead = true
+					fs.ancestryMu.Unlock()
+				}
 			}
 			fs.mu.Unlock()
+			if evicted != nil {
+				evicted.DecRef(ctx)
+			}
 		}
 		return nil, Entry{}, err
 	}
+
+	var evicted *dentry
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	if parent.children == nil {
 		parent.children = make(map[string]*dentry)
 	}
-	if existing, ok := parent.children[name]; ok && !existing.dead {
-		if existing.mode.Load()&linux.S_IFMT == e.Mode&linux.S_IFMT {
-			existing.mode.Store(e.Mode)
-			if e.Ino != 0 {
-				existing.ino.Store(e.Ino)
-			}
+	if existing, ok := parent.children[name]; ok {
+		fs.ancestryMu.RLock()
+		isDead := existing.dead
+		fs.ancestryMu.RUnlock()
+		if !isDead && existing.mode.Load()&linux.S_IFMT == e.Mode&linux.S_IFMT {
+			existing.updateAttr(e)
 			existing.IncRef()
+			fs.mu.Unlock()
 			return existing, e, nil
 		}
-		delete(parent.children, name)
+		evicted = existing
+		fs.ancestryMu.Lock()
+		existing.dead = true
+		fs.ancestryMu.Unlock()
 	}
-	child := fs.newDentry(parent, name, rel, e)
+	child := fs.newDentry(parent, name, e)
 	child.refs.Store(2) // 1 for cache, 1 for caller
 	parent.children[name] = child
+	fs.mu.Unlock()
+
+	if evicted != nil {
+		evicted.DecRef(ctx)
+	}
 	return child, e, nil
 }
 
@@ -335,11 +447,14 @@ func (fs *filesystem) step(ctx context.Context, rp *vfs.ResolvingPath, cur *dent
 	if !cur.isDir() {
 		return nil, Entry{}, false, linuxerr.ENOTDIR
 	}
+	if err := cur.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+		return nil, Entry{}, false, err
+	}
 	name := rp.Component()
 	if name == "." {
 		rp.Advance()
 		cur.IncRef()
-		return cur, Entry{Mode: cur.mode.Load(), Ino: cur.ino.Load()}, false, nil
+		return cur, Entry{Mode: cur.mode.Load(), UID: cur.uid.Load(), GID: cur.gid.Load(), Ino: cur.ino.Load()}, false, nil
 	}
 	if name == ".." {
 		if isRoot, err := rp.CheckRoot(ctx, &cur.vfsd); err != nil {
@@ -347,24 +462,25 @@ func (fs *filesystem) step(ctx context.Context, rp *vfs.ResolvingPath, cur *dent
 		} else if isRoot {
 			rp.Advance()
 			cur.IncRef()
-			return cur, Entry{Mode: cur.mode.Load(), Ino: cur.ino.Load()}, false, nil
+			return cur, Entry{Mode: cur.mode.Load(), UID: cur.uid.Load(), GID: cur.gid.Load(), Ino: cur.ino.Load()}, false, nil
 		}
 		fs.ancestryMu.RLock()
 		parent := cur.parent
+		gotParent := parent != nil && parent.TryIncRef()
 		fs.ancestryMu.RUnlock()
-		if parent == nil {
+		if !gotParent {
 			rp.Advance()
 			cur.IncRef()
-			return cur, Entry{Mode: cur.mode.Load(), Ino: cur.ino.Load()}, false, nil
+			return cur, Entry{Mode: cur.mode.Load(), UID: cur.uid.Load(), GID: cur.gid.Load(), Ino: cur.ino.Load()}, false, nil
 		}
 		if err := rp.CheckMount(ctx, &parent.vfsd); err != nil {
+			parent.DecRef(ctx)
 			return nil, Entry{}, false, err
 		}
 		rp.Advance()
-		parent.IncRef()
-		return parent, Entry{Mode: parent.mode.Load(), Ino: parent.ino.Load()}, false, nil
+		return parent, Entry{Mode: parent.mode.Load(), UID: parent.uid.Load(), GID: parent.gid.Load(), Ino: parent.ino.Load()}, false, nil
 	}
-	child, e, err := fs.lookupChild(cur, name)
+	child, e, err := fs.lookupChild(ctx, cur, name)
 	if err != nil {
 		return nil, Entry{}, false, err
 	}
@@ -376,18 +492,21 @@ func (fs *filesystem) step(ctx context.Context, rp *vfs.ResolvingPath, cur *dent
 		target := e.LinkTarget
 		if target == "" {
 			var rlErr error
-			target, rlErr = fs.client.Readlink(goContext.Background(), child.path())
+			target, rlErr = callRPC(ctx, func(c goContext.Context) (string, error) {
+				return fs.client.Readlink(c, child.path())
+			})
 			if rlErr != nil {
 				child.DecRef(ctx)
 				return nil, Entry{}, false, rlErr
 			}
 		}
-		child.DecRef(ctx)
-		followed, err := rp.HandleSymlink(target)
-		if err != nil {
-			return nil, Entry{}, false, err
+		followed, sErr := rp.HandleSymlink(target)
+		if sErr != nil {
+			child.DecRef(ctx)
+			return nil, Entry{}, false, sErr
 		}
 		if followed {
+			child.DecRef(ctx)
 			cur.IncRef()
 			return cur, Entry{}, true, nil
 		}
@@ -418,12 +537,14 @@ func (fs *filesystem) resolve(ctx context.Context, rp *vfs.ResolvingPath) (*dent
 		return nil, Entry{}, linuxerr.ENOTDIR
 	}
 	if !haveEntry {
-		e, err := fs.client.Stat(goContext.Background(), cur.path())
+		e, err := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+			return fs.client.Stat(c, cur.path())
+		})
 		if err != nil {
 			cur.DecRef(ctx)
 			return nil, Entry{}, err
 		}
-		cur.mode.Store(e.Mode)
+		cur.updateAttr(e)
 		lastEntry = e
 	}
 	return cur, lastEntry, nil
@@ -444,6 +565,10 @@ func (fs *filesystem) resolveParent(ctx context.Context, rp *vfs.ResolvingPath) 
 		cur.DecRef(ctx)
 		return nil, linuxerr.ENOTDIR
 	}
+	if err := cur.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+		cur.DecRef(ctx)
+		return nil, err
+	}
 	return cur, nil
 }
 
@@ -453,7 +578,7 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 		return err
 	}
 	defer d.DecRef(ctx)
-	if ats.MayWrite() && rp.Mount().ReadOnly() {
+	if ats.MayWrite() && fs.isReadOnly(rp.Mount()) {
 		return linuxerr.EROFS
 	}
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(e.Mode), nil, auth.KUID(e.UID), auth.KGID(e.GID))
@@ -464,8 +589,13 @@ func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, op
 	// round-trip so UmountAt can detach a mount even after the client disconnects.
 	if rp.Done() {
 		d := rp.Start().Impl().(*dentry)
-		if opts.CheckSearchable && !d.isDir() {
-			return nil, linuxerr.ENOTDIR
+		if opts.CheckSearchable {
+			if !d.isDir() {
+				return nil, linuxerr.ENOTDIR
+			}
+			if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+				return nil, err
+			}
 		}
 		d.IncRef()
 		return &d.vfsd, nil
@@ -500,7 +630,7 @@ func (fs *filesystem) LinkAt(context.Context, *vfs.ResolvingPath, vfs.VirtualDen
 }
 
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
-	if rp.Mount().ReadOnly() {
+	if fs.isReadOnly(rp.Mount()) {
 		return linuxerr.EROFS
 	}
 	parent, err := fs.resolveParent(ctx, rp)
@@ -508,12 +638,17 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		return err
 	}
 	defer parent.DecRef(ctx)
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
 	name := rp.Component()
 	if name == "." || name == ".." {
 		return linuxerr.EEXIST
 	}
 	rel := joinRel(parent.path(), name)
-	if err := fs.client.Mkdir(goContext.Background(), rel, uint32(opts.Mode.Permissions())); err != nil {
+	if err := callRPCErr(ctx, func(c goContext.Context) error {
+		return fs.client.Mkdir(c, rel, uint32(opts.Mode.Permissions()))
+	}); err != nil {
 		return err
 	}
 	parent.watches.Notify(ctx, name, linux.IN_CREATE|linux.IN_ISDIR, 0, vfs.InodeEvent, false)
@@ -533,70 +668,141 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	writable := vfs.MayWriteFileWithOpenFlags(opts.Flags)
 
 	var (
-		d   *dentry
-		e   Entry
-		err error
+		d           *dentry
+		e           Entry
+		err         error
+		createdHere bool
 	)
 	if mayCreate && !rp.Done() {
-		parent, pErr := fs.resolveParent(ctx, rp)
-		if pErr != nil {
-			return nil, pErr
-		}
-		defer parent.DecRef(ctx)
-		name := rp.Component()
-		if name == "." || name == ".." {
-			if mustCreate {
-				return nil, linuxerr.EEXIST
+		cur := rp.Start().Impl().(*dentry)
+		cur.IncRef()
+		for {
+			for !rp.Final() {
+				next, _, _, sErr := fs.step(ctx, rp, cur)
+				cur.DecRef(ctx)
+				if sErr != nil {
+					return nil, sErr
+				}
+				cur = next
 			}
-			d = parent
-			d.IncRef()
-			e, err = fs.client.Stat(goContext.Background(), d.path())
-			if err != nil {
-				d.DecRef(ctx)
+			if !cur.isDir() {
+				cur.DecRef(ctx)
+				return nil, linuxerr.ENOTDIR
+			}
+			if err := cur.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+				cur.DecRef(ctx)
 				return nil, err
 			}
-		} else {
-			child, ce, lErr := fs.lookupChild(parent, name)
+			name := rp.Component()
+			if name == "." || name == ".." {
+				if mustCreate {
+					cur.DecRef(ctx)
+					return nil, linuxerr.EEXIST
+				}
+				next, ne, _, sErr := fs.step(ctx, rp, cur)
+				cur.DecRef(ctx)
+				if sErr != nil {
+					return nil, sErr
+				}
+				d, e = next, ne
+				break
+			}
+			child, ce, lErr := fs.lookupChild(ctx, cur, name)
 			if lErr == nil {
 				if mustCreate {
 					child.DecRef(ctx)
+					cur.DecRef(ctx)
 					return nil, linuxerr.EEXIST
+				}
+				if err := rp.CheckMount(ctx, &child.vfsd); err != nil {
+					child.DecRef(ctx)
+					cur.DecRef(ctx)
+					return nil, err
 				}
 				if ce.Mode&linux.S_IFMT == linux.S_IFLNK && rp.ShouldFollowSymlink() {
 					target := ce.LinkTarget
 					if target == "" {
-						target, _ = fs.client.Readlink(goContext.Background(), child.path())
+						var rlErr error
+						target, rlErr = callRPC(ctx, func(c goContext.Context) (string, error) {
+							return fs.client.Readlink(c, child.path())
+						})
+						if rlErr != nil {
+							child.DecRef(ctx)
+							cur.DecRef(ctx)
+							return nil, rlErr
+						}
 					}
-					child.DecRef(ctx)
-					if _, sErr := rp.HandleSymlink(target); sErr != nil {
+					followed, sErr := rp.HandleSymlink(target)
+					if sErr != nil {
+						child.DecRef(ctx)
+						cur.DecRef(ctx)
 						return nil, sErr
 					}
-					return nil, linuxerr.ELOOP
+					if followed {
+						child.DecRef(ctx)
+						if rp.Done() {
+							se, stErr := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+								return fs.client.Stat(c, cur.path())
+							})
+							if stErr != nil {
+								cur.DecRef(ctx)
+								return nil, stErr
+							}
+							cur.updateAttr(se)
+							d, e = cur, se
+							break
+						}
+						continue
+					}
 				}
+				cur.DecRef(ctx)
 				d, e = child, ce
+				break
 			} else if lErr == linuxerr.ENOENT {
-				if rp.Mount().ReadOnly() {
+				if fs.isReadOnly(rp.Mount()) {
+					cur.DecRef(ctx)
 					return nil, linuxerr.EROFS
 				}
-				rel := joinRel(parent.path(), name)
-				created, cErr := fs.client.Create(goContext.Background(), rel, uint32(opts.Mode.Permissions()), opts.Flags)
+				if err := cur.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+					cur.DecRef(ctx)
+					return nil, err
+				}
+				rel := joinRel(cur.path(), name)
+				created, cErr := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+					return fs.client.Create(c, rel, uint32(opts.Mode.Permissions()), opts.Flags)
+				})
 				if cErr != nil {
+					cur.DecRef(ctx)
 					return nil, cErr
 				}
 				if created.Mode&linux.S_IFMT == 0 {
 					created.Mode |= linux.S_IFREG | uint32(opts.Mode.Permissions())
 				}
-				fs.mu.Lock()
-				if parent.children == nil {
-					parent.children = make(map[string]*dentry)
-				}
-				nd := fs.newDentry(parent, name, rel, created)
+				nd := fs.newDentry(cur, name, created)
 				nd.refs.Store(2)
-				parent.children[name] = nd
+				var evicted *dentry
+				fs.mu.Lock()
+				if cur.children == nil {
+					cur.children = make(map[string]*dentry)
+				}
+				if old := cur.children[name]; old != nil {
+					evicted = old
+					fs.ancestryMu.Lock()
+					old.dead = true
+					fs.ancestryMu.Unlock()
+				}
+				cur.children[name] = nd
 				fs.mu.Unlock()
-				parent.watches.Notify(ctx, name, linux.IN_CREATE, 0, vfs.InodeEvent, false)
+				if evicted != nil {
+					evicted.DecRef(ctx)
+				}
+				cur.watches.Notify(ctx, name, linux.IN_CREATE, 0, vfs.InodeEvent, false)
+				cur.DecRef(ctx)
 				d, e = nd, created
+				createdHere = true
+				break
 			} else {
+				cur.DecRef(ctx)
 				return nil, lErr
 			}
 		}
@@ -612,6 +818,12 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		if writable {
 			return nil, linuxerr.EISDIR
 		}
+		if !createdHere {
+			ats := vfs.AccessTypesForOpenFlags(&opts)
+			if err := vfs.GenericCheckPermissions(rp.Credentials(), ats, linux.FileMode(e.Mode), nil, auth.KUID(e.UID), auth.KGID(e.GID)); err != nil {
+				return nil, err
+			}
+		}
 		fd := &dirFD{fileDescription: fileDescription{dentry: d}}
 		fd.LockFD.Init(&d.locks)
 		if err := fd.vfsfd.Init(fd, opts.Flags, rp.Credentials(), rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
@@ -622,11 +834,20 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	if opts.Flags&linux.O_DIRECTORY != 0 || rp.MustBeDir() {
 		return nil, linuxerr.ENOTDIR
 	}
-	if writable && rp.Mount().ReadOnly() {
+	if writable && fs.isReadOnly(rp.Mount()) {
 		return nil, linuxerr.EROFS
 	}
+	if !createdHere {
+		ats := vfs.AccessTypesForOpenFlags(&opts)
+		if err := vfs.GenericCheckPermissions(rp.Credentials(), ats, linux.FileMode(e.Mode), nil, auth.KUID(e.UID), auth.KGID(e.GID)); err != nil {
+			return nil, err
+		}
+	}
 	if opts.Flags&linux.O_TRUNC != 0 && writable {
-		if err := fs.client.Truncate(goContext.Background(), d.path(), 0); err != nil {
+		rel := d.path()
+		if err := callRPCErr(ctx, func(c goContext.Context) error {
+			return fs.client.Truncate(c, rel, 0)
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -650,14 +871,17 @@ func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (st
 	if e.LinkTarget != "" {
 		return e.LinkTarget, nil
 	}
-	return fs.client.Readlink(goContext.Background(), d.path())
+	rel := d.path()
+	return callRPC(ctx, func(c goContext.Context) (string, error) {
+		return fs.client.Readlink(c, rel)
+	})
 }
 
 func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldParentVD vfs.VirtualDentry, oldName string, opts vfs.RenameOptions) error {
 	if opts.Flags != 0 {
 		return linuxerr.EINVAL
 	}
-	if rp.Mount().ReadOnly() {
+	if fs.isReadOnly(rp.Mount()) {
 		return linuxerr.EROFS
 	}
 	if rp.Mount() != oldParentVD.Mount() {
@@ -668,40 +892,62 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 	defer newParent.DecRef(ctx)
+	if err := newParent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
 	newName := rp.Component()
 	if newName == "." || newName == ".." {
 		return linuxerr.EBUSY
 	}
 	oldParent := oldParentVD.Dentry().Impl().(*dentry)
+	if err := oldParent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
 	oldRel := joinRel(oldParent.path(), oldName)
 	newRel := joinRel(newParent.path(), newName)
 	if oldRel == newRel {
 		return nil
 	}
-	if err := fs.client.Rename(goContext.Background(), oldRel, newRel); err != nil {
+	if err := callRPCErr(ctx, func(c goContext.Context) error {
+		return fs.client.Rename(c, oldRel, newRel)
+	}); err != nil {
 		return err
 	}
+	var replaced *dentry
 	fs.mu.Lock()
 	fs.ancestryMu.Lock()
+	if newParent.children != nil {
+		if existing, ok := newParent.children[newName]; ok {
+			replaced = existing
+			delete(newParent.children, newName)
+			existing.dead = true
+		}
+	}
 	if oldParent.children != nil {
 		if moved, ok := oldParent.children[oldName]; ok {
 			delete(oldParent.children, oldName)
 			if newParent.children == nil {
 				newParent.children = make(map[string]*dentry)
 			}
+			if moved == replaced {
+				replaced = nil
+				moved.dead = false
+			}
 			moved.parent = newParent
 			moved.name = newName
-			moved.relPath = newRel
 			newParent.children[newName] = moved
 		}
 	}
 	fs.ancestryMu.Unlock()
 	fs.mu.Unlock()
+	if replaced != nil {
+		replaced.DecRef(ctx)
+	}
 	return nil
 }
 
 func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error {
-	if rp.Mount().ReadOnly() {
+	if fs.isReadOnly(rp.Mount()) {
 		return linuxerr.EROFS
 	}
 	parent, err := fs.resolveParent(ctx, rp)
@@ -709,6 +955,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 	defer parent.DecRef(ctx)
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
 	name := rp.Component()
 	if name == "." {
 		return linuxerr.EINVAL
@@ -717,15 +966,26 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return linuxerr.ENOTEMPTY
 	}
 	rel := joinRel(parent.path(), name)
-	if err := fs.client.Rmdir(goContext.Background(), rel); err != nil {
+	e, stErr := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+		return fs.client.Stat(c, rel)
+	})
+	if stErr != nil {
+		return stErr
+	}
+	if e.Mode&linux.S_IFMT != linux.S_IFDIR {
+		return linuxerr.ENOTDIR
+	}
+	if err := callRPCErr(ctx, func(c goContext.Context) error {
+		return fs.client.Rmdir(c, rel)
+	}); err != nil {
 		return err
 	}
-	fs.dropChild(parent, name)
+	fs.dropChild(ctx, parent, name)
 	return nil
 }
 
 func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error {
-	if rp.Mount().ReadOnly() {
+	if fs.isReadOnly(rp.Mount()) {
 		return linuxerr.EROFS
 	}
 	parent, err := fs.resolveParent(ctx, rp)
@@ -733,19 +993,33 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 	defer parent.DecRef(ctx)
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
 	name := rp.Component()
 	if name == "." || name == ".." {
 		return linuxerr.EISDIR
 	}
 	rel := joinRel(parent.path(), name)
-	if err := fs.client.Unlink(goContext.Background(), rel); err != nil {
+	e, stErr := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+		return fs.client.Stat(c, rel)
+	})
+	if stErr != nil {
+		return stErr
+	}
+	if e.Mode&linux.S_IFMT == linux.S_IFDIR {
+		return linuxerr.EISDIR
+	}
+	if err := callRPCErr(ctx, func(c goContext.Context) error {
+		return fs.client.Unlink(c, rel)
+	}); err != nil {
 		return err
 	}
-	fs.dropChild(parent, name)
+	fs.dropChild(ctx, parent, name)
 	return nil
 }
 
-func (fs *filesystem) dropChild(parent *dentry, name string) {
+func (fs *filesystem) dropChild(ctx context.Context, parent *dentry, name string) {
 	fs.mu.Lock()
 	var old *dentry
 	if parent.children != nil {
@@ -759,12 +1033,12 @@ func (fs *filesystem) dropChild(parent *dentry, name string) {
 	}
 	fs.mu.Unlock()
 	if old != nil {
-		old.DecRef(context.Background())
+		old.DecRef(ctx)
 	}
 }
 
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
-	if rp.Mount().ReadOnly() {
+	if fs.isReadOnly(rp.Mount()) {
 		return linuxerr.EROFS
 	}
 	parent, err := fs.resolveParent(ctx, rp)
@@ -772,32 +1046,63 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 		return err
 	}
 	defer parent.DecRef(ctx)
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
 	name := rp.Component()
 	if name == "." || name == ".." {
 		return linuxerr.EEXIST
 	}
-	return fs.client.Symlink(goContext.Background(), target, joinRel(parent.path(), name))
+	rel := joinRel(parent.path(), name)
+	return callRPCErr(ctx, func(c goContext.Context) error {
+		return fs.client.Symlink(c, target, rel)
+	})
 }
 
-func (fs *filesystem) setStatDentry(d *dentry, mnt *vfs.Mount, opts vfs.SetStatOptions) error {
-	if mnt.ReadOnly() {
+func (fs *filesystem) setStatDentry(ctx context.Context, creds *auth.Credentials, d *dentry, mnt *vfs.Mount, opts vfs.SetStatOptions) error {
+	if fs.isReadOnly(mnt) {
 		return linuxerr.EROFS
+	}
+	if creds != nil {
+		owner := auth.KUID(d.uid.Load())
+		isOwner := creds.EffectiveKUID == owner || creds.HasCapabilityIn(linux.CAP_FOWNER, creds.UserNamespace)
+		if opts.Stat.Mask&linux.STATX_SIZE != 0 {
+			if err := d.checkPermissions(creds, vfs.MayWrite); err != nil {
+				return err
+			}
+		}
+		if opts.Stat.Mask&linux.STATX_MODE != 0 && !isOwner {
+			return linuxerr.EPERM
+		}
+		if opts.Stat.Mask&(linux.STATX_ATIME|linux.STATX_MTIME) != 0 && !isOwner {
+			if err := d.checkPermissions(creds, vfs.MayWrite); err != nil {
+				return linuxerr.EPERM
+			}
+		}
 	}
 	rel := d.path()
 	if opts.Stat.Mask&linux.STATX_SIZE != 0 {
-		if err := fs.client.Truncate(goContext.Background(), rel, int64(opts.Stat.Size)); err != nil {
+		if err := callRPCErr(ctx, func(c goContext.Context) error {
+			return fs.client.Truncate(c, rel, int64(opts.Stat.Size))
+		}); err != nil {
 			return err
 		}
 	}
 	if opts.Stat.Mask&linux.STATX_MODE != 0 {
-		if err := fs.client.Chmod(goContext.Background(), rel, uint32(opts.Stat.Mode)&0o7777); err != nil {
+		newPerm := uint32(opts.Stat.Mode) & 0o7777
+		if err := callRPCErr(ctx, func(c goContext.Context) error {
+			return fs.client.Chmod(c, rel, newPerm)
+		}); err != nil {
 			return err
 		}
+		d.mode.Store((d.mode.Load() & linux.S_IFMT) | newPerm)
 	}
 	setA := opts.Stat.Mask&linux.STATX_ATIME != 0
 	setM := opts.Stat.Mask&linux.STATX_MTIME != 0
 	if setA || setM {
-		if err := fs.client.Utimens(goContext.Background(), rel, opts.Stat.Atime.ToNsec(), opts.Stat.Mtime.ToNsec(), setA, setM); err != nil {
+		if err := callRPCErr(ctx, func(c goContext.Context) error {
+			return fs.client.Utimens(c, rel, opts.Stat.Atime.ToNsec(), opts.Stat.Mtime.ToNsec(), setA, setM)
+		}); err != nil {
 			return err
 		}
 	}
@@ -810,7 +1115,7 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		return err
 	}
 	defer d.DecRef(ctx)
-	return fs.setStatDentry(d, rp.Mount(), opts)
+	return fs.setStatDentry(ctx, rp.Credentials(), d, rp.Mount(), opts)
 }
 
 func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
@@ -904,15 +1209,18 @@ func (fd *fileDescription) Release(context.Context) {}
 
 func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	rel := fd.dentry.path()
-	e, err := fd.dentry.fs.client.Stat(goContext.Background(), rel)
+	e, err := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+		return fd.dentry.fs.client.Stat(c, rel)
+	})
 	if err != nil {
 		return linux.Statx{}, err
 	}
+	fd.dentry.updateAttr(e)
 	return fd.dentry.fs.statxFor(e, rel), nil
 }
 
 func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
-	return fd.dentry.fs.setStatDentry(fd.dentry, fd.vfsfd.Mount(), opts)
+	return fd.dentry.fs.setStatDentry(ctx, auth.CredentialsFromContext(ctx), fd.dentry, fd.vfsfd.Mount(), opts)
 }
 
 func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
@@ -937,8 +1245,13 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	var total int64
 	for total < want {
 		chunkLen := min(want-total, int64(maxChunkSize))
-		data, err := fd.dentry.fs.client.Read(goContext.Background(), rel, offset+total, chunkLen)
+		data, err := callRPC(ctx, func(c goContext.Context) ([]byte, error) {
+			return fd.dentry.fs.client.Read(c, rel, offset+total, chunkLen)
+		})
 		if len(data) > 0 {
+			if int64(len(data)) > chunkLen {
+				data = data[:chunkLen]
+			}
 			n, copyErr := dst.DropFirst64(total).CopyOut(ctx, data)
 			total += int64(n)
 			if copyErr != nil {
@@ -973,6 +1286,9 @@ func (fd *regularFD) PWrite(ctx context.Context, src usermem.IOSequence, offset 
 	if offset < 0 {
 		return 0, linuxerr.EINVAL
 	}
+	if fd.dentry.fs.isReadOnly(fd.vfsfd.Mount()) {
+		return 0, linuxerr.EROFS
+	}
 	want := src.NumBytes()
 	if want == 0 {
 		return 0, nil
@@ -986,7 +1302,15 @@ func (fd *regularFD) PWrite(ctx context.Context, src usermem.IOSequence, offset 
 		if copied == 0 {
 			return total, copyErr
 		}
-		written, wErr := fd.dentry.fs.client.Write(goContext.Background(), rel, offset+total, buf[:copied])
+		written, wErr := callRPC(ctx, func(c goContext.Context) (int64, error) {
+			return fd.dentry.fs.client.Write(c, rel, offset+total, buf[:copied])
+		})
+		if written < 0 || written > int64(copied) {
+			if total > 0 {
+				return total, nil
+			}
+			return 0, linuxerr.EIO
+		}
 		total += written
 		if wErr != nil {
 			if total > 0 {
@@ -1009,7 +1333,10 @@ func (fd *regularFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs
 	defer fd.mu.Unlock()
 	off := fd.off
 	if fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 {
-		e, err := fd.dentry.fs.client.Stat(goContext.Background(), fd.dentry.path())
+		rel := fd.dentry.path()
+		e, err := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+			return fd.dentry.fs.client.Stat(c, rel)
+		})
 		if err != nil {
 			return 0, err
 		}
@@ -1030,7 +1357,10 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 	case linux.SEEK_CUR:
 		next = fd.off + offset
 	case linux.SEEK_END:
-		e, err := fd.dentry.fs.client.Stat(goContext.Background(), fd.dentry.path())
+		rel := fd.dentry.path()
+		e, err := callRPC(ctx, func(c goContext.Context) (Entry, error) {
+			return fd.dentry.fs.client.Stat(c, rel)
+		})
 		if err != nil {
 			return 0, err
 		}
@@ -1080,7 +1410,9 @@ func (fd *dirFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) er
 	defer fd.mu.Unlock()
 	if !fd.loaded {
 		rel := fd.dentry.path()
-		raw, err := fd.dentry.fs.client.Readdir(goContext.Background(), rel)
+		raw, err := callRPC(ctx, func(c goContext.Context) ([]Entry, error) {
+			return fd.dentry.fs.client.Readdir(c, rel)
+		})
 		if err != nil {
 			return err
 		}

@@ -61,8 +61,10 @@ type Conn struct {
 	reader        *prefixReader
 	maxFrameBytes int
 	isServer      bool
+	allowFDs      bool
 
 	writeMu sync.Mutex
+	ctrlOut chan Frame
 
 	mu         sync.Mutex
 	streams    map[uint32]*Stream
@@ -78,7 +80,7 @@ type Conn struct {
 	inFlightWG sync.WaitGroup
 }
 
-func newConn(raw net.Conn, prefix []byte, maxFrameBytes int, isServer bool, onRequest func(incomingRequest)) *Conn {
+func newConn(raw net.Conn, prefix []byte, maxFrameBytes int, isServer, allowFDs bool, onRequest func(incomingRequest)) *Conn {
 	if maxFrameBytes <= 0 || maxFrameBytes > AbsoluteMaxFrameBytes {
 		maxFrameBytes = DefaultMaxFrameBytes
 	}
@@ -87,6 +89,8 @@ func newConn(raw net.Conn, prefix []byte, maxFrameBytes int, isServer bool, onRe
 		reader:        &prefixReader{prefix: prefix, conn: raw},
 		maxFrameBytes: maxFrameBytes,
 		isServer:      isServer,
+		allowFDs:      allowFDs,
+		ctrlOut:       make(chan Frame, 32),
 		streams:       make(map[uint32]*Stream),
 		pings:         make(map[uint64]chan struct{}),
 		onRequest:     onRequest,
@@ -101,7 +105,27 @@ func newConn(raw net.Conn, prefix []byte, maxFrameBytes int, isServer bool, onRe
 }
 
 func (c *Conn) startReadLoop() {
+	go c.ctrlWriteLoop()
 	go c.readLoop()
+}
+
+func (c *Conn) ctrlWriteLoop() {
+	for {
+		select {
+		case f := <-c.ctrlOut:
+			_ = c.writeFrame(f)
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *Conn) enqueueCtrlFrame(f Frame) {
+	select {
+	case c.ctrlOut <- f:
+	case <-c.done:
+	default:
+	}
 }
 
 // Done returns a channel closed when the connection terminates.
@@ -280,6 +304,10 @@ func (c *Conn) readLoop() {
 			return
 		}
 		if f.Flags&FlagHasFDs != 0 {
+			if !c.allowFDs || f.Type != FrameRequest || len(c.reader.prefix) > 0 {
+				_ = c.closeWithError(errors.New("control: unexpected SCM_RIGHTS file descriptors"))
+				return
+			}
 			fds, fdErr := RecvFDs(c.raw, 4)
 			if fdErr != nil {
 				_ = c.closeWithError(fdErr)
@@ -305,9 +333,7 @@ func (c *Conn) dispatchFrame(f Frame) error {
 	switch f.Type {
 	case FramePing:
 		closeFDs(f.FDs)
-		go func(payload []byte) {
-			_ = c.writeFrame(Frame{Type: FramePong, Payload: payload})
-		}(f.Payload)
+		c.enqueueCtrlFrame(Frame{Type: FramePong, Payload: f.Payload})
 		return nil
 
 	case FramePong:
@@ -344,12 +370,17 @@ func (c *Conn) dispatchFrame(f Frame) error {
 		if c.goingAway || c.closed {
 			c.mu.Unlock()
 			closeFDs(f.FDs)
-			go func(id uint32) {
-				_ = c.writeResponseEnvelope(id, ResponseEnvelope{
-					OK:    false,
-					Error: NewError(CodeSandboxExiting, "control server is shutting down"),
-				}, FlagEndStream)
-			}(f.StreamID)
+			if payload, mErr := json.Marshal(ResponseEnvelope{
+				OK:    false,
+				Error: NewError(CodeSandboxExiting, "control server is shutting down"),
+			}); mErr == nil {
+				c.enqueueCtrlFrame(Frame{
+					Type:     FrameResponse,
+					Flags:    FlagEndStream,
+					StreamID: f.StreamID,
+					Payload:  payload,
+				})
+			}
 			return nil
 		}
 		if _, exists := c.streams[f.StreamID]; exists {
@@ -360,12 +391,17 @@ func (c *Conn) dispatchFrame(f Frame) error {
 		if len(c.streams) >= maxConcurrentStreams {
 			c.mu.Unlock()
 			closeFDs(f.FDs)
-			go func(id uint32) {
-				_ = c.writeResponseEnvelope(id, ResponseEnvelope{
-					OK:    false,
-					Error: NewError(CodeLimitExceeded, "too many concurrent control streams"),
-				}, FlagEndStream)
-			}(f.StreamID)
+			if payload, mErr := json.Marshal(ResponseEnvelope{
+				OK:    false,
+				Error: NewError(CodeLimitExceeded, "too many concurrent control streams"),
+			}); mErr == nil {
+				c.enqueueCtrlFrame(Frame{
+					Type:     FrameResponse,
+					Flags:    FlagEndStream,
+					StreamID: f.StreamID,
+					Payload:  payload,
+				})
+			}
 			return nil
 		}
 		s := newStream(context.Background(), c, f.StreamID)
@@ -710,9 +746,6 @@ func (s *Stream) Reply(result any) error {
 }
 
 func (s *Stream) sendResponse(result any, flags FrameFlags) error {
-	if !s.respSent.CompareAndSwap(false, true) {
-		return nil
-	}
 	var raw json.RawMessage
 	if result != nil {
 		b, err := json.Marshal(result)
@@ -720,6 +753,9 @@ func (s *Stream) sendResponse(result any, flags FrameFlags) error {
 			return fmt.Errorf("control: marshal response: %w", err)
 		}
 		raw = b
+	}
+	if !s.respSent.CompareAndSwap(false, true) {
+		return nil
 	}
 	return s.conn.writeResponseEnvelope(s.id, ResponseEnvelope{
 		OK:     true,
@@ -881,7 +917,11 @@ func (s *Stream) ReadData(ctx context.Context, ch Channel, dst []byte) (int, err
 		if len(q.chunks) > 0 {
 			n := copy(dst, q.chunks[0])
 			if n == len(q.chunks[0]) {
+				q.chunks[0] = nil
 				q.chunks = q.chunks[1:]
+				if len(q.chunks) == 0 {
+					q.chunks = nil
+				}
 			} else {
 				q.chunks[0] = q.chunks[0][n:]
 			}
@@ -988,7 +1028,11 @@ func (s *Stream) RecvEvent(ctx context.Context) (EventEnvelope, error) {
 		s.rxMu.Lock()
 		if len(s.events) > 0 {
 			ev := s.events[0]
+			s.events[0] = EventEnvelope{}
 			s.events = s.events[1:]
+			if len(s.events) == 0 {
+				s.events = nil
+			}
 			s.rxMu.Unlock()
 			return ev, nil
 		}

@@ -58,6 +58,9 @@ func (pf *PortForwarder) AddDynamicRule(
 	if rule.GuestPort == 0 {
 		return PortForwardRule{}, errors.New("netbackend: guest port must be non-zero")
 	}
+	if rule.HostSocket != "" && proto != "tcp" {
+		return PortForwardRule{}, fmt.Errorf("netbackend: unix socket %s forwards tcp only", rule.HostSocket)
+	}
 	hostIP := rule.HostIP
 	if hostIP == "" && rule.HostSocket == "" {
 		hostIP = "127.0.0.1"
@@ -87,7 +90,8 @@ func (pf *PortForwarder) AddDynamicRule(
 		pf.mu.Unlock()
 		return PortForwardRule{}, errors.New("netbackend: PortForwarder is closed")
 	}
-	// Static rules cannot be shadowed or replaced by dynamic rules.
+	// Check capacity before evicting any active listener.
+	var willEvict int
 	if norm.HostPort != 0 || norm.HostSocket != "" {
 		for _, b := range pf.tcpList {
 			if portBindingsMatch(b.rule, norm) {
@@ -101,20 +105,53 @@ func (pf *PortForwarder) AddDynamicRule(
 				return PortForwardRule{}, fmt.Errorf("%w: static rule already bound", ErrPortRuleExists)
 			}
 		}
-		// Check existing manual dynamic rules.
 		if proto == "tcp" {
-			for i := 0; i < len(pf.manualTCP); i++ {
-				if portBindingsMatch(pf.manualTCP[i].rule, norm) {
+			for _, b := range pf.manualTCP {
+				if portBindingsMatch(b.rule, norm) {
 					if !replace {
 						pf.mu.Unlock()
 						return PortForwardRule{}, fmt.Errorf("%w: dynamic rule already bound", ErrPortRuleExists)
 					}
+					willEvict++
+				}
+			}
+			for _, b := range pf.dynTCP {
+				if portBindingsMatch(b.rule, norm) {
+					willEvict++
+				}
+			}
+		} else {
+			for _, b := range pf.manualUDP {
+				if portBindingsMatch(b.rule, norm) {
+					if !replace {
+						pf.mu.Unlock()
+						return PortForwardRule{}, fmt.Errorf("%w: dynamic rule already bound", ErrPortRuleExists)
+					}
+					willEvict++
+				}
+			}
+			for _, b := range pf.dynUDP {
+				if portBindingsMatch(b.rule, norm) {
+					willEvict++
+				}
+			}
+		}
+	}
+	activeDynamic := len(pf.manualTCP) + len(pf.manualUDP) + len(pf.dynTCP) + len(pf.dynUDP)
+	if pf.maxDynamicPorts > 0 && activeDynamic-willEvict >= pf.maxDynamicPorts {
+		pf.mu.Unlock()
+		return PortForwardRule{}, fmt.Errorf("%w (%d active)", ErrDynamicPortLimit, pf.maxDynamicPorts)
+	}
+	if norm.HostPort != 0 || norm.HostSocket != "" {
+		// Evict replaced dynamic/auto rules now that validation and capacity succeeded.
+		if proto == "tcp" {
+			for i := 0; i < len(pf.manualTCP); i++ {
+				if portBindingsMatch(pf.manualTCP[i].rule, norm) {
 					evictTCP = append(evictTCP, pf.manualTCP[i])
 					pf.manualTCP = append(pf.manualTCP[:i], pf.manualTCP[i+1:]...)
 					i--
 				}
 			}
-			// Dynamic rules take precedence over auto-published rules.
 			for k, b := range pf.dynTCP {
 				if portBindingsMatch(b.rule, norm) {
 					delete(pf.dynTCP, k)
@@ -124,10 +161,6 @@ func (pf *PortForwarder) AddDynamicRule(
 		} else {
 			for i := 0; i < len(pf.manualUDP); i++ {
 				if portBindingsMatch(pf.manualUDP[i].rule, norm) {
-					if !replace {
-						pf.mu.Unlock()
-						return PortForwardRule{}, fmt.Errorf("%w: dynamic rule already bound", ErrPortRuleExists)
-					}
 					b := pf.manualUDP[i]
 					b.closed = true
 					for c, s := range b.sessions {

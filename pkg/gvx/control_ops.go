@@ -34,6 +34,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/cgroup2fs"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/mm"
 	"z.gfire.dev/gvx/pkg/waiter"
 )
 
@@ -277,12 +278,14 @@ func (s *Sandbox) handleProcList(ctx context.Context, stream *control.Stream) er
 			uid = uint32(creds.EffectiveKUID)
 			gid = uint32(creds.EffectiveKGID)
 		}
-		var rss uint64
+		var tmm *mm.MemoryManager
 		leader.WithMuLocked(func(t *kernel.Task) {
-			if mm := t.MemoryManager(); mm != nil {
-				rss = mm.ResidentSetSize()
-			}
+			tmm = t.MemoryManager()
 		})
+		var rss uint64
+		if tmm != nil {
+			rss = tmm.ResidentSetSize()
+		}
 		cpuStats := tg.CPUStats()
 		var cmdline []string
 		if rawCmd, rErr := readGuestFile(sctxWithRoot, vfsObj, rootCreds, root, fmt.Sprintf("/proc/%d/cmdline", pid), 4096); rErr == nil && len(rawCmd) > 0 {
@@ -383,6 +386,9 @@ func (s *Sandbox) handleKernelLog(ctx context.Context, stream *control.Stream, r
 	var req control.KernelLogRequest
 	if err := decodeParams(raw, &req); err != nil {
 		return err
+	}
+	if req.Clear && !slices.Contains(s.ControlCapabilities(), control.CapKernelLogClear) {
+		return control.NewError(control.CodeForbiddenByPolicy, "clearing the kernel log is disabled by sandbox policy")
 	}
 	k, _, err := s.activeKernelChecked(ctx)
 	if err != nil {

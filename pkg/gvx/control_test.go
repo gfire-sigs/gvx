@@ -114,9 +114,13 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 		Token:    ep.Token,
 	})
 	if err != nil {
+		_ = stdinW.Close()
+		_ = stdinR.Close()
 		cancel()
 		ctrlCancel()
 		_ = sb.Close()
+		<-ctrlDone
+		<-runDone
 		t.Fatalf("control.Dial: %v", err)
 	}
 
@@ -133,6 +137,7 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 		select {
 		case <-runDone:
 		case <-time.After(10 * time.Second):
+			t.Errorf("Sandbox.Run did not exit within 10s during test cleanup")
 		}
 		_ = sb.Close()
 	})
@@ -280,11 +285,11 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		if err := st.WaitResponse(ctx, &started); err != nil {
 			t.Fatalf("exec wait: %v", err)
 		}
-		out, _ := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
+		out, readErr := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
 		ev, err := st.RecvEvent(ctx)
 		st.Close()
-		if err != nil || ev.Type != "exec.exit" || len(out) != 0 {
-			t.Fatalf("closed-stdin exec: out=%q ev=%+v err=%v", out, ev, err)
+		if readErr != nil || err != nil || ev.Type != "exec.exit" || len(out) != 0 {
+			t.Fatalf("closed-stdin exec: out=%q readErr=%v ev=%+v err=%v", out, readErr, ev, err)
 		}
 	}
 	// 3b: /bin/cat /proc/self/fd/0 with Stdin=true echoes piped bytes.
@@ -300,12 +305,16 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 			t.Fatalf("exec -i wait: %v", err)
 		}
 		w := st.ChannelWriter(ctx, control.ChannelStdin, false)
-		_, _ = io.WriteString(w, "piped-stdin-payload\n")
-		_ = w.Close()
-		out, _ := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
+		if _, err := io.WriteString(w, "piped-stdin-payload\n"); err != nil {
+			t.Fatalf("exec -i write stdin: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("exec -i close stdin: %v", err)
+		}
+		out, readErr := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
 		st.Close()
-		if string(out) != "piped-stdin-payload\n" {
-			t.Fatalf("exec -i stdout = %q, want piped-stdin-payload", out)
+		if readErr != nil || string(out) != "piped-stdin-payload\n" {
+			t.Fatalf("exec -i stdout = (%q, %v), want piped-stdin-payload", out, readErr)
 		}
 	}
 	// 3c: /bin/exit42 propagates exit code 42.
@@ -319,13 +328,13 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		if err := st.WaitResponse(ctx, nil); err != nil {
 			t.Fatalf("exec42 wait: %v", err)
 		}
-		out, _ := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
+		out, readErr := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
 		ev, err := st.RecvEvent(ctx)
 		st.Close()
 		var exitEv control.ExecExitEvent
-		_ = json.Unmarshal(ev.Data, &exitEv)
-		if err != nil || exitEv.ExitCode != 42 || string(out) != "exit42-out\n" {
-			t.Fatalf("exec42 = (out=%q, exit=%+v, err=%v)", out, exitEv, err)
+		unmarshalErr := json.Unmarshal(ev.Data, &exitEv)
+		if readErr != nil || err != nil || unmarshalErr != nil || exitEv.ExitCode != 42 || string(out) != "exit42-out\n" {
+			t.Fatalf("exec42 = (out=%q, readErr=%v, exit=%+v, unmarshalErr=%v, err=%v)", out, readErr, exitEv, unmarshalErr, err)
 		}
 	}
 
@@ -385,9 +394,39 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		if err != nil || hdr.Name != "copied.txt" {
 			t.Fatalf("exported tar header = (%+v, %v)", hdr, err)
 		}
-		got, _ := io.ReadAll(tr)
-		if string(got) != string(payload) {
-			t.Fatalf("exported content = %q, want %q", got, payload)
+		got, readErr := io.ReadAll(tr)
+		if readErr != nil || string(got) != string(payload) {
+			t.Fatalf("exported content = (%q, %v), want %q", got, readErr, payload)
+		}
+
+		// fs.import must reject symlink traversal escaping DestPath.
+		{
+			var escTar bytes.Buffer
+			twEsc := tar.NewWriter(&escTar)
+			_ = twEsc.WriteHeader(&tar.Header{Name: "sub", Typeflag: tar.TypeSymlink, Linkname: "/etc"})
+			_ = twEsc.WriteHeader(&tar.Header{Name: "sub/escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 3})
+			_, _ = twEsc.Write([]byte("bad"))
+			_ = twEsc.Close()
+
+			escSt, err := rs.client.OpenStream(ctx, control.MethodFSImport, control.FSImportRequest{DestPath: "/tmp"})
+			if err != nil {
+				t.Fatalf("fs.import escape open: %v", err)
+			}
+			wEsc := escSt.ChannelWriter(ctx, control.ChannelGeneric, false)
+			_, _ = wEsc.Write(escTar.Bytes())
+			_ = wEsc.Close()
+			if err := escSt.WaitResponse(ctx, nil); err == nil {
+				t.Fatal("fs.import accepted symlink traversal outside DestPath, want error")
+			}
+			escSt.Close()
+
+			var checkEsc control.FSStatResponse
+			if err := rs.client.Call(ctx, control.MethodFSStat, control.FSStatRequest{Path: "/etc/escaped.txt"}, &checkEsc); err != nil {
+				t.Fatalf("fs.stat escaped check: %v", err)
+			}
+			if checkEsc.Exists {
+				t.Fatal("/etc/escaped.txt was created via fs.import symlink escape")
+			}
 		}
 
 		// Upper-only export should include tmp/copied.txt and exclude lower-layer etc/seed.txt.
@@ -401,8 +440,11 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		if err := upSt.WaitResponse(ctx, nil); err != nil {
 			t.Fatalf("fs.export upper_only resp: %v", err)
 		}
-		upBytes, _ := io.ReadAll(upSt.ChannelReader(ctx, control.ChannelGeneric))
+		upBytes, upErr := io.ReadAll(upSt.ChannelReader(ctx, control.ChannelGeneric))
 		upSt.Close()
+		if upErr != nil {
+			t.Fatalf("fs.export upper_only read: %v", upErr)
+		}
 		upTR := tar.NewReader(bytes.NewReader(upBytes))
 		var seenCopied, seenLower bool
 		for {
@@ -425,7 +467,7 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		}
 	}
 
-	// 5. Runtime mounts: add tmpfs, remount ro/rw, refuse RO->RW on host-RO workspace, unmount tmpfs
+	// 5. Runtime mounts: add tmpfs, remount rw->ro->rw, refuse RO->RW on host-RO workspace, subpath, and symlink, unmount tmpfs
 	{
 		var added control.MountInfo
 		if err := rs.client.Call(ctx, control.MethodMountAdd, control.MountAddRequest{
@@ -441,11 +483,49 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		}, nil); err != nil {
 			t.Fatalf("mount.remount ro: %v", err)
 		}
+		// Originally writable mount must allow remounting back from ro to rw.
+		if err := rs.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+			Target:   "/mnt/tmp",
+			ReadOnly: false,
+		}, nil); err != nil {
+			t.Fatalf("mount.remount rw round-trip: %v", err)
+		}
 		if err := rs.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
 			Target:   "/workspace",
 			ReadOnly: false,
 		}, nil); !control.IsCode(err, control.CodeLockdownDenied) {
 			t.Fatalf("remount host-RO workspace rw err = %v, want LOCKDOWN_DENIED", err)
+		}
+		// Subpath inside a host-RO mount must NOT bypass the RO->RW guard.
+		if err := rs.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+			Target:   "/workspace/ro.txt",
+			ReadOnly: false,
+		}, nil); err == nil {
+			t.Fatal("remount subpath /workspace/ro.txt rw succeeded, want rejection")
+		}
+		// Symlink pointing to /workspace must NOT bypass the RO->RW guard.
+		{
+			var symTar bytes.Buffer
+			twSym := tar.NewWriter(&symTar)
+			_ = twSym.WriteHeader(&tar.Header{Name: "wslink", Typeflag: tar.TypeSymlink, Linkname: "/workspace"})
+			_ = twSym.Close()
+			symSt, err := rs.client.OpenStream(ctx, control.MethodFSImport, control.FSImportRequest{DestPath: "/tmp"})
+			if err != nil {
+				t.Fatalf("import wslink open: %v", err)
+			}
+			wSym := symSt.ChannelWriter(ctx, control.ChannelGeneric, false)
+			_, _ = wSym.Write(symTar.Bytes())
+			_ = wSym.Close()
+			if err := symSt.WaitResponse(ctx, nil); err != nil {
+				t.Fatalf("import wslink resp: %v", err)
+			}
+			symSt.Close()
+			if err := rs.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+				Target:   "/tmp/wslink",
+				ReadOnly: false,
+			}, nil); err == nil {
+				t.Fatal("remount symlink /tmp/wslink rw succeeded, want rejection")
+			}
 		}
 		if err := rs.client.Call(ctx, control.MethodMountRemove, control.MountRemoveRequest{
 			Target: "/mnt/tmp",
@@ -509,10 +589,10 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		if err := catSt.WaitResponse(ctx, nil); err != nil {
 			t.Fatalf("exec cat proxy wait: %v", err)
 		}
-		gotProxy, _ := io.ReadAll(catSt.ChannelReader(ctx, control.ChannelStdout))
+		gotProxy, readErr := io.ReadAll(catSt.ChannelReader(ctx, control.ChannelStdout))
 		catSt.Close()
-		if string(gotProxy) != "hello-from-rpcfs-host\n" {
-			t.Fatalf("guest read from rpcfs = %q, want hello-from-rpcfs-host", gotProxy)
+		if readErr != nil || string(gotProxy) != "hello-from-rpcfs-host\n" {
+			t.Fatalf("guest read from rpcfs = (%q, %v), want hello-from-rpcfs-host", gotProxy, readErr)
 		}
 
 		// Write /mnt/proxy/from_guest.txt from inside the guest.
@@ -525,7 +605,9 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		if err := wrSt.WaitResponse(ctx, nil); err != nil {
 			t.Fatalf("exec writeproxy wait: %v", err)
 		}
-		_, _ = wrSt.RecvEvent(ctx)
+		if _, err := wrSt.RecvEvent(ctx); err != nil {
+			t.Fatalf("exec writeproxy exit event: %v", err)
+		}
 		wrSt.Close()
 
 		hostWritten, err := os.ReadFile(filepath.Join(serveDir, "from_guest.txt"))
@@ -539,10 +621,32 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 		}
 
 		serveCancel()
-		serveSt.Close()
+		serveSt.Cancel(nil)
 		<-loopDone
-		// Give server unmount cleanup a brief moment.
-		time.Sleep(100 * time.Millisecond)
+
+		// Poll mount.list until /mnt/proxy is unmounted; fail if deadline expires.
+		unmounted := false
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			var ml control.MountListResponse
+			if err := rs.client.Call(ctx, control.MethodMountList, nil, &ml); err == nil {
+				found := false
+				for _, m := range ml.Mounts {
+					if m.Target == "/mnt/proxy" {
+						found = true
+						break
+					}
+				}
+				if !found {
+					unmounted = true
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !unmounted {
+			t.Fatal("/mnt/proxy was not unmounted within 5s after mount.serve stream closed")
+		}
 	}
 }
 
@@ -663,6 +767,66 @@ func TestControlResourceUpdateAndMultiSandboxIsolation(t *testing.T) {
 		t.Fatalf("immutable tunable err = %v, want INVALID_ARGUMENT", err)
 	}
 
+	// Verify memory limit below current usage returns LIMIT_EXCEEDED without ForceMemory.
+	{
+		// Allocate >7 MiB in guest tmpfs so Memory.TotalBytes exceeds the 6 MiB minimum.
+		var fillTar bytes.Buffer
+		twFill := tar.NewWriter(&fillTar)
+		fillData := bytes.Repeat([]byte("M"), 7<<20)
+		if err := twFill.WriteHeader(&tar.Header{Name: "memfill.bin", Mode: 0o644, Size: int64(len(fillData))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := twFill.Write(fillData); err != nil {
+			t.Fatal(err)
+		}
+		if err := twFill.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fillSt, err := sbA.client.OpenStream(ctx, control.MethodFSImport, control.FSImportRequest{DestPath: "/tmp", Compress: true})
+		if err != nil {
+			t.Fatalf("fs.import memfill open: %v", err)
+		}
+		wFill := fillSt.ChannelWriter(ctx, control.ChannelGeneric, true)
+		if _, err := wFill.Write(fillTar.Bytes()); err != nil {
+			t.Fatalf("fs.import memfill write: %v", err)
+		}
+		if err := wFill.Close(); err != nil {
+			t.Fatalf("fs.import memfill close: %v", err)
+		}
+		if err := fillSt.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("fs.import memfill resp: %v", err)
+		}
+		fillSt.Close()
+
+		var curStats control.StatsSample
+		if err := sbA.client.Call(ctx, control.MethodStats, control.StatsRequest{}, &curStats); err != nil {
+			t.Fatalf("stats sbA: %v", err)
+		}
+		if curStats.Memory.TotalBytes <= 6<<20 {
+			t.Fatalf("expected sbA TotalBytes > 6 MiB after 7 MiB tmpfs write, got %d", curStats.Memory.TotalBytes)
+		}
+		tooLow := int64(6 << 20)
+		if err := sbA.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
+			MemoryBytes: &tooLow,
+		}, nil); !control.IsCode(err, control.CodeLimitExceeded) {
+			t.Fatalf("memory below usage err = %v, want LIMIT_EXCEEDED", err)
+		}
+	}
+
+	// Verify CPUQuotaUSec <= 0 (-1 and 0) clears the quota cleanly.
+	clearNeg := int64(-1)
+	if err := sbA.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
+		CPUQuotaUSec: &clearNeg,
+	}, &snapA); err != nil || snapA.CPUQuotaUSec != 0 {
+		t.Fatalf("update CPUQuotaUSec=-1 = (%+v, %v), want 0", snapA, err)
+	}
+	clearZero := int64(0)
+	if err := sbA.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
+		CPUQuotaUSec: &clearZero,
+	}, &snapA); err != nil || snapA.CPUQuotaUSec != 0 {
+		t.Fatalf("update CPUQuotaUSec=0 = (%+v, %v), want 0", snapA, err)
+	}
+
 	// Verify Sandbox B is completely isolated from Sandbox A's updates.
 	var inspectB control.InspectResponse
 	if err := sbB.client.Call(ctx, control.MethodInspect, nil, &inspectB); err != nil {
@@ -722,6 +886,18 @@ func TestControlCheckpointStreamAndRestoreRoundTrip(t *testing.T) {
 		}
 	}
 
+	// Close the first sandbox completely before calling Restore so single-partition
+	// hypervisors (such as Windows WHPX) release their partition first.
+	_ = rs.client.Close()
+	select {
+	case <-rs.runDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("sandbox did not exit after checkpoint_stream with LeaveRunning=false")
+	}
+	if err := rs.sb.Close(); err != nil {
+		t.Fatalf("close original sandbox before restore: %v", err)
+	}
+
 	var restoredOut bytes.Buffer
 	restoredCfg := newCheckpointTestConfig(t, cacheDir)
 	restoredCfg.OCIImage = imgRef
@@ -760,6 +936,12 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 	if err := rs.client.Call(ctx, control.MethodInspect, nil, nil); err != nil {
 		t.Fatalf("inspect under readonly policy: %v", err)
 	}
+	if err := rs.client.Call(ctx, control.MethodKernelLog, control.KernelLogRequest{Tail: 5}, nil); err != nil {
+		t.Fatalf("kernel.log read under readonly policy: %v", err)
+	}
+	if err := rs.client.Call(ctx, control.MethodKernelLog, control.KernelLogRequest{Clear: true}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
+		t.Fatalf("kernel.log clear under readonly policy = %v, want FORBIDDEN_BY_POLICY", err)
+	}
 	if err := rs.client.Call(ctx, control.MethodExecStart, control.ExecStartRequest{Argv: []string{"/bin/hello"}}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
 		t.Fatalf("exec under readonly policy = %v, want FORBIDDEN_BY_POLICY", err)
 	}
@@ -776,5 +958,54 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 	case <-rs.runDone:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Sandbox.Run deadlocked when context was canceled while paused")
+	}
+}
+
+func TestControlCheckpointStreamForceStopsActiveExec(t *testing.T) {
+	cacheDir, regURL, imgRef := buildControlTestImage(t)
+	rs := startControlTestSandbox(t, Config{
+		Name:            "force-exec",
+		OCIImage:        imgRef,
+		OCICacheDir:     cacheDir,
+		RegistryBaseURL: regURL,
+	})
+	rs.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
+	ctx := context.Background()
+
+	// Start a blocking exec session reading stdin.
+	execSt, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+		Argv:  []string{"/bin/cat", "/proc/self/fd/0"},
+		Stdin: true,
+	})
+	if err != nil {
+		t.Fatalf("exec open: %v", err)
+	}
+	defer execSt.Close()
+	if err := execSt.WaitResponse(ctx, nil); err != nil {
+		t.Fatalf("exec wait: %v", err)
+	}
+
+	// Without Force, checkpoint_stream must fail with EXEC_ACTIVE.
+	if err := rs.client.Call(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{
+		LeaveRunning: true,
+	}, nil); !control.IsCode(err, control.CodeExecActive) {
+		t.Fatalf("checkpoint with active exec without Force = %v, want EXEC_ACTIVE", err)
+	}
+
+	// With Force=true, checkpoint_stream kills and drains the exec session cleanly.
+	ckptSt, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{
+		LeaveRunning: true,
+		Force:        true,
+	})
+	if err != nil {
+		t.Fatalf("checkpoint_stream Force open: %v", err)
+	}
+	if err := ckptSt.WaitResponse(ctx, nil); err != nil {
+		t.Fatalf("checkpoint_stream Force resp: %v", err)
+	}
+	bundleTar, err := io.ReadAll(ckptSt.ChannelReader(ctx, control.ChannelGeneric))
+	ckptSt.Close()
+	if err != nil || len(bundleTar) == 0 {
+		t.Fatalf("checkpoint_stream Force read = (%d bytes, %v)", len(bundleTar), err)
 	}
 }

@@ -41,6 +41,7 @@ type ServerConfig struct {
 	SandboxID        string
 	Token            string
 	Capabilities     []string
+	AllowFDs         bool
 	MaxConnections   int
 	MaxFrameBytes    int
 	HandshakeTimeout time.Duration
@@ -71,7 +72,7 @@ func NewServer(ln net.Listener, cfg ServerConfig) *Server {
 		cfg.MaxFrameBytes = DefaultMaxFrameBytes
 	}
 	if cfg.HandshakeTimeout <= 0 {
-		cfg.HandshakeTimeout = 5 * time.Second
+		cfg.HandshakeTimeout = 10 * time.Second
 	}
 	return &Server{
 		cfg:      cfg,
@@ -84,9 +85,14 @@ func NewServer(ln net.Listener, cfg ServerConfig) *Server {
 
 // Serve accepts connections until ctx is canceled or Close/Shutdown is called.
 func (s *Server) Serve(ctx context.Context) error {
+	serveDone := make(chan struct{})
+	defer close(serveDone)
 	go func() {
-		<-ctx.Done()
-		_ = s.listener.Close()
+		select {
+		case <-ctx.Done():
+			_ = s.listener.Close()
+		case <-serveDone:
+		}
 	}()
 	for {
 		conn, err := s.listener.Accept()
@@ -245,8 +251,10 @@ func (s *Server) serveConn(ctx context.Context, nc net.Conn) {
 		return
 	}
 
+	_, isUnix := nc.(*net.UnixConn)
+	allowFDs := s.cfg.AllowFDs && isUnix && (runtime.GOOS == "linux" || runtime.GOOS == "darwin")
 	features := []string{"zstd"}
-	if _, isUnix := nc.(*net.UnixConn); isUnix && (runtime.GOOS == "linux" || runtime.GOOS == "darwin") {
+	if allowFDs {
 		features = append(features, "scm_rights")
 	}
 	helloResp := HelloResponse{
@@ -275,7 +283,7 @@ func (s *Server) serveConn(ctx context.Context, nc net.Conn) {
 	_ = nc.SetDeadline(time.Time{})
 
 	var c *Conn
-	c = newConn(nc, pr.prefix, s.cfg.MaxFrameBytes, true, func(req incomingRequest) {
+	c = newConn(nc, pr.prefix, s.cfg.MaxFrameBytes, true, allowFDs, func(req incomingRequest) {
 		c.inFlightWG.Add(1)
 		go func() {
 			defer c.inFlightWG.Done()
@@ -367,13 +375,9 @@ func (s *Server) serveLegacyV1(ctx context.Context, nc net.Conn, br *bufio.Reade
 		b = append(b, '\n')
 		_, _ = nc.Write(b)
 	}
-	data, err := io.ReadAll(io.LimitReader(br, HandshakeMaxFrameBytes))
-	if err != nil {
-		writeResp(false, fmt.Sprintf("read request: %v", err))
-		return
-	}
 	var req LegacyCheckpointRequest
-	if err := json.Unmarshal(data, &req); err != nil {
+	dec := json.NewDecoder(io.LimitReader(br, HandshakeMaxFrameBytes))
+	if err := dec.Decode(&req); err != nil {
 		writeResp(false, fmt.Sprintf("decode request: %v", err))
 		return
 	}

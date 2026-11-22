@@ -379,19 +379,24 @@ func (s *Sandbox) initKernelInstance(k *kernel.Kernel, tk *kernel.Timekeeper, cr
 		return errors.New("gvx: the kernel log exists before its size is set")
 	}
 	k.KernelLog().WriteBootMessages()
-	s.applyInitialKernelLimits(k)
+	if err := s.applyInitialKernelLimits(k); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (s *Sandbox) applyInitialKernelLimits(k *kernel.Kernel) {
+func (s *Sandbox) applyInitialKernelLimits(k *kernel.Kernel) error {
 	if s.cfg.Resources.CPUMillis > 0 {
 		period := 100 * time.Millisecond
 		quota := max(time.Duration(s.cfg.Resources.CPUMillis)*100*time.Microsecond, time.Millisecond)
 		k.SetSandboxCPULimit(quota, period)
 	}
 	if s.cfg.Resources.PidsLimit > 0 {
-		_ = cgroup2fs.SetRootPidsMax(k, s.cfg.Resources.PidsLimit)
+		if err := cgroup2fs.SetRootPidsMax(k, s.cfg.Resources.PidsLimit); err != nil {
+			return fmt.Errorf("gvx: apply initial pids limit %d: %w", s.cfg.Resources.PidsLimit, err)
+		}
 	}
+	return nil
 }
 
 // createInitialGuestProcess resolves the target executable, user credentials,
@@ -532,7 +537,9 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 	cleanupStdio := s.activateRestoredStdio(ctx, tg, collector)
 	defer cleanupStdio()
 
-	s.applyInitialKernelLimits(k)
+	if err := s.applyInitialKernelLimits(k); err != nil {
+		return 1, err
+	}
 	hostRAM, _ := hostMemory()
 	return s.executeActiveKernel(ctx, k, tg, mf, hostRAM, "gvx: start restored Sentry kernel")
 }
@@ -561,6 +568,7 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 		select {
 		case <-ctx.Done():
 			s.unpauseForShutdown(k, dog)
+			s.closeRPCMounts()
 			_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 			s.killActiveExecSessions(k)
 		case <-doneCh:
@@ -573,6 +581,7 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 
 	tg.WaitExited()
 	s.killActiveExecSessions(k)
+	s.closeRPCMounts()
 	s.ckptMu.Lock()
 	s.clearActiveKernel()
 	k.WaitExited()

@@ -185,7 +185,7 @@ func portRemoveSubcommand(ctx context.Context, args []string, stdout, stderr io.
 	allDynamic := fs.Bool("all-dynamic", false, "Remove all dynamically added port rules")
 	var force bool
 	registerAlias([]string{"f", "force"}, func(n string) {
-		fs.BoolVar(&force, n, false, "Do not fail if a specified rule is not currently bound")
+		fs.BoolVar(&force, n, false, "Allow removing static startup -p port rules")
 	})
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
@@ -246,7 +246,12 @@ func parseTunnelSpec(spec, defaultBindIP, defaultGuestIP string) (tunnelSpec, er
 		}, nil
 	}
 
-	parts := strings.Split(s, ":")
+	// Split port-forward spec into colon-delimited tokens while keeping
+	// bracketed IPv6 literals such as [::1] intact.
+	parts, err := splitTunnelTokens(s)
+	if err != nil {
+		return tunnelSpec{}, fmt.Errorf("invalid port-forward spec %q: %w", spec, err)
+	}
 	switch len(parts) {
 	case 1:
 		gp, err := parsePortNumber(parts[0])
@@ -326,6 +331,44 @@ func parseTunnelSpec(spec, defaultBindIP, defaultGuestIP string) (tunnelSpec, er
 	}
 }
 
+// splitTunnelTokens splits colon-separated port-forward fields while treating
+// bracketed IPv6 literals ("[::1]") as single unbracketed tokens.
+func splitTunnelTokens(s string) ([]string, error) {
+	var parts []string
+	for len(s) > 0 {
+		if s[0] == '[' {
+			end := strings.IndexByte(s, ']')
+			if end < 0 {
+				return nil, fmt.Errorf("missing closing bracket in IPv6 address")
+			}
+			parts = append(parts, s[1:end])
+			s = s[end+1:]
+			if len(s) == 0 {
+				break
+			}
+			if s[0] != ':' {
+				return nil, fmt.Errorf("expected ':' after closing bracket")
+			}
+			s = s[1:]
+			if len(s) == 0 {
+				parts = append(parts, "")
+			}
+			continue
+		}
+		idx := strings.IndexByte(s, ':')
+		if idx < 0 {
+			parts = append(parts, s)
+			break
+		}
+		parts = append(parts, s[:idx])
+		s = s[idx+1:]
+		if len(s) == 0 {
+			parts = append(parts, "")
+		}
+	}
+	return parts, nil
+}
+
 func parsePortNumber(s string) (uint16, error) {
 	n, err := strconv.Atoi(strings.TrimSpace(s))
 	if err != nil || n < 1 || n > 65535 {
@@ -370,6 +413,11 @@ func portForwardSubcommand(ctx context.Context, args []string, streams cliIO) in
 		return controlUsageError(streams.stderr, cmdName, "specify at least one port-forward SPEC ([HOST:]GUEST)")
 	}
 
+	fmtMode := strings.ToLower(strings.TrimSpace(format))
+	if fmtMode != "" && fmtMode != "json" && fmtMode != "table" && fmtMode != "text" {
+		return controlUsageError(streams.stderr, cmdName, "unsupported --format %q (want json or text)", format)
+	}
+
 	specs := make([]tunnelSpec, 0, fs.NArg())
 	for _, raw := range fs.Args() {
 		ts, err := parseTunnelSpec(raw, strings.TrimSpace(bindAddr), strings.TrimSpace(guestIP))
@@ -407,7 +455,18 @@ func portForwardSubcommand(ctx context.Context, args []string, streams cliIO) in
 
 	for _, ts := range specs {
 		if ts.network == "unix" {
-			_ = os.Remove(ts.listenAddr)
+			if fi, lErr := os.Lstat(ts.listenAddr); lErr == nil {
+				if fi.Mode()&os.ModeSocket == 0 {
+					return controlFail(streams.stderr, cmdName, fmt.Errorf("unix socket path %q already exists and is not a socket", ts.listenAddr))
+				}
+				if probe, dErr := net.DialTimeout("unix", ts.listenAddr, 100*time.Millisecond); dErr == nil {
+					_ = probe.Close()
+					return controlFail(streams.stderr, cmdName, fmt.Errorf("unix socket %q is already in use", ts.listenAddr))
+				}
+				if rmErr := os.Remove(ts.listenAddr); rmErr != nil {
+					return controlFail(streams.stderr, cmdName, fmt.Errorf("remove stale unix socket %q: %w", ts.listenAddr, rmErr))
+				}
+			}
 		}
 		ln, err := net.Listen(ts.network, ts.listenAddr)
 		if err != nil {
@@ -425,7 +484,7 @@ func portForwardSubcommand(ctx context.Context, args []string, streams cliIO) in
 		})
 	}
 
-	if strings.EqualFold(strings.TrimSpace(format), "json") {
+	if fmtMode == "json" {
 		enc := json.NewEncoder(streams.stdout)
 		enc.SetEscapeHTML(false)
 		_ = enc.Encode(bound)
@@ -438,12 +497,17 @@ func portForwardSubcommand(ctx context.Context, args []string, streams cliIO) in
 	tunnelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
-		<-tunnelCtx.Done()
+		select {
+		case <-tunnelCtx.Done():
+		case <-client.Done():
+			cancel()
+		}
 		for _, al := range listeners {
 			_ = al.ln.Close()
 		}
 	}()
 
+	safeStderr := &syncWriter{w: streams.stderr}
 	var wg sync.WaitGroup
 	for _, al := range listeners {
 		wg.Add(1)
@@ -458,7 +522,7 @@ func portForwardSubcommand(ctx context.Context, args []string, streams cliIO) in
 				go func(c net.Conn) {
 					defer wg.Done()
 					defer c.Close()
-					proxyTunnelConn(tunnelCtx, client, c, al.spec, streams.stderr)
+					proxyTunnelConn(tunnelCtx, client, c, al.spec, safeStderr)
 				}(conn)
 			}
 		}(al)
@@ -468,6 +532,9 @@ func portForwardSubcommand(ctx context.Context, args []string, streams cliIO) in
 }
 
 func proxyTunnelConn(ctx context.Context, client *control.Client, local net.Conn, ts tunnelSpec, stderr io.Writer) {
+	stop := context.AfterFunc(ctx, func() { _ = local.Close() })
+	defer stop()
+
 	stream, err := client.OpenStream(ctx, control.MethodNetDial, control.NetDialRequest{
 		Proto:            "tcp",
 		GuestIP:          ts.guestIP,
@@ -475,14 +542,18 @@ func proxyTunnelConn(ctx context.Context, client *control.Client, local net.Conn
 		LoopbackFallback: ts.guestIP == "",
 	})
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "rungv port-forward: dial guest %d: %v\n", ts.guestPort, err)
+		if ctx.Err() == nil {
+			_, _ = fmt.Fprintf(stderr, "rungv port-forward: dial guest %d: %v\n", ts.guestPort, err)
+		}
 		return
 	}
 	defer stream.Close()
 
 	var resp control.NetDialResponse
 	if err := stream.WaitResponse(ctx, &resp); err != nil {
-		_, _ = fmt.Fprintf(stderr, "rungv port-forward: dial guest %d: %v\n", ts.guestPort, err)
+		if ctx.Err() == nil {
+			_, _ = fmt.Fprintf(stderr, "rungv port-forward: dial guest %d: %v\n", ts.guestPort, err)
+		}
 		return
 	}
 
@@ -497,8 +568,8 @@ func proxyTunnelConn(ctx context.Context, client *control.Client, local net.Conn
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(local, stream.ChannelReader(ctx, control.ChannelGeneric))
-		if tc, ok := local.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
+		if cw, ok := local.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
 		}
 	}()
 	wg.Wait()

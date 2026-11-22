@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -143,6 +144,7 @@ func (s *Sandbox) ControlCapabilities() []string {
 		control.CapProcList,
 		control.CapProcSignal,
 		control.CapKernelLog,
+		control.CapKernelLogClear,
 		control.CapDebug,
 	}
 	if hasCkptDir {
@@ -178,10 +180,12 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 	if ln == nil {
 		return fmt.Errorf("%w: Config.ControlListener is nil", ErrInvalidConfig)
 	}
+	caps := s.ControlCapabilities()
 	srv := control.NewServer(lockedControlListener{Listener: ln, locked: locked}, control.ServerConfig{
 		SandboxID:        cmp.Or(cfg.Name, "gvx-default"),
 		Token:            cfg.ControlToken,
-		Capabilities:     s.ControlCapabilities(),
+		Capabilities:     caps,
+		AllowFDs:         slices.Contains(caps, control.CapMountVolumeAttach),
 		MaxConnections:   cfg.Tuning.Int(tuning.ControlMaxConnections),
 		MaxFrameBytes:    int(cfg.Tuning.Size(tuning.ControlMaxFrameBytes)),
 		HandshakeTimeout: cfg.Tuning.Duration(tuning.ControlHandshakeTimeout),
@@ -222,6 +226,7 @@ func (s *Sandbox) HandleLegacyCheckpoint(ctx context.Context, req control.Legacy
 func (s *Sandbox) HandleStream(ctx context.Context, stream *control.Stream, req control.RequestEnvelope, fds []int) error {
 	if req.Method != control.MethodMountAdd {
 		closeUnusedFDs(fds)
+		fds = nil
 	}
 	switch req.Method {
 	case control.MethodPing:
@@ -279,7 +284,6 @@ func (s *Sandbox) HandleStream(ctx context.Context, stream *control.Stream, req 
 	case control.MethodDebugLogLevel:
 		return s.handleDebugLogLevel(ctx, stream, req.Params)
 	default:
-		closeUnusedFDs(fds)
 		return control.NewErrorf(control.CodeUnsupported, "unknown control method %q", req.Method)
 	}
 }

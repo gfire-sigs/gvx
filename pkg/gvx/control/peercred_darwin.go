@@ -24,6 +24,9 @@ import (
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
+// processEUID is captured before host lockdown applies.
+var processEUID = uint32(os.Geteuid())
+
 // VerifyPeerCredentials verifies that a Unix domain socket peer runs under the
 // same effective user ID as the server process via LOCAL_PEERCRED.
 func VerifyPeerCredentials(conn net.Conn) error {
@@ -50,9 +53,8 @@ func VerifyPeerCredentials(conn net.Conn) error {
 	if credErr != nil {
 		return fmt.Errorf("LOCAL_PEERCRED: %w", credErr)
 	}
-	wantUID := uint32(os.Geteuid())
-	if peerUID != wantUID {
-		return fmt.Errorf("unauthorized peer uid %d (want %d)", peerUID, wantUID)
+	if peerUID != processEUID {
+		return fmt.Errorf("unauthorized peer uid %d (want %d)", peerUID, processEUID)
 	}
 	return nil
 }

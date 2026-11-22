@@ -120,16 +120,27 @@ func (s *Sandbox) handlePortAdd(_ context.Context, stream *control.Stream, raw j
 	}
 
 	added := make([]control.PortRuleInfo, 0, len(parsed))
+	boundRules := make([]netbackend.PortForwardRule, 0, len(parsed))
 	for _, r := range parsed {
 		bound, err := s.portForwarder.AddDynamicRule(r, req.Replace, listenTCP, listenUDP)
 		if err != nil {
+			// Roll back any rules already bound earlier in this batch.
+			for _, prev := range boundRules {
+				_, _ = s.portForwarder.RemoveRule(prev, false)
+			}
 			if errors.Is(err, netbackend.ErrPortRuleExists) {
 				return control.NewError(control.CodeAlreadyExists, err.Error())
 			}
+			if errors.Is(err, netbackend.ErrDynamicPortLimit) {
+				return control.NewError(control.CodeLimitExceeded, err.Error())
+			}
 			return control.NewError(control.CodeInternal, err.Error())
 		}
+		boundRules = append(boundRules, bound)
 		info := toPortRuleInfo(netbackend.BoundPortRule{Rule: bound, Source: netbackend.PortSourceDynamic})
 		added = append(added, info)
+	}
+	for _, bound := range boundRules {
 		s.emitEvent("port", "add", map[string]string{
 			"proto":      bound.Proto,
 			"host_ip":    bound.HostIP,

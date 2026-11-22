@@ -109,6 +109,12 @@ func (s *Sandbox) handleFSStat(ctx context.Context, stream *control.Stream, raw 
 	return stream.Reply(st)
 }
 
+type exportDirKey struct {
+	devMajor uint32
+	devMinor uint32
+	ino      uint64
+}
+
 func (s *Sandbox) handleFSExport(ctx context.Context, stream *control.Stream, raw json.RawMessage) error {
 	var req control.FSExportRequest
 	if err := decodeParams(raw, &req); err != nil {
@@ -172,12 +178,17 @@ func (s *Sandbox) handleFSExport(ctx context.Context, stream *control.Stream, ra
 		if target == "/" {
 			baseName = ""
 		}
-		exportErr = exportDirToTar(ctx, sctxWithRoot, vfsObj, creds, exportRoot, target, baseName, req.FollowLink, skipPseudo, req.UpperOnly, tw)
+		var activeDirs map[exportDirKey]bool
+		if req.FollowLink {
+			activeDirs = make(map[exportDirKey]bool)
+		}
+		exportErr = exportDirToTar(ctx, sctxWithRoot, vfsObj, creds, exportRoot, target, baseName, req.FollowLink, skipPseudo, req.UpperOnly, activeDirs, tw)
 	} else {
 		exportErr = exportEntryToTar(ctx, sctxWithRoot, vfsObj, creds, exportRoot, target, path.Base(target), req.FollowLink, req.UpperOnly, tw)
 	}
 	if exportErr != nil {
-		_ = tw.Close()
+		// Do not call tw.Close() so the client never observes valid tar EOF on a
+		// truncated archive; dispatchStream cancels the stream on error return.
 		return control.NewErrorf(control.CodeInternal, "export %q: %v", target, exportErr)
 	}
 	if err := tw.Close(); err != nil {
@@ -201,17 +212,26 @@ func exportDirToTar(
 	root vfs.VirtualDentry,
 	guestDir, tarPrefix string,
 	followLink, skipPseudo, upperOnly bool,
+	activeDirs map[exportDirKey]bool,
 	tw *tar.Writer,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if tarPrefix != "" {
-		pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(guestDir), FollowFinalSymlink: followLink}
-		st, err := vfsObj.StatAt(sctx, creds, &pop, &vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
-		if err != nil {
-			return err
+	dirPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(guestDir), FollowFinalSymlink: followLink}
+	st, err := vfsObj.StatAt(sctx, creds, &dirPop, &vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
+	if err != nil {
+		return err
+	}
+	if activeDirs != nil {
+		key := exportDirKey{devMajor: st.DevMajor, devMinor: st.DevMinor, ino: st.Ino}
+		if activeDirs[key] {
+			return nil
 		}
+		activeDirs[key] = true
+		defer delete(activeDirs, key)
+	}
+	if tarPrefix != "" {
 		hdr := &tar.Header{
 			Typeflag: tar.TypeDir,
 			Name:     strings.TrimSuffix(tarPrefix, "/") + "/",
@@ -224,9 +244,25 @@ func exportDirToTar(
 			return err
 		}
 	}
+	if upperOnly {
+		if val, xErr := vfsObj.GetXattrAt(sctx, creds, &dirPop, &vfs.GetXattrOptions{Name: "trusted.overlay.opaque", Size: 16}); xErr == nil && val == "y" {
+			opqName := ".wh..wh..opq"
+			if tarPrefix != "" {
+				opqName = path.Join(tarPrefix, opqName)
+			}
+			if err := tw.WriteHeader(&tar.Header{
+				Typeflag: tar.TypeReg,
+				Name:     opqName,
+				Mode:     0o644,
+				Size:     0,
+				ModTime:  time.Unix(0, st.Mtime.ToNsec()),
+			}); err != nil {
+				return err
+			}
+		}
+	}
 
-	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(guestDir), FollowFinalSymlink: followLink}
-	fd, err := vfsObj.OpenAt(sctx, creds, &pop, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
+	fd, err := vfsObj.OpenAt(sctx, creds, &dirPop, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
 	if err != nil {
 		return err
 	}
@@ -256,15 +292,15 @@ func exportDirToTar(
 			childTar = path.Join(tarPrefix, name)
 		}
 		cPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(childGuest), FollowFinalSymlink: followLink}
-		st, err := vfsObj.StatAt(sctx, creds, &cPop, &vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
+		cst, err := vfsObj.StatAt(sctx, creds, &cPop, &vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
 		if err != nil {
 			if linuxerr.Equals(linuxerr.ENOENT, err) {
 				continue
 			}
 			return err
 		}
-		if st.Mode&linux.S_IFMT == linux.S_IFDIR {
-			if err := exportDirToTar(ctx, sctx, vfsObj, creds, root, childGuest, childTar, followLink, false, upperOnly, tw); err != nil {
+		if cst.Mode&linux.S_IFMT == linux.S_IFDIR {
+			if err := exportDirToTar(ctx, sctx, vfsObj, creds, root, childGuest, childTar, followLink, false, upperOnly, activeDirs, tw); err != nil {
 				return err
 			}
 			continue
@@ -375,15 +411,74 @@ func exportEntryToTar(
 }
 
 func cleanRelativeTarName(raw string) (string, bool) {
-	cleaned := path.Clean("/" + strings.TrimPrefix(raw, "/"))
+	norm := strings.ReplaceAll(raw, `\`, "/")
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == ".." {
+			return "", false
+		}
+	}
+	cleaned := path.Clean("/" + strings.TrimPrefix(norm, "/"))
 	cleaned = strings.TrimPrefix(cleaned, "/")
 	if cleaned == "" || cleaned == "." {
 		return "", false
 	}
-	if strings.HasPrefix(cleaned, "..") || strings.Contains(cleaned, "/../") {
-		return "", false
-	}
 	return cleaned, true
+}
+
+// resolveImportDirUnder walks relDir component by component beneath destVD
+// without following symlinks, creating missing directories when create is true.
+// The caller owns one reference on the returned VirtualDentry.
+func resolveImportDirUnder(
+	sctx gvcontext.Context,
+	vfsObj *vfs.VirtualFilesystem,
+	creds *auth.Credentials,
+	destVD vfs.VirtualDentry,
+	relDir string,
+	create bool,
+) (vfs.VirtualDentry, error) {
+	cur := destVD
+	cur.IncRef()
+	if relDir == "" || relDir == "." {
+		return cur, nil
+	}
+	for _, seg := range strings.Split(relDir, "/") {
+		if seg == "" || seg == "." {
+			continue
+		}
+		pop := vfs.PathOperation{
+			Root:               destVD,
+			Start:              cur,
+			Path:               makeFPath(seg),
+			FollowFinalSymlink: false,
+		}
+		st, err := vfsObj.StatAt(sctx, creds, &pop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+		if err != nil {
+			if !create || !linuxerr.Equals(linuxerr.ENOENT, err) {
+				cur.DecRef(sctx)
+				return vfs.VirtualDentry{}, err
+			}
+			if mkErr := vfsObj.MkdirAt(sctx, creds, &pop, &vfs.MkdirOptions{Mode: 0o755}); mkErr != nil && !linuxerr.Equals(linuxerr.EEXIST, mkErr) {
+				cur.DecRef(sctx)
+				return vfs.VirtualDentry{}, mkErr
+			}
+			st, err = vfsObj.StatAt(sctx, creds, &pop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+			if err != nil {
+				cur.DecRef(sctx)
+				return vfs.VirtualDentry{}, err
+			}
+		}
+		if st.Mode&linux.S_IFMT != linux.S_IFDIR {
+			cur.DecRef(sctx)
+			return vfs.VirtualDentry{}, control.NewErrorf(control.CodeInvalidArgument, "tar import refuses traversing non-directory component %q", seg)
+		}
+		next, err := vfsObj.GetDentryAt(sctx, creds, &pop, &vfs.GetDentryOptions{CheckSearchable: true})
+		cur.DecRef(sctx)
+		if err != nil {
+			return vfs.VirtualDentry{}, err
+		}
+		cur = next
+	}
+	return cur, nil
 }
 
 func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, raw json.RawMessage) error {
@@ -423,16 +518,22 @@ func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, ra
 		overrideUID, overrideGID = &uid, &gid
 	}
 
-	destStat, err := statGuestPath(sctxWithRoot, vfsObj, rootCreds, root, dest, true)
+	destPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(dest), FollowFinalSymlink: true}
+	destSt, err := vfsObj.StatAt(sctxWithRoot, rootCreds, &destPop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
 	if err != nil {
+		if linuxerr.Equals(linuxerr.ENOENT, err) || linuxerr.Equals(linuxerr.ENOTDIR, err) {
+			return control.NewErrorf(control.CodeNotFound, "destination directory %q does not exist", dest)
+		}
 		return control.NewErrorf(control.CodeInternal, "stat destination %q: %v", dest, err)
 	}
-	if !destStat.Exists {
-		return control.NewErrorf(control.CodeNotFound, "destination directory %q does not exist", dest)
-	}
-	if destStat.Type != "dir" {
+	if destSt.Mode&linux.S_IFMT != linux.S_IFDIR {
 		return control.NewErrorf(control.CodeInvalidArgument, "destination %q is not a directory", dest)
 	}
+	destVD, err := vfsObj.GetDentryAt(sctxWithRoot, rootCreds, &destPop, &vfs.GetDentryOptions{CheckSearchable: true})
+	if err != nil {
+		return control.NewErrorf(control.CodeInternal, "resolve destination %q: %v", dest, err)
+	}
+	defer destVD.DecRef(sctxWithRoot)
 
 	tr := tar.NewReader(stream.ChannelReader(ctx, control.ChannelGeneric))
 	var (
@@ -450,16 +551,31 @@ func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, ra
 		}
 		rel, ok := cleanRelativeTarName(hdr.Name)
 		if !ok {
+			if strings.Contains(hdr.Name, "..") {
+				return control.NewErrorf(control.CodeInvalidArgument, "unsafe tar path %q escapes destination", hdr.Name)
+			}
 			continue
 		}
+		parentRel := path.Dir(rel)
+		baseName := path.Base(rel)
 		fullPath := path.Join(dest, rel)
-		if parent := path.Dir(fullPath); parent != "/" && parent != "." {
-			if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, rootCreds, root, parent, 0o755); err != nil {
-				return control.NewErrorf(control.CodeInternal, "create parent dir %q: %v", parent, err)
+
+		parentVD, pErr := resolveImportDirUnder(sctxWithRoot, vfsObj, rootCreds, destVD, parentRel, true)
+		if pErr != nil {
+			var pe *control.ProtoError
+			if errors.As(pErr, &pe) {
+				return pe
 			}
+			return control.NewErrorf(control.CodeInternal, "create parent dir %q: %v", path.Join(dest, parentRel), pErr)
 		}
 
-		applyOwnerAndTime := func(targetPath string, isSymlink bool) {
+		pop := vfs.PathOperation{
+			Root:               destVD,
+			Start:              parentVD,
+			Path:               makeFPath(baseName),
+			FollowFinalSymlink: false,
+		}
+		applyOwnerAndTime := func(isSymlink bool) {
 			var stat linux.Statx
 			if overrideUID != nil {
 				stat.Mask |= linux.STATX_UID | linux.STATX_GID
@@ -481,21 +597,26 @@ func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, ra
 			if stat.Mask == 0 {
 				return
 			}
-			pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(targetPath), FollowFinalSymlink: false}
 			_ = vfsObj.SetStatAt(sctxWithRoot, rootCreds, &pop, &vfs.SetStatOptions{Stat: stat})
 		}
 
-		pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(fullPath)}
+		var entryErr error
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if existing, _ := statGuestPath(sctxWithRoot, vfsObj, rootCreds, root, fullPath, false); existing.Exists {
-				if existing.Type != "dir" {
+			if existing, stErr := vfsObj.StatAt(sctxWithRoot, rootCreds, &pop, &vfs.StatOptions{Mask: linux.STATX_TYPE}); stErr == nil {
+				if existing.Mode&linux.S_IFMT != linux.S_IFDIR {
 					if req.NoOverwriteDir {
-						return control.NewErrorf(control.CodeAlreadyExists, "cannot overwrite non-directory %q with directory", fullPath)
+						entryErr = control.NewErrorf(control.CodeAlreadyExists, "cannot overwrite non-directory %q with directory", fullPath)
+						break
 					}
 					_ = vfsObj.UnlinkAt(sctxWithRoot, rootCreds, &pop)
-					if err := vfsObj.MkdirAt(sctxWithRoot, rootCreds, &pop, &vfs.MkdirOptions{Mode: linux.FileMode(hdr.Mode & 0o7777)}); err != nil {
-						return control.NewErrorf(control.CodeInternal, "mkdir %q: %v", fullPath, err)
+					mode := linux.FileMode(hdr.Mode & 0o7777)
+					if mode == 0 {
+						mode = 0o755
+					}
+					if err := vfsObj.MkdirAt(sctxWithRoot, rootCreds, &pop, &vfs.MkdirOptions{Mode: mode}); err != nil {
+						entryErr = control.NewErrorf(control.CodeInternal, "mkdir %q: %v", fullPath, err)
+						break
 					}
 				}
 			} else {
@@ -504,42 +625,70 @@ func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, ra
 					mode = 0o755
 				}
 				if err := vfsObj.MkdirAt(sctxWithRoot, rootCreds, &pop, &vfs.MkdirOptions{Mode: mode}); err != nil && !linuxerr.Equals(linuxerr.EEXIST, err) {
-					return control.NewErrorf(control.CodeInternal, "mkdir %q: %v", fullPath, err)
+					entryErr = control.NewErrorf(control.CodeInternal, "mkdir %q: %v", fullPath, err)
+					break
 				}
 			}
-			applyOwnerAndTime(fullPath, false)
+			applyOwnerAndTime(false)
 			filesWritten++
 
 		case tar.TypeSymlink:
 			_ = vfsObj.UnlinkAt(sctxWithRoot, rootCreds, &pop)
 			if err := vfsObj.SymlinkAt(sctxWithRoot, rootCreds, &pop, hdr.Linkname); err != nil {
-				return control.NewErrorf(control.CodeInternal, "symlink %q: %v", fullPath, err)
+				entryErr = control.NewErrorf(control.CodeInternal, "symlink %q: %v", fullPath, err)
+				break
 			}
-			applyOwnerAndTime(fullPath, true)
+			applyOwnerAndTime(true)
 			filesWritten++
 
 		case tar.TypeLink:
-			linkRel, ok := cleanRelativeTarName(hdr.Linkname)
-			if !ok {
-				continue
+			linkRel, linkOK := cleanRelativeTarName(hdr.Linkname)
+			if !linkOK {
+				entryErr = control.NewErrorf(control.CodeInvalidArgument, "unsafe hard link target %q", hdr.Linkname)
+				break
 			}
-			targetPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(path.Join(dest, linkRel))}
+			targetParentVD, tpErr := resolveImportDirUnder(sctxWithRoot, vfsObj, rootCreds, destVD, path.Dir(linkRel), false)
+			if tpErr != nil {
+				var pe *control.ProtoError
+				if errors.As(tpErr, &pe) {
+					entryErr = pe
+				} else {
+					entryErr = control.NewErrorf(control.CodeInvalidArgument, "resolve hard link target %q: %v", linkRel, tpErr)
+				}
+				break
+			}
+			targetPop := vfs.PathOperation{
+				Root:               destVD,
+				Start:              targetParentVD,
+				Path:               makeFPath(path.Base(linkRel)),
+				FollowFinalSymlink: false,
+			}
 			_ = vfsObj.UnlinkAt(sctxWithRoot, rootCreds, &pop)
 			if err := vfsObj.LinkAt(sctxWithRoot, rootCreds, &targetPop, &pop); err != nil {
-				return control.NewErrorf(control.CodeInternal, "link %q -> %q: %v", fullPath, linkRel, err)
+				targetParentVD.DecRef(sctxWithRoot)
+				entryErr = control.NewErrorf(control.CodeInternal, "link %q -> %q: %v", fullPath, linkRel, err)
+				break
 			}
+			targetParentVD.DecRef(sctxWithRoot)
 			filesWritten++
 
 		case tar.TypeReg, tar.TypeRegA:
-			if existing, _ := statGuestPath(sctxWithRoot, vfsObj, rootCreds, root, fullPath, false); existing.Exists {
-				if existing.Type == "dir" {
+			if existing, stErr := vfsObj.StatAt(sctxWithRoot, rootCreds, &pop, &vfs.StatOptions{Mask: linux.STATX_TYPE}); stErr == nil {
+				switch existing.Mode & linux.S_IFMT {
+				case linux.S_IFDIR:
 					if req.NoOverwriteDir {
-						return control.NewErrorf(control.CodeAlreadyExists, "cannot overwrite directory %q with file", fullPath)
+						entryErr = control.NewErrorf(control.CodeAlreadyExists, "cannot overwrite directory %q with file", fullPath)
+					} else {
+						entryErr = control.NewErrorf(control.CodeInvalidArgument, "cannot overwrite directory %q with regular file", fullPath)
 					}
-					return control.NewErrorf(control.CodeInvalidArgument, "cannot overwrite directory %q with regular file", fullPath)
-				}
-				if existing.Type == "symlink" {
+				case linux.S_IFREG:
+				default:
+					// Replace symlinks, FIFOs, sockets, and device nodes rather
+					// than following or blocking on them.
 					_ = vfsObj.UnlinkAt(sctxWithRoot, rootCreds, &pop)
+				}
+				if entryErr != nil {
+					break
 				}
 			}
 			mode := linux.FileMode(hdr.Mode & 0o7777)
@@ -547,11 +696,12 @@ func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, ra
 				mode = 0o644
 			}
 			fd, err := vfsObj.OpenAt(sctxWithRoot, rootCreds, &pop, &vfs.OpenOptions{
-				Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC,
+				Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC | linux.O_NOFOLLOW,
 				Mode:  mode,
 			})
 			if err != nil {
-				return control.NewErrorf(control.CodeInternal, "open %q: %v", fullPath, err)
+				entryErr = control.NewErrorf(control.CodeInternal, "open %q: %v", fullPath, err)
+				break
 			}
 			for {
 				n, rErr := tr.Read(buf)
@@ -559,21 +709,27 @@ func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, ra
 					w, wErr := fd.Write(sctxWithRoot, usermem.BytesIOSequence(buf[:n]), vfs.WriteOptions{})
 					bytesWritten += w
 					if wErr != nil {
-						fd.DecRef(sctxWithRoot)
-						return control.NewErrorf(control.CodeInternal, "write %q: %v", fullPath, wErr)
+						entryErr = control.NewErrorf(control.CodeInternal, "write %q: %v", fullPath, wErr)
+						break
 					}
 				}
 				if errors.Is(rErr, io.EOF) {
 					break
 				}
 				if rErr != nil {
-					fd.DecRef(sctxWithRoot)
-					return control.NewErrorf(control.CodeInvalidArgument, "read tar entry %q: %v", fullPath, rErr)
+					entryErr = control.NewErrorf(control.CodeInvalidArgument, "read tar entry %q: %v", fullPath, rErr)
+					break
 				}
 			}
 			fd.DecRef(sctxWithRoot)
-			applyOwnerAndTime(fullPath, false)
-			filesWritten++
+			if entryErr == nil {
+				applyOwnerAndTime(false)
+				filesWritten++
+			}
+		}
+		parentVD.DecRef(sctxWithRoot)
+		if entryErr != nil {
+			return entryErr
 		}
 	}
 

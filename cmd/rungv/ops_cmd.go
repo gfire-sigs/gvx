@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -200,6 +201,7 @@ func statsSubcommand(ctx context.Context, args []string, stdout, stderr io.Write
 	}
 	defer client.Close()
 
+	tw := tabwriter.NewWriter(stdout, 12, 1, 2, ' ', 0)
 	if *noStream {
 		callCtx, cancel := target.callContext(ctx)
 		defer cancel()
@@ -207,7 +209,7 @@ func statsSubcommand(ctx context.Context, args []string, stdout, stderr io.Write
 		if err := client.Call(callCtx, control.MethodStats, control.StatsRequest{Stream: false}, &sample); err != nil {
 			return controlFail(stderr, cmdName, err)
 		}
-		return printStatsSample(stdout, stderr, cmdName, format, sample, true)
+		return printStatsSample(stdout, tw, stderr, cmdName, format, sample, true)
 	}
 
 	stream, err := client.OpenStream(ctx, control.MethodStats, control.StatsRequest{
@@ -223,7 +225,7 @@ func statsSubcommand(ctx context.Context, args []string, stdout, stderr io.Write
 	if err := stream.WaitResponse(ctx, &first); err != nil {
 		return controlFail(stderr, cmdName, err)
 	}
-	if code := printStatsSample(stdout, stderr, cmdName, format, first, true); code != 0 {
+	if code := printStatsSample(stdout, tw, stderr, cmdName, format, first, true); code != 0 {
 		return code
 	}
 	for {
@@ -241,13 +243,13 @@ func statsSubcommand(ctx context.Context, args []string, stdout, stderr io.Write
 		if err := json.Unmarshal(ev.Data, &sample); err != nil {
 			continue
 		}
-		if code := printStatsSample(stdout, stderr, cmdName, format, sample, false); code != 0 {
+		if code := printStatsSample(stdout, tw, stderr, cmdName, format, sample, false); code != 0 {
 			return code
 		}
 	}
 }
 
-func printStatsSample(stdout, stderr io.Writer, cmdName, format string, s control.StatsSample, header bool) int {
+func printStatsSample(stdout io.Writer, tw *tabwriter.Writer, stderr io.Writer, cmdName, format string, s control.StatsSample, header bool) int {
 	spec := strings.TrimSpace(format)
 	if spec == "json" {
 		enc := json.NewEncoder(stdout)
@@ -272,7 +274,6 @@ func printStatsSample(stdout, stderr io.Writer, cmdName, format string, s contro
 		rx += n.RxBytes
 		tx += n.TxBytes
 	}
-	tw := tabwriter.NewWriter(stdout, 10, 1, 2, ' ', 0)
 	if header {
 		_, _ = fmt.Fprintln(tw, "CPU_USER\tCPU_SYS\tMEM_USAGE / LIMIT\tNET_IO\tPIDS")
 	}
@@ -364,6 +365,12 @@ func killSubcommand(ctx context.Context, args []string, _, stderr io.Writer) int
 	if fs.NArg() > 0 {
 		return controlUsageError(stderr, cmdName, "unexpected argument %q", fs.Arg(0))
 	}
+	if *pid < 0 {
+		return controlUsageError(stderr, cmdName, "--pid must be non-negative")
+	}
+	if *all && *pid > 0 {
+		return controlUsageError(stderr, cmdName, "--pid cannot be combined with --all")
+	}
 
 	client, err := target.dial(ctx, "")
 	if err != nil {
@@ -401,6 +408,9 @@ func stopSubcommand(ctx context.Context, args []string, _, stderr io.Writer) int
 	if fs.NArg() > 0 {
 		return controlUsageError(stderr, cmdName, "unexpected argument %q", fs.Arg(0))
 	}
+	if grace < 0 {
+		return controlUsageError(stderr, cmdName, "-t/--time must be non-negative")
+	}
 
 	client, err := target.dial(ctx, "")
 	if err != nil {
@@ -410,9 +420,10 @@ func stopSubcommand(ctx context.Context, args []string, _, stderr io.Writer) int
 	callCtx, cancel := target.callContext(ctx)
 	defer cancel()
 
+	timeoutMS := grace.Milliseconds()
 	if err := client.Call(callCtx, control.MethodStop, control.StopRequest{
 		Signal:    strings.TrimSpace(sig),
-		TimeoutMS: grace.Milliseconds(),
+		TimeoutMS: &timeoutMS,
 	}, nil); err != nil {
 		return controlFail(stderr, cmdName, err)
 	}
@@ -438,6 +449,12 @@ func dmesgSubcommand(ctx context.Context, args []string, stdout, stderr io.Write
 	}
 	if fs.NArg() > 0 {
 		return controlUsageError(stderr, cmdName, "unexpected argument %q", fs.Arg(0))
+	}
+	if tail < 0 {
+		return controlUsageError(stderr, cmdName, "--tail must be non-negative")
+	}
+	if level < 0 || level > 8 {
+		return controlUsageError(stderr, cmdName, "--level must be between 0 and 8")
 	}
 
 	client, err := target.dial(ctx, "")
@@ -521,6 +538,10 @@ func eventsSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	if fs.NArg() > 0 {
 		return controlUsageError(stderr, cmdName, "unexpected argument %q", fs.Arg(0))
 	}
+	fmtMode := strings.ToLower(strings.TrimSpace(format))
+	if fmtMode != "" && fmtMode != "table" && fmtMode != "json" {
+		return controlUsageError(stderr, cmdName, "unsupported --format %q (want table or json)", format)
+	}
 
 	client, err := target.dial(ctx, "")
 	if err != nil {
@@ -541,7 +562,7 @@ func eventsSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	enc := json.NewEncoder(stdout)
 	enc.SetEscapeHTML(false)
-	asJSON := strings.EqualFold(strings.TrimSpace(format), "json")
+	asJSON := fmtMode == "json"
 	for {
 		ev, err := stream.RecvEvent(ctx)
 		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
@@ -567,6 +588,7 @@ func eventsSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 		for k, v := range se.Attributes {
 			attrs = append(attrs, k+"="+v)
 		}
+		slices.Sort(attrs)
 		_, _ = fmt.Fprintf(stdout, "%s %s %s %s\n", se.Timestamp.Format(time.RFC3339), se.Type, se.Action, strings.Join(attrs, " "))
 	}
 }
@@ -586,12 +608,29 @@ func pingSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	if fs.NArg() > 0 {
 		return controlUsageError(stderr, cmdName, "unexpected argument %q", fs.Arg(0))
 	}
+	if *waitDur < 0 {
+		return controlUsageError(stderr, cmdName, "--wait must be non-negative")
+	}
+	endpoint, err := target.resolveEndpoint("")
+	if err != nil {
+		return controlUsageError(stderr, cmdName, "%v", err)
+	}
+	if _, _, err := control.ParseEndpoint(endpoint); err != nil {
+		return controlUsageError(stderr, cmdName, "%v", err)
+	}
 
 	deadline := time.Now().Add(*waitDur)
 	var client *control.Client
-	var err error
 	for {
-		client, err = target.dial(ctx, "")
+		dialCtx := ctx
+		var dialCancel context.CancelFunc
+		if *waitDur > 0 {
+			dialCtx, dialCancel = context.WithDeadline(ctx, deadline)
+		}
+		client, err = target.dial(dialCtx, "")
+		if dialCancel != nil {
+			dialCancel()
+		}
 		if err == nil {
 			break
 		}
