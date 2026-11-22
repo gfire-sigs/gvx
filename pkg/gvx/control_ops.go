@@ -64,6 +64,7 @@ func (s *Sandbox) handleInspect(_ context.Context, stream *control.Stream) error
 
 	var memUsed uint64
 	if mf != nil {
+		mf.FlushCommitScan()
 		_ = mf.UpdateUsage(nil)
 		memUsed = mf.Accounting().Total()
 	}
@@ -160,6 +161,7 @@ func (s *Sandbox) sampleStats(k *kernel.Kernel) control.StatsSample {
 	}
 
 	if mf != nil {
+		mf.FlushCommitScan()
 		_ = mf.UpdateUsage(nil)
 		memStats, total := mf.Accounting().Copy()
 		sample.Memory = control.MemoryStatsSample{
