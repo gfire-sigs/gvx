@@ -547,19 +547,27 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 // executeActiveKernel starts k, attaches the watchdog and memory guard, waits
 // for guest exit or cancellation, and translates the exit status.
 func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, mf *pgalloc.MemoryFile, hostRAM uint64, startErrPrefix string) (int, error) {
-	if err := k.Start(); err != nil {
-		return 1, fmt.Errorf("%s: %w", startErrPrefix, err)
-	}
 	// The watchdog logs the stacks of a task that stays in the Sentry for a
 	// long time. GVX_DEBUG_LOG shows the log.
 	dog := watchdog.New(k, watchdog.DefaultOpts)
-	dog.Start()
-	defer dog.Stop()
 
+	// Publish activeKernel before k.Start() while holding opMu so that guest
+	// stdout observed immediately after startup never races ahead of control
+	// state ("running"), while mutating RPCs (exec, pause, checkpoint, mounts)
+	// wait until k.Start() and dog.Start() finish.
+	s.opMu.Lock()
 	s.mu.Lock()
 	s.startedAt = time.Now()
 	s.mu.Unlock()
 	s.setActiveKernel(k, dog)
+	if err := k.Start(); err != nil {
+		s.clearActiveKernel()
+		s.opMu.Unlock()
+		return 1, fmt.Errorf("%s: %w", startErrPrefix, err)
+	}
+	dog.Start()
+	s.opMu.Unlock()
+	defer dog.Stop()
 	defer s.clearActiveKernel()
 	s.emitEvent("sandbox", "started", nil)
 
