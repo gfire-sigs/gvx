@@ -1,0 +1,167 @@
+From f9c2a6a3c5de670bf050f63261c60b88911f42f2 Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Mon, 23 Nov 2026 00:29:14 +0900
+Subject: [PATCH] vrend: apply active sample mask to gl_SampleMaskIn
+
+Guest Mesa lowers GL_SAMPLE_COVERAGE to the gallium sample mask, and
+vrend forwards that mask through glSampleMaski with GL_SAMPLE_MASK.
+Apple OpenGL 4.1 applies GL_SAMPLE_MASK after the fragment shader, so
+gl_SampleMaskIn[0] contains all coverage bits. WebGL tests for sample
+variables (oes-sample-variables) then read an unmasked bit count.
+
+This change appends int sample_mask (std140 offset 656) and three scalar
+int pad members (offsets 660, 664, 668) to VirglBlock. It also appends
+GLint sample_mask and GLint sysval_pad[3] to struct sysval_uniform_block.
+The C struct stays 672 bytes (16-byte std140 aligned) without moving any
+prior field. When a fragment shader declares TGSI_SEMANTIC_SAMPLEMASK as
+a system value, vrend emits (gl_SampleMaskIn[0] & sample_mask) and
+requests VirglBlock. Shaders without gl_SampleMaskIn and without other
+VirglBlock fields stay byte-identical; shaders that already declare
+VirglBlock gain only the trailing members.
+
+Sub-context creation initializes the stored sample mask and
+sysvalue_data.sample_mask to all bits. vrend writes the guest mask while
+feat_multisample, feat_sample_mask, and rs_state.multisample are true.
+Otherwise vrend writes all bits, including when
+vrend_object_bind_rasterizer clears rs_state for handle 0. On hosts
+without feat_sample_mask, the uniform stays at all bits so the AND
+leaves gl_SampleMaskIn[0] unchanged. On hosts that apply GL_SAMPLE_MASK
+before the fragment shader, those bits are already clear, so the AND
+yields the same value.
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 29 ++++++++++++++++++++++++++++-
+ src/vrend/vrend_shader.c   | 16 +++++++++++++++-
+ 2 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index c8ee44c..8eb3b53 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -413,7 +413,11 @@ struct sysval_uniform_block {
+    GLfloat alpha_ref_val;
+    GLfloat clip_plane_enabled;
+    GLint drawid_base;
++   GLint sample_mask;
++   GLint sysval_pad[3];
+ };
++static_assert(sizeof(struct sysval_uniform_block) % 16 == 0,
++              "sysval_uniform_block must match std140 block alignment");
+ 
+ static struct global_renderer_state vrend_state;
+ 
+@@ -817,6 +821,7 @@ struct vrend_sub_context {
+    struct vrend_context *parent;
+    struct sysval_uniform_block sysvalue_data;
+    uint32_t sysvalue_data_cookie;
++   unsigned sample_mask;
+    uint32_t current_program_id;
+    uint32_t current_pipeline_id;
+ };
+@@ -6078,6 +6083,22 @@ static void vrend_draw_bind_images_shader(struct vrend_sub_context *sub_ctx, int
+    }
+ }
+ 
++/* Value that a fragment shader ANDs into gl_SampleMaskIn[0]: the guest
++ * sample mask while GL_SAMPLE_MASK is active, all bits otherwise. */
++static void
++vrend_update_sample_mask_sysval(struct vrend_sub_context *sub_ctx)
++{
++   GLint mask = (has_feature(feat_multisample) &&
++                 has_feature(feat_sample_mask) &&
++                 sub_ctx->rs_state.multisample)
++                   ? (GLint)sub_ctx->sample_mask
++                   : ~0;
++   if (sub_ctx->sysvalue_data.sample_mask != mask) {
++      sub_ctx->sysvalue_data.sample_mask = mask;
++      sub_ctx->sysvalue_data_cookie++;
++   }
++}
++
+ static void
+ vrend_fill_sysval_uniform_block (struct vrend_sub_context *sub_ctx)
+ {
+@@ -7520,6 +7541,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
+             glEnable(GL_SAMPLE_MASK);
+          else
+             glDisable(GL_SAMPLE_MASK);
++         vrend_update_sample_mask_sysval(ctx->sub);
+       }
+ 
+       /* GLES doesn't have GL_MULTISAMPLE */
+@@ -7553,6 +7575,7 @@ void vrend_object_bind_rasterizer(struct vrend_context *ctx,
+ 
+    if (handle == 0) {
+       memset(&ctx->sub->rs_state, 0, sizeof(ctx->sub->rs_state));
++      vrend_update_sample_mask_sysval(ctx->sub);
+       return;
+    }
+ 
+@@ -10899,10 +10922,12 @@ void vrend_set_clip_state(struct vrend_context *ctx, struct pipe_clip_state *ucp
+    }
+ }
+ 
+-void vrend_set_sample_mask(UNUSED struct vrend_context *ctx, unsigned sample_mask)
++void vrend_set_sample_mask(struct vrend_context *ctx, unsigned sample_mask)
+ {
+    if (has_feature(feat_sample_mask))
+       glSampleMaski(0, sample_mask);
++   ctx->sub->sample_mask = sample_mask;
++   vrend_update_sample_mask_sysval(ctx->sub);
+ }
+ 
+ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples)
+@@ -14037,6 +14062,8 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+    sub->object_hash = vrend_object_init_ctx_table();
+ 
+    sub->sysvalue_data.winsys_adjust_y = 1.f;
++   sub->sample_mask = ~0u;
++   sub->sysvalue_data.sample_mask = ~0;
+ 
+    ctx->sub = sub;
+    list_add(&sub->head, &ctx->sub_ctxs);
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index b1ea467..5f1992b 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -95,7 +95,8 @@ enum vrend_sysval_uniform {
+    UNIFORM_CLIP_PLANE,
+    UNIFORM_ALPHA_REF_VAL,
+    UNIFORM_PSTIPPLE_SAMPLER,
+-   UNIFORM_DRAWID_BASE
++   UNIFORM_DRAWID_BASE,
++   UNIFORM_SAMPLE_MASK
+ };
+ 
+ enum vec_type {
+@@ -2008,6 +2009,15 @@ iter_declaration(struct tgsi_iterate_context *iter,
+          snprintf(ctx->system_values[i].glsl_name, 64, "%s", name_prefix);
+          if (decl->Semantic.Name == TGSI_SEMANTIC_DRAWID)
+             ctx->glsl_strbufs.required_sysval_uniform_decls |= BIT(UNIFORM_DRAWID_BASE);
++         if (decl->Semantic.Name == TGSI_SEMANTIC_SAMPLEMASK) {
++            /* A host that applies GL_SAMPLE_MASK after the fragment shader
++             * (Apple OpenGL 4.1) gives full coverage in gl_SampleMaskIn.
++             * The guest lowers GL_SAMPLE_COVERAGE to the sample mask and
++             * expects the masked value. The AND has no effect on a host
++             * that masks before the shader. */
++            snprintf(ctx->system_values[i].glsl_name, 64, "(gl_SampleMaskIn[0] & sample_mask)");
++            ctx->glsl_strbufs.required_sysval_uniform_decls |= BIT(UNIFORM_SAMPLE_MASK);
++         }
+          break;
+       } else {
+          virgl_error("System value %d out of range\n", decl->Semantic.Name);
+@@ -8069,6 +8079,10 @@ static void emit_required_sysval_uniforms(struct vrend_strbuf *block, uint32_t m
+    strbuf_append(block, "\tfloat alpha_ref_val;\n");
+    strbuf_append(block, "\tbool clip_plane_enabled;\n");
+    strbuf_append(block, "\tint drawid_base;\n");
++   strbuf_append(block, "\tint sample_mask;\n");
++   strbuf_append(block, "\tint sysval_pad0;\n");
++   strbuf_append(block, "\tint sysval_pad1;\n");
++   strbuf_append(block, "\tint sysval_pad2;\n");
+    strbuf_append(block, "};\n");
+ 
+ }
+-- 
+2.55.0
+
