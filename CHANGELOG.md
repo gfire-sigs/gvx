@@ -2,11 +2,13 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.20.10012026111600] - 2026-11-23
+
+This release enables live `SCM_RIGHTS` volume attachment and `XDG_RUNTIME_DIR` socket resolution on `GOOS=android` (#230).
 
 ### Bug Fixes
 
-- **Android `SCM_RIGHTS` volume attachment (`pkg/gvx`, `pkg/gvx/control`)**: Treat `runtime.GOOS == "android"` identically to `"linux"` for `mount.volume_attach` capability advertisement, `scm_rights` server negotiation, lockdown error reporting, and `XDG_RUNTIME_DIR` control socket directory resolution.
+- **Android `SCM_RIGHTS` volume attachment (`pkg/gvx`, `pkg/gvx/control`)** (#230): Control servers now treat `runtime.GOOS == "android"` identically to `"linux"` for `mount.volume_attach`, `scm_rights` negotiation, and lockdown errors. Control endpoints also resolve socket directories under `XDG_RUNTIME_DIR` identically on Android.
 
 ## [v0.20.10002026111600] - 2026-11-22
 
