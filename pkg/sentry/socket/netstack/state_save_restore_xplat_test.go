@@ -17,10 +17,13 @@ package netstack
 import (
 	"bytes"
 	goContext "context"
+	"slices"
 	"testing"
 
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/state"
 	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/faketime"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
 	"z.gfire.dev/gvx/pkg/tcpip/link/veth"
@@ -175,5 +178,63 @@ func TestNetstackXplatStateAndPoliciesSurviveSaveLoad(t *testing.T) {
 	}
 	if !restored.Stack.SourceAddressValid(2, sender, ethAddr, 0, header.UDPProtocolNumber) {
 		t.Error("SourceAddressValid rejected a valid subnet source on link 2 after restore")
+	}
+}
+
+func TestLegacyNetstackCheckpointRestoresAndResavesIPTables(t *testing.T) {
+	roundTrip := func(loadCtx goContext.Context, original *Stack) *Stack {
+		t.Helper()
+		var buf bytes.Buffer
+		if _, err := state.Save(t.Context(), &buf, &original); err != nil {
+			t.Fatalf("state.Save: %v", err)
+		}
+		var restored *Stack
+		if _, err := state.Load(loadCtx, &buf, &restored); err != nil {
+			t.Fatalf("state.Load: %v", err)
+		}
+		t.Cleanup(restored.Stack.Destroy)
+		return restored
+	}
+
+	// Do not opt in to capture until the first restore.
+	legacy := NewStack(stack.New(stack.Options{Clock: faketime.NewManualClock()}), 1)
+	t.Cleanup(legacy.Stack.Destroy)
+	restored := roundTrip(WithIPTablesCheckpointRestore(gvcontext.Background()), legacy)
+	tables := restored.Stack.IPTables()
+	if tables == nil {
+		t.Fatal("legacy iptables missing after decode")
+	}
+	if got := restored.ConntrackMax(); got != stack.DefaultConntrackMax {
+		t.Errorf("legacy conntrack max = %d, want %d", got, stack.DefaultConntrackMax)
+	}
+	for _, ipv6 := range []bool{false, true} {
+		table := tables.GetTable(stack.FilterID, ipv6)
+		input := table.BuiltinChains[stack.Input]
+		target := table.Rules[input].Target
+		if got, _ := target.Action(nil, stack.Input, nil, nil); got != stack.RuleAccept {
+			t.Errorf("legacy filter INPUT verdict (ipv6=%t) = %v, want ACCEPT", ipv6, got)
+		}
+		if _, bare := target.(*stack.AcceptTarget); bare {
+			t.Errorf("legacy filter INPUT target (ipv6=%t) has no Linux wrapper", ipv6)
+		}
+		table.Rules = slices.Clone(table.Rules)
+		table.Rules[input].Target = &stack.DropTarget{NetworkProtocol: table.Rules[input].Filter.NetworkProtocol()}
+		tables.ReplaceTable(stack.FilterID, table, ipv6)
+	}
+
+	resaved := roundTrip(t.Context(), restored)
+	resavedTables := resaved.Stack.IPTables()
+	if resavedTables == nil {
+		t.Fatal("resaved iptables missing after decode")
+	}
+	for _, ipv6 := range []bool{false, true} {
+		table := resavedTables.GetTable(stack.FilterID, ipv6)
+		target := table.Rules[table.BuiltinChains[stack.Input]].Target
+		if got, _ := target.Action(nil, stack.Input, nil, nil); got != stack.RuleDrop {
+			t.Errorf("resaved filter INPUT verdict (ipv6=%t) = %v, want DROP", ipv6, got)
+		}
+		if _, bare := target.(*stack.DropTarget); bare {
+			t.Errorf("resaved filter INPUT target (ipv6=%t) has no Linux wrapper", ipv6)
+		}
 	}
 }

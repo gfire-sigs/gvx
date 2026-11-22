@@ -567,9 +567,7 @@ func (s *Sandbox) Close() error {
 	}
 
 	if s.restoredKernel != nil {
-		if tk := s.restoredKernel.Timekeeper(); tk != nil {
-			tk.Destroy()
-		}
+		stopRestoredKernelTimers(s.restoredKernel)
 		s.restoredKernel = nil
 	}
 

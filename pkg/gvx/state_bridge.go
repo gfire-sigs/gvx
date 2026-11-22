@@ -325,14 +325,11 @@ func newGuestNetnsCreator(k *kernel.Kernel, opts netbackend.StackOptions) *guest
 }
 
 func (c *guestNetnsCreator) stackOptions() netbackend.StackOptions {
-	opts := netbackend.StackOptions{
+	return netbackend.StackOptions{
 		RawSockets:        c.rawSockets,
 		PacketSocketWrite: c.packetSocketWrite,
+		IPTables:          netfilter.DefaultLinuxTables,
 	}
-	if c.rawSockets {
-		opts.IPTables = netfilter.DefaultLinuxTables
-	}
-	return opts
 }
 
 func (c *guestNetnsCreator) afterLoad(ctx context.Context) {
@@ -349,6 +346,7 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 	if err != nil {
 		return nil, err
 	}
+	st.EnableIPTablesCheckpoint()
 	if c.k == nil {
 		stack := netstack.NewStack(st, 0)
 		stack.InitConntrackLimit(nil)

@@ -26,14 +26,11 @@ import (
 // stackOptions returns the guest network stack features that the Config
 // selects.
 func (s *Sandbox) stackOptions() netbackend.StackOptions {
-	opts := netbackend.StackOptions{
+	return netbackend.StackOptions{
 		RawSockets:        s.cfg.NetRaw,
 		PacketSocketWrite: s.cfg.AllowPacketSocketWrite,
+		IPTables:          netfilter.DefaultLinuxTables,
 	}
-	if s.cfg.NetRaw {
-		opts.IPTables = netfilter.DefaultLinuxTables
-	}
-	return opts
 }
 
 // initNetstack builds the Netstack for the configured mode and pre-binds

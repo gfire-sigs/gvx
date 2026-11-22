@@ -110,11 +110,11 @@ func (c *Config) validateNetPolicyConfig() error {
 
 func (m CheckpointManifest) validateNetPolicyBinding() error {
 	switch m.Version {
-	case CheckpointManifestVersion:
+	case legacyCheckpointManifestVersion, CheckpointManifestVersion:
 		if m.NetPolicy != nil {
-			return fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "a version 1 bundle cannot contain a network policy binding"))
+			return fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "an unprotected bundle cannot contain a network policy binding"))
 		}
-	case protectedCheckpointManifestVersion:
+	case legacyProtectedCheckpointManifestVersion, protectedCheckpointManifestVersion:
 		binding := m.NetPolicy
 		if m.NetMode != NetModeNAT || binding == nil || !validPolicyStoreID(binding.StoreID) || binding.MinGeneration == 0 {
 			return fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "invalid network policy binding"))

@@ -46,8 +46,6 @@ type stackLifecycleHook struct {
 // stackExtState owns per-stack extension state so checkpoint and restore
 // preserve ipset, netfilter recent tables, and bridge netfilter settings
 // without cross-sandbox sharing.
-//
-// +stateify savable
 type stackExtState struct {
 	mu                 sync.RWMutex                  `state:"nosave"`
 	hooks              map[uint64]stackLifecycleHook `state:"nosave"`

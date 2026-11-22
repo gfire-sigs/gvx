@@ -73,6 +73,7 @@ func (c *restoredStackCreator) CreateStack() (inet.Stack, error) {
 		Clock:                    clock,
 		HandleLocal:              true,
 		AllowPacketEndpointWrite: true,
+		DefaultIPTables:          defaultLinuxIPTables,
 	})
 	loEP := packetsocket.New(ethernet.New(loopback.New()))
 	if err := st.CreateNICWithOptions(1, loEP, stack.NICOptions{

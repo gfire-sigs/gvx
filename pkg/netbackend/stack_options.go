@@ -48,9 +48,8 @@ type StackOptions struct {
 	// still applies its destination rules to every packet that leaves eth0.
 	RawSockets bool
 
-	// IPTables creates the initial iptables tables when RawSockets is set,
-	// such as netfilter.DefaultLinuxTables of the Sentry. When nil, the stack
-	// uses its built-in empty tables.
+	// IPTables creates the initial tables independently of raw socket access.
+	// When nil, the stack uses its built-in empty tables.
 	IPTables func(clock tcpip.Clock, rand *rand.Rand) *stack.IPTables
 
 	// PacketSocketWrite lets the guest send packets on AF_PACKET sockets.
@@ -74,10 +73,10 @@ func newStack(opts StackOptions) (*stack.Stack, error) {
 		},
 		HandleLocal:              true,
 		AllowPacketEndpointWrite: opts.PacketSocketWrite,
+		DefaultIPTables:          opts.IPTables,
 	}
 	if opts.RawSockets {
 		sopts.RawFactory = raw.EndpointFactory{}
-		sopts.DefaultIPTables = opts.IPTables
 	}
 	s := stack.New(sopts)
 	if opts.RawSockets && nftables.IsNFTablesEnabled() {

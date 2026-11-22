@@ -326,7 +326,7 @@ func (it *IPTables) replaceTable(id TableID, table Table, ipv6, force bool) {
 		}
 
 		it.connections.init()
-		it.startReaper(reaperDelay)
+		it.startReaperLocked(reaperDelay)
 	}
 	it.modified = true
 	if ipv6 {
@@ -696,23 +696,44 @@ func (it *IPTables) check(table Table, hook Hook, pkt *PacketBuffer, r *Route, a
 
 // beforeSave is invoked by stateify.
 func (it *IPTables) beforeSave() {
-	// Ensure the reaper exits cleanly.
-	if it.reaper != nil {
-		it.reaper.Stop()
-	}
+	it.stopReaper()
 	// Prevent others from modifying the connection table.
 	it.connections.mu.Lock()
 }
 
 // afterLoad is invoked by stateify.
 func (it *IPTables) afterLoad(context.Context) {
-	it.startReaper(reaperDelay)
+	it.resumeReaper()
 }
 
-// startReaper periodically reaps timed out connections.
-func (it *IPTables) startReaper(interval time.Duration) {
+func (it *IPTables) resumeReaper() {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	if it.modified && it.reaper == nil {
+		it.startReaperLocked(reaperDelay)
+	}
+}
+
+func (it *IPTables) stopReaper() {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	if it.reaper != nil {
+		it.reaper.Stop()
+		it.reaper = nil
+	}
+}
+
+// startReaperLocked periodically reaps timed out connections.
+//
+// +checklocks:it.mu
+func (it *IPTables) startReaperLocked(interval time.Duration) {
 	bucket := 0
 	it.reaper = it.connections.clock.AfterFunc(interval, func() {
+		it.mu.RLock()
+		defer it.mu.RUnlock()
+		if it.reaper == nil {
+			return
+		}
 		bucket, interval = it.connections.reapUnused(bucket, interval)
 		it.reaper.Reset(interval)
 	})

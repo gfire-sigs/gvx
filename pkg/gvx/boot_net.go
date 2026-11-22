@@ -42,6 +42,7 @@ func (s *Sandbox) initKernelRootNetworkNamespace(k *kernel.Kernel, creds *auth.C
 	if s.netStack == nil {
 		return nil, func() {}
 	}
+	s.netStack.EnableIPTablesCheckpoint()
 	inetStack := netstack.NewStack(s.netStack, k.UniqueID())
 	// The root network namespace is the network namespace of the container,
 	// where Docker and containerd set ip_unprivileged_port_start to 0. A

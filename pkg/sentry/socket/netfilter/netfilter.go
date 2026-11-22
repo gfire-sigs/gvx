@@ -78,6 +78,13 @@ func tableLookupError(err error) *syserr.Error {
 // compatibility with netfilter extensions.
 func DefaultLinuxTables(clock tcpip.Clock, rand *rand.Rand) *stack.IPTables {
 	tables := stack.DefaultTables(clock, rand)
+	WrapLinuxTableTargets(tables)
+	return tables
+}
+
+// WrapLinuxTableTargets gives bare default targets the Linux wire format
+// without changing the policy. Call it before packets can use the tables.
+func WrapLinuxTableTargets(tables *stack.IPTables) {
 	tables.VisitTargets(func(oldTarget stack.Target) stack.Target {
 		switch val := oldTarget.(type) {
 		case *stack.AcceptTarget:
@@ -95,10 +102,9 @@ func DefaultLinuxTables(clock tcpip.Clock, rand *rand.Rand) *stack.IPTables {
 		case *stack.CTTarget:
 			return &ctTarget{CTTarget: *val}
 		default:
-			panic(fmt.Sprintf("Unknown rule in default iptables of type %T", val))
+			return oldTarget
 		}
 	})
-	return tables
 }
 
 // GetInfo returns information about iptables.

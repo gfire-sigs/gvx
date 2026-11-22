@@ -501,11 +501,12 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 		s.runMemFile = mf
 	}
 	s.mu.Unlock()
-	if k == nil || mf == nil {
+	if k == nil {
 		return 1, errRunConsumed
 	}
-	if tk := k.Timekeeper(); tk != nil {
-		defer tk.Destroy()
+	defer stopRestoredKernelTimers(k)
+	if mf == nil {
+		return 1, errRunConsumed
 	}
 	if s.netStack != nil {
 		netfilter.SetStackLog(s.netStack, kernelLogFunc(k))

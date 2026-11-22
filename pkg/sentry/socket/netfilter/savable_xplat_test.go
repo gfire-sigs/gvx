@@ -118,6 +118,7 @@ func TestIPTablesWithStandardMatchersAndTargetsSurvivesSaveLoad(t *testing.T) {
 	})
 	t.Cleanup(stk.Destroy)
 	configureNICsForFilterStack(t, stk)
+	stk.EnableIPTablesCheckpoint()
 
 	rules := standardRules(t)
 	wantTypes := []string{
@@ -141,16 +142,18 @@ func TestIPTablesWithStandardMatchersAndTargetsSurvivesSaveLoad(t *testing.T) {
 
 	stk.Pause()
 	var buf bytes.Buffer
-	// Stack.tables is nosave upstream, so save the IPTables object itself.
-	saved := []any{stk.IPTables(), clock}
-	if _, err := state.Save(context.Background(), &buf, &saved); err != nil {
+	if _, err := state.Save(context.Background(), &buf, &stk); err != nil {
 		t.Fatalf("state.Save: %v", err)
 	}
-	var loaded []any
-	if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), &loaded); err != nil {
+	var restored *stack.Stack
+	if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), &restored); err != nil {
 		t.Fatalf("state.Load: %v", err)
 	}
-	restoredTables := loaded[0].(*stack.IPTables)
+	t.Cleanup(restored.Destroy)
+	if !restored.RestoreIPTablesCheckpoint() {
+		t.Fatal("restored stack did not contain guest rules")
+	}
+	restoredTables := restored.IPTables()
 
 	gotRules := restoredTables.GetTable(stack.NATID, false).Rules
 	if len(gotRules) != len(wantRules) {

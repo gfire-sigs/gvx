@@ -898,7 +898,10 @@ func runNetMode(replaceFilter bool) error {
 	defer runtime.UnlockOSThread()
 
 	if replaceFilter {
-		if err := setGuestForwardPolicy(false); err != nil {
+		if err := guestFilterV4.setPolicy(guestFilterForward, guestFilterDrop); err != nil {
+			return err
+		}
+		if err := guestFilterV6.setPolicy(guestFilterForward, guestFilterDrop); err != nil {
 			return err
 		}
 	}
@@ -952,6 +955,16 @@ func runNetMode(replaceFilter bool) error {
 			childReadyCh <- fmt.Errorf("child netns inode %d equals root inode", childIno)
 			return
 		}
+		if replaceFilter {
+			if err := guestFilterV4.setPolicy(guestFilterOutput, guestFilterDrop); err != nil {
+				childReadyCh <- err
+				return
+			}
+			if err := guestFilterV6.setPolicy(guestFilterInput, guestFilterDrop); err != nil {
+				childReadyCh <- err
+				return
+			}
+		}
 		if err := os.WriteFile(sysctlUnprivPorts, []byte("512\n"), 0o644); err != nil {
 			childReadyCh <- fmt.Errorf("write child sysctl: %w", err)
 			return
@@ -975,6 +988,21 @@ func runNetMode(replaceFilter bool) error {
 		childReadyCh <- nil
 
 		<-resumeChildCh
+
+		if replaceFilter {
+			if err := guestFilterV4.expectPolicy(guestFilterOutput, guestFilterDrop); err != nil {
+				childDoneCh <- err
+				return
+			}
+			if err := guestFilterV6.expectPolicy(guestFilterInput, guestFilterDrop); err != nil {
+				childDoneCh <- err
+				return
+			}
+			if err := verifyGuestOutputDrop(); err != nil {
+				childDoneCh <- err
+				return
+			}
+		}
 
 		postChildIno, err := threadNetnsInode()
 		if err != nil {
@@ -1073,7 +1101,13 @@ func runNetMode(replaceFilter bool) error {
 	}
 
 	if replaceFilter {
-		if err := setGuestForwardPolicy(true); err != nil {
+		if err := guestFilterV4.expectPolicy(guestFilterForward, guestFilterDrop); err != nil {
+			return err
+		}
+		if err := guestFilterV6.expectPolicy(guestFilterForward, guestFilterDrop); err != nil {
+			return err
+		}
+		if err := guestFilterV4.setPolicy(guestFilterForward, guestFilterAccept); err != nil {
 			return err
 		}
 	}

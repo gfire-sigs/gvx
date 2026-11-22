@@ -2293,6 +2293,7 @@ func (s *Stack) Close() {
 	for _, p := range s.networkProtocols {
 		p.Close()
 	}
+	s.StopRestoredIPTablesReaper()
 }
 
 // Wait waits for all transport and link endpoints to halt their worker
@@ -2383,8 +2384,10 @@ func (s *Stack) ReplaceConfig(st *Stack) {
 	defer s.mu.Unlock()
 	s.resetPreservedConfigLocked()
 
-	// Update iptables and nftables.
-	s.tables = st.IPTables()
+	// The donor stack supplies links, not saved firewall rules.
+	if !s.hasRestoredIPTables() {
+		s.tables = st.IPTables()
+	}
 	s.SetNFTables(st.NFTables())
 	for id, nic := range nics {
 		nic.stack = s
@@ -2405,6 +2408,10 @@ func (s *Stack) Restore() {
 	// RestoredEndpoint.Restore() may call other methods on s, so we can't hold
 	// s.mu while restoring the endpoints.
 	s.mu.Lock()
+	if s.hasRestoredIPTables() {
+		// A restored clock may not support timers during state decode.
+		s.tables.resumeReaper()
+	}
 	s.prepareRestoreLocked()
 	for id, nic := range s.preservedNICs {
 		if !s.restorePreservedNICLocked(id, nic) {

@@ -110,6 +110,15 @@ func (n *Namespace) markRestored() bool {
 	return true
 }
 
+// ForEachChildStack calls f for each child network namespace with a stack.
+func (n *Namespace) ForEachChildStack(f func(Stack)) {
+	for _, child := range n.childrenSlice() {
+		if st := child.Stack(); st != nil {
+			f(st)
+		}
+	}
+}
+
 // PauseChildStacks pauses all active child network namespace stacks registered
 // under n.
 func (n *Namespace) PauseChildStacks() {

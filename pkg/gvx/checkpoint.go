@@ -36,10 +36,13 @@ import (
 )
 
 const (
-	// CheckpointManifestVersion identifies the schema of unprotected bundles.
-	CheckpointManifestVersion = 1
+	legacyCheckpointManifestVersion          = 1
+	legacyProtectedCheckpointManifestVersion = 2
 
-	protectedCheckpointManifestVersion = 2
+	// CheckpointManifestVersion identifies unprotected bundles with guest
+	// iptables state. Older readers must not resume without those rules.
+	CheckpointManifestVersion          = 3
+	protectedCheckpointManifestVersion = 4
 
 	// Protected state starts with the signature, version, hex store ID, and big-endian generation.
 	checkpointPolicyStateMagic      = "GVXNPST"

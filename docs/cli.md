@@ -91,7 +91,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode (`nat`, `wg`, `none`) and its options. |
 | `--privileged` | On by default. Enables `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` disables all three. Explicit per-flag values override `--privileged` (see Section 4.8). |
-| `--net-raw` | Allow guest raw sockets and `iptables` (required by `dockerd`). Defaults to `--privileged`. |
+| `--net-raw` | Allow guest raw sockets (required by `dockerd`). Defaults to `--privileged`. |
 | `--allow-packet-socket-write` | Allow guest writes on `AF_PACKET` sockets (requires `--net-raw`). Defaults to `--privileged` when `--net-raw` is on. |
 | `--allow-suid` | Obey `setuid` and `setgid` bits on guest executables (`sudo`, `su`, `passwd` for non-root users). Defaults to `--privileged`. |
 | `--host-ca-certs` | Copy host root CA certificates into the guest (off by default; see Section 4.10). |
@@ -328,6 +328,10 @@ SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO-
 `rungv` can save a running sandbox to a host directory and resume it in a new process. Because host lockdown blocks new file opens and socket binds after startup, the sandbox pre-opens `-checkpoint-dir` and binds `-control-socket` before calling `hostlockdown.Apply()`.
 
 A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.meta`, and `pages.img`. `manifest.json` records the host OS, CPU architecture, platform backend, address holes, EROFS layer digests, mounts, and network mode. `rungv restore` (`rungv resume`) validates `manifest.json` against the current host and reopens cached layers and mounts before applying lockdown.
+
+The bundle preserves the guest's IPv4 and IPv6 `iptables-legacy` rules in each network namespace. It does not preserve connection tracking entries or host socket sessions. The host NAT policy uses its own store (see Section 4.12).
+
+Use a `rungv` build that supports guest firewall restore to resume a new bundle. Older bundles do not contain guest firewall rules.
 
 | Command or flag | Meaning |
 | :--- | :--- |

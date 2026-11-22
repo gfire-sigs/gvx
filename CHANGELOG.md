@@ -10,6 +10,10 @@ This file records the observable changes of each `gvx` release. The release work
 
 - **Host NAT policy** (#226): Apply a stateless IPv4 and IPv6 filter at the NAT peer, host dials, DNS relay, and published ports. Set aggregate transmit and receive limits for the sandbox. Use `rungv net-policy` to read or atomically replace the saved configuration. A protected checkpoint requires its matching host store.
 
+### Bug Fixes
+
+- **Guest firewall restore**: Preserve IPv4 and IPv6 `iptables-legacy` rules per network namespace. Restore Linux-compatible defaults for bundles that contain no guest rules.
+
 ## [v0.19.10002026111600] - 2026-11-21
 
 This release serializes virtual processor creation and partition teardown in `pkg/sentry/platform/whpx` to prevent `HYPERVISOR_ERROR` (`0x00020001`) crashes on Windows `arm64` hosts.

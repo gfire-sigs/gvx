@@ -119,6 +119,21 @@ func (r restoreNetworkArgs) ConfigureNetwork(st inet.Stack) error {
 	return nil
 }
 
+func stopRestoredKernelTimers(k *kernel.Kernel) {
+	if root := k.RootNetworkNamespace(); root != nil {
+		stop := func(st inet.Stack) {
+			if ns, ok := st.(*netstack.Stack); ok && ns != nil && ns.Stack != nil {
+				ns.Stack.StopRestoredIPTablesReaper()
+			}
+		}
+		stop(root.Stack())
+		root.ForEachChildStack(stop)
+	}
+	if tk := k.Timekeeper(); tk != nil {
+		tk.Destroy()
+	}
+}
+
 // maxManifestBytes bounds the size of manifest.json. A manifest of 1 MiB
 // holds thousands of mounts, so a larger file is corrupt.
 const maxManifestBytes = 1 << 20
@@ -499,6 +514,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		RawHost: &rawHost,
 	}).(gvcontext.Context)
 	loadCtx = WithRestoreNetnsHook(loadCtx, nil).(gvcontext.Context)
+	loadCtx = netstack.WithIPTablesCheckpointRestore(loadCtx)
 
 	pagesMetaReader := stateio.NewBufioReadCloser(io.NopCloser(pagesMetaFile))
 	pagesAsyncReader := stateio.NewIOReader(nopCloseReaderAt{pagesFile}, 4<<20, 1024, 4)
@@ -524,15 +540,13 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	_ = stateReader.Close()
 	waitErr := asyncMFLoader.Wait()
 	closeErr := closeBundleReadFiles()
+	sb.restoredKernel = k
 	if loadErr != nil || waitErr != nil || closeErr != nil {
-		if tk := k.Timekeeper(); tk != nil {
-			tk.Destroy()
-		}
+		// Close stops root and child timers before destroying their clock.
 		return cleanup(errors.Join(loadErr, waitErr, closeErr))
 	}
 
 	k.IncCheckpointGenOnRestore()
-	sb.restoredKernel = k
 	sb.restoredStdio = collector
 	return sb, nil
 }

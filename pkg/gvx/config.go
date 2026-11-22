@@ -173,11 +173,10 @@ type Config struct {
 	// that names its own DNS servers keeps them for the guest relay.
 	HostDNSServers []string
 
-	// NetRaw lets the guest open raw IP sockets and use iptables, as the runsc
-	// flag --net-raw does. dockerd and its bridge network need it. A raw
-	// socket can send packets with any source address on the guest network,
-	// so the SDK default is off. The rungv CLI turns it on through its
-	// --privileged flag, which is on by default.
+	// NetRaw lets the guest open raw IP sockets. The dockerd bridge network
+	// needs raw sockets. A raw socket can send packets with any source address
+	// on the guest network, so the SDK default is off. The rungv CLI enables
+	// raw sockets through --privileged, which is on by default.
 	NetRaw bool
 
 	// AllowPacketSocketWrite lets the guest send packets on AF_PACKET sockets.
