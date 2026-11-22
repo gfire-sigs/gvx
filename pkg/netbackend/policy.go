@@ -281,8 +281,8 @@ var (
 // NATPolicy owns one sandbox's active policy, admitted work, and QoS state.
 // A nil *NATPolicy leaves the legacy NAT path unrestricted.
 type NATPolicy struct {
-	update     sync.Mutex // serializes Commit and Close
-	transition atomic.Pointer[policyTransition]
+	update     sync.Mutex                       // serializes Commit and Close
+	transition atomic.Pointer[policyTransition] // stays set after Close
 	gate       sync.RWMutex
 	active     *CompiledPolicy
 	release    func()
@@ -335,7 +335,7 @@ func (p *NATPolicy) tryRead() func() {
 	return release
 }
 
-// Allow evaluates all legs against one revision without waiting at cutover.
+// Allow evaluates all legs against one rule snapshot without waiting at cutover.
 func (p *NATPolicy) Allow(chain PolicyChain, tuples ...PolicyTuple) bool {
 	if p == nil {
 		return true
@@ -351,7 +351,7 @@ func (p *NATPolicy) Allow(chain PolicyChain, tuples ...PolicyTuple) bool {
 
 func noopPolicyRelease() {}
 
-// Begin pins the active revision for a nonblocking final handoff.
+// Begin pins the active rule snapshot for a nonblocking final handoff.
 // Call release exactly once after a permitted handoff.
 func (p *NATPolicy) Begin(chain PolicyChain, tuples ...PolicyTuple) (release func(), allowed bool) {
 	if p != nil && len(tuples) == 0 {
@@ -405,7 +405,7 @@ func (p *NATPolicy) HostDialAllowed(target netip.AddrPort) bool {
 }
 
 // Dial authorizes a context-aware dial before it can submit a connection.
-// Commit cancels and settles dials from the old revision before changing it.
+// Commit cancels and settles pending dials before it replaces the rules.
 func (p *NATPolicy) Dial(ctx context.Context, chain PolicyChain, dial func(context.Context) (net.Conn, error), tuples ...PolicyTuple) (net.Conn, error) {
 	if p == nil {
 		return dial(ctx)
@@ -432,34 +432,22 @@ func (p *NATPolicy) Dial(ctx context.Context, chain PolicyChain, dial func(conte
 	return conn, err
 }
 
-// Commit settles old handoffs before mark makes the replacement durable.
-// An error from mark permanently suspends this policy instance.
-func (p *NATPolicy) Commit(compiled *CompiledPolicy, mark func() error) error {
-	if p == nil || p.done == nil || compiled == nil || compiled.rules == nil || mark == nil {
+// Commit replaces the rules and QoS limits after pending handoffs settle.
+func (p *NATPolicy) Commit(compiled *CompiledPolicy) error {
+	if p == nil || p.done == nil || compiled == nil || compiled.rules == nil {
 		return &PolicyError{Code: "invalid_policy", Detail: "invalid live policy commit"}
 	}
 	p.update.Lock()
 	defer p.update.Unlock()
-	if p.transition.Load() != nil {
-		return &PolicyError{Code: "commit_uncertain", Detail: "NAT policy is suspended"}
+	if p.active == nil {
+		return ErrPolicyDenied
 	}
 	transition := &policyTransition{published: make(chan struct{})}
+	// Stop earning credit when admission closes, before waiting for pinned work.
+	freeze := time.Now()
 	p.transition.Store(transition)
 	p.cancelDial()
 	p.gate.Lock()
-	if p.active == nil {
-		p.stopLocked()
-		p.gate.Unlock()
-		p.workers.Wait()
-		return &PolicyError{Code: "state_unavailable", Detail: "no active NAT policy"}
-	}
-	freeze := time.Now()
-	if err := mark(); err != nil {
-		p.stopLocked()
-		p.gate.Unlock()
-		p.workers.Wait()
-		return err
-	}
 	txDropped := p.tx.replace(compiled, compiled.config.TX, freeze)
 	rxDropped := p.rx.replace(compiled, compiled.config.RX, freeze)
 	p.streamsMu.Lock()
@@ -496,12 +484,6 @@ func (p *NATPolicy) Close() {
 	p.transition.Store(&policyTransition{})
 	p.cancelDial()
 	p.gate.Lock()
-	p.stopLocked()
-	p.gate.Unlock()
-	p.workers.Wait()
-}
-
-func (p *NATPolicy) stopLocked() {
 	p.active = nil
 	p.streamsMu.Lock()
 	for stream := range p.streams {
@@ -509,4 +491,6 @@ func (p *NATPolicy) stopLocked() {
 	}
 	p.streamsMu.Unlock()
 	close(p.done)
+	p.gate.Unlock()
+	p.workers.Wait()
 }

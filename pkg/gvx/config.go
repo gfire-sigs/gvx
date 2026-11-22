@@ -160,7 +160,8 @@ type Config struct {
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
 
-	// NetPolicy selects the host-owned policy store for a NAT sandbox.
+	// NetPolicy selects the initial host policy for a NAT sandbox. Restore
+	// requires it for a protected checkpoint.
 	NetPolicy *NetPolicyOptions
 
 	// HostDNSServers lists the DNS servers of the host, each a bare IP or

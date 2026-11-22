@@ -318,7 +318,14 @@ func (s *policyScheduler) dispatch(p *NATPolicy) time.Duration {
 		canceled = context.Cause(w.ctx)
 	}
 	if canceled == nil {
-		if wait := s.bucket.acquire(w.n, time.Now()); wait > 0 {
+		now := time.Now()
+		// A worker can pin the rules before cutover and acquire s.mu after it starts.
+		if p.transition.Load() != nil {
+			s.mu.Unlock()
+			release()
+			return -1
+		}
+		if wait := s.bucket.acquire(w.n, now); wait > 0 {
 			s.mu.Unlock()
 			release()
 			return wait
@@ -472,7 +479,7 @@ func (p *NATPolicy) Enqueue(chain PolicyChain, n int, send func(), dispose func(
 }
 
 // Send waits for a whole unit to reach its destination or return an error.
-// Send runs under the revision gate. Bound socket writes with a write deadline.
+// Send pins the active rule snapshot. Bound socket writes with a write deadline.
 func (p *NATPolicy) Send(ctx context.Context, chain PolicyChain, n int, send func() error, tuples ...PolicyTuple) error {
 	if err := context.Cause(ctx); err != nil {
 		return err
@@ -698,7 +705,7 @@ func readPolicyStreamTail(ctx context.Context, src net.Conn, buf []byte) (int, e
 	return n, err
 }
 
-// policyWrite bounds the socket operation while the worker pins a revision.
+// policyWrite bounds the socket operation while the worker pins the rules.
 // The caller must own the socket's write deadline for the duration of send.
 func policyWrite(conn interface{ SetWriteDeadline(time.Time) error }, send func() error) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(policyWriteTimeout)); err != nil {

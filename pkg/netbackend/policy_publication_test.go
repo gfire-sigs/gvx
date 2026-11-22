@@ -64,7 +64,7 @@ func newPolicyPublication(t *testing.T, v4, v6 string) (*NATPolicy, *PortForward
 
 func commitPublicationPolicy(t *testing.T, policy *NATPolicy, v4, v6 string) {
 	t.Helper()
-	if err := policy.Commit(compilePublicationPolicy(t, v4, v6), func() error { return nil }); err != nil {
+	if err := policy.Commit(compilePublicationPolicy(t, v4, v6)); err != nil {
 		t.Fatalf("commit publication policy: %v", err)
 	}
 }

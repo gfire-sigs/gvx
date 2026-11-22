@@ -34,7 +34,7 @@ const (
 
 var netPolicyUsage = []string{
 	"rungv net-policy get -control-socket=<address>",
-	"rungv net-policy replace -control-socket=<address> --expected-revision=<revision> --file=<rules.v4> --file6=<rules.v6> --qos-tx=<limit> --qos-rx=<limit>",
+	"rungv net-policy replace -control-socket=<address> --file=<rules.v4> --file6=<rules.v6> --qos-tx=<limit> --qos-rx=<limit>",
 }
 
 func init() {
@@ -47,41 +47,37 @@ func init() {
 }
 
 type netPolicyStartupFlags struct {
-	statePath string
-	live      bool
-	config    netPolicyConfigFlags
+	live   bool
+	config netPolicyConfigFlags
 }
 
 func (f *netPolicyStartupFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&f.statePath, "net-policy-state", "", "Host path to persistent NAT policy state")
-	fs.BoolVar(&f.live, "net-policy-live", false, "Allow live policy changes over the host control socket")
-	f.config.register(fs, "nat-iptables-file", "nat-ip6tables-file")
+	fs.BoolVar(&f.live, "net-policy-live", false, "Allow live NAT policy control; requires both rule files and -control-socket")
+	f.config.register(fs, "nat-iptables-file", "nat-ip6tables-file", "unlimited")
 }
 
 func (f netPolicyStartupFlags) options(fs *flag.FlagSet, mode gvx.NetworkMode, socket string) (*gvx.NetPolicyOptions, error) {
-	path := strings.TrimSpace(f.statePath)
-	seed := flagVisited(fs, "nat-iptables-file") || flagVisited(fs, "nat-ip6tables-file") || flagVisited(fs, "qos-tx") || flagVisited(fs, "qos-rx")
-	if path == "" && !seed && !f.live && !flagVisited(fs, "net-policy-state") {
+	configured := f.live
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "nat-iptables-file", "nat-ip6tables-file", "qos-tx", "qos-rx":
+			configured = true
+		}
+	})
+	if !configured {
 		return nil, nil
 	}
 	if mode != "" && mode != gvx.NetModeNAT {
 		return nil, errors.New("unsupported_mode: network policy requires NAT")
 	}
-	if path == "" {
-		return nil, errors.New("specify --net-policy-state with a nonempty host path")
-	}
 	if f.live && strings.TrimSpace(socket) == "" {
 		return nil, errors.New("--net-policy-live requires -control-socket")
 	}
-	opts := &gvx.NetPolicyOptions{Path: path}
-	if seed {
-		config, err := f.config.load("nat-iptables-file", "nat-ip6tables-file")
-		if err != nil {
-			return nil, err
-		}
-		opts.Seed = &config
+	config, err := f.config.load("nat-iptables-file", "nat-ip6tables-file")
+	if err != nil {
+		return nil, err
 	}
-	return opts, nil
+	return &gvx.NetPolicyOptions{Policy: config}, nil
 }
 
 type netPolicyConfigFlags struct {
@@ -89,16 +85,22 @@ type netPolicyConfigFlags struct {
 	tx, rx       string
 }
 
-func (f *netPolicyConfigFlags) register(fs *flag.FlagSet, file4Flag, file6Flag string) {
-	fs.StringVar(&f.file4, file4Flag, "", "Host file with IPv4 filter rules")
-	fs.StringVar(&f.file6, file6Flag, "", "Host file with IPv6 filter rules")
-	fs.StringVar(&f.tx, "qos-tx", "", "Guest transmit limit: unlimited or rate-bps=N,burst-bytes=B,queue-bytes=Q")
-	fs.StringVar(&f.rx, "qos-rx", "", "Guest receive limit: unlimited or rate-bps=N,burst-bytes=B,queue-bytes=Q")
+func (f *netPolicyConfigFlags) register(fs *flag.FlagSet, file4Flag, file6Flag, qosDefault string) {
+	fs.StringVar(&f.file4, file4Flag, "", "Host file with IPv4 filter rules (required with IPv6 rules)")
+	fs.StringVar(&f.file6, file6Flag, "", "Host file with IPv6 filter rules (required with IPv4 rules)")
+	fs.StringVar(&f.tx, "qos-tx", qosDefault, "Guest transmit limit: unlimited or rate-bps=N,burst-bytes=B,queue-bytes=Q")
+	fs.StringVar(&f.rx, "qos-rx", qosDefault, "Guest receive limit: unlimited or rate-bps=N,burst-bytes=B,queue-bytes=Q")
 }
 
 func (f netPolicyConfigFlags) load(file4Flag, file6Flag string) (gvx.NetPolicyConfig, error) {
-	if f.file4 == "" || f.file6 == "" || f.tx == "" || f.rx == "" {
-		return gvx.NetPolicyConfig{}, fmt.Errorf("specify both --%s and --%s and both --qos-tx and --qos-rx", file4Flag, file6Flag)
+	if f.file4 == "" || f.file6 == "" {
+		return gvx.NetPolicyConfig{}, fmt.Errorf("specify both --%s and --%s with nonempty paths", file4Flag, file6Flag)
+	}
+	if f.tx == "" {
+		return gvx.NetPolicyConfig{}, errors.New("specify a nonempty --qos-tx limit")
+	}
+	if f.rx == "" {
+		return gvx.NetPolicyConfig{}, errors.New("specify a nonempty --qos-rx limit")
 	}
 	tx, err := gvx.ParseNetPolicyLimit(f.tx)
 	if err != nil {
@@ -156,10 +158,8 @@ func netPolicySubcommand(ctx context.Context, args []string, streams cliIO) int 
 	fs.SetOutput(streams.stderr)
 	socket := fs.String("control-socket", "", "Host path or loopback address for the control listener")
 	var configFlags netPolicyConfigFlags
-	var replacement netPolicyReplacement
 	if op == "replace" {
-		fs.StringVar(&replacement.ExpectedRevision, "expected-revision", "", "Current revision from net-policy get")
-		configFlags.register(fs, "file", "file6")
+		configFlags.register(fs, "file", "file6", "")
 	}
 	if err := fs.Parse(normalizeCommandArgs(fs, args[1:])); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -179,16 +179,12 @@ func netPolicySubcommand(ctx context.Context, args []string, streams cliIO) int 
 	}
 	req := netPolicyRequest{Op: netPolicyGet}
 	if op == "replace" {
-		if replacement.ExpectedRevision == "" {
-			return fail(errors.New("specify --expected-revision"), 2)
-		}
-		var err error
-		replacement.NetPolicyConfig, err = configFlags.load("file", "file6")
+		config, err := configFlags.load("file", "file6")
 		if err != nil {
 			return fail(err, 2)
 		}
 		req.Op = netPolicyReplace
-		req.netPolicyReplacement = &replacement
+		req.NetPolicyConfig = &config
 	}
 	result, err := requestNetPolicy(ctx, *socket, req)
 	if err != nil {

@@ -50,10 +50,6 @@ type RestoreOptions struct {
 	// Dir is the host directory containing manifest.json, state.img,
 	// pages.meta, and pages.img.
 	Dir string
-
-	// NetPolicy overrides Config.NetPolicy when non-nil. A protected bundle
-	// requires a matching existing store.
-	NetPolicy *NetPolicyOptions
 }
 
 // ErrCheckpointManifest reports a checkpoint manifest validation failure.
@@ -162,11 +158,17 @@ func readAndParseManifest(dir string) (CheckpointManifest, error) {
 	if err != nil {
 		return CheckpointManifest{}, fmt.Errorf("%w: read %q: %w", ErrCheckpointManifest, manifestPath, err)
 	}
-	var m CheckpointManifest
-	if err := json.Unmarshal(data, &m); err != nil {
+	var decoded struct {
+		CheckpointManifest
+		LegacyNetPolicy json.RawMessage `json:"net_policy"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
 		return CheckpointManifest{}, fmt.Errorf("%w: decode %q: %w", ErrCheckpointManifest, manifestPath, err)
 	}
-	return m, nil
+	if len(decoded.LegacyNetPolicy) != 0 && string(decoded.LegacyNetPolicy) != "null" {
+		return CheckpointManifest{}, fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "checkpoint manifest contains obsolete network policy metadata"))
+	}
+	return decoded.CheckpointManifest, nil
 }
 
 func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
@@ -277,7 +279,6 @@ func restorePlatform(goos string, requested PlatformType, manifestPlatform strin
 // Restore takes ownership of Config.CheckpointListener on every call. When
 // Restore fails, it closes the listener.
 func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, retErr error) {
-	initRuntimeGlobals()
 	if ln := cfg.CheckpointListener; ln != nil {
 		defer func() {
 			if retErr != nil {
@@ -292,45 +293,11 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if err != nil {
 		return nil, err
 	}
-	if err := manifest.validateNetPolicyBinding(); err != nil {
+	if err := manifest.validateVersion(); err != nil {
 		return nil, err
 	}
-	if opts.NetPolicy != nil {
-		cfg.NetPolicy = opts.NetPolicy
-	}
-	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
-	if cfg.Platform, err = restorePlatform(runtime.GOOS, cfg.Platform, manifest.Platform, allowUnconfined); err != nil {
-		return nil, err
-	}
-	if cfg.NetworkMode == "" && manifest.NetMode != "" {
-		cfg.NetworkMode = manifest.NetMode
-	}
-	if cfg.Architecture == "" && manifest.Arch != "" {
-		cfg.Architecture = manifest.Arch
-	}
-	if err := cfg.normalizeWithMode(len(manifest.LayerDigests) > 0); err != nil {
-		return nil, err
-	}
-	if manifest.RootVolume != (cfg.RootVolume != "") {
-		return nil, fmt.Errorf("%w: root volume mismatch: bundle has %v, config has %v", ErrCheckpointManifest, manifest.RootVolume, cfg.RootVolume != "")
-	}
-	applyHostMemoryDefaults()
-
-	sb := &Sandbox{
-		cfg:            cfg,
-		kernelReady:    make(chan struct{}),
-		runDone:        make(chan struct{}),
-		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
-	}
-	if cfg.HostCACerts {
-		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
-		if err != nil {
-			return nil, errors.Join(fmt.Errorf("gvx: read the host root certificates: %w", err), sb.Close())
-		}
-		sb.hostCARoots = roots
-	}
-
 	var (
+		sb            *Sandbox
 		stateFile     *os.File
 		pagesMetaFile *os.File
 		pagesFile     *os.File
@@ -349,7 +316,11 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 
 	cleanup := func(cause error) (*Sandbox, error) {
-		return nil, errors.Join(cause, closeBundleReadFiles(), sb.Close())
+		readErr := closeBundleReadFiles()
+		if sb == nil {
+			return nil, errors.Join(cause, readErr)
+		}
+		return nil, errors.Join(cause, readErr, sb.Close())
 	}
 	openReadOnly := func(name string) (*os.File, error) {
 		p := filepath.Join(opts.Dir, name)
@@ -365,7 +336,48 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if _, err := manifest.statePayloadOffset(stateFile); err != nil {
 		return cleanup(err)
 	}
-	if err := sb.openNetPolicy(manifest.NetPolicy, opts.Dir); err != nil {
+	if manifest.Version == protectedCheckpointManifestVersion {
+		if cfg.NetPolicy == nil {
+			return cleanup(netPolicyError("policy_required", "a protected checkpoint requires an explicit network policy"))
+		}
+		if cfg.NetworkMode != "" && cfg.NetworkMode != NetModeNAT {
+			return cleanup(fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "a protected checkpoint requires NAT mode")))
+		}
+	}
+
+	initRuntimeGlobals()
+	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
+	if cfg.Platform, err = restorePlatform(runtime.GOOS, cfg.Platform, manifest.Platform, allowUnconfined); err != nil {
+		return cleanup(err)
+	}
+	if cfg.NetworkMode == "" && manifest.NetMode != "" {
+		cfg.NetworkMode = manifest.NetMode
+	}
+	if cfg.Architecture == "" && manifest.Arch != "" {
+		cfg.Architecture = manifest.Arch
+	}
+	if err := cfg.normalizeWithMode(len(manifest.LayerDigests) > 0); err != nil {
+		return cleanup(err)
+	}
+	if manifest.RootVolume != (cfg.RootVolume != "") {
+		return cleanup(fmt.Errorf("%w: root volume mismatch: bundle has %v, config has %v", ErrCheckpointManifest, manifest.RootVolume, cfg.RootVolume != ""))
+	}
+	applyHostMemoryDefaults()
+
+	sb = &Sandbox{
+		cfg:            cfg,
+		kernelReady:    make(chan struct{}),
+		runDone:        make(chan struct{}),
+		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
+	}
+	if cfg.HostCACerts {
+		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
+		if err != nil {
+			return cleanup(fmt.Errorf("gvx: read the host root certificates: %w", err))
+		}
+		sb.hostCARoots = roots
+	}
+	if err := sb.initNetPolicy(opts.Dir); err != nil {
 		return cleanup(err)
 	}
 	if pagesMetaFile, err = openReadOnly(checkpointPagesMetaFileName); err != nil {

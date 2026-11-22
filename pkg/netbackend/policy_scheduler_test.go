@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -60,6 +61,58 @@ func schedulerEvent[T any](t *testing.T, ch <-chan T, operation string) T {
 		t.Fatalf("%s did not complete", operation)
 		var zero T
 		return zero
+	}
+}
+
+func awaitSchedulerEvent[T any](t *testing.T, ctx context.Context, ch <-chan T, operation string) T {
+	t.Helper()
+	select {
+	case got := <-ch:
+		return got
+	case <-ctx.Done():
+		t.Fatalf("%s did not complete: %v", operation, ctx.Err())
+		var zero T
+		return zero
+	}
+}
+
+// pinPolicyCommit keeps a canceled dial in flight until the test lets it settle.
+func pinPolicyCommit(t *testing.T, ctx context.Context, p *NATPolicy, candidate *CompiledPolicy, lateConn net.Conn) func() {
+	t.Helper()
+	started, canceled, settle := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	dialed, committed := make(chan error, 1), make(chan error, 1)
+	release := sync.OnceFunc(func() { close(settle) })
+	t.Cleanup(release)
+	go func() {
+		_, err := p.Dial(t.Context(), PolicyInput, func(ctx context.Context) (net.Conn, error) {
+			close(started)
+			select {
+			case <-ctx.Done():
+				close(canceled)
+			case <-settle:
+				return nil, ctx.Err()
+			}
+			<-settle
+			if lateConn != nil {
+				return lateConn, nil
+			}
+			return nil, ctx.Err()
+		}, schedulerIPv4)
+		dialed <- err
+	}()
+	awaitSchedulerEvent(t, ctx, started, "start old dial")
+	go func() { committed <- p.Commit(candidate) }()
+	awaitSchedulerEvent(t, ctx, canceled, "cancel old dial at cutover")
+	schedulerNoEvent(t, committed, "replacement while the old dial is pinned")
+	return func() {
+		t.Helper()
+		release()
+		if err := awaitSchedulerEvent(t, ctx, dialed, "settle old dial"); !errors.Is(err, ErrPolicyDenied) {
+			t.Errorf("old Dial = %v, want %v", err, ErrPolicyDenied)
+		}
+		if err := awaitSchedulerEvent(t, ctx, committed, "publish replacement"); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
 	}
 }
 
@@ -109,7 +162,7 @@ func TestNATPolicyInstanceReplacementDoesNotChangeAnotherBudget(t *testing.T) {
 		time.Sleep(time.Second)
 		synctest.Wait()
 		candidate := schedulerCompile(t, schedulerDropRules, schedulerAcceptRules, schedulerLimit(32), schedulerLimit(8))
-		if err := a.Commit(candidate, func() error { return nil }); err != nil {
+		if err := a.Commit(candidate); err != nil {
 			t.Fatal(err)
 		}
 		schedulerEvent(t, oldDisposed, "disposal of queued work denied by replacement")
@@ -119,7 +172,7 @@ func TestNATPolicyInstanceReplacementDoesNotChangeAnotherBudget(t *testing.T) {
 		nextTX, nextRX := make(chan struct{}, 1), make(chan struct{}, 1)
 		if !a.Enqueue(PolicyInput, 2, func() { nextTX <- struct{}{} }, nil, schedulerIPv6) ||
 			!a.Enqueue(PolicyOutput, 1, func() { nextRX <- struct{}{} }, nil, schedulerIPv6) {
-			t.Fatal("enqueue under new revision")
+			t.Fatal("enqueue under replacement policy")
 		}
 		time.Sleep(250 * time.Millisecond)
 		synctest.Wait()
@@ -134,99 +187,95 @@ func TestNATPolicyInstanceReplacementDoesNotChangeAnotherBudget(t *testing.T) {
 	})
 }
 
-func TestNATPolicyCommitDoesNotRefillWhileSuspended(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := schedulerPolicy(t, schedulerLimit(8), PolicyLimit{})
-		sent := make(chan struct{}, 1)
-		if !p.Enqueue(PolicyInput, 1, func() { sent <- struct{}{} }, nil, schedulerIPv4) {
-			t.Fatal("enqueue under old revision")
-		}
-		candidate := schedulerCompile(t, schedulerAcceptRules, schedulerAcceptRules, schedulerLimit(16), PolicyLimit{})
-		if err := p.Commit(candidate, func() error {
-			time.Sleep(time.Hour)
-			schedulerNoEvent(t, sent, "handoff during durable commit")
-			if p.Allow(PolicyInput, schedulerIPv4) {
-				t.Error("packet hook admitted traffic during durable commit")
-			}
-			return nil
-		}); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
-		schedulerNoEvent(t, sent, "new revision with no elapsed active time")
-		time.Sleep(500 * time.Millisecond)
-		synctest.Wait()
-		schedulerEvent(t, sent, "revalidated work at the new rate")
-	})
+func TestNATPolicyCommitDoesNotRefillWhileBlocked(t *testing.T) {
+	ctx := testContext(t)
+	p := schedulerPolicy(t, PolicyLimit{}, schedulerLimit(8))
+	sent := make(chan struct{}, 1)
+	if !p.Enqueue(PolicyOutput, 1, func() { sent <- struct{}{} }, nil, schedulerIPv4) {
+		t.Fatal("enqueue under original policy")
+	}
+	candidate := schedulerCompile(t, schedulerAcceptRules, schedulerAcceptRules, PolicyLimit{}, schedulerLimit(1))
+	finish := pinPolicyCommit(t, ctx, p, candidate, nil)
+	if p.Allow(PolicyOutput, schedulerIPv4) {
+		t.Error("packet hook admitted traffic while cutover was blocked")
+	}
+	// One second behind the gate would earn a byte at the old rate.
+	// synctest cannot advance time while Commit waits on the pinned RWMutex.
+	select {
+	case <-sent:
+		t.Fatal("handoff during blocked cutover")
+	case <-time.After(time.Second):
+	case <-ctx.Done():
+		t.Fatal("timed out holding the handoff")
+	}
+	finish()
+	probeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := p.Send(probeCtx, PolicyOutput, 0, func() error { return nil }, schedulerIPv4); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("zero-byte probe behind paced work = %v, want context.DeadlineExceeded", err)
+	}
+	schedulerNoEvent(t, sent, "handoff using credit from the blocked interval")
+}
+
+type schedulerWaitingContext struct {
+	context.Context
+	waiting chan<- struct{}
+}
+
+func (c schedulerWaitingContext) Done() <-chan struct{} {
+	select {
+	case c.waiting <- struct{}{}:
+	default:
+	}
+	return c.Context.Done()
 }
 
 func TestNATPolicyStreamWaitingAtCutoverCanCancel(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := schedulerPolicy(t, PolicyLimit{}, PolicyLimit{})
-		candidate := schedulerCompile(t, schedulerAcceptRules, schedulerAcceptRules, PolicyLimit{}, PolicyLimit{})
-		marking, unblockMarker := make(chan struct{}), make(chan struct{}, 1)
-		defer func() { unblockMarker <- struct{}{} }()
-		committed := make(chan error, 1)
-		go func() {
-			committed <- p.Commit(candidate, func() error {
-				close(marking)
-				<-unblockMarker
-				return nil
-			})
-		}()
-		<-marking
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-		src, dst := net.Pipe()
-		defer src.Close()
-		defer dst.Close()
-		done := make(chan error, 1)
-		go func() { done <- p.CopyStream(ctx, PolicyInput, dst, src, schedulerIPv4) }()
-		synctest.Wait()
-		schedulerNoEvent(t, done, "stream before commit or cancellation")
-		cancel()
-		synctest.Wait()
-		if err := schedulerEvent(t, done, "canceled stream during commit"); !errors.Is(err, context.Canceled) {
-			t.Errorf("CopyStream = %v, want context.Canceled", err)
-		}
-		schedulerNoEvent(t, committed, "commit while marker remains blocked")
-		unblockMarker <- struct{}{}
-		if err := <-committed; err != nil {
-			t.Fatal(err)
-		}
-	})
+	ctx := testContext(t)
+	p := schedulerPolicy(t, PolicyLimit{}, PolicyLimit{})
+	candidate := schedulerCompile(t, schedulerAcceptRules, schedulerAcceptRules, PolicyLimit{}, PolicyLimit{})
+	finish := pinPolicyCommit(t, ctx, p, candidate, nil)
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	src, dst := net.Pipe()
+	defer src.Close()
+	defer dst.Close()
+	waiting, done := make(chan struct{}, 1), make(chan error, 1)
+	go func() {
+		done <- p.CopyStream(schedulerWaitingContext{streamCtx, waiting}, PolicyInput, dst, src, schedulerIPv4)
+	}()
+	awaitSchedulerEvent(t, ctx, waiting, "stream waiting on cutover")
+	schedulerNoEvent(t, done, "stream before cancellation")
+	cancel()
+	if err := awaitSchedulerEvent(t, ctx, done, "canceled stream during cutover"); !errors.Is(err, context.Canceled) {
+		t.Errorf("CopyStream = %v, want context.Canceled", err)
+	}
+	finish()
 }
 
-func TestNATPolicyCommitFailureStopsAdmissions(t *testing.T) {
+func TestNATPolicyCloseStopsAdmissions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := schedulerPolicy(t, schedulerLimit(8), PolicyLimit{})
 		sent, disposed := make(chan struct{}, 1), make(chan struct{}, 1)
 		if !p.Enqueue(PolicyInput, 10, func() { sent <- struct{}{} }, func() { disposed <- struct{}{} }, schedulerIPv4) {
-			t.Fatal("enqueue before marker failure")
+			t.Fatal("enqueue before close")
 		}
+		p.Close()
+		schedulerEvent(t, disposed, "queued disposal after close")
+		schedulerNoEvent(t, sent, "queued handoff after close")
 		candidate := schedulerCompile(t, schedulerAcceptRules, schedulerAcceptRules, PolicyLimit{}, PolicyLimit{})
-		markerError := errors.New("marker sync failed")
-		if err := p.Commit(candidate, func() error { return markerError }); !errors.Is(err, markerError) {
-			t.Fatalf("Commit = %v, want %v", err, markerError)
+		if err := p.Commit(candidate); !errors.Is(err, ErrPolicyDenied) {
+			t.Errorf("Commit after close = %v, want %v", err, ErrPolicyDenied)
 		}
-		schedulerEvent(t, disposed, "queued disposal after uncertain commit")
-		schedulerNoEvent(t, sent, "queued handoff after uncertain commit")
 		if release, ok := p.Begin(PolicyOutput, schedulerIPv6); ok {
 			release()
-			t.Error("Begin admitted traffic after uncertain commit")
+			t.Error("Begin admitted traffic after close")
 		}
 		if err := p.Send(t.Context(), PolicyInput, 0, func() error {
-			t.Error("Send admitted traffic after uncertain commit")
+			t.Error("Send admitted traffic after close")
 			return nil
 		}, schedulerIPv4); !errors.Is(err, ErrPolicyDenied) {
-			t.Errorf("Send after uncertain commit = %v, want %v", err, ErrPolicyDenied)
-		}
-		var policyErr *PolicyError
-		if err := p.Commit(candidate, func() error {
-			t.Error("second Commit called its marker after uncertain commit")
-			return nil
-		}); !errors.As(err, &policyErr) || policyErr.Code != "commit_uncertain" {
-			t.Errorf("second Commit = %v, want commit_uncertain", err)
+			t.Errorf("Send after close = %v, want %v", err, ErrPolicyDenied)
 		}
 	})
 }
@@ -275,7 +324,7 @@ func TestNATPolicyCommitDropsWholeDatagramWhenQueueShrinks(t *testing.T) {
 		}
 		limit := PolicyLimit{RateBPS: 8 * 65537, BurstBytes: 65537, QueueBytes: 65537}
 		candidate := schedulerCompile(t, schedulerAcceptRules, schedulerAcceptRules, limit, PolicyLimit{})
-		if err := p.Commit(candidate, func() error { return nil }); err != nil {
+		if err := p.Commit(candidate); err != nil {
 			t.Fatal(err)
 		}
 		schedulerEvent(t, secondDisposed, "disposal of datagram beyond new capacity")
@@ -345,31 +394,23 @@ func TestNATPolicySendCancellationWaitsForDispatchedWrite(t *testing.T) {
 	})
 }
 
-func TestNATPolicyCommitCancelsOldDialBeforeMarker(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := schedulerPolicy(t, PolicyLimit{}, PolicyLimit{})
-		started, settled, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
-		go func() {
-			_, err := p.Dial(t.Context(), PolicyInput, func(ctx context.Context) (net.Conn, error) {
-				close(started)
-				<-ctx.Done()
-				close(settled)
-				return nil, ctx.Err()
-			}, schedulerIPv4)
-			done <- err
-		}()
-		<-started
-		candidate := schedulerCompile(t, schedulerDropRules, schedulerAcceptRules, PolicyLimit{}, PolicyLimit{})
-		if err := p.Commit(candidate, func() error {
-			schedulerEvent(t, settled, "old dial before marker write")
-			return nil
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if err := <-done; !errors.Is(err, ErrPolicyDenied) {
-			t.Errorf("canceled Dial = %v, want %v", err, ErrPolicyDenied)
-		}
-	})
+func TestNATPolicyCommitRejectsLateDial(t *testing.T) {
+	ctx := testContext(t)
+	p := schedulerPolicy(t, PolicyLimit{}, PolicyLimit{})
+	candidate := schedulerCompile(t, schedulerDropRules, schedulerAcceptRules, PolicyLimit{}, PolicyLimit{})
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	deadline, _ := ctx.Deadline()
+	if err := peer.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	finish := pinPolicyCommit(t, ctx, p, candidate, conn)
+	finish()
+	var b [1]byte
+	if n, err := peer.Read(b[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("read from late dial's peer = %d, %v; want 0, EOF", n, err)
+	}
 }
 
 func TestNATPolicyCommitSettlesBlockedWrite(t *testing.T) {
@@ -377,9 +418,12 @@ func TestNATPolicyCommitSettlesBlockedWrite(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
-	started, result := make(chan struct{}), make(chan error, 1)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	started, settled, result := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
 		result <- p.Send(t.Context(), PolicyInput, 1, func() error {
+			defer close(settled)
 			return policyWrite(a, func() error {
 				close(started)
 				_, err := a.Write([]byte{1})
@@ -387,17 +431,16 @@ func TestNATPolicyCommitSettlesBlockedWrite(t *testing.T) {
 			})
 		}, schedulerIPv4)
 	}()
-	<-started
+	awaitSchedulerEvent(t, ctx, started, "start pinned write")
 	candidate := schedulerCompile(t, schedulerDropRules, schedulerAcceptRules, PolicyLimit{}, PolicyLimit{})
 	committed := make(chan error, 1)
-	go func() { committed <- p.Commit(candidate, func() error { return nil }) }()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
+	go func() { committed <- p.Commit(candidate) }()
 	select {
 	case err := <-committed:
 		if err != nil {
 			t.Fatal(err)
 		}
+		schedulerEvent(t, settled, "pinned write before replacement")
 	case <-ctx.Done():
 		t.Fatal("blocked writer prevented policy commit")
 	}
@@ -502,7 +545,7 @@ func TestNATPolicyCopyStreamWakesAnIdleDeniedDirection(t *testing.T) {
 		synctest.Wait()
 		schedulerNoEvent(t, done, "idle stream under allowing policy")
 		candidate := schedulerCompile(t, schedulerDropRules, schedulerAcceptRules, PolicyLimit{}, PolicyLimit{})
-		if err := p.Commit(candidate, func() error { return nil }); err != nil {
+		if err := p.Commit(candidate); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()
@@ -591,7 +634,7 @@ func TestNATPolicyCopyStreamWaitsOutsideGateDuringCheckpoint(t *testing.T) {
 		synctest.Wait()
 		schedulerEvent(t, paused.waiting, "stream waiting for checkpoint resume")
 		candidate := schedulerCompile(t, schedulerAcceptRules, schedulerDropRules, PolicyLimit{}, PolicyLimit{})
-		if err := p.Commit(candidate, func() error { return nil }); err != nil {
+		if err := p.Commit(candidate); err != nil {
 			t.Fatal(err)
 		}
 		close(paused.resumed)

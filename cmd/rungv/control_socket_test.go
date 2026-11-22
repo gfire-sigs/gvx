@@ -73,7 +73,7 @@ func freeLoopbackAddr(t *testing.T) string {
 // startFakeControl binds a real control endpoint and serves it with cp.
 func startFakeControl(t *testing.T, raw string, cp checkpointer) (*controlEndpoint, func()) {
 	t.Helper()
-	ep, err := listenCheckpointSocket(raw, "")
+	ep, err := listenCheckpointSocket(raw, false)
 	if err != nil {
 		t.Fatalf("listenCheckpointSocket(%q): %v", raw, err)
 	}
@@ -249,14 +249,14 @@ func TestControlStopKeepsInFlightResponse(t *testing.T) {
 func TestControlFailedBindKeepsTheTokenOfTheLiveListener(t *testing.T) {
 	isolateControlTokenDir(t)
 	addr := freeLoopbackAddr(t)
-	first, err := listenCheckpointSocket("tcp://"+addr, "")
+	first, err := listenCheckpointSocket("tcp://"+addr, false)
 	if err != nil {
 		t.Fatalf("first listenCheckpointSocket: %v", err)
 	}
 	defer first.Cleanup()
 	defer first.Listener.Close()
 
-	if second, err := listenCheckpointSocket("tcp://"+addr, ""); err == nil {
+	if second, err := listenCheckpointSocket("tcp://"+addr, false); err == nil {
 		second.Cleanup()
 		_ = second.Listener.Close()
 		t.Fatal("a second listener bound the address of a live listener")

@@ -30,7 +30,6 @@ import (
 
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
-	"z.gfire.dev/gvx/pkg/netbackend"
 )
 
 const (
@@ -53,58 +52,64 @@ func closeNetPolicyTestSandbox(t *testing.T, sb *Sandbox) {
 	}
 }
 
-func TestNetPolicyConcurrentReplacePersistsOnlyTheCASWinner(t *testing.T) {
+func TestNetPolicyConcurrentReplacementsBothSucceed(t *testing.T) {
 	cfg := newNetPolicyTestConfig(t)
-	seed := netbackend.PolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}
-	path := filepath.Join(privatePolicyStoreDir(t), "policy")
-	cfg.NetPolicy = &NetPolicyOptions{Path: path, Seed: &seed}
+	cfg.NetPolicy = &NetPolicyOptions{Policy: NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}}
 	sb, err := New(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("create protected sandbox: %v", err)
 	}
 	defer closeNetPolicyTestSandbox(t, sb)
-	initial, err := sb.NetPolicy()
-	if err != nil || initial.Revision == "" || initial.PolicyConfig != seed {
-		t.Fatalf("read seed policy: (%+v, %v), want nonempty revision and %+v", initial, err, seed)
-	}
 
-	limit := netbackend.PolicyLimit{RateBPS: 10_000_000, BurstBytes: 131_072, QueueBytes: 524_288}
-	candidates := []netbackend.PolicyConfig{
+	limit := NetPolicyLimit{RateBPS: 10_000_000, BurstBytes: 131_072, QueueBytes: 524_288}
+	candidates := []NetPolicyConfig{
 		{RulesV4: policyDropAll, RulesV6: policyAllowAll, TX: limit},
 		{RulesV4: policyAllowAll, RulesV6: policyDropAll, RX: limit},
 	}
-	type result struct {
-		candidate netbackend.PolicyConfig
-		snapshot  NetPolicySnapshot
-		err       error
-	}
 	start := make(chan struct{})
-	results := make(chan result, len(candidates))
+	results := make(chan error, len(candidates))
 	for _, candidate := range candidates {
 		go func() {
 			<-start
-			snapshot, err := sb.ReplaceNetPolicy(initial.Revision, candidate)
-			results <- result{candidate, snapshot, err}
+			results <- sb.ReplaceNetPolicy(candidate)
 		}()
 	}
 	close(start)
-	first, second := <-results, <-results
-	if first.err != nil {
-		first, second = second, first
+	for range candidates {
+		if err := <-results; err != nil {
+			t.Errorf("concurrent replacement: %v", err)
+		}
 	}
-	if first.err != nil || first.snapshot.Revision == initial.Revision || first.snapshot.PolicyConfig != first.candidate {
-		t.Fatalf("winning replacement: (%+v, %v), want new revision and %+v", first.snapshot, first.err, first.candidate)
+	got, err := sb.NetPolicy()
+	if err != nil || (got != candidates[0] && got != candidates[1]) {
+		t.Fatalf("active policy after concurrent replacements: (%+v, %v), want one complete replacement", got, err)
 	}
-	if got := NetPolicyErrorCode(second.err); got != "revision_conflict" {
-		t.Fatalf("second replacement: code %s (%v), want revision_conflict", got, second.err)
+}
+
+func TestNetPolicyRestartReadsSuppliedConfig(t *testing.T) {
+	cfg := newNetPolicyTestConfig(t)
+	initial := NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}
+	restart := NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyDropAll}
+	live := NetPolicyConfig{RulesV4: policyDropAll, RulesV6: policyDropAll}
+	cfg.NetPolicy = &NetPolicyOptions{Policy: initial}
+	sb, err := New(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("create protected sandbox: %v", err)
 	}
-	cfg.NetPolicy = &NetPolicyOptions{Path: path}
-	busy, err := New(t.Context(), cfg)
-	if busy != nil {
-		closeNetPolicyTestSandbox(t, busy)
+	defer closeNetPolicyTestSandbox(t, sb)
+
+	cfg.NetPolicy.Policy = restart
+	if got, err := sb.NetPolicy(); err != nil || got != initial {
+		t.Fatalf("active policy after editing options: (%+v, %v), want %+v", got, err, initial)
 	}
-	if NetPolicyErrorCode(err) != "state_unavailable" {
-		t.Fatalf("reopen a busy store: %v, want state_unavailable", err)
+	if err := sb.ReplaceNetPolicy(restart); err != nil {
+		t.Fatalf("first live replacement: %v", err)
+	}
+	if err := sb.ReplaceNetPolicy(live); err != nil {
+		t.Fatalf("replace live policy: %v", err)
+	}
+	if got, err := sb.NetPolicy(); err != nil || got != live {
+		t.Fatalf("active policy after replacement: (%+v, %v), want %+v", got, err, live)
 	}
 	if err := sb.Close(); err != nil {
 		t.Fatalf("close before restart: %v", err)
@@ -112,177 +117,126 @@ func TestNetPolicyConcurrentReplacePersistsOnlyTheCASWinner(t *testing.T) {
 
 	reopened, err := New(t.Context(), cfg)
 	if err != nil {
-		t.Fatalf("reopen committed policy: %v", err)
+		t.Fatalf("restart protected sandbox: %v", err)
 	}
 	defer closeNetPolicyTestSandbox(t, reopened)
-	current, err := reopened.NetPolicy()
-	if err != nil || current.Revision == first.snapshot.Revision || current.PolicyConfig != first.candidate {
-		t.Fatalf("policy after restart: (%+v, %v), want a new revision and the CAS winner", current, err)
-	}
-	if _, err := reopened.ReplaceNetPolicy(first.snapshot.Revision, second.candidate); NetPolicyErrorCode(err) != "revision_conflict" {
-		t.Fatalf("replace with previous instance revision: %v, want revision_conflict", err)
+	if got, err := reopened.NetPolicy(); err != nil || got != restart {
+		t.Fatalf("policy after restart: (%+v, %v), want %+v", got, err, restart)
 	}
 }
 
-func TestProtectedCheckpointUsesLatestMatchingStoreGeneration(t *testing.T) {
+func TestProtectedCheckpointRestoreUsesExplicitPolicy(t *testing.T) {
 	cfg := netPolicyCheckpointConfig(t)
-	seed := netbackend.PolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}
-	second := netbackend.PolicyConfig{RulesV4: policyDropAll, RulesV6: policyAllowAll}
-	latest := netbackend.PolicyConfig{RulesV4: policyDropAll, RulesV6: policyDropAll}
-	storePath := filepath.Join(privatePolicyStoreDir(t), "policy")
-	store, err := openNetPolicyStore(storePath, &seed)
-	if err != nil {
-		t.Fatalf("create initial policy store: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close initial policy store: %v", err)
-	}
-	firstGeneration := readNetPolicyStoreTestBytes(t, storePath)
-	cfg.NetPolicy = &NetPolicyOptions{Path: storePath}
+	initial := NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}
+	live := NetPolicyConfig{RulesV4: policyDropAll, RulesV6: policyAllowAll}
+	cfg.NetPolicy = &NetPolicyOptions{Policy: initial}
 	bundle := filepath.Join(t.TempDir(), "checkpoint")
-	manifest := captureNetPolicyCheckpoint(t, cfg, bundle, &second)
-	if manifest.Version != protectedCheckpointManifestVersion {
-		t.Fatalf("protected manifest version = %d, want %d", manifest.Version, protectedCheckpointManifestVersion)
+	manifest := captureNetPolicyCheckpoint(t, cfg, bundle, &live)
+	if manifest.Version != 5 {
+		t.Fatalf("protected manifest version = %d, want 5", manifest.Version)
 	}
-	if manifest.NetPolicy == nil {
-		t.Fatal("protected manifest has no policy binding")
-	}
-	if got := manifest.NetPolicy.MinGeneration; got != 2 {
-		t.Fatalf("protected manifest minimum policy generation = %d, want 2", got)
-	}
-	cfg.NetPolicy = nil
 
-	t.Run("store is mandatory", func(t *testing.T) {
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle}, "state_unavailable")
-	})
-	t.Run("missing store cannot be recreated", func(t *testing.T) {
-		missingPath := filepath.Join(privatePolicyStoreDir(t), "missing")
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle, NetPolicy: &NetPolicyOptions{Path: missingPath}}, "state_unavailable")
-		if _, err := os.Stat(missingPath); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("protected restore recreated the missing store: stat error %v", err)
-		}
-	})
-	t.Run("protected store cannot be seeded", func(t *testing.T) {
-		newPath := filepath.Join(privatePolicyStoreDir(t), "replacement")
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle, NetPolicy: &NetPolicyOptions{Path: newPath, Seed: &seed}}, "state_mismatch")
-		if _, err := os.Stat(newPath); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("protected restore created a replacement store: stat error %v", err)
-		}
-	})
-	t.Run("store identity must match", func(t *testing.T) {
-		otherPath := filepath.Join(privatePolicyStoreDir(t), "policy")
-		other, err := openNetPolicyStore(otherPath, &seed)
-		if err != nil {
-			t.Fatalf("create unrelated store: %v", err)
-		}
-		if err := other.Close(); err != nil {
-			t.Fatalf("close unrelated store: %v", err)
-		}
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle, NetPolicy: &NetPolicyOptions{Path: otherPath}}, "state_mismatch")
-	})
-	t.Run("store must meet the recorded minimum", func(t *testing.T) {
-		currentGeneration := readNetPolicyStoreTestBytes(t, storePath)
-		writeNetPolicyStoreTestBytes(t, storePath, firstGeneration)
-		defer writeNetPolicyStoreTestBytes(t, storePath, currentGeneration)
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle, NetPolicy: &NetPolicyOptions{Path: storePath}}, "state_mismatch")
-	})
-	t.Run("protected manifest requires a binding", func(t *testing.T) {
-		incomplete := manifest
-		incomplete.NetPolicy = nil
-		writeNetPolicyTestManifest(t, bundle, incomplete)
-		defer writeNetPolicyTestManifest(t, bundle, manifest)
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle}, "state_mismatch")
-	})
-	t.Run("legacy manifest cannot name protected state", func(t *testing.T) {
-		stale := manifest
-		stale.Version, stale.NetPolicy = legacyCheckpointManifestVersion, nil
-		writeNetPolicyTestManifest(t, bundle, stale)
-		defer writeNetPolicyTestManifest(t, bundle, manifest)
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle}, "state_mismatch")
-	})
-	t.Run("state header must agree with the protected manifest", func(t *testing.T) {
-		stale := manifest
-		stale.NetPolicy = &CheckpointNetPolicy{StoreID: manifest.NetPolicy.StoreID, MinGeneration: 3}
-		writeNetPolicyTestManifest(t, bundle, stale)
-		defer writeNetPolicyTestManifest(t, bundle, manifest)
-		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle}, "state_mismatch")
-	})
+	withoutPolicy := cfg
+	withoutPolicy.NetPolicy = nil
+	withoutPolicy.Platform = PlatformType("invalid")
+	requireNetPolicyRestoreError(t, withoutPolicy, RestoreOptions{Dir: bundle}, "policy_required")
 
-	selected := &NetPolicyOptions{Path: storePath}
-	restored, err := Restore(t.Context(), cfg, RestoreOptions{Dir: bundle, NetPolicy: selected})
+	selected := NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyDropAll}
+	cfg.NetPolicy = &NetPolicyOptions{Policy: selected}
+	mountedBundle := cfg
+	mountedBundle.WorkspacePath = filepath.Dir(bundle)
+	requireNetPolicyRestoreError(t, mountedBundle, RestoreOptions{Dir: bundle}, "invalid_policy")
+
+	restored, err := Restore(t.Context(), cfg, RestoreOptions{Dir: bundle})
 	if err != nil {
-		t.Fatalf("restore exact generation: %v", err)
+		t.Fatalf("restore with a different explicit policy: %v", err)
 	}
 	defer closeNetPolicyTestSandbox(t, restored)
-	atMinimum, err := restored.NetPolicy()
-	if err != nil || atMinimum.PolicyConfig != second {
-		t.Fatalf("policy at checkpoint generation: (%+v, %v), want %+v", atMinimum, err, second)
-	}
-	third, err := restored.ReplaceNetPolicy(atMinimum.Revision, latest)
-	if err != nil {
-		t.Fatalf("commit a policy newer than the checkpoint: %v", err)
-	}
-	if err := restored.Close(); err != nil {
-		t.Fatalf("close sandbox after replacing restored policy: %v", err)
-	}
-	newer, err := Restore(t.Context(), cfg, RestoreOptions{Dir: bundle, NetPolicy: selected})
-	if err != nil {
-		t.Fatalf("restore with store newer than the checkpoint: %v", err)
-	}
-	defer closeNetPolicyTestSandbox(t, newer)
-	got, err := newer.NetPolicy()
-	if err != nil || got.PolicyConfig != latest || got.Revision == third.Revision {
-		t.Fatalf("policy after restoring older checkpoint: (%+v, %v), want %+v and a new instance revision", got, err, latest)
+	if got, err := restored.NetPolicy(); err != nil || got != selected {
+		t.Fatalf("policy after restore: (%+v, %v), want %+v", got, err, selected)
 	}
 }
 
-func TestUnprotectedNATCheckpointAcceptsExplicitPolicySeed(t *testing.T) {
+func TestProtectedCheckpointRejectsManifestStateMismatch(t *testing.T) {
+	cfg := netPolicyCheckpointConfig(t)
+	cfg.NetPolicy = &NetPolicyOptions{Policy: NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}}
+	bundle := filepath.Join(t.TempDir(), "checkpoint")
+	manifest := captureNetPolicyCheckpoint(t, cfg, bundle, nil)
+	cfg.NetPolicy = nil
+	statePath := filepath.Join(bundle, checkpointStateFileName)
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state) <= checkpointPolicyStateHeaderSize {
+		t.Fatalf("saved state has no payload after the protected prefix: %d bytes", len(state))
+	}
+	for _, tc := range []struct {
+		name    string
+		version int
+		state   []byte
+	}{
+		{"downgrade to legacy unprotected manifest", legacyCheckpointManifestVersion, state},
+		{"downgrade to unprotected manifest", CheckpointManifestVersion, state},
+		{"partial magic under unprotected manifest", CheckpointManifestVersion, state[:len(checkpointPolicyStateMagic)-1]},
+		{"unprotected state under protected manifest", protectedCheckpointManifestVersion, state[checkpointPolicyStateHeaderSize:]},
+		{"truncated protected header", protectedCheckpointManifestVersion, state[:len(checkpointPolicyStateMagic)]},
+		{"obsolete protected header", protectedCheckpointManifestVersion, []byte(checkpointPolicyStateMagic + "\x01")},
+		{"unreleased protected manifest version 2", 2, state},
+		{"unreleased protected manifest version 4", 4, state},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := manifest
+			m.Version = tc.version
+			writeNetPolicyTestManifest(t, bundle, m)
+			if err := os.WriteFile(statePath, tc.state, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle}, "state_mismatch")
+		})
+	}
+}
+
+func TestUnprotectedNATCheckpointAcceptsExplicitPolicy(t *testing.T) {
 	cfg := netPolicyCheckpointConfig(t)
 	bundle := filepath.Join(t.TempDir(), "checkpoint")
 	manifest := captureNetPolicyCheckpoint(t, cfg, bundle, nil)
 	if manifest.Version != CheckpointManifestVersion {
 		t.Fatalf("unprotected manifest version = %d, want %d", manifest.Version, CheckpointManifestVersion)
 	}
-	if manifest.NetPolicy != nil {
-		t.Fatalf("unprotected manifest policy binding = %+v, want nil", manifest.NetPolicy)
-	}
-	seed := netbackend.PolicyConfig{RulesV4: policyDropAll, RulesV6: policyDropAll}
-	path := filepath.Join(privatePolicyStoreDir(t), "policy")
-	opts := RestoreOptions{Dir: bundle, NetPolicy: &NetPolicyOptions{Path: path, Seed: &seed}}
-	restored, err := Restore(t.Context(), cfg, opts)
+	policy := NetPolicyConfig{RulesV4: policyDropAll, RulesV6: policyDropAll}
+	cfg.NetPolicy = &NetPolicyOptions{Policy: policy}
+	restored, err := Restore(t.Context(), cfg, RestoreOptions{Dir: bundle})
 	if err != nil {
 		t.Fatalf("restore unprotected bundle with new policy: %v", err)
 	}
 	defer closeNetPolicyTestSandbox(t, restored)
-	current, err := restored.NetPolicy()
-	if err != nil || current.Revision == "" || current.PolicyConfig != seed {
-		t.Fatalf("policy after restore with seed: (%+v, %v), want a nonempty revision and %+v", current, err, seed)
+	if got, err := restored.NetPolicy(); err != nil || got != policy {
+		t.Fatalf("policy after explicit restore: (%+v, %v), want %+v", got, err, policy)
 	}
 }
 
-func TestNetPolicyRejectsPrivateFilesInGuestMountsAndCaches(t *testing.T) {
-	private := privatePolicyStoreDir(t)
-	store := filepath.Join(private, "policy")
-	seed := netbackend.PolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}
+func TestNetPolicyRejectsPrivateFilesInGuestMounts(t *testing.T) {
+	private := t.TempDir()
+	token := filepath.Join(private, "control.token")
+	policy := NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}
 	for _, tc := range []struct {
 		name      string
 		configure func(*testing.T, *Config)
 	}{
 		{"read-only workspace", func(_ *testing.T, c *Config) { c.WorkspacePath, c.WorkspaceReadOnly = private, true }},
-		{"layer cache", func(_ *testing.T, c *Config) { c.OCICacheDir = private }},
-		{"checkpoint directory", func(_ *testing.T, c *Config) { c.CheckpointDir = private }},
 		{"checkpoint output mounted separately", func(t *testing.T, c *Config) {
 			c.CheckpointDir = filepath.Join(t.TempDir(), "checkpoints")
 			c.WorkspacePath = filepath.Dir(c.CheckpointDir)
 		}},
 		{"ext4 image", func(_ *testing.T, c *Config) {
-			c.Mounts = []Mount{{Kind: MountVolume, ImagePath: store, GuestPath: "/data"}}
+			c.Mounts = []Mount{{Kind: MountVolume, ImagePath: token, GuestPath: "/data"}}
 		}},
 		{"overlay upper", func(_ *testing.T, c *Config) {
-			c.Mounts = []Mount{{Kind: MountOverlay, ImagePath: filepath.Join(private, "base.ext4"), UpperImagePath: store, GuestPath: "/data"}}
+			c.Mounts = []Mount{{Kind: MountOverlay, ImagePath: filepath.Join(private, "base.ext4"), UpperImagePath: token, GuestPath: "/data"}}
 		}},
 		{"root image", func(_ *testing.T, c *Config) {
-			c.OCIImage, c.RootVolume = "example.invalid/gvx", store
+			c.OCIImage, c.RootVolume = "example.invalid/gvx", token
 		}},
 		{"control token mounted separately", func(t *testing.T, c *Config) {
 			workspace := t.TempDir()
@@ -305,17 +259,17 @@ func TestNetPolicyRejectsPrivateFilesInGuestMountsAndCaches(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{NetPolicy: &NetPolicyOptions{Path: store, Seed: &seed}, DisableHostLockdown: true}
+			cfg := Config{
+				NetPolicy:           &NetPolicyOptions{Policy: policy, ControlPaths: []string{token}},
+				DisableHostLockdown: true,
+			}
 			tc.configure(t, &cfg)
 			sb, err := New(t.Context(), cfg)
 			if sb != nil {
 				closeNetPolicyTestSandbox(t, sb)
 			}
-			if !errors.Is(err, ErrInvalidConfig) || NetPolicyErrorCode(err) != "state_unavailable" {
-				t.Fatalf("start with overlapping private path: %v, want invalid configuration with state_unavailable", err)
-			}
-			if _, err := os.Stat(store); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("overlapping path created a store: stat error %v", err)
+			if !errors.Is(err, ErrInvalidConfig) || NetPolicyErrorCode(err) != "invalid_policy" {
+				t.Fatalf("start with overlapping private path: %v, want invalid configuration with invalid_policy", err)
 			}
 		})
 	}
@@ -330,7 +284,7 @@ func TestNetPolicyRejectsControlAddressDifferentFromBoundListener(t *testing.T) 
 	bound := ln.Addr().(*net.TCPAddr).AddrPort()
 	other := netip.AddrPortFrom(bound.Addr(), bound.Port()^1)
 	cfg := Config{
-		NetPolicy:           &NetPolicyOptions{Path: filepath.Join(privatePolicyStoreDir(t), "policy"), ControlAddress: other},
+		NetPolicy:           &NetPolicyOptions{Policy: NetPolicyConfig{RulesV4: policyAllowAll, RulesV6: policyAllowAll}, ControlAddress: other},
 		CheckpointListener:  ln,
 		DisableHostLockdown: true,
 	}
@@ -362,7 +316,7 @@ func netPolicyCheckpointConfig(t *testing.T) Config {
 	return cfg
 }
 
-func captureNetPolicyCheckpoint(t *testing.T, cfg Config, bundle string, replacement *netbackend.PolicyConfig) CheckpointManifest {
+func captureNetPolicyCheckpoint(t *testing.T, cfg Config, bundle string, replacement *NetPolicyConfig) CheckpointManifest {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -377,11 +331,7 @@ func captureNetPolicyCheckpoint(t *testing.T, cfg Config, bundle string, replace
 	}
 	defer closeNetPolicyTestSandbox(t, sb)
 	if replacement != nil {
-		current, err := sb.NetPolicy()
-		if err != nil {
-			t.Fatalf("read policy before checkpoint: %v", err)
-		}
-		if _, err := sb.ReplaceNetPolicy(current.Revision, *replacement); err != nil {
+		if err := sb.ReplaceNetPolicy(*replacement); err != nil {
 			t.Fatalf("replace policy before checkpoint: %v", err)
 		}
 	}
@@ -412,22 +362,6 @@ func captureNetPolicyCheckpoint(t *testing.T, cfg Config, bundle string, replace
 	return manifest
 }
 
-func readNetPolicyStoreTestBytes(t *testing.T, path string) []byte {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("save policy fixture: %v", err)
-	}
-	return data
-}
-
-func writeNetPolicyStoreTestBytes(t *testing.T, path string, data []byte) {
-	t.Helper()
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("restore policy fixture: %v", err)
-	}
-}
-
 func writeNetPolicyTestManifest(t *testing.T, bundle string, manifest CheckpointManifest) {
 	t.Helper()
 	data, err := json.Marshal(manifest)
@@ -447,5 +381,8 @@ func requireNetPolicyRestoreError(t *testing.T, cfg Config, opts RestoreOptions,
 	}
 	if got := NetPolicyErrorCode(err); got != wantCode {
 		t.Fatalf("restore: code %s (%v), want %s", got, err, wantCode)
+	}
+	if wantCode == "state_mismatch" && !errors.Is(err, ErrCheckpointManifest) {
+		t.Fatalf("restore: %v, want ErrCheckpointManifest", err)
 	}
 }

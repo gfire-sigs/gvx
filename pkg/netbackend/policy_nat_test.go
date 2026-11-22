@@ -161,8 +161,7 @@ func TestNATPolicyUDPChecksTranslatedReplyOnExistingSession(t *testing.T) {
 	host.send("before", peer)
 	readReply("before")
 
-	mark := func() error { return nil }
-	if err := policy.Commit(denyReply, mark); err != nil {
+	if err := policy.Commit(denyReply); err != nil {
 		t.Fatal(err)
 	}
 	host.send("denied", peer)
@@ -172,7 +171,7 @@ func TestNATPolicyUDPChecksTranslatedReplyOnExistingSession(t *testing.T) {
 	if n, err := conn.Read(buf[:]); !isTimeout(err) {
 		t.Fatalf("guest got %q, %v from denied host reply; want timeout", buf[:n], err)
 	}
-	if err := policy.Commit(permit, mark); err != nil {
+	if err := policy.Commit(permit); err != nil {
 		t.Fatal(err)
 	}
 	host.send("after", peer)

@@ -15,19 +15,15 @@
 package gvx
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/netbackend"
-	"z.gfire.dev/gvx/pkg/oci"
 )
 
 // NetPolicyConfig contains both rule files and bandwidth limits.
@@ -47,24 +43,16 @@ func ParseNetPolicyLimit(s string) (NetPolicyLimit, error) {
 	return netbackend.ParsePolicyLimit(s)
 }
 
-// NetPolicyOptions selects the durable policy for a NAT sandbox.
+// NetPolicyOptions selects the initial policy for a NAT sandbox.
 type NetPolicyOptions struct {
-	// Path names the private host store. The sandbox opens it before lockdown.
-	Path string
-	// Seed creates a new store exclusively. Nil opens an existing store.
-	Seed *netbackend.PolicyConfig
+	// Policy supplies both rule files and both directional limits.
+	Policy NetPolicyConfig
 	// ControlAddress reserves an optional loopback TCP management endpoint.
 	// A TCP CheckpointListener supplies its bound address when this is zero.
 	ControlAddress netip.AddrPort
 	// ControlPaths lists private endpoint files, such as a token sidecar,
 	// that the guest must not see. The sandbox also checks a Unix listener's path.
 	ControlPaths []string
-}
-
-// NetPolicySnapshot contains the accepted policy and its instance-specific revision.
-type NetPolicySnapshot struct {
-	Revision string `json:"revision"`
-	netbackend.PolicyConfig
 }
 
 // NetPolicyErrorCode returns a stable policy error code, or internal.
@@ -89,9 +77,6 @@ func (c *Config) validateNetPolicyConfig() error {
 	if c.NetworkMode != NetModeNAT {
 		return netPolicyError("unsupported_mode", "network policy requires NAT mode")
 	}
-	if c.NetPolicy.Path == "" {
-		return netPolicyError("state_unavailable", "network policy requires a host store path")
-	}
 	if c.StreamInterceptor != nil {
 		return netPolicyError("invalid_policy", "protected NAT does not allow a stream interceptor")
 	}
@@ -108,45 +93,9 @@ func (c *Config) validateNetPolicyConfig() error {
 	return nil
 }
 
-func (m CheckpointManifest) validateNetPolicyBinding() error {
-	switch m.Version {
-	case legacyCheckpointManifestVersion, CheckpointManifestVersion:
-		if m.NetPolicy != nil {
-			return fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "an unprotected bundle cannot contain a network policy binding"))
-		}
-	case legacyProtectedCheckpointManifestVersion, protectedCheckpointManifestVersion:
-		binding := m.NetPolicy
-		if m.NetMode != NetModeNAT || binding == nil || !validPolicyStoreID(binding.StoreID) || binding.MinGeneration == 0 {
-			return fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "invalid network policy binding"))
-		}
-	default:
-		return fmt.Errorf("%w: unsupported version %d", ErrCheckpointManifest, m.Version)
-	}
-	return nil
-}
-
-func validPolicyStoreID(id string) bool {
-	if len(id) != hex.EncodedLen(policyStoreIDBytes) || strings.ContainsAny(id, "ABCDEF") {
-		return false
-	}
-	var decoded [policyStoreIDBytes]byte
-	_, err := hex.Decode(decoded[:], []byte(id))
-	return err == nil
-}
-
-func (s *Sandbox) openNetPolicy(binding *CheckpointNetPolicy, restoreDir string) error {
+func (s *Sandbox) initNetPolicy(restoreDir string) error {
 	opts := s.cfg.NetPolicy
-	if binding != nil {
-		if s.cfg.NetworkMode != NetModeNAT {
-			return netPolicyError("state_mismatch", "a protected checkpoint requires NAT mode")
-		}
-		if opts == nil {
-			return netPolicyError("state_unavailable", "a protected checkpoint requires its host policy store")
-		}
-		if opts.Seed != nil {
-			return netPolicyError("state_mismatch", "a protected checkpoint cannot seed a policy store")
-		}
-	}
+	s.cfg.NetPolicy = nil
 	if opts == nil {
 		return nil
 	}
@@ -154,47 +103,16 @@ func (s *Sandbox) openNetPolicy(binding *CheckpointNetPolicy, restoreDir string)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	validatePaths := func() error {
-		if err := s.cfg.validateNetPolicyPaths(restoreDir, unixPath); err != nil {
-			return fmt.Errorf("%w: %w: %w", ErrInvalidConfig, netPolicyError("state_unavailable", "unsafe network policy path"), err)
-		}
-		return nil
+	if err := s.cfg.validateNetPolicyPaths(restoreDir, unixPath, opts.ControlPaths); err != nil {
+		return fmt.Errorf("%w: %w: %w", ErrInvalidConfig, netPolicyError("invalid_policy", "unsafe network policy path"), err)
 	}
-	if err := validatePaths(); err != nil {
+	policy := opts.Policy
+	compiled, err := netbackend.CompilePolicy(policy)
+	if err != nil {
 		return err
 	}
-	var compiled *netbackend.CompiledPolicy
-	var seed *netbackend.PolicyConfig
-	if opts.Seed != nil {
-		candidate := *opts.Seed
-		compiled, err = netbackend.CompilePolicy(candidate)
-		if err != nil {
-			return err
-		}
-		seed = &candidate
-	}
-	store, err := openNetPolicyStore(opts.Path, seed)
-	if err != nil {
-		return fmt.Errorf("%w: %w", netPolicyError("state_unavailable", "open network policy store"), err)
-	}
-	s.policyStore = store
-	if binding != nil && (store.id != binding.StoreID || store.generation < binding.MinGeneration) {
-		return netPolicyError("state_mismatch", "the selected store does not meet the checkpoint binding")
-	}
-	// A new file can make an alternate filesystem name resolve.
-	if seed != nil {
-		if err := validatePaths(); err != nil {
-			return err
-		}
-	}
-	if compiled == nil {
-		compiled, err = netbackend.CompilePolicy(store.config)
-		if err != nil {
-			return fmt.Errorf("%w: %w", netPolicyError("state_unavailable", "compile stored network policy"), err)
-		}
-	}
-	s.policyRunID = rand.Text()
 	s.netPolicy = netbackend.NewNATPolicy(compiled, control)
+	s.netPolicyConfig = policy
 	return nil
 }
 
@@ -234,31 +152,15 @@ func unmapAddrPort(ap netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
-func (c *Config) validateNetPolicyPaths(restoreDir, unixPath string) error {
-	storePath := c.NetPolicy.Path
-	privatePaths := append([]string{storePath}, c.NetPolicy.ControlPaths...)
-	if unixPath != "" {
-		privatePaths = append(privatePaths, unixPath)
-	}
-	for _, controlPath := range privatePaths[1:] {
-		if controlPath == "" {
+func (c *Config) validateNetPolicyPaths(restoreDir, unixPath string, controlPaths []string) error {
+	for _, path := range controlPaths {
+		if path == "" {
 			return errEmptyNetPolicyControlPath
 		}
-		if err := rejectNetPolicyOverlap(storePath, controlPath, false); err != nil {
-			return err
-		}
 	}
-	cache := c.OCICacheDir
-	volumeRoot, _ := c.volumeRoot()
-	if cache == "" {
-		cache, _ = oci.DefaultCacheDir()
-	}
-	for _, dir := range []string{cache, volumeRoot, c.CheckpointDir, restoreDir} {
-		if dir != "" {
-			if err := rejectNetPolicyOverlap(storePath, dir, true); err != nil {
-				return err
-			}
-		}
+	privatePaths := controlPaths[:len(controlPaths):len(controlPaths)]
+	if unixPath != "" {
+		privatePaths = append(privatePaths, unixPath)
 	}
 	for _, dir := range []string{c.CheckpointDir, restoreDir} {
 		if dir != "" {
@@ -375,48 +277,39 @@ func rejectNetPolicyOverlap(private, source string, dir bool) error {
 	}
 }
 
-// NetPolicy reads the current confirmed policy of a protected NAT sandbox.
-func (s *Sandbox) NetPolicy() (NetPolicySnapshot, error) {
+// NetPolicy reads the active policy of a protected NAT sandbox.
+func (s *Sandbox) NetPolicy() (NetPolicyConfig, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.netPolicyStatusLocked(); err != nil {
-		return NetPolicySnapshot{}, err
+		return NetPolicyConfig{}, err
 	}
-	return s.netPolicySnapshotLocked(), nil
+	return s.netPolicyConfig, nil
 }
 
-// ReplaceNetPolicy commits cfg if expected matches the current revision.
-// The revision changes after both durable commit and live publication succeed.
-func (s *Sandbox) ReplaceNetPolicy(expected string, cfg netbackend.PolicyConfig) (NetPolicySnapshot, error) {
+// ReplaceNetPolicy atomically replaces both rule files and both directional limits.
+func (s *Sandbox) ReplaceNetPolicy(cfg NetPolicyConfig) error {
 	s.mu.Lock()
 	err := s.netPolicyStatusLocked()
 	s.mu.Unlock()
 	if err != nil {
-		return NetPolicySnapshot{}, err
+		return err
 	}
 	compiled, err := netbackend.CompilePolicy(cfg)
 	if err != nil {
-		return NetPolicySnapshot{}, err
+		return err
 	}
 
-	s.ckptMu.Lock()
-	defer s.ckptMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.netPolicyStatusLocked(); err != nil {
-		return NetPolicySnapshot{}, err
+		return err
 	}
-	if expected != s.netPolicyRevisionLocked() {
-		return NetPolicySnapshot{}, netPolicyError("revision_conflict", "the network policy revision changed")
+	if err := s.netPolicy.Commit(compiled); err != nil {
+		return err
 	}
-	if err := s.policyStore.Stage(cfg); err != nil {
-		return NetPolicySnapshot{}, fmt.Errorf("%w: %w", netPolicyError("state_unavailable", "stage network policy"), err)
-	}
-	if err := s.netPolicy.Commit(compiled, s.policyStore.Commit); err != nil {
-		s.policyCommitErr = fmt.Errorf("%w: %w", netPolicyError("commit_uncertain", "network policy requires recovery"), err)
-		return NetPolicySnapshot{}, s.policyCommitErr
-	}
-	return s.netPolicySnapshotLocked(), nil
+	s.netPolicyConfig = cfg
+	return nil
 }
 
 func (s *Sandbox) netPolicyStatusLocked() error {
@@ -426,26 +319,5 @@ func (s *Sandbox) netPolicyStatusLocked() error {
 	if s.netPolicy == nil {
 		return netPolicyError("policy_disabled", "this sandbox has no active network policy")
 	}
-	return s.policyCommitErr
-}
-
-func (s *Sandbox) netPolicyRevisionLocked() string {
-	return s.policyRunID + ":" + strconv.FormatUint(s.policyStore.generation, 10)
-}
-
-func (s *Sandbox) netPolicySnapshotLocked() NetPolicySnapshot {
-	return NetPolicySnapshot{
-		Revision:     s.netPolicyRevisionLocked(),
-		PolicyConfig: s.policyStore.config,
-	}
-}
-
-func (s *Sandbox) checkpointNetPolicyLocked() (*CheckpointNetPolicy, error) {
-	if s.policyCommitErr != nil {
-		return nil, s.policyCommitErr
-	}
-	if s.policyStore == nil {
-		return nil, nil
-	}
-	return &CheckpointNetPolicy{StoreID: s.policyStore.id, MinGeneration: s.policyStore.generation}, nil
+	return nil
 }

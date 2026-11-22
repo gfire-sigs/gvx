@@ -103,9 +103,8 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-lockdown=false` | Skip host lockdown. Use for debugging only. |
 | `--tune KEY=VALUE` | Set a host-side tunable (repeatable; see Section 3.3). Accepted by `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info`. |
 | `--tune-file FILE` | Load host-side tunables from a JSON object. `--tune` flags override the file. Accepted by the same commands. |
-| `--net-policy-state FILE` | Create or reopen a host-owned policy store for `-net=nat` (see Section 4.12). |
-| `--nat-iptables-file FILE`, `--nat-ip6tables-file FILE` | Seed a new policy store with the IPv4 and IPv6 `*filter` files. |
-| `--qos-tx LIMIT`, `--qos-rx LIMIT` | Specify transmit and receive limits when seeding a store. Both arguments are required. |
+| `--nat-iptables-file FILE`, `--nat-ip6tables-file FILE` | Apply IPv4 and IPv6 `*filter` rules in NAT mode. Specify both files to enable the host policy. |
+| `--qos-tx LIMIT`, `--qos-rx LIMIT` | Set transmit and receive limits for the host policy. Each limit defaults to `unlimited` on `run` and `restore`. |
 | `--net-policy-live` | Enable `net-policy get` and `net-policy replace` on `-control-socket`. |
 
 ### 3.3 Tunables
@@ -329,7 +328,7 @@ SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO-
 
 A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.meta`, and `pages.img`. `manifest.json` records the host OS, CPU architecture, platform backend, address holes, EROFS layer digests, mounts, and network mode. `rungv restore` (`rungv resume`) validates `manifest.json` against the current host and reopens cached layers and mounts before applying lockdown.
 
-The bundle preserves the guest's IPv4 and IPv6 `iptables-legacy` rules in each network namespace. It does not preserve connection tracking entries or host socket sessions. The host NAT policy uses its own store (see Section 4.12).
+The bundle preserves the guest's IPv4 and IPv6 `iptables-legacy` rules in each network namespace. It does not preserve connection tracking entries, host socket sessions, or the host NAT policy. A protected bundle requires explicit host policy files on restore (see Section 4.12).
 
 Use a `rungv` build that supports guest firewall restore to resume a new bundle. Older bundles do not contain guest firewall rules.
 
@@ -367,22 +366,24 @@ Each rule file has a 64 KiB limit. Each built-in chain can visit at most 4,096 r
 | Publications | Protected runs reject Unix-socket publications and wildcard UDP bind addresses. The default loopback bind is valid. |
 | Bandwidth | Each direction takes `unlimited` or `rate-bps=N,burst-bytes=B,queue-bytes=Q`. One bucket per direction covers all protected paths. RX limits delivery, not packets the host kernel already received. |
 
+Pass both rule files on every protected start or restore. A protected checkpoint rejects restore without these files. It does not record which rules or limits were active. The operator selects the policy for the next run.
+
+`net-policy replace` changes both rule sets and both limits together. The last successful replacement wins. Neither `get` nor `replace` edits the input files. If a reply is lost, use `get` before retrying.
+
 > [!IMPORTANT]
-> Keep policy and control files in private host directories outside guest mounts. Create the store's parent directory before starting. Supply the same store on restart or restore.
+> Keep policy files and control endpoints outside guest mounts.
 
 ```sh
-rungv run -net=nat --net-policy-state ./private/policy.state \
-  --nat-iptables-file rules.v4 --nat-ip6tables-file rules.v6 \
-  --qos-tx unlimited --qos-rx rate-bps=10000000,burst-bytes=131072,queue-bytes=524288 \
-  --net-policy-live -control-socket tcp://127.0.0.1:7401 IMAGE
+rungv run -net=nat --nat-iptables-file rules.v4 --nat-ip6tables-file rules.v6 \
+  --qos-rx rate-bps=10000000,burst-bytes=131072,queue-bytes=524288 \
+  --net-policy-live -checkpoint-dir ./ckpt -control-socket tcp://127.0.0.1:7401 IMAGE
 rungv net-policy get -control-socket tcp://127.0.0.1:7401
-rungv net-policy replace -control-socket tcp://127.0.0.1:7401 --expected-revision REV \
+rungv net-policy replace -control-socket tcp://127.0.0.1:7401 \
   --file next.v4 --file6 next.v6 --qos-tx unlimited --qos-rx unlimited
+rungv checkpoint -control-socket tcp://127.0.0.1:7401
+rungv restore -checkpoint-dir ./ckpt \
+  --nat-iptables-file next.v4 --nat-ip6tables-file next.v6
 ```
-
-`REV` is the opaque revision from `get`. Replacement commits both rule files and both limits together. A restart invalidates the old revision token, not the saved configuration. If the reply is lost, use `get` before any retry.
-
-On an ordinary restart, specify the state path without seed rules or limits. For a protected checkpoint, restore requires a store with the recorded identity and at least the recorded generation. Restore uses a newer committed policy if the same store has one.
 
 The NAT backend refuses guest connections to its own TCP control endpoint. A checkpoint listener does not enable policy commands unless the operator sets `--net-policy-live`.
 

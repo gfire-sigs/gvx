@@ -4,11 +4,11 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
-`rungv` can enforce a host-owned firewall and bandwidth limits for a NAT sandbox. The policy can change during execution and persists outside the guest.
+`rungv` can enforce a host-owned firewall and bandwidth limits for a NAT sandbox. The operator supplies the policy at start or restore.
 
 ### Features
 
-- **Host NAT policy** (#226): Apply a stateless IPv4 and IPv6 filter at the NAT peer, host dials, DNS relay, and published ports. Set aggregate transmit and receive limits for the sandbox. Use `rungv net-policy` to read or atomically replace the saved configuration. A protected checkpoint requires its matching host store.
+- **Host NAT policy** (#226): Apply a stateless IPv4 and IPv6 filter at the NAT peer, host dials, DNS relay, and published ports. Set aggregate transmit and receive limits. Use `rungv net-policy` to read or atomically replace the live policy. Live changes do not persist. A protected checkpoint requires explicit rules on restore.
 
 ### Bug Fixes
 

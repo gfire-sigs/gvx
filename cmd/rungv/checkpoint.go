@@ -225,25 +225,10 @@ type controlEndpoint struct {
 }
 
 // Bind and publish credentials before host lockdown.
-func listenCheckpointSocket(raw, statePath string) (*controlEndpoint, error) {
+func listenCheckpointSocket(raw string, protected bool) (*controlEndpoint, error) {
 	network, address, err := parseCheckpointEndpoint(raw)
 	if err != nil {
 		return nil, err
-	}
-	protected := statePath != ""
-	if protected && network == "unix" {
-		if err := validateControlStatePaths(statePath, address); err != nil {
-			return nil, err
-		}
-		if controlTokenRequired(network) {
-			path, err := controlTokenPath(network, address)
-			if err != nil {
-				return nil, err
-			}
-			if err := validateControlStatePaths(statePath, path); err != nil {
-				return nil, err
-			}
-		}
 	}
 	if protected {
 		address, err = policyControlAddress(network, address, true)
@@ -257,11 +242,8 @@ func listenCheckpointSocket(raw, statePath string) (*controlEndpoint, error) {
 		if token, err = newControlToken(); err != nil {
 			return nil, err
 		}
-		if tokenPath, err = controlTokenPath(network, address); err != nil {
-			return nil, err
-		}
-		if protected {
-			if err := validateControlStatePaths(statePath, tokenPath); err != nil {
+		if !protected || network == "unix" {
+			if tokenPath, err = controlTokenPath(network, address); err != nil {
 				return nil, err
 			}
 		}
@@ -283,9 +265,6 @@ func listenCheckpointSocket(raw, statePath string) (*controlEndpoint, error) {
 		if protected {
 			tokenPath, err = controlTokenPath(network, ln.Addr().String())
 			if err != nil {
-				return nil, errors.Join(err, ln.Close())
-			}
-			if err := validateControlStatePaths(statePath, tokenPath); err != nil {
 				return nil, errors.Join(err, ln.Close())
 			}
 		}
@@ -443,7 +422,7 @@ type checkpointer interface {
 // connections that still wait for a request, so stop can close them.
 type controlServer struct {
 	cp             checkpointer
-	policy         netPolicyController
+	policy         *gvx.Sandbox
 	token          string
 	cleanDir       string
 	absDir         string

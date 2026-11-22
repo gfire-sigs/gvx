@@ -26,7 +26,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 )
 
 // TCP and Windows AF_UNIX connections require a per-run token. POSIX Unix
@@ -197,53 +196,4 @@ func privatePolicyControlDir(dir string, create bool) (string, error) {
 		return "", fmt.Errorf("control directory %q: %w", dir, err)
 	}
 	return dir, nil
-}
-
-func validateControlStatePaths(statePath, endpointPath string) error {
-	state, err := canonicalControlPath(statePath)
-	if err != nil {
-		return err
-	}
-	endpoint, err := canonicalControlPath(endpointPath)
-	if err != nil {
-		return err
-	}
-	if state == endpoint || runtime.GOOS == "windows" && strings.EqualFold(state, endpoint) {
-		return errors.New("state_mismatch: control endpoint overlaps the network policy store")
-	}
-	a, aErr := os.Stat(state)
-	b, bErr := os.Stat(endpoint)
-	for _, err := range []error{aErr, bErr} {
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	if aErr == nil && bErr == nil && os.SameFile(a, b) {
-		return errors.New("state_mismatch: control endpoint aliases the network policy store")
-	}
-	return nil
-}
-
-func canonicalControlPath(path string) (string, error) {
-	path, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	return resolveExistingControlPrefix(path)
-}
-
-func resolveExistingControlPrefix(path string) (string, error) {
-	resolved, err := filepath.EvalSymlinks(path)
-	if err == nil {
-		return resolved, nil
-	}
-	parent := filepath.Dir(path)
-	if !errors.Is(err, os.ErrNotExist) || parent == path {
-		return "", err
-	}
-	dir, err := resolveExistingControlPrefix(parent)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, filepath.Base(path)), nil
 }

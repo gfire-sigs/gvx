@@ -69,9 +69,7 @@ type Sandbox struct {
 	natForwarder      *netbackend.NATForwarder
 	portForwarder     *netbackend.PortForwarder
 	netPolicy         *netbackend.NATPolicy
-	policyStore       *netPolicyStore
-	policyRunID       string
-	policyCommitErr   error
+	netPolicyConfig   NetPolicyConfig // guarded by mu
 	wgEndpoint        *netbackend.WireGuardEndpoint
 	wgPeerPort        uint16
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
@@ -131,7 +129,7 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	cleanup := func(cause error) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
 	}
-	if err := sb.openNetPolicy(nil, ""); err != nil {
+	if err := sb.initNetPolicy(""); err != nil {
 		return cleanup(err)
 	}
 	if cfg.HostCACerts {
@@ -564,6 +562,7 @@ func (s *Sandbox) Close() error {
 	if s.netPolicy != nil {
 		s.netPolicy.Close()
 		s.netPolicy = nil
+		s.netPolicyConfig = NetPolicyConfig{}
 	}
 
 	if s.restoredKernel != nil {
@@ -618,12 +617,6 @@ func (s *Sandbox) Close() error {
 	if s.netStack != nil {
 		s.netStack.Close()
 		s.netStack = nil
-	}
-	if s.policyStore != nil {
-		if err := s.policyStore.Close(); err != nil {
-			errs = append(errs, err)
-		}
-		s.policyStore = nil
 	}
 
 	if s.plat != nil {

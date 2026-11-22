@@ -451,7 +451,7 @@ TCP DNS queries from the guest travel directly over upstream TCP, while truncate
 
 The private peer uses the Netstack hook interface for `INPUT`, `FORWARD`, and `OUTPUT`. This adapter does not enable conntrack on that peer. Operator files still use the supported `iptables-save` syntax; the API does not accept nftables rules.
 
-`pkg/gvx` opens the host store before lockdown. It publishes one policy revision after the commit record reaches durable storage. A protected checkpoint records the store identity and minimum generation in its manifest and saved state. Restore rejects a mismatch before it starts NAT. Older runtimes cannot restore a protected checkpoint as an unprotected sandbox.
+`pkg/gvx` compiles the supplied policy before lockdown. A live replacement changes only the running sandbox. A protected checkpoint marks both its manifest and state. Restore requires an explicit policy and rejects a mismatch between the two files before it starts NAT.
 
 `cmd/rungv` exposes live control only when the operator opts in. For rule syntax, commands, and direction semantics, see [Host NAT policy](cli.md#412-host-nat-policy).
 

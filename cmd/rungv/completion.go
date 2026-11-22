@@ -67,7 +67,7 @@ _rungv_completions() {
     local image_cmds="ls list pull rm remove rmi inspect tag save load prune"
     local volume_cmds="create ls list inspect compact rm remove prune"
     local system_cmds="info df prune"
-    local policy_flags="--net-policy-state --net-policy-live --nat-iptables-file --nat-ip6tables-file --qos-tx --qos-rx"
+    local policy_flags="--net-policy-live --nat-iptables-file --nat-ip6tables-file --qos-tx --qos-rx"
     local shells="bash zsh fish powershell"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -100,7 +100,7 @@ _rungv_completions() {
             elif [[ "${cur}" == -* ]]; then
                 local flags="-control-socket"
                 if [[ "${COMP_WORDS[2]}" == replace ]]; then
-                    flags+=" --expected-revision --file --file6 --qos-tx --qos-rx"
+                    flags+=" --file --file6 --qos-tx --qos-rx"
                 fi
                 COMPREPLY=( $(compgen -W "${flags}" -- "${cur}") )
             fi
@@ -148,7 +148,6 @@ _rungv() {
     local -a policy_flags
     policy_flags=(
         '-control-socket[Host control endpoint]:address:_files'
-        '--net-policy-state[Host NAT policy store]:file:_files'
         '--net-policy-live[Enable live NAT policy control]'
         '--nat-iptables-file[IPv4 filter rules]:file:_files'
         '--nat-ip6tables-file[IPv6 filter rules]:file:_files'
@@ -203,7 +202,6 @@ _rungv() {
                 compadd get replace
             elif [[ "${words[3]}" == replace ]]; then
                 _arguments '-control-socket[Host control endpoint]:address:_files' \
-                    '--expected-revision[Current revision]:revision:' \
                     '--file[IPv4 filter rules]:file:_files' '--file6[IPv6 filter rules]:file:_files' \
                     '--qos-tx[Guest transmit limit]:limit:' '--qos-rx[Guest receive limit]:limit:'
             else

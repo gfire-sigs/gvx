@@ -908,7 +908,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/gvx"}, "runsc/boot/filter/config", "Linux lockdown installs the seccomp allowlist from runsc"},
 	{[]string{"pkg/gvx"}, "pkg/seccomp", "Linux lockdown compiles seccomp rules with upstream rule types"},
 	{[]string{"pkg/gvx"}, "golang.org/x/sys/*", "Linux lockdown names syscalls and TTY bridges read terminal state"},
-	{[]string{"pkg/gvx", "cmd/rungv"}, "internal/darwinacl", "policy stores and credentials reject unsafe Darwin ACL grants"},
+	{[]string{"cmd/rungv"}, "internal/darwinacl", "Darwin control credentials reject unsafe ACL grants"},
 
 	// pkg/oci: EROFS writer and compression codecs.
 	{[]string{"pkg/oci"}, "pkg/erofs", "OCI layer compiler writes images with the upstream erofs ABI"},

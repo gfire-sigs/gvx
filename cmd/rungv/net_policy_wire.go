@@ -31,28 +31,18 @@ import (
 )
 
 const (
-	netPolicyFrameTag = "GVXNP/1\n"
+	netPolicyFrameTag = "GVXNP/2\n"
 	maxNetPolicyFrame = 1 << 20
 )
-
-type netPolicyController interface {
-	NetPolicy() (gvx.NetPolicySnapshot, error)
-	ReplaceNetPolicy(string, gvx.NetPolicyConfig) (gvx.NetPolicySnapshot, error)
-}
-
-type netPolicyReplacement struct {
-	ExpectedRevision string `json:"expected_revision"`
-	gvx.NetPolicyConfig
-}
 
 type netPolicyRequest struct {
 	Op    string `json:"op"`
 	Token string `json:"token,omitempty"`
-	*netPolicyReplacement
+	*gvx.NetPolicyConfig
 }
 
-type netPolicyRevision struct {
-	Revision string `json:"revision"`
+type netPolicySuccess struct {
+	OK bool `json:"ok"`
 }
 
 type netPolicyFailure struct {
@@ -130,13 +120,12 @@ func writeNetPolicyFrame(w io.Writer, value any) error {
 }
 
 type netPolicyRequestFields struct {
-	Op               *string        `json:"op"`
-	Token            jsontext.Value `json:"token"`
-	ExpectedRevision *string        `json:"expected_revision"`
-	RulesV4          *string        `json:"rules_v4"`
-	RulesV6          *string        `json:"rules_v6"`
-	TX               jsontext.Value `json:"qos_tx"`
-	RX               jsontext.Value `json:"qos_rx"`
+	Op      *string        `json:"op"`
+	Token   jsontext.Value `json:"token"`
+	RulesV4 *string        `json:"rules_v4"`
+	RulesV6 *string        `json:"rules_v6"`
+	TX      jsontext.Value `json:"qos_tx"`
+	RX      jsontext.Value `json:"qos_rx"`
 }
 
 func (s *controlServer) serveNetPolicy(conn net.Conn, reader io.Reader) {
@@ -179,28 +168,27 @@ func (s *controlServer) dispatchNetPolicy(payload []byte) any {
 		if err := jsonv2.Unmarshal(payload, &get, jsonv2.RejectUnknownMembers(true)); err != nil {
 			return errPolicyWireInvalid
 		}
-		snapshot, err := s.policy.NetPolicy()
+		config, err := s.policy.NetPolicy()
 		if err != nil {
 			return s.netPolicyError(err)
 		}
-		return snapshot
+		return config
 	case netPolicyReplace:
 		config, failure := req.replacementConfig()
 		if failure != nil {
 			return failure
 		}
-		snapshot, err := s.policy.ReplaceNetPolicy(*req.ExpectedRevision, config)
-		if err != nil {
+		if err := s.policy.ReplaceNetPolicy(config); err != nil {
 			return s.netPolicyError(err)
 		}
-		return netPolicyRevision{Revision: snapshot.Revision}
+		return netPolicySuccess{OK: true}
 	default:
 		return errPolicyWireInvalid
 	}
 }
 
 func (req netPolicyRequestFields) replacementConfig() (gvx.NetPolicyConfig, *netPolicyFailure) {
-	if req.ExpectedRevision == nil || *req.ExpectedRevision == "" || req.RulesV4 == nil || req.RulesV6 == nil || len(req.TX) == 0 || len(req.RX) == 0 {
+	if req.RulesV4 == nil || req.RulesV6 == nil || len(req.TX) == 0 || len(req.RX) == 0 {
 		return gvx.NetPolicyConfig{}, errPolicyWireInvalid
 	}
 	if len(*req.RulesV4) > gvx.MaxNetPolicyRules || len(*req.RulesV6) > gvx.MaxNetPolicyRules {
@@ -282,9 +270,6 @@ func requestNetPolicy(ctx context.Context, raw string, req netPolicyRequest) (an
 		return nil, netPolicyExchangeError(req.Op, "decode response", err)
 	}
 	if failure, ok := result.(*netPolicyFailure); ok {
-		if failure.Code == "commit_uncertain" {
-			return nil, netPolicyExchangeError(req.Op, "replace", failure)
-		}
 		return nil, failure
 	}
 	return result, nil
@@ -314,22 +299,25 @@ func decodeNetPolicyReply(payload []byte, op string) (any, error) {
 		}
 		return &failure, nil
 	}
-	if fields["revision"].Kind() != '"' {
-		return nil, errPolicyFrameVersion
-	}
 	if op == netPolicyReplace {
-		var revision netPolicyRevision
-		if len(fields) != 1 || jsonv2.Unmarshal(payload, &revision) != nil || revision.Revision == "" {
+		if len(fields) != 1 || fields["ok"].Kind() != 't' {
 			return nil, errPolicyFrameVersion
 		}
-		return revision, nil
+		return netPolicySuccess{OK: true}, nil
 	}
-	var snapshot gvx.NetPolicySnapshot
-	if len(fields) != 5 || fields["rules_v4"].Kind() != '"' || fields["rules_v6"].Kind() != '"' || len(fields["qos_tx"]) == 0 || len(fields["qos_rx"]) == 0 {
+	if len(fields) != 4 || fields["rules_v4"].Kind() != '"' || fields["rules_v6"].Kind() != '"' {
 		return nil, errPolicyFrameVersion
 	}
-	if err := jsonv2.Unmarshal(payload, &snapshot, jsonv2.RejectUnknownMembers(true)); err != nil || snapshot.Revision == "" || len(snapshot.RulesV4) > gvx.MaxNetPolicyRules || len(snapshot.RulesV6) > gvx.MaxNetPolicyRules {
+	for _, name := range [...]string{"qos_tx", "qos_rx"} {
+		switch fields[name].Kind() {
+		case '"', '{':
+		default:
+			return nil, errPolicyFrameVersion
+		}
+	}
+	var config gvx.NetPolicyConfig
+	if err := jsonv2.Unmarshal(payload, &config, jsonv2.RejectUnknownMembers(true)); err != nil || len(config.RulesV4) > gvx.MaxNetPolicyRules || len(config.RulesV6) > gvx.MaxNetPolicyRules {
 		return nil, errPolicyFrameVersion
 	}
-	return snapshot, nil
+	return config, nil
 }

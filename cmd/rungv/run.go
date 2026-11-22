@@ -198,11 +198,7 @@ func bindControlSocket(cfg *gvx.Config, socketSpec, cmdPrefix string, stderr io.
 	if socketSpec == "" {
 		return nil, true
 	}
-	var statePath string
-	if cfg.NetPolicy != nil {
-		statePath = cfg.NetPolicy.Path
-	}
-	ep, err := listenCheckpointSocket(socketSpec, statePath)
+	ep, err := listenCheckpointSocket(socketSpec, cfg.NetPolicy != nil)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: listen control socket: %v\n", cmdPrefix, err)
 		return nil, false

@@ -16,7 +16,6 @@ package gvx
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,20 +35,17 @@ import (
 )
 
 const (
-	legacyCheckpointManifestVersion          = 1
-	legacyProtectedCheckpointManifestVersion = 2
+	legacyCheckpointManifestVersion = 1
 
 	// CheckpointManifestVersion identifies unprotected bundles with guest
 	// iptables state. Older readers must not resume without those rules.
 	CheckpointManifestVersion          = 3
-	protectedCheckpointManifestVersion = 4
+	protectedCheckpointManifestVersion = 5
 
-	// Protected state starts with the signature, version, hex store ID, and big-endian generation.
+	// The prefix marks protected state independently of the manifest version.
 	checkpointPolicyStateMagic      = "GVXNPST"
-	checkpointPolicyStateVersion    = 1
-	checkpointPolicyStateIDOffset   = len(checkpointPolicyStateMagic) + 1
-	checkpointPolicyStateGeneration = checkpointPolicyStateIDOffset + 2*policyStoreIDBytes
-	checkpointPolicyStateHeaderSize = checkpointPolicyStateGeneration + 8
+	checkpointPolicyStateHeader     = checkpointPolicyStateMagic + "\x02"
+	checkpointPolicyStateHeaderSize = len(checkpointPolicyStateHeader)
 
 	checkpointManifestFileName  = "manifest.json"
 	checkpointStateFileName     = "state.img"
@@ -79,19 +75,21 @@ type ManifestMount struct {
 	Kind      string    `json:"kind,omitempty"`
 }
 
-// CheckpointNetPolicy binds a protected bundle to host-selected policy state.
-type CheckpointNetPolicy struct {
-	StoreID       string `json:"store_id"`
-	MinGeneration uint64 `json:"min_generation"`
-}
-
-func (b *CheckpointNetPolicy) stateHeader() [checkpointPolicyStateHeaderSize]byte {
-	var h [checkpointPolicyStateHeaderSize]byte
-	copy(h[:], checkpointPolicyStateMagic)
-	h[len(checkpointPolicyStateMagic)] = checkpointPolicyStateVersion
-	copy(h[checkpointPolicyStateIDOffset:checkpointPolicyStateGeneration], b.StoreID)
-	binary.BigEndian.PutUint64(h[checkpointPolicyStateGeneration:], b.MinGeneration)
-	return h
+func (m CheckpointManifest) validateVersion() error {
+	switch m.Version {
+	case legacyCheckpointManifestVersion, CheckpointManifestVersion:
+		return nil
+	case protectedCheckpointManifestVersion:
+		if m.NetMode != NetModeNAT {
+			return fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "a protected checkpoint requires NAT mode"))
+		}
+		return nil
+	// These versions use an obsolete protected format.
+	case 2, 4:
+		return fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", fmt.Sprintf("unsupported protected checkpoint version %d", m.Version)))
+	default:
+		return fmt.Errorf("%w: unsupported version %d", ErrCheckpointManifest, m.Version)
+	}
 }
 
 func (m CheckpointManifest) statePayloadOffset(f *os.File) (int64, error) {
@@ -100,15 +98,15 @@ func (m CheckpointManifest) statePayloadOffset(f *os.File) (int64, error) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		return 0, fmt.Errorf("%w: read checkpoint state header: %w", ErrCheckpointManifest, err)
 	}
-	if m.NetPolicy == nil {
+	if m.Version != protectedCheckpointManifestVersion {
 		signatureBytes := min(n, len(checkpointPolicyStateMagic))
 		if signatureBytes > 0 && string(h[:signatureBytes]) == checkpointPolicyStateMagic[:signatureBytes] {
 			return 0, fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "protected checkpoint state requires a protected manifest"))
 		}
 		return 0, nil
 	}
-	if n != len(h) || h != m.NetPolicy.stateHeader() {
-		return 0, fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "checkpoint state header does not match the network policy binding"))
+	if n != len(h) || string(h[:]) != checkpointPolicyStateHeader {
+		return 0, fmt.Errorf("%w: %w", ErrCheckpointManifest, netPolicyError("state_mismatch", "a protected manifest requires a matching state header"))
 	}
 	return int64(len(h)), nil
 }
@@ -130,8 +128,6 @@ type CheckpointManifest struct {
 	// in NAT mode. A restore applies them again. The field is absent in other
 	// network modes and in bundles of older runtimes.
 	Eth0 *netbackend.Eth0Config `json:"eth0,omitempty"`
-	// NetPolicy records the store binding of a protected NAT sandbox.
-	NetPolicy *CheckpointNetPolicy `json:"net_policy,omitempty"`
 	// MemoryLimitBytes is the memory limit that the guard of the saving
 	// sandbox enforced: the configured limit, or the RAM of the host without
 	// one. A restore sizes the cap of the memory file from the larger of this
@@ -394,11 +390,8 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	files := s.ckptFiles
 	readyCh := s.kernelReady
 	doneCh := s.runDone
-	policyBinding, policyErr := s.checkpointNetPolicyLocked()
+	protected := s.netPolicy != nil
 	s.mu.Unlock()
-	if policyErr != nil {
-		return policyErr
-	}
 
 	if files == nil {
 		return fmt.Errorf("%w: Config.CheckpointDir must be set before New or Restore", ErrInvalidConfig)
@@ -427,9 +420,8 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	if err := files.rewindAndTruncate(); err != nil {
 		return err
 	}
-	if policyBinding != nil {
-		header := policyBinding.stateHeader()
-		if _, err := files.state.Write(header[:]); err != nil {
+	if protected {
+		if _, err := files.state.WriteString(checkpointPolicyStateHeader); err != nil {
 			return fmt.Errorf("gvx: write protected checkpoint state header: %w", err)
 		}
 	}
@@ -503,9 +495,8 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 		}
 	}
 	manifest := s.buildCheckpointManifest()
-	if policyBinding != nil {
+	if protected {
 		manifest.Version = protectedCheckpointManifestVersion
-		manifest.NetPolicy = policyBinding
 	}
 	manifest.Eth0 = eth0
 	hostRAM, _ := hostMemory()

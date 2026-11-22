@@ -110,7 +110,7 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 
 	var err error
-	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir, NetPolicy: rc.cfg.NetPolicy})
+	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir})
 	if err != nil {
 		if rc.cfg.CheckpointListener != nil {
 			_ = rc.cfg.CheckpointListener.Close()

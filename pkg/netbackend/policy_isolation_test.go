@@ -102,7 +102,7 @@ func TestNATPolicyInstancesKeepIndependentRelays(t *testing.T) {
 
 	// Keep the guest packet leg open. Only A's actual host tuple denies input.
 	denyHost := compile("-A INPUT -d 127.0.0.1/32 -j DROP\n", PolicyLimit{RateBPS: 1, BurstBytes: 131072, QueueBytes: 262144})
-	if err := a.Commit(denyHost, func() error { return nil }); err != nil {
+	if err := a.Commit(denyHost); err != nil {
 		t.Fatal(err)
 	}
 	exchange(bConn, "beta after\n")
