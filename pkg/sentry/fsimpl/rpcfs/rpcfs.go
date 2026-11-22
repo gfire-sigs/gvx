@@ -19,6 +19,7 @@ package rpcfs
 
 import (
 	goContext "context"
+	"errors"
 	"hash/fnv"
 	"io"
 	"path"
@@ -95,6 +96,9 @@ func callRPC[T any](ctx context.Context, fn func(goContext.Context) (T, error)) 
 	if err := ctx.Block(done); err != nil {
 		cancel()
 		var zero T
+		if errors.Is(err, linuxerr.ErrInterrupted) {
+			return zero, linuxerr.ERESTARTSYS
+		}
 		return zero, linuxerr.EINTR
 	}
 	cancel()
@@ -180,27 +184,57 @@ func (fs *filesystem) MountSource() string {
 	return "rpcfs"
 }
 
+// detachSubtreeLocked detaches d and all of its cached descendants from their
+// child maps, marks them dead under ancestryMu, and appends them to out for
+// post-unlock DecRef.
+//
+// Preconditions: fs.mu must be held; fs.ancestryMu must not be held.
+func (fs *filesystem) detachSubtreeLocked(d *dentry, out *[]*dentry) {
+	if d == nil {
+		return
+	}
+	var collect func(cur *dentry)
+	collect = func(cur *dentry) {
+		for name, child := range cur.children {
+			delete(cur.children, name)
+			collect(child)
+			*out = append(*out, child)
+		}
+		cur.children = nil
+	}
+	start := len(*out)
+	collect(d)
+	*out = append(*out, d)
+	fs.ancestryMu.Lock()
+	for _, node := range (*out)[start:] {
+		node.dead = true
+	}
+	fs.ancestryMu.Unlock()
+}
+
+// isAncestorLocked reports whether anc is equal to or an ancestor of desc.
+//
+// Preconditions: fs.ancestryMu must be held for reading or writing.
+func isAncestorLocked(anc, desc *dentry) bool {
+	for cur := desc; cur != nil; cur = cur.parent {
+		if cur == anc {
+			return true
+		}
+	}
+	return false
+}
+
 func (fs *filesystem) Release(ctx context.Context) {
 	var toDecRef []*dentry
 	fs.mu.Lock()
 	root := fs.root
 	fs.root = nil
 	if root != nil {
-		var collect func(d *dentry)
-		collect = func(d *dentry) {
-			for name, child := range d.children {
-				delete(d.children, name)
-				collect(child)
-				toDecRef = append(toDecRef, child)
-			}
-			d.children = nil
+		for name, child := range root.children {
+			delete(root.children, name)
+			fs.detachSubtreeLocked(child, &toDecRef)
 		}
-		collect(root)
-		fs.ancestryMu.Lock()
-		for _, child := range toDecRef {
-			child.dead = true
-		}
-		fs.ancestryMu.Unlock()
+		root.children = nil
 	}
 	fs.mu.Unlock()
 
@@ -393,26 +427,23 @@ func (fs *filesystem) lookupChild(ctx context.Context, parent *dentry, name stri
 	})
 	if err != nil {
 		if err == linuxerr.ENOENT {
-			var evicted *dentry
+			var evicted []*dentry
 			fs.mu.Lock()
 			if parent.children != nil {
 				if old := parent.children[name]; old != nil {
-					evicted = old
 					delete(parent.children, name)
-					fs.ancestryMu.Lock()
-					old.dead = true
-					fs.ancestryMu.Unlock()
+					fs.detachSubtreeLocked(old, &evicted)
 				}
 			}
 			fs.mu.Unlock()
-			if evicted != nil {
-				evicted.DecRef(ctx)
+			for _, d := range evicted {
+				d.DecRef(ctx)
 			}
 		}
 		return nil, Entry{}, err
 	}
 
-	var evicted *dentry
+	var evicted []*dentry
 	fs.mu.Lock()
 	if parent.children == nil {
 		parent.children = make(map[string]*dentry)
@@ -427,18 +458,16 @@ func (fs *filesystem) lookupChild(ctx context.Context, parent *dentry, name stri
 			fs.mu.Unlock()
 			return existing, e, nil
 		}
-		evicted = existing
-		fs.ancestryMu.Lock()
-		existing.dead = true
-		fs.ancestryMu.Unlock()
+		delete(parent.children, name)
+		fs.detachSubtreeLocked(existing, &evicted)
 	}
 	child := fs.newDentry(parent, name, e)
 	child.refs.Store(2) // 1 for cache, 1 for caller
 	parent.children[name] = child
 	fs.mu.Unlock()
 
-	if evicted != nil {
-		evicted.DecRef(ctx)
+	for _, d := range evicted {
+		d.DecRef(ctx)
 	}
 	return child, e, nil
 }
@@ -780,21 +809,19 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 				}
 				nd := fs.newDentry(cur, name, created)
 				nd.refs.Store(2)
-				var evicted *dentry
+				var evicted []*dentry
 				fs.mu.Lock()
 				if cur.children == nil {
 					cur.children = make(map[string]*dentry)
 				}
 				if old := cur.children[name]; old != nil {
-					evicted = old
-					fs.ancestryMu.Lock()
-					old.dead = true
-					fs.ancestryMu.Unlock()
+					delete(cur.children, name)
+					fs.detachSubtreeLocked(old, &evicted)
 				}
 				cur.children[name] = nd
 				fs.mu.Unlock()
-				if evicted != nil {
-					evicted.DecRef(ctx)
+				for _, oldD := range evicted {
+					oldD.DecRef(ctx)
 				}
 				cur.watches.Notify(ctx, name, linux.IN_CREATE, 0, vfs.InodeEvent, false)
 				cur.DecRef(ctx)
@@ -833,6 +860,14 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	}
 	if opts.Flags&linux.O_DIRECTORY != 0 || rp.MustBeDir() {
 		return nil, linuxerr.ENOTDIR
+	}
+	// Reject non-regular files (symlinks under O_NOFOLLOW must return ELOOP;
+	// FIFOs/sockets/devices must never open on the synchronous host RPC peer).
+	if e.Mode&linux.S_IFMT == linux.S_IFLNK {
+		return nil, linuxerr.ELOOP
+	}
+	if e.Mode&linux.S_IFMT != linux.S_IFREG {
+		return nil, linuxerr.ENXIO
 	}
 	if writable && fs.isReadOnly(rp.Mount()) {
 		return nil, linuxerr.EROFS
@@ -908,40 +943,64 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if oldRel == newRel {
 		return nil
 	}
+	if oldRel == "." || strings.HasPrefix(newRel, oldRel+"/") {
+		return linuxerr.EINVAL
+	}
+	fs.mu.Lock()
+	var cycleBefore bool
+	if oldParent.children != nil {
+		if moved := oldParent.children[oldName]; moved != nil {
+			fs.ancestryMu.RLock()
+			cycleBefore = isAncestorLocked(moved, newParent)
+			fs.ancestryMu.RUnlock()
+		}
+	}
+	fs.mu.Unlock()
+	if cycleBefore {
+		return linuxerr.EINVAL
+	}
+
 	if err := callRPCErr(ctx, func(c goContext.Context) error {
 		return fs.client.Rename(c, oldRel, newRel)
 	}); err != nil {
 		return err
 	}
-	var replaced *dentry
+	var evicted []*dentry
+	var cycleAfter bool
 	fs.mu.Lock()
-	fs.ancestryMu.Lock()
 	if newParent.children != nil {
 		if existing, ok := newParent.children[newName]; ok {
-			replaced = existing
-			delete(newParent.children, newName)
-			existing.dead = true
+			if oldParent.children == nil || oldParent.children[oldName] != existing {
+				delete(newParent.children, newName)
+				fs.detachSubtreeLocked(existing, &evicted)
+			}
 		}
 	}
 	if oldParent.children != nil {
 		if moved, ok := oldParent.children[oldName]; ok {
 			delete(oldParent.children, oldName)
-			if newParent.children == nil {
-				newParent.children = make(map[string]*dentry)
+			fs.ancestryMu.Lock()
+			if isAncestorLocked(moved, newParent) {
+				fs.ancestryMu.Unlock()
+				fs.detachSubtreeLocked(moved, &evicted)
+				cycleAfter = true
+			} else {
+				if newParent.children == nil {
+					newParent.children = make(map[string]*dentry)
+				}
+				moved.parent = newParent
+				moved.name = newName
+				newParent.children[newName] = moved
+				fs.ancestryMu.Unlock()
 			}
-			if moved == replaced {
-				replaced = nil
-				moved.dead = false
-			}
-			moved.parent = newParent
-			moved.name = newName
-			newParent.children[newName] = moved
 		}
 	}
-	fs.ancestryMu.Unlock()
 	fs.mu.Unlock()
-	if replaced != nil {
-		replaced.DecRef(ctx)
+	for _, d := range evicted {
+		d.DecRef(ctx)
+	}
+	if cycleAfter {
+		return linuxerr.EINVAL
 	}
 	return nil
 }
@@ -1020,20 +1079,17 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 }
 
 func (fs *filesystem) dropChild(ctx context.Context, parent *dentry, name string) {
+	var evicted []*dentry
 	fs.mu.Lock()
-	var old *dentry
 	if parent.children != nil {
-		old = parent.children[name]
-		delete(parent.children, name)
-	}
-	if old != nil {
-		fs.ancestryMu.Lock()
-		old.dead = true
-		fs.ancestryMu.Unlock()
+		if old := parent.children[name]; old != nil {
+			delete(parent.children, name)
+			fs.detachSubtreeLocked(old, &evicted)
+		}
 	}
 	fs.mu.Unlock()
-	if old != nil {
-		old.DecRef(ctx)
+	for _, d := range evicted {
+		d.DecRef(ctx)
 	}
 }
 

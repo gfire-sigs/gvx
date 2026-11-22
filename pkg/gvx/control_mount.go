@@ -940,16 +940,40 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		sandboxExited = true
 	}
 
+	if sandboxExited {
+		s.rpcMountsMu.Lock()
+		if s.rpcMounts[target] == entry {
+			delete(s.rpcMounts, target)
+		}
+		s.rpcMountsMu.Unlock()
+		return nil
+	}
+
+	// Lock order: opMu -> mountOpMu -> mu -> rpcMountsMu. Keep entry in
+	// s.rpcMounts until UmountAt finishes so concurrent Checkpoint/mount.add
+	// cannot observe a half-unmounted rpcfs or clobber a replacement mount.
+	s.opMu.RLock()
+	s.mountOpMu.Lock()
+	s.mu.Lock()
+	active := s.activeKernel == k
+	s.mu.Unlock()
 	s.rpcMountsMu.Lock()
 	stillMounted := s.rpcMounts[target] == entry
-	if stillMounted {
+	s.rpcMountsMu.Unlock()
+
+	if stillMounted && active {
+		umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
+		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
+	}
+	s.rpcMountsMu.Lock()
+	if s.rpcMounts[target] == entry {
 		delete(s.rpcMounts, target)
 	}
 	s.rpcMountsMu.Unlock()
+	s.mountOpMu.Unlock()
+	s.opMu.RUnlock()
 
-	if stillMounted && !sandboxExited {
-		umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
-		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
+	if stillMounted && active {
 		s.emitEvent("mount", "remove", map[string]string{"target": target, "reason": "client_disconnected"})
 	}
 	return nil

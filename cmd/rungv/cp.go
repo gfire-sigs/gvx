@@ -66,6 +66,10 @@ func hasWindowsDrivePrefix(s string) bool {
 	return len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':' && (len(s) == 2 || s[2] == '\\' || s[2] == '/')
 }
 
+func hasWindowsDriveDesignator(s string) bool {
+	return len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':'
+}
+
 func parseCPEndpoint(raw string) cpEndpoint {
 	if raw == "-" {
 		return cpEndpoint{isPipe: true, path: "-"}
@@ -284,10 +288,13 @@ func cpHostToGuest(ctx context.Context, client *control.Client, src cpEndpoint, 
 	respErr := stream.WaitResponse(ctx, &resp)
 	if respErr != nil {
 		// Unblock writer goroutine immediately if server rejected early (e.g.
-		// >1 MiB upload exceeding InitialStreamWindow).
+		// >1 MiB upload exceeding InitialStreamWindow). Do not wait on a live
+		// stdin pipe that cannot be unblocked by writeCancel.
 		writeCancel()
 		stream.Close()
-		<-writeErrCh
+		if !src.isPipe {
+			<-writeErrCh
+		}
 		return controlFail(streams.stderr, cmdName, respErr)
 	}
 	sendErr := <-writeErrCh
@@ -430,18 +437,39 @@ func validateSafeSymlinkTarget(rel, linkTarget string) error {
 	if strings.ContainsRune(linkTarget, '\\') {
 		return fmt.Errorf("refuse symlink target with backslash %q -> %q", rel, linkTarget)
 	}
-	if strings.HasPrefix(linkTarget, "/") || path.IsAbs(linkTarget) || hasWindowsDrivePrefix(linkTarget) {
-		return fmt.Errorf("refuse absolute symlink target %q -> %q", rel, linkTarget)
+	if strings.HasPrefix(linkTarget, "/") || path.IsAbs(linkTarget) || hasWindowsDriveDesignator(linkTarget) {
+		return fmt.Errorf("refuse absolute or drive-prefixed symlink target %q -> %q", rel, linkTarget)
 	}
-	resolved := path.Clean(path.Join(path.Dir(rel), linkTarget))
-	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+	// Require all ".." segments to be strictly leading so chained symlinks
+	// cannot cancel a symlink component with a subsequent ".." segment.
+	leadingUp := 0
+	seenNonUp := false
+	for _, seg := range strings.Split(linkTarget, "/") {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if seenNonUp {
+				return fmt.Errorf("refuse symlink with non-leading '..' component: %q -> %q", rel, linkTarget)
+			}
+			leadingUp++
+		default:
+			seenNonUp = true
+		}
+	}
+	parentDir := path.Dir(rel)
+	depth := 0
+	if parentDir != "." && parentDir != "" {
+		depth = len(strings.Split(parentDir, "/"))
+	}
+	if leadingUp > depth {
 		return fmt.Errorf("refuse symlink escaping destination root: %q -> %q", rel, linkTarget)
 	}
 	return nil
 }
 
 func validateRenameSingleSegment(name string) error {
-	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) || hasWindowsDrivePrefix(name) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) || hasWindowsDriveDesignator(name) {
 		return fmt.Errorf("invalid destination filename %q", name)
 	}
 	return validateHostFilename(name)
@@ -550,6 +578,13 @@ func extractTarToHostDir(r io.Reader, destDir string, opts hostExtractOptions) e
 			if err := verifyExistingAncestorsInRoot(root, path.Dir(linkRel)); err != nil {
 				return err
 			}
+			linkFI, lErr := root.Lstat(linkRel)
+			if lErr != nil {
+				return fmt.Errorf("hardlink target %q: %w", linkRel, lErr)
+			}
+			if !linkFI.Mode().IsRegular() {
+				return fmt.Errorf("refuse hardlink to non-regular target %q", linkRel)
+			}
 			if parent := path.Dir(rel); parent != "." && parent != "" {
 				if err := mkdirAllInRoot(root, parent); err != nil {
 					return err
@@ -569,7 +604,7 @@ func sanitizeHostTarPath(raw string, opts hostExtractOptions) (string, bool, err
 		return "", false, fmt.Errorf("unsafe tar path %q contains NUL", raw)
 	}
 	norm := strings.ReplaceAll(raw, `\`, "/")
-	if hasWindowsDrivePrefix(norm) {
+	if hasWindowsDriveDesignator(norm) {
 		return "", false, fmt.Errorf("unsafe tar path %q contains drive prefix", raw)
 	}
 	for _, seg := range strings.Split(norm, "/") {

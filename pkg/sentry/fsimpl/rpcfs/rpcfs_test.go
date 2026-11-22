@@ -306,7 +306,7 @@ func (ic *interruptibleCtx) Interrupt() {
 func (ic *interruptibleCtx) Block(ch <-chan struct{}) error {
 	select {
 	case <-ic.cancel:
-		return errors.New("interrupted")
+		return linuxerr.ErrInterrupted
 	case <-ch:
 		return nil
 	}
@@ -490,7 +490,13 @@ func TestRPCFSFullVFSContractAndRenameRebase(t *testing.T) {
 		if err != nil || target != "child.txt" {
 			t.Fatalf("ReadlinkAt = (%q, %v), want child.txt", target, err)
 		}
-		lfd, err := vfsObj.OpenAt(ctx, creds, pop("/dirB/link.txt"), &vfs.OpenOptions{
+		followPop := &vfs.PathOperation{
+			Root:               rootVD,
+			Start:              rootVD,
+			Path:               fspath.Parse("/dirB/link.txt"),
+			FollowFinalSymlink: true,
+		}
+		lfd, err := vfsObj.OpenAt(ctx, creds, followPop, &vfs.OpenOptions{
 			Flags: linux.O_RDWR | linux.O_CREAT,
 			Mode:  0o644,
 		})
@@ -503,9 +509,45 @@ func TestRPCFSFullVFSContractAndRenameRebase(t *testing.T) {
 		if err != nil || string(buf[:n]) != "after" {
 			t.Fatalf("Read via symlink = (%q, %v), want after", buf[:n], err)
 		}
+		// OpenAt with O_NOFOLLOW on a symlink MUST return ELOOP and MUST NOT truncate the target.
+		noFollowPop := &vfs.PathOperation{
+			Root:               rootVD,
+			Start:              rootVD,
+			Path:               fspath.Parse("/dirB/link.txt"),
+			FollowFinalSymlink: false,
+		}
+		if f, err := vfsObj.OpenAt(ctx, creds, noFollowPop, &vfs.OpenOptions{
+			Flags: linux.O_WRONLY | linux.O_TRUNC | linux.O_NOFOLLOW,
+		}); !linuxerr.Equals(linuxerr.ELOOP, err) {
+			if f != nil {
+				f.DecRef(ctx)
+			}
+			t.Fatalf("OpenAt(O_NOFOLLOW|O_TRUNC) on symlink = %v, want ELOOP", err)
+		}
+		// Target file must still be untouched ("after").
+		if gotTarget, err := os.ReadFile(filepath.Join(hostDir, "dirB", "child.txt")); err != nil || string(gotTarget) != "after" {
+			t.Fatalf("O_NOFOLLOW symlink open clobbered target: (%q, %v)", gotTarget, err)
+		}
+		// O_PATH|O_NOFOLLOW (GetDentryAt) on symlink still succeeds.
+		if vd, err := vfsObj.GetDentryAt(ctx, creds, noFollowPop, &vfs.GetDentryOptions{}); err != nil {
+			t.Fatalf("GetDentryAt(FollowFinalSymlink=false) on symlink failed: %v", err)
+		} else {
+			vd.DecRef(ctx)
+		}
 		if err := vfsObj.UnlinkAt(ctx, creds, pop("/dirB/link.txt")); err != nil {
 			t.Fatalf("UnlinkAt symlink: %v", err)
 		}
+	}
+
+	// 4b. RenameAt directory into its own descendant must return EINVAL (cycle guard).
+	if err := vfsObj.MkdirAt(ctx, creds, pop("/dirB/sub"), &vfs.MkdirOptions{Mode: 0o755}); err != nil {
+		t.Fatalf("MkdirAt /dirB/sub: %v", err)
+	}
+	if err := vfsObj.RenameAt(ctx, creds, pop("/dirB"), pop("/dirB/sub/loop"), &vfs.RenameOptions{}); !linuxerr.Equals(linuxerr.EINVAL, err) {
+		t.Fatalf("RenameAt /dirB -> /dirB/sub/loop = %v, want EINVAL", err)
+	}
+	if err := vfsObj.RmdirAt(ctx, creds, pop("/dirB/sub")); err != nil {
+		t.Fatalf("RmdirAt /dirB/sub: %v", err)
 	}
 
 	// 5. UnlinkAt rejects directories (EISDIR); RmdirAt rejects regular files (ENOTDIR).
@@ -647,8 +689,8 @@ func TestRPCFSReadOnlyPermissionsBoundsAndInterrupt(t *testing.T) {
 		ic.Interrupt()
 		select {
 		case err := <-statErrCh:
-			if !linuxerr.Equals(linuxerr.EINTR, err) {
-				t.Fatalf("interrupted StatAt err = %v, want EINTR", err)
+			if !linuxerr.Equals(linuxerr.ERESTARTSYS, err) {
+				t.Fatalf("interrupted StatAt err = %v, want ERESTARTSYS", err)
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("interrupted StatAt did not unblock")

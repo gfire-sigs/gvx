@@ -171,7 +171,9 @@ func execSubcommand(ctx context.Context, args []string, streams cliIO) int {
 		}
 	}
 
-	execCtx, execCancel := context.WithCancel(ctx)
+	// Derive execCtx from Background so host ctx cancellation (SIGINT) does not
+	// abort stream.RecvEvent before the 150ms graceful signal-exit window completes.
+	execCtx, execCancel := context.WithCancel(context.Background())
 	defer execCancel()
 
 	if tty {

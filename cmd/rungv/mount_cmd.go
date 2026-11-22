@@ -417,6 +417,9 @@ func cleanRPCFSRelPath(raw string) (string, bool) {
 		return "", false
 	}
 	norm := strings.ReplaceAll(raw, `\`, "/")
+	if hasWindowsDriveDesignator(norm) {
+		return "", false
+	}
 	for _, seg := range strings.Split(norm, "/") {
 		if seg == ".." {
 			return "", false
@@ -428,6 +431,67 @@ func cleanRPCFSRelPath(raw string) (string, bool) {
 		return ".", true
 	}
 	return rel, true
+}
+
+func lstatRegularInRoot(root *os.Root, rel string) int {
+	fi, err := root.Lstat(rel)
+	if err != nil {
+		return control.HostErrorToLinuxErrno(err)
+	}
+	switch {
+	case fi.Mode()&os.ModeSymlink != 0:
+		return control.LinuxELOOP
+	case fi.IsDir():
+		return control.LinuxEISDIR
+	case !fi.Mode().IsRegular():
+		return control.LinuxEOPNOTSUPP
+	default:
+		return 0
+	}
+}
+
+func rpcfsRelDepth(rel string) int {
+	if rel == "." || rel == "" {
+		return 0
+	}
+	return len(strings.Split(rel, "/"))
+}
+
+// verifySubtreeSymlinksAtDest verifies that moving srcRel to dstRel does not
+// cause any symlink inside srcRel (either srcRel itself or any descendant) to
+// escape root at its new shallower depth.
+func verifySubtreeSymlinksAtDest(root *os.Root, srcRel, dstRel string) error {
+	fi, err := root.Lstat(srcRel)
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		target, err := root.Readlink(srcRel)
+		if err != nil {
+			return err
+		}
+		return validateSafeSymlinkTarget(dstRel, target)
+	}
+	if !fi.IsDir() {
+		return nil
+	}
+	f, err := root.Open(srcRel)
+	if err != nil {
+		return err
+	}
+	des, err := f.ReadDir(-1)
+	_ = f.Close()
+	if err != nil {
+		return err
+	}
+	for _, de := range des {
+		childSrc := path.Join(srcRel, de.Name())
+		childDst := path.Join(dstRel, de.Name())
+		if err := verifySubtreeSymlinksAtDest(root, childSrc, childDst); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func stablePathIno(rel string) uint64 {
@@ -543,6 +607,10 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEINVAL
 			return resp
 		}
+		if errno := lstatRegularInRoot(root, rel); errno != 0 {
+			resp.Errno = errno
+			return resp
+		}
 		length := req.Length
 		if length <= 0 {
 			return resp
@@ -572,6 +640,10 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 		}
 		if req.Offset < 0 {
 			resp.Errno = control.LinuxEINVAL
+			return resp
+		}
+		if errno := lstatRegularInRoot(root, rel); errno != 0 {
+			resp.Errno = errno
 			return resp
 		}
 		f, err := root.OpenFile(rel, os.O_WRONLY, 0)
@@ -684,6 +756,24 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEINVAL
 			return resp
 		}
+		if err := verifyExistingAncestorsInRoot(root, path.Dir(rel)); err != nil {
+			resp.Errno = control.LinuxEPERM
+			return resp
+		}
+		if err := verifyExistingAncestorsInRoot(root, path.Dir(newRel)); err != nil {
+			resp.Errno = control.LinuxEPERM
+			return resp
+		}
+		if rpcfsRelDepth(newRel) < rpcfsRelDepth(rel) {
+			if err := verifySubtreeSymlinksAtDest(root, rel, newRel); err != nil {
+				if os.IsNotExist(err) {
+					resp.Errno = control.LinuxENOENT
+				} else {
+					resp.Errno = control.LinuxEPERM
+				}
+				return resp
+			}
+		}
 		if err := root.Rename(rel, newRel); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 		}
@@ -692,6 +782,10 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 	case "truncate":
 		if readOnly {
 			resp.Errno = control.LinuxEROFS
+			return resp
+		}
+		if errno := lstatRegularInRoot(root, rel); errno != 0 {
+			resp.Errno = errno
 			return resp
 		}
 		f, err := root.OpenFile(rel, os.O_WRONLY, 0)
@@ -752,6 +846,14 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 		if err := validateSafeSymlinkTarget(rel, req.Target); err != nil {
 			resp.Errno = control.LinuxEPERM
 			return resp
+		}
+		// Reject any ".." segment in rpcfs symlinks so neither chained symlinks
+		// nor later directory renames can ever escape the served host root.
+		for _, seg := range strings.Split(req.Target, "/") {
+			if seg == ".." {
+				resp.Errno = control.LinuxEPERM
+				return resp
+			}
 		}
 		if err := verifyExistingAncestorsInRoot(root, path.Dir(rel)); err != nil {
 			resp.Errno = control.LinuxEPERM

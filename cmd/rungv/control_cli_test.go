@@ -203,7 +203,7 @@ func TestExtractTarToHostDirSecurity(t *testing.T) {
 		t.Fatal("accepted ../escape.txt")
 	}
 
-	// 2. Chained relative symlink escape rejected.
+	// 2. Chained relative symlink escapes rejected (both parent-traversal and non-leading '..').
 	if runtime.GOOS != "windows" {
 		chained := makeTar(
 			tar.Header{Name: "a/b/", Typeflag: tar.TypeDir, Mode: 0o755},
@@ -211,12 +211,29 @@ func TestExtractTarToHostDirSecurity(t *testing.T) {
 			tar.Header{Name: "a/b/up/escape", Typeflag: tar.TypeSymlink, Linkname: "../../outside"},
 		)
 		if err := extractTarToHostDir(bytes.NewReader(chained), t.TempDir(), hostExtractOptions{}); err == nil {
-			t.Fatal("accepted chained relative symlink escape")
+			t.Fatal("accepted chained relative symlink escape via parent traversal")
+		}
+		nonLeadingUp := makeTar(
+			tar.Header{Name: "a/b/", Typeflag: tar.TypeDir, Mode: 0o755},
+			tar.Header{Name: "a/b/up", Typeflag: tar.TypeSymlink, Linkname: "../.."},
+			tar.Header{Name: "a/c", Typeflag: tar.TypeSymlink, Linkname: "b/up/../../../etc/passwd"},
+		)
+		if err := extractTarToHostDir(bytes.NewReader(nonLeadingUp), t.TempDir(), hostExtractOptions{}); err == nil {
+			t.Fatal("accepted chained relative symlink escape via non-leading '..'")
+		}
+		// Hardlinking a valid deep '..' symlink to root depth must be rejected.
+		elevateLink := makeTar(
+			tar.Header{Name: "a/b/c/d/", Typeflag: tar.TypeDir, Mode: 0o755},
+			tar.Header{Name: "a/b/c/d/link", Typeflag: tar.TypeSymlink, Linkname: "../../../../etc/passwd"},
+			tar.Header{Name: "escape", Typeflag: tar.TypeLink, Linkname: "a/b/c/d/link"},
+		)
+		if err := extractTarToHostDir(bytes.NewReader(elevateLink), t.TempDir(), hostExtractOptions{}); err == nil {
+			t.Fatal("accepted TypeLink elevating deep symlink to root depth")
 		}
 	}
 
-	// 3. Windows drive / UNC / backslash symlink targets rejected on all OSes.
-	for _, badTarget := range []string{`C:\Windows\win.ini`, `\\server\share\x`, `..\..\outside`} {
+	// 3. Windows drive / drive-relative / UNC / backslash symlink targets rejected on all OSes.
+	for _, badTarget := range []string{`C:\Windows\win.ini`, `C:secret.txt`, `\\server\share\x`, `..\..\outside`, `sub/../outside`} {
 		badTar := makeTar(tar.Header{Name: "sub/link", Typeflag: tar.TypeSymlink, Linkname: badTarget})
 		if err := extractTarToHostDir(bytes.NewReader(badTar), t.TempDir(), hostExtractOptions{}); err == nil {
 			t.Fatalf("accepted unsafe symlink target %q", badTarget)
@@ -293,12 +310,16 @@ func TestServeRPCFSRequestSecurityAndSemantics(t *testing.T) {
 		t.Fatalf("stat ../../etc/passwd errno = %d, want EINVAL (%d)", resp.Errno, control.LinuxEINVAL)
 	}
 
-	// 2. Escaping / absolute / backslash symlink targets rejected with EPERM.
-	for _, target := range []string{"/etc/passwd", "../secret", `C:\win.ini`, `a\b`} {
-		resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "symlink", Path: "/badlink", Target: target})
+	// 2. Escaping / absolute / drive-relative / '..' / backslash symlink targets rejected with EPERM.
+	for _, target := range []string{"/etc/passwd", "../secret", "a/../b", `C:\win.ini`, `C:secret.txt`, `a\b`} {
+		resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "symlink", Path: "/sub/badlink", Target: target})
 		if resp.Errno != control.LinuxEPERM {
 			t.Fatalf("symlink %q errno = %d, want EPERM (%d)", target, resp.Errno, control.LinuxEPERM)
 		}
+	}
+	// Drive-prefixed path rejected cleanly in cleanRPCFSRelPath.
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "stat", Path: "C:secret.txt"}); resp.Errno != control.LinuxEINVAL {
+		t.Fatalf("stat C:secret.txt errno = %d, want EINVAL (%d)", resp.Errno, control.LinuxEINVAL)
 	}
 
 	// 3. Create dir + file, verify unlink rejects dir (EISDIR) and rmdir rejects file (ENOTDIR).
@@ -313,6 +334,41 @@ func TestServeRPCFSRequestSecurityAndSemantics(t *testing.T) {
 	}
 	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "rmdir", Path: "/f.txt"}); resp.Errno != control.LinuxENOTDIR {
 		t.Fatalf("rmdir file errno = %d, want ENOTDIR (%d)", resp.Errno, control.LinuxENOTDIR)
+	}
+	// read/write/truncate on directories return EISDIR.
+	if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "read", Path: "/sub", Length: 4}); resp.Errno != control.LinuxEISDIR {
+		t.Fatalf("read dir errno = %d, want EISDIR", resp.Errno)
+	}
+	// Symlink read/write/truncate return ELOOP without touching target; pre-existing deep '..' symlink cannot be elevated via rename.
+	if runtime.GOOS != "windows" {
+		if err := os.WriteFile(filepath.Join(dir, "target.txt"), []byte("keep-intact"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "symlink", Path: "/goodlink", Target: "target.txt"}); resp.Errno != 0 {
+			t.Fatalf("create safe sibling symlink errno = %d", resp.Errno)
+		}
+		for _, op := range []string{"read", "write", "truncate"} {
+			resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: op, Path: "/goodlink", Length: 4, Data: []byte("bad"), Size: 0})
+			if resp.Errno != control.LinuxELOOP {
+				t.Fatalf("%s on symlink errno = %d, want ELOOP (%d)", op, resp.Errno, control.LinuxELOOP)
+			}
+		}
+		if got, err := os.ReadFile(filepath.Join(dir, "target.txt")); err != nil || string(got) != "keep-intact" {
+			t.Fatalf("symlink op modified target.txt: (%q, %v)", got, err)
+		}
+		// Pre-existing host deep '..' symlink inside a/b/deep cannot be renamed to a shallower depth directly or via its parent dir.
+		if err := os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../../target.txt", filepath.Join(dir, "a", "b", "deep")); err != nil {
+			t.Fatal(err)
+		}
+		if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "rename", Path: "/a/b/deep", NewPath: "/deep"}); resp.Errno != control.LinuxEPERM {
+			t.Fatalf("direct rename elevating deep '..' symlink errno = %d, want EPERM", resp.Errno)
+		}
+		if resp := serveRPCFSRequest(root, false, 1024, control.RPCFSRequest{Op: "rename", Path: "/a/b", NewPath: "/b"}); resp.Errno != control.LinuxEPERM {
+			t.Fatalf("parent dir rename elevating deep '..' symlink errno = %d, want EPERM", resp.Errno)
+		}
 	}
 
 	// 4. Negative read offset rejected; oversized read length capped to maxReadBytes.
@@ -434,9 +490,14 @@ func TestCPHostToGuestEarlyRejectionLargeUploadNoDeadlock(t *testing.T) {
 }
 
 func TestPortForwardCancelAndUnixSocketSafety(t *testing.T) {
+	dialed := make(chan struct{}, 1)
 	ep := startMockCLIServer(t, []string{control.CapNetDial}, func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error {
 		if err := stream.SendResponse(control.NetDialResponse{RemoteAddr: "127.0.0.1:80"}); err != nil {
 			return err
+		}
+		select {
+		case dialed <- struct{}{}:
+		default:
 		}
 		<-ctx.Done()
 		return ctx.Err()
@@ -494,8 +555,11 @@ func TestPortForwardCancelAndUnixSocketSafety(t *testing.T) {
 		t.Fatalf("dial port-forward listener: %v", err)
 	}
 	defer idleConn.Close()
-	// Give accept loop a moment to attach the tunnel.
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-dialed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("port-forward did not establish tunnel stream")
+	}
 
 	pfCancel()
 	select {

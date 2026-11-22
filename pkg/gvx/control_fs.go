@@ -590,7 +590,7 @@ func (s *Sandbox) handleFSImport(ctx context.Context, stream *control.Stream, ra
 				stat.Mask |= linux.STATX_MTIME
 				stat.Mtime = linux.NsecToStatxTimestamp(hdr.ModTime.UnixNano())
 			}
-			if !isSymlink {
+			if !isSymlink && hdr.Mode != 0 {
 				stat.Mask |= linux.STATX_MODE
 				stat.Mode = uint16(hdr.Mode & 0o7777)
 			}
