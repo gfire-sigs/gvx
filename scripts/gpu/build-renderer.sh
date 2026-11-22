@@ -460,24 +460,52 @@ step_driver() {
 			mv -- "$tmp_stage" "$DRIVER_STAGE_DIR"
 		fi
 	elif [[ $driver_source == "mesa-source" ]]; then
-		DRIVER_STAGE_DIR="$cache_dir/driver-mesa-source-${DRIVER_SOURCE_SHA256:0:16}"
-		local tmp_stage
-		tmp_stage=$(mktemp -d "$cache_dir/.tmp-driver.XXXXXX")
-		rmdir -- "$tmp_stage"
-		tmp_paths+=("$tmp_stage")
-
-		local stage_args=(
-			--lock "$repo_root/gpurenderer/third_party.lock"
-			--source mesa-source
-			--cache "$cache_dir"
-			--out "$tmp_stage"
+		local mesa_patch_dir="$repo_root/gpurenderer/patches/mesa"
+		local mesa_key
+		mesa_key=$(
+			{
+				shasum -a 256 \
+					"$repo_root/gpurenderer/third_party.lock" \
+					"$repo_root/scripts/gpu/stage_driver.py"
+				if [[ -d $mesa_patch_dir ]]; then
+					local pf
+					shopt -s nullglob
+					for pf in "$mesa_patch_dir"/*.patch; do
+						printf '%s %s\n' "$(basename -- "$pf")" "$(shasum -a 256 -- "$pf" | awk '{print $1}')"
+					done | LC_ALL=C sort
+					shopt -u nullglob
+				fi
+			} | shasum -a 256 | awk '{print substr($1, 1, 16)}'
 		)
-		if ((offline)); then
-			stage_args+=(--offline)
+		DRIVER_STAGE_DIR="$cache_dir/driver-mesa-source-${mesa_key}"
+		if [[ -d $DRIVER_STAGE_DIR && -f "$DRIVER_STAGE_DIR/driver.txt" && -f "$DRIVER_STAGE_DIR/lib/libvulkan_kosmickrisp.dylib" ]]; then
+			"$venv_python" -I "$repo_root/scripts/gpu/stage_driver.py" \
+				--lock "$repo_root/gpurenderer/third_party.lock" \
+				--source mesa-source \
+				--cache "$cache_dir" \
+				--verify-cache-only
+		else
+			local tmp_stage
+			tmp_stage=$(mktemp -d "$cache_dir/.tmp-driver.XXXXXX")
+			rmdir -- "$tmp_stage"
+			tmp_paths+=("$tmp_stage")
+
+			local stage_args=(
+				--lock "$repo_root/gpurenderer/third_party.lock"
+				--source mesa-source
+				--cache "$cache_dir"
+				--out "$tmp_stage"
+			)
+			if [[ -d $mesa_patch_dir ]]; then
+				stage_args+=(--patches-dir "$mesa_patch_dir")
+			fi
+			if ((offline)); then
+				stage_args+=(--offline)
+			fi
+			"$venv_python" -I "$repo_root/scripts/gpu/stage_driver.py" "${stage_args[@]}"
+			rm -rf -- "$DRIVER_STAGE_DIR"
+			mv -- "$tmp_stage" "$DRIVER_STAGE_DIR"
 		fi
-		"$venv_python" -I "$repo_root/scripts/gpu/stage_driver.py" "${stage_args[@]}"
-		rm -rf -- "$DRIVER_STAGE_DIR"
-		mv -- "$tmp_stage" "$DRIVER_STAGE_DIR"
 	else
 		DRIVER_STAGE_DIR="$cache_dir/driver-homebrew"
 		local tmp_stage
@@ -526,11 +554,17 @@ step_work_tree() {
 		local patch_file
 		shopt -s nullglob
 		for patch_file in "$patch_dir"/*.patch; do
-			GIT_CEILING_DIRECTORIES="$work_dir" git -C "$work_dir/subprojects/virglrenderer" \
-				apply --check "$patch_file" ||
+			GIT_CEILING_DIRECTORIES="$work_dir" \
+				GIT_CONFIG_GLOBAL=/dev/null \
+				GIT_CONFIG_NOSYSTEM=1 \
+				git -C "$work_dir/subprojects/virglrenderer" \
+				apply --check -- "$patch_file" ||
 				die "virglrenderer patch failed check: $patch_file"
-			GIT_CEILING_DIRECTORIES="$work_dir" git -C "$work_dir/subprojects/virglrenderer" \
-				apply "$patch_file" ||
+			GIT_CEILING_DIRECTORIES="$work_dir" \
+				GIT_CONFIG_GLOBAL=/dev/null \
+				GIT_CONFIG_NOSYSTEM=1 \
+				git -C "$work_dir/subprojects/virglrenderer" \
+				apply -- "$patch_file" ||
 				die "virglrenderer patch failed to apply: $patch_file"
 		done
 		shopt -u nullglob

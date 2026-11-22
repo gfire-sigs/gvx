@@ -1,0 +1,58 @@
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 21:45:00 +0900
+Subject: [PATCH] kk: include color attachment locations in fragment shader key
+
+In src/kosmickrisp/vulkan/kk_shader.c, fragment shader compilation reads
+state->cal->color_map through kk_get_logical_color_att_index. It also
+reads state->ial color_map and color_attachment_count in
+msl_nir_lower_input_attachments. However, struct kk_fs_key omits those
+maps. A second pipeline with matching formats and different attachment
+locations reuses the cached shader and accesses the wrong color
+attachments.
+
+Add color_map, input_color_map, and input_color_attachment_count to
+struct kk_fs_key and copy them in kk_populate_fs_key. Default color_map
+to identity indices when state->cal is null. Leave input attachment
+fields zeroed when state->ial is null. First bad upstream commit:
+59627d905 ("kk: Implement VK_KHR_dynamic_rendering_local_read",
+2026-07-02).
+
+License: MIT
+---
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index f5dd748..dcf542d 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -118,6 +118,8 @@ kk_populate_vs_key(struct kk_vs_key *key,
+ 
+ struct kk_fs_key {
+    VkFormat color_formats[MESA_VK_MAX_COLOR_ATTACHMENTS];
++   uint8_t color_map[MESA_VK_MAX_COLOR_ATTACHMENTS];
++   uint8_t input_color_map[MESA_VK_MAX_COLOR_ATTACHMENTS];
+    struct vk_color_blend_state color_blend;
+    struct vk_depth_stencil_state ds;
+    uint32_t rasterization_samples;
+@@ -126,6 +128,7 @@ struct kk_fs_key {
+    bool has_depth;
+    bool has_stencil;
+    bool dynamic_input_attachment_map;
++   uint8_t input_color_attachment_count;
+    uint8_t depth_input_att;
+    uint8_t stencil_input_att;
+ };
+@@ -141,6 +144,15 @@ kk_populate_fs_key(struct kk_fs_key *key,
+    memcpy(key->color_formats, state->rp->color_attachment_formats,
+           sizeof(key->color_formats));
+ 
++   for (unsigned i = 0; i < ARRAY_SIZE(key->color_map); i++)
++      key->color_map[i] = state->cal ? state->cal->color_map[i] : i;
++
++   if (state->ial) {
++      memcpy(key->input_color_map, state->ial->color_map,
++             sizeof(key->input_color_map));
++      key->input_color_attachment_count = state->ial->color_attachment_count;
++   }
++
+    if (has_static_depth_stencil_state(state))
+       key->ds = *(state->ds);
+ 

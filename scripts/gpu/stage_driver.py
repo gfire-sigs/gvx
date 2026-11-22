@@ -473,20 +473,51 @@ def fetch_mesa_source(
     return archive, redownloaded
 
 
+def collect_mesa_patches(
+    patches_dir: Path | None,
+) -> tuple[list[tuple[Path, str]], str]:
+    if patches_dir is None or not patches_dir.exists():
+        return [], hashlib.sha256(b"").hexdigest()[:16]
+    patches_dir = patches_dir.resolve()
+    if not patches_dir.is_dir():
+        die(f"mesa patches path is not a directory: {patches_dir}")
+    patch_files = sorted(
+        (p for p in patches_dir.iterdir() if p.is_file() and p.name.endswith(".patch")),
+        key=lambda p: p.name,
+    )
+    for p in patch_files:
+        if any(ch.isspace() for ch in p.name):
+            die(f"mesa patch name must not contain whitespace: {p.name!r}")
+    patches = [(p, sha256_file(p)) for p in patch_files]
+    h = hashlib.sha256()
+    for p, sha in patches:
+        h.update(f"{p.name} {sha}\n".encode("utf-8"))
+    return patches, h.hexdigest()[:16]
+
+
 def extract_mesa_source(
     archive: Path,
     version: str,
     cache_dir: Path,
     redownloaded: bool,
+    patches: list[tuple[Path, str]],
+    patch_digest: str,
 ) -> Path:
-    src_dir = cache_dir / f"mesa-{version}"
-    if not redownloaded and (src_dir / "meson.build").is_file():
+    src_dir = cache_dir / f"mesa-{version}-{patch_digest}"
+    marker = src_dir / ".gvx-patches-applied"
+    expected_marker = "".join(f"{p.name} {sha}\n" for p, sha in patches)
+    if (
+        not redownloaded
+        and (src_dir / "meson.build").is_file()
+        and marker.is_file()
+        and marker.read_text(encoding="utf-8") == expected_marker
+    ):
         return src_dir
 
     use_data_filter = hasattr(tarfile, "data_filter")
     root_name = f"mesa-{version}"
     root_prefix = PurePosixPath(root_name)
-    tmp_dir = Path(tempfile.mkdtemp(prefix=".tmp-mesa-ext.", dir=cache_dir))
+    tmp_dir = Path(tempfile.mkdtemp(prefix=".tmp-mesa-ext.", dir=cache_dir)).resolve()
     try:
         with tarfile.open(archive, "r:xz") as tf:
             members = tf.getmembers()
@@ -503,6 +534,25 @@ def extract_mesa_source(
         extracted_root = tmp_dir / root_name
         if not (extracted_root / "meson.build").is_file():
             die(f"extracted mesa source missing meson.build in {extracted_root}")
+        env = os.environ.copy()
+        env["GIT_CEILING_DIRECTORIES"] = str(tmp_dir)
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        for patch_path, _ in patches:
+            for check_args in (["--check"], []):
+                res = subprocess.run(
+                    ["git", "-C", str(extracted_root), "apply", *check_args, "--", str(patch_path)],
+                    check=False,
+                    text=True,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                if res.returncode != 0:
+                    detail = (res.stderr or res.stdout).strip()
+                    phase = "check" if check_args else "apply"
+                    die(f"mesa patch failed {phase}: {patch_path}: {detail}")
+        (extracted_root / ".gvx-patches-applied").write_text(expected_marker, encoding="utf-8")
         if src_dir.exists():
             shutil.rmtree(src_dir)
         os.replace(extracted_root, src_dir)
@@ -519,9 +569,10 @@ def build_mesa_source(
     cache_dir: Path,
     redownloaded: bool,
     jobs: int | None,
+    patch_digest: str,
 ) -> Path:
     version = driver["DRIVER_SOURCE_VERSION"]
-    build_dir = cache_dir / f"mesa-build-{version}"
+    build_dir = cache_dir / f"mesa-build-{version}-{patch_digest}"
     if redownloaded and build_dir.exists():
         shutil.rmtree(build_dir)
 
@@ -784,6 +835,7 @@ def stage_and_check(
     mesa_src_dir: Path | None = None,
     mesa_version: str | None = None,
     mesa_sha256: str | None = None,
+    mesa_patches: list[tuple[str, str]] | None = None,
     build_tool_versions: list[str] | None = None,
     out_dir: Path,
 ) -> None:
@@ -882,8 +934,10 @@ def stage_and_check(
         report_lines = [
             "SOURCE=mesa-source",
             f"MESA={mesa_version} sha256:{mesa_sha256}",
-            f"MIN_MACOS={format_version(max_minos)}",
         ]
+        for patch_name, patch_sha in mesa_patches or []:
+            report_lines.append(f"MESA_PATCH={patch_name} {patch_sha}")
+        report_lines.append(f"MIN_MACOS={format_version(max_minos)}")
         report_lines.extend(build_tool_versions)
         report_lines.extend(homebrew_versions[formula] for formula in sorted(homebrew_versions))
     else:
@@ -907,17 +961,26 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--cache", type=Path)
     parser.add_argument("--tag", choices=VALID_TAGS)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--patches-dir", type=Path)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--jobs", type=int)
     parser.add_argument("--verify-cache-only", action="store_true")
     args = parser.parse_args(argv)
 
     if args.verify_cache_only:
-        if args.source != "pinned" or args.cache is None or args.tag is None:
-            die("--verify-cache-only requires --source pinned, --cache, and --tag")
-        _, bottles = parse_lock(args.lock, args.tag, "pinned")
-        fetch_bottles(bottles, args.tag, args.cache / "bottles", offline=True)
-        return 0
+        if args.source == "pinned":
+            if args.cache is None or args.tag is None:
+                die("--verify-cache-only requires --cache and --tag when --source is pinned")
+            _, bottles = parse_lock(args.lock, args.tag, "pinned")
+            fetch_bottles(bottles, args.tag, args.cache / "bottles", offline=True)
+            return 0
+        if args.source == "mesa-source":
+            if args.cache is None:
+                die("--verify-cache-only requires --cache when --source is mesa-source")
+            driver, _ = parse_lock(args.lock, None, "mesa-source")
+            fetch_mesa_source(driver, args.cache, offline=True)
+            return 0
+        die("--verify-cache-only requires --source pinned or mesa-source")
 
     if args.out is None:
         die("--out is required")
@@ -954,9 +1017,17 @@ def main(argv: list[str]) -> int:
         )
     elif args.source == "mesa-source":
         assert args.cache is not None
+        patches, patch_digest = collect_mesa_patches(args.patches_dir)
         archive, redownloaded = fetch_mesa_source(driver, args.cache, args.offline)
-        src_dir = extract_mesa_source(archive, driver["DRIVER_SOURCE_VERSION"], args.cache, redownloaded)
-        built_dylib = build_mesa_source(driver, src_dir, args.cache, redownloaded, args.jobs)
+        src_dir = extract_mesa_source(
+            archive,
+            driver["DRIVER_SOURCE_VERSION"],
+            args.cache,
+            redownloaded,
+            patches,
+            patch_digest,
+        )
+        built_dylib = build_mesa_source(driver, src_dir, args.cache, redownloaded, args.jobs, patch_digest)
         staged, dep_kegs, dep_versions = compute_mesa_source_closure(driver, built_dylib)
         build_tools = collect_build_tool_versions()
         stage_and_check(
@@ -969,6 +1040,7 @@ def main(argv: list[str]) -> int:
             mesa_src_dir=src_dir,
             mesa_version=driver["DRIVER_SOURCE_VERSION"],
             mesa_sha256=driver["DRIVER_SOURCE_SHA256"],
+            mesa_patches=[(p.name, sha) for p, sha in patches],
             build_tool_versions=build_tools,
             out_dir=args.out,
         )

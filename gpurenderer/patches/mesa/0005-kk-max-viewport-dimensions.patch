@@ -1,0 +1,30 @@
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 21:45:00 +0900
+Subject: [PATCH] kk: cap maxViewportDimensions to 16384
+
+In src/kosmickrisp/vulkan/kk_physical_device.c, kk_get_device_properties
+reports maxViewportDimensions as {32768, 32768} while
+maxFramebufferWidth is 16384. Draws with a viewport of 28672 or larger
+produce no pixels on Apple Silicon.
+
+Report maxViewportDimensions as {16384, 16384} and viewportBoundsRange
+as {-32768, 32767} to match the framebuffer limit and the Vulkan bounds
+rule.
+
+License: MIT
+---
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 65b99ed..05afb6c 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -618,8 +618,8 @@ kk_get_device_properties(
+       .maxSamplerLodBias = 15,
+       .maxSamplerAnisotropy = 16,
+       .maxViewports = KK_MAX_VIEWPORTS,
+-      .maxViewportDimensions = {32768, 32768},
+-      .viewportBoundsRange = {-65536, 65536},
++      .maxViewportDimensions = {16384, 16384},
++      .viewportBoundsRange = {-32768, 32767},
+       .viewportSubPixelBits = 8,
+       .minMemoryMapAlignment = os_page_size,
+       .minTexelBufferOffsetAlignment = KK_MIN_TEXEL_BUFFER_ALIGNMENT,

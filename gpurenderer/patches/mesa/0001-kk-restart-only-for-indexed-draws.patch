@@ -1,0 +1,30 @@
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 21:45:00 +0900
+Subject: [PATCH] kk: enable primitive restart only for indexed draws
+
+In src/kosmickrisp/vulkan/kk_cmd_draw.c, kk_draw copies
+dyn->ia.primitive_restart_enable into data->restart for every draw.
+When a non-indexed draw enters the unroll path for flat shading, the
+compute kernel compares each vertex number against data->restart_index.
+A new command buffer leaves primitive_restart_index at 0 until an index
+buffer binds, so the draw drops vertex 0.
+
+Gate data->restart on data->indexed so primitive restart applies only to
+indexed draws. First bad upstream commit: 1388ec1b7 ("kk: Support
+VK_EXT_provoking_vertex", 2026-08-05).
+
+License: MIT
+---
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 8f627aa..04f3494 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -2061,7 +2061,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ 
+    kk_flush_gfx_state(cmd);
+ 
+-   data->restart = dyn->ia.primitive_restart_enable;
++   data->restart = data->indexed && dyn->ia.primitive_restart_enable;
+    data->restart_index = dyn->ia.primitive_restart_index;
+    data->flatshade_first =
+       dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
