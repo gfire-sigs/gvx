@@ -327,6 +327,7 @@ func TestCgroup2IOAccountingGuestEndToEndAndMultiSandboxIsolation(t *testing.T) 
 		RootVolume:             filepath.Join(t.TempDir(), "rootvol.ext4"),
 		NetworkMode:            NetModeNone,
 		DisableHostLockdown:    true,
+		Envv:                   []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 		Mounts: []Mount{{
 			Kind:      MountVolume,
 			ImagePath: filepath.Join(t.TempDir(), "vol.ext4"),
