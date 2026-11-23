@@ -204,12 +204,12 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 		SandboxID:        cmp.Or(cfg.Name, "gvx-default"),
 		Token:            cfg.ControlToken,
 		Capabilities:     caps,
-		Features:         features,
 		AllowFDs:         slices.Contains(caps, control.CapMountVolumeAttach),
 		MaxConnections:   cfg.Tuning.Int(tuning.ControlMaxConnections),
 		MaxFrameBytes:    int(cfg.Tuning.Size(tuning.ControlMaxFrameBytes)),
 		HandshakeTimeout: cfg.Tuning.Duration(tuning.ControlHandshakeTimeout),
 		Handler:          s,
+		Features:         features,
 	})
 	s.mu.Lock()
 	if s.closed {
