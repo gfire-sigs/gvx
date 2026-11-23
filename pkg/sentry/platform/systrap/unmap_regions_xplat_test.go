@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
+	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
 
 func TestSubtractRanges(t *testing.T) {
@@ -87,5 +88,35 @@ func TestUnmapSegmentWith16KBHostPages(t *testing.T) {
 		if want := []mapsRegion{sealed}; !slices.Equal(holes, want) {
 			t.Errorf("range %#x: holes = %#x, want %#x", r, holes, want)
 		}
+	}
+}
+
+func TestIsForkStubSealedSweep(t *testing.T) {
+	origROMapEnd, origMaxUser := stubROMapEnd, maximumUserAddress
+	t.Cleanup(func() {
+		stubROMapEnd, maximumUserAddress = origROMapEnd, origMaxUser
+	})
+	stubROMapEnd = 0x10000
+	maximumUserAddress = 0x8000000000
+
+	sweepArgs := []arch.SyscallArgument{
+		{Value: stubROMapEnd},
+		{Value: maximumUserAddress - stubROMapEnd},
+	}
+	if !isForkStubSealedSweep(sweepArgs, unix.EPERM) {
+		t.Fatal("isForkStubSealedSweep(sweepArgs, EPERM) = false, want true")
+	}
+	if isForkStubSealedSweep(sweepArgs, unix.EINVAL) {
+		t.Fatal("isForkStubSealedSweep(sweepArgs, EINVAL) = true, want false")
+	}
+	if isForkStubSealedSweep([]arch.SyscallArgument{{Value: stubROMapEnd}}, unix.EPERM) {
+		t.Fatal("isForkStubSealedSweep(shortArgs, EPERM) = true, want false")
+	}
+	otherRange := []arch.SyscallArgument{
+		{Value: stubROMapEnd + 0x4000},
+		{Value: maximumUserAddress - stubROMapEnd - 0x4000},
+	}
+	if isForkStubSealedSweep(otherRange, unix.EPERM) {
+		t.Fatal("isForkStubSealedSweep(otherRange, EPERM) = true, want false")
 	}
 }

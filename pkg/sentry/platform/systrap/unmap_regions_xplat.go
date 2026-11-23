@@ -97,6 +97,16 @@ func unmapSegmentWith(r mapsRegion, unit uintptr, unmap func(start, length uintp
 	}
 }
 
+// isForkStubSealedSweep reports whether err is EPERM from forkStub's
+// upper-range munmap sweep (stubROMapEnd..maximumUserAddress). The
+// subsequent subprocess.unmap call isolates sealed pages page by page.
+func isForkStubSealedSweep(args []arch.SyscallArgument, err error) bool {
+	return errors.Is(err, unix.EPERM) &&
+		len(args) >= 2 &&
+		args[0].Value == stubROMapEnd &&
+		args[1].Value == maximumUserAddress-stubROMapEnd
+}
+
 // subtractRanges returns the parts of r that no range of holes covers. holes
 // is sorted and its ranges do not overlap.
 func subtractRanges(r mapsRegion, holes []mapsRegion) []mapsRegion {

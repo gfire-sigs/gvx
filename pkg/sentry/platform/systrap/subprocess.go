@@ -842,6 +842,9 @@ func (t *thread) syscallIgnoreInterrupt(
 		case ERESTARTNOHAND:
 			continue
 		default:
+			if sysno == unix.SYS_MUNMAP && isForkStubSealedSweep(args, err) {
+				return 0, nil
+			}
 			return rval, err
 		}
 	}
