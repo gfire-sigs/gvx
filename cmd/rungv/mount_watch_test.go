@@ -532,7 +532,7 @@ func buildRPCFSProbeLinuxELF(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	outPath := filepath.Join(srcDir, "probe")
-	cmd := exec.Command("go", "build", "-o", outPath, ".")
+	cmd := exec.Command("go", "build", "-ldflags=-linkmode=internal", "-o", outPath, ".")
 	cmd.Dir = srcDir
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -647,7 +647,7 @@ func TestMountServeEndToEndSendfileReaddirInotifyAndSingleFile(t *testing.T) {
 
 	runExec := func(args ...string) (int, string, string) {
 		var outB, errB bytes.Buffer
-		full := append([]string{"exec", "-S", sockPath, "--"}, args...)
+		full := append([]string{"exec", "-S", sockPath, "-e", "GODEBUG=asyncpreemptoff=1", "-e", "GOMAXPROCS=2", "--"}, args...)
 		code := executeCLI(context.Background(), full, nil, &outB, &errB)
 		return code, outB.String(), errB.String()
 	}
@@ -669,7 +669,7 @@ func TestMountServeEndToEndSendfileReaddirInotifyAndSingleFile(t *testing.T) {
 		watchErr := newSyncNotifyBuffer()
 		watchDone := make(chan int, 1)
 		go func() {
-			watchDone <- executeCLI(context.Background(), []string{"exec", "-S", sockPath, "--", "/bin/probe", "watch", "/mnt/proj/one.txt"}, nil, watchOut, watchErr)
+			watchDone <- executeCLI(context.Background(), []string{"exec", "-S", sockPath, "-e", "GODEBUG=asyncpreemptoff=1", "-e", "GOMAXPROCS=2", "--", "/bin/probe", "watch", "/mnt/proj/one.txt"}, nil, watchOut, watchErr)
 		}()
 		watchOut.waitForSubstring(t, "WATCH_READY\n", 10*time.Second)
 		if err := os.WriteFile(onePath, []byte("edited-on-host\n"), 0o600); err != nil {
@@ -718,7 +718,7 @@ func TestMountServeEndToEndSendfileReaddirInotifyAndSingleFile(t *testing.T) {
 		watchErr := newSyncNotifyBuffer()
 		watchDone := make(chan int, 1)
 		go func() {
-			watchDone <- executeCLI(context.Background(), []string{"exec", "-S", sockPath, "--", "/bin/probe", "watch", "/mnt/config.yml"}, nil, watchOut, watchErr)
+			watchDone <- executeCLI(context.Background(), []string{"exec", "-S", sockPath, "-e", "GODEBUG=asyncpreemptoff=1", "-e", "GOMAXPROCS=2", "--", "/bin/probe", "watch", "/mnt/config.yml"}, nil, watchOut, watchErr)
 		}()
 		watchOut.waitForSubstring(t, "WATCH_READY\n", 10*time.Second)
 		if err := os.WriteFile(singleHost, []byte("mode: updated\n"), 0o600); err != nil {

@@ -95,6 +95,9 @@ func main() {
 			return
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "SCANNER_ERR:%v\n", err)
+	}
 }
 `
 
@@ -210,6 +213,7 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*running
 
 	stdinR, stdinW := net.Pipe()
 	stdout := newNotifyBuffer()
+	stderr := newNotifyBuffer()
 
 	if cfg.Platform == "" {
 		cfg.Platform = PlatformAuto
@@ -223,7 +227,7 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*running
 	cfg.ControlToken = ep.Token
 	cfg.Stdin = stdinR
 	cfg.Stdout = stdout
-	cfg.Stderr = io.Discard
+	cfg.Stderr = stderr
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sb, err := Restore(ctx, cfg, RestoreOptions{Dir: dir})
@@ -246,7 +250,10 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*running
 	runDone := make(chan struct{})
 	go func() {
 		defer close(runDone)
-		_, _ = sb.Run(ctx)
+		code, rErr := sb.Run(ctx)
+		if rErr != nil {
+			_, _ = fmt.Fprintf(stderr, "sb.Run=(%d,%v)\n", code, rErr)
+		}
 	}()
 
 	client, err := control.Dial(ctx, control.DialOptions{
@@ -263,6 +270,18 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*running
 		<-runDone
 		ep.Cleanup()
 		t.Fatalf("control.Dial: %v", err)
+	}
+	// Wait until the restored kernel has finished k.Start() so stdin/stdout are active.
+	pingDeadline := time.Now().Add(10 * time.Second)
+	for {
+		var ping control.PingResponse
+		if pErr := client.Call(ctx, control.MethodPing, nil, &ping); pErr == nil && ping.State == "running" {
+			break
+		}
+		if time.Now().After(pingDeadline) {
+			t.Fatalf("restored sandbox did not reach running state (stderr=%q)", stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	var closed bool
@@ -330,6 +349,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 		OCICacheDir:   cacheDir,
 		CheckpointDir: ckptDir,
 		Argv:          []string{"/bin/fdhold"},
+		Envv:          []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
 	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 
@@ -705,6 +725,7 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 		OCICacheDir:   cacheDir,
 		CheckpointDir: ckpt1,
 		Argv:          []string{"/bin/fdhold"},
+		Envv:          []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
 	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 

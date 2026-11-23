@@ -50,13 +50,6 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	token := opts.Token
-	if token == "" {
-		token, err = ReadToken(network, address, opts.TokenFile)
-		if err != nil {
-			return nil, err
-		}
-	}
 	timeout := opts.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -65,6 +58,33 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 	nc, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, fmt.Errorf("connect control socket %s://%s: %w", network, address, err)
+	}
+	token := opts.Token
+	if token == "" {
+		token, err = ReadToken(network, address, opts.TokenFile)
+		if err != nil {
+			_ = nc.Close()
+			return nil, err
+		}
+		// Listen() writes the per-run token file immediately after net.Listen.
+		// If a client dials a freshly bound TCP endpoint during that window,
+		// retry briefly before sending an empty token.
+		if token == "" && opts.TokenFile == "" && TokenRequired(network) {
+			waitEnd := time.Now().Add(250 * time.Millisecond)
+			for token == "" && time.Now().Before(waitEnd) {
+				select {
+				case <-ctx.Done():
+					_ = nc.Close()
+					return nil, ctx.Err()
+				case <-time.After(15 * time.Millisecond):
+				}
+				token, err = ReadToken(network, address, "")
+				if err != nil {
+					_ = nc.Close()
+					return nil, err
+				}
+			}
+		}
 	}
 	deadline := time.Now().Add(timeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
