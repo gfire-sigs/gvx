@@ -582,6 +582,11 @@ func (s *Stream) ID() uint32 {
 	return s.id
 }
 
+// Conn returns the control connection that owns this stream.
+func (s *Stream) Conn() *Conn {
+	return s.conn
+}
+
 // MaxFrameBytes returns the negotiated maximum payload length per wire frame.
 func (s *Stream) MaxFrameBytes() int {
 	return s.conn.maxFrameBytes

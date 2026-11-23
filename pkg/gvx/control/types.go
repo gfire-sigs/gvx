@@ -44,6 +44,8 @@ const (
 	MethodNetDial          = "net.dial"
 	MethodNATPolicyGet     = "net.policy_get"
 	MethodNATPolicySet     = "net.policy_set"
+	MethodUnixForward      = "net.unix_forward"
+	MethodUnixAccept       = "net.unix_accept"
 	MethodMountList        = "mount.list"
 	MethodMountAdd         = "mount.add"
 	MethodMountRemount     = "mount.remount"
@@ -82,6 +84,7 @@ const (
 	CapNetDial             = "net.dial"
 	CapNATPolicyRead       = "net.policy.read"
 	CapNATPolicyWrite      = "net.policy.write"
+	CapUnixForward         = "net.unix_forward"
 	CapMountList           = "mount.list"
 	CapMountTmpfs          = "mount.tmpfs"
 	CapMountRemount        = "mount.remount"
@@ -123,6 +126,7 @@ var allKnownCapabilities = []string{
 	CapNetDial,
 	CapNATPolicyRead,
 	CapNATPolicyWrite,
+	CapUnixForward,
 	CapMountList,
 	CapMountTmpfs,
 	CapMountRemount,
@@ -226,6 +230,8 @@ var methodRequiredCap = map[string]string{
 	MethodNetDial:          CapNetDial,
 	MethodNATPolicyGet:     CapNATPolicyRead,
 	MethodNATPolicySet:     CapNATPolicyWrite,
+	MethodUnixForward:      CapUnixForward,
+	MethodUnixAccept:       CapUnixForward,
 	MethodMountList:        CapMountList,
 	MethodMountAdd:         CapMountTmpfs, // checked per-kind as well
 	MethodMountRemount:     CapMountRemount,
@@ -569,6 +575,40 @@ type NetDialResponse struct {
 // is installed. A set request requires a policy object.
 type NATPolicyState struct {
 	Policy json.RawMessage `json:"policy"`
+}
+
+// UnixForwardRequest binds a listening Unix stream socket inside the guest VFS
+// and forwards each guest connect() to the control client.
+type UnixForwardRequest struct {
+	GuestPath string `json:"guest_path"`
+	UID       uint32 `json:"uid,omitempty"`
+	GID       uint32 `json:"gid,omitempty"`
+	Mode      uint32 `json:"mode,omitempty"`
+	Replace   bool   `json:"replace,omitempty"`
+}
+
+// UnixForwardResponse confirms that GuestPath is bound and listening.
+type UnixForwardResponse struct {
+	GuestPath string `json:"guest_path"`
+}
+
+// UnixAcceptEvent notifies the client of a new guest connection waiting to be
+// claimed via MethodUnixAccept.
+type UnixAcceptEvent struct {
+	ConnID uint64 `json:"conn_id"`
+}
+
+// UnixRejectEvent notifies the sandbox that dialing the host socket failed for
+// ConnID so the pending guest socket can be closed immediately.
+type UnixRejectEvent struct {
+	ConnID uint64 `json:"conn_id"`
+	Error  string `json:"error,omitempty"`
+}
+
+// UnixAcceptRequest claims a pending guest Unix socket connection for binary
+// streaming on ChannelGeneric.
+type UnixAcceptRequest struct {
+	ConnID uint64 `json:"conn_id"`
 }
 
 // MountInfo describes one guest mount entry.

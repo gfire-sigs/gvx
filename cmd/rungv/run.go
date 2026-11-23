@@ -179,6 +179,18 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		}()
 	}
 
+	if len(rc.cfg.UnixForwards) > 0 && !rc.cfg.DisableHostLockdown {
+		stopHelper, helperErr := startBootUnixForwardHelper(ctx, rc.cfg.UnixForwards)
+		if helperErr != nil {
+			if rc.cfg.ControlListener != nil {
+				_ = rc.cfg.ControlListener.Close()
+			}
+			_, _ = fmt.Fprintf(stderr, "rungv run: start unix-forward helper: %v\n", helperErr)
+			return 1
+		}
+		defer stopHelper()
+	}
+
 	var err error
 	sb, err = gvx.New(ctx, rc.cfg)
 	if err != nil {

@@ -929,6 +929,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/gvx"}, "pkg/cpuid", "kernel.Init requires a cpuid.FeatureSet"},
 	{[]string{"pkg/gvx"}, "pkg/marshal/primitive", "guest memory copies use primitive marshal types"},
 	{[]string{"pkg/gvx"}, "pkg/memutil", "kernel memory files require host memory views"},
+	{[]string{"pkg/gvx"}, "pkg/syserr", "reverse Unix socket forwarding converts transport syserr values to errors"},
 	{[]string{"pkg/gvx"}, "pkg/waiter", "stdio file descriptions implement waiter.Waitable for blocking reads"},
 
 	// pkg/netbackend: Netstack foundation packages live outside pkg/tcpip.

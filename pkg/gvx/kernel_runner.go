@@ -294,6 +294,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err := s.setupKernelSubmountsAndFiles(sctxWithRoot, k.VFS(), creds, root); err != nil {
 		return 1, err
 	}
+	if err := s.startBootUnixForwards(ctx, k, creds, root, mntns); err != nil {
+		return 1, err
+	}
+	defer s.closeUnixForwards()
 
 	tg, cleanupStdio, err := s.createInitialGuestProcess(ctx, sctx, sctxWithRoot, k, creds, mntns, root, argv)
 	if cleanupStdio != nil {
@@ -540,6 +544,21 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 	if err := s.applyInitialKernelLimits(k); err != nil {
 		return 1, err
 	}
+	if len(s.cfg.UnixForwards) > 0 {
+		sctx := k.SupervisorContext()
+		root, mntns, err := s.guestRoot(sctx, k)
+		if err != nil {
+			return 1, fmt.Errorf("gvx: resolve guest root for restored unix forwards: %w", err)
+		}
+		creds := auth.NewRootCredentials(k.RootUserNamespace())
+		bindErr := s.startBootUnixForwards(ctx, k, creds, root, mntns)
+		root.DecRef(sctx)
+		mntns.DecRef(sctx)
+		if bindErr != nil {
+			return 1, bindErr
+		}
+		defer s.closeUnixForwards()
+	}
 	hostRAM, _ := hostMemory()
 	return s.executeActiveKernel(ctx, k, tg, mf, hostRAM, "gvx: start restored Sentry kernel")
 }
@@ -577,6 +596,7 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 		case <-ctx.Done():
 			s.unpauseForShutdown(k, dog)
 			s.closeRPCMounts()
+			s.closeUnixForwards()
 			_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 			s.killActiveExecSessions(k)
 		case <-doneCh:
@@ -590,6 +610,7 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	tg.WaitExited()
 	s.killActiveExecSessions(k)
 	s.closeRPCMounts()
+	s.closeUnixForwards()
 	s.ckptMu.Lock()
 	s.clearActiveKernel()
 	k.WaitExited()

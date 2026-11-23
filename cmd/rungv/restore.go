@@ -130,6 +130,18 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 		}()
 	}
 
+	if len(rc.cfg.UnixForwards) > 0 && !rc.cfg.DisableHostLockdown {
+		stopHelper, err := startBootUnixForwardHelper(ctx, rc.cfg.UnixForwards)
+		if err != nil {
+			if rc.cfg.ControlListener != nil {
+				_ = rc.cfg.ControlListener.Close()
+			}
+			_, _ = fmt.Fprintf(stderr, "rungv restore: %v\n", err)
+			return 1
+		}
+		defer stopHelper()
+	}
+
 	var err error
 	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir})
 	if err != nil {

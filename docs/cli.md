@@ -25,6 +25,7 @@ Run `rungv help` to print this command list.
 | `update` | Update live memory, CPU quota, PID limit, LAN isolation, or mutable tunables. |
 | `port` | Group command for `ls`, `add`, and `rm` on published sandbox ports. |
 | `port-forward` | Tunnel host TCP or Unix sockets into a sandbox over its control socket (alias: `pf`). |
+| `unix-forward` | Forward guest Unix sockets to host Unix sockets over the control socket (alias: `uf`). |
 | `mount` | Group command for `ls`, `add`, `remount`, `rm`, and `serve` on runtime sandbox mounts. |
 | `status` | Inspect a running sandbox over its control socket (also `rungv sandbox inspect`). |
 | `stats` | Display live CPU, memory, network, block I/O, and PID statistics. |
@@ -127,6 +128,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `--control-token-file PATH` | Write the 256-bit control token to `PATH` and require token authentication even on POSIX Unix sockets. |
 | `--dynamic-ports` | Allow runtime loopback (`127.0.0.1` and `[::1]`) port publishing through `rungv port add` under host lockdown. |
 | `--dynamic-ports-addr IP` | Allow runtime `rungv port add` binds on the listed host IP literal under host lockdown (repeatable). Unlisted addresses and Unix sockets stay denied. |
+| `--unix-forward SPEC` | Forward a guest Unix socket to a host Unix socket (`GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]`, repeatable). Uses a pre-lockdown helper so the locked sandbox never dials host sockets. |
 | `--allow-volume-attach` | Enable Linux seccomp rules for attaching `ext4lite` volumes over POSIX `SCM_RIGHTS` via `rungv mount add --type volume`. |
 | `--allow-bind-attach` | Enable runtime bind attachment for `hostfs` via POSIX `SCM_RIGHTS` under host lockdown. On Linux this skips Landlock while keeping seccomp enforced; Windows uses `rungv mount serve`. |
 | `-lockdown=false` | Skip host lockdown. Use for debugging only. |
@@ -396,6 +398,7 @@ Every control subcommand accepts `-S`/`--control-socket SPEC` (or `GVX_CONTROL_S
 | `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps N] [--net-rx-bps N] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
 | `net-policy` | `rungv net-policy get` reads the active NAT policy. `rungv net-policy replace --file FILE` replaces it. Both use the existing control socket. |
 | `port` / `port-forward` | `rungv port <ls\|add\|rm>` lists, adds, and removes host-to-guest NAT rules (requiring `--dynamic-ports` or `--auto-publish` under lockdown). `rungv port-forward` (alias `pf`) listens on the client and tunnels TCP connections via `net.dial` with zero lockdown relaxation. |
+| `unix-forward` | `rungv unix-forward [--replace] GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]` (alias `uf`) binds a Unix socket inside the guest and relays connections to a host Unix socket with zero lockdown relaxation. |
 | `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, and unmounts targets. `mount serve HOST_PATH:GUEST_PATH` serves a host directory or regular file via `rpcfs` with paginated `readdir` and host-to-guest `inotify` events. |
 | `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect sandbox metadata, stream resource counters and kernel logs, send signals, stop PID 1 cleanly, or adjust Sentry log verbosity. |
 
