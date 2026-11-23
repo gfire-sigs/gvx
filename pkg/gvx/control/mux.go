@@ -582,15 +582,15 @@ func (s *Stream) ID() uint32 {
 	return s.id
 }
 
+// Context returns the stream context, canceled when the stream or connection ends.
+func (s *Stream) Context() context.Context {
+	return s.ctx
+}
+
 // PeerAddr returns the transport connection's remote address, not an address
 // supplied by the RPC peer. Callers must not modify the address.
 func (s *Stream) PeerAddr() net.Addr {
 	return s.conn.raw.RemoteAddr()
-}
-
-// Context returns the stream context, canceled when the stream or connection ends.
-func (s *Stream) Context() context.Context {
-	return s.ctx
 }
 
 // Close terminates the local stream state and detaches it from its connection.
