@@ -73,6 +73,7 @@ type Sandbox struct {
 	natForwarder      *netbackend.NATForwarder
 	portForwarder     *netbackend.PortForwarder
 	bandwidth         *netbackend.BandwidthShaper
+	natPolicy         *netbackend.NATPolicy
 	natTunnelGroup    *natTunnelGroup // protected by mu
 	shapedNATTunnels  int             // protected by mu
 	wgEndpoint        *netbackend.WireGuardEndpoint
@@ -691,6 +692,9 @@ func (s *Sandbox) Close() error {
 		s.cfg.CheckpointListener = nil
 	}
 
+	if s.natPolicy != nil {
+		s.natPolicy.Close()
+	}
 	if s.bandwidth != nil {
 		// Queued transfers can hold relay buffers until the shaper stops.
 		s.mu.Unlock()

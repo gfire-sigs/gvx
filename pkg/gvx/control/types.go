@@ -42,6 +42,8 @@ const (
 	MethodPortAdd          = "port.add"
 	MethodPortRemove       = "port.remove"
 	MethodNetDial          = "net.dial"
+	MethodNATPolicyGet     = "net.policy_get"
+	MethodNATPolicySet     = "net.policy_set"
 	MethodMountList        = "mount.list"
 	MethodMountAdd         = "mount.add"
 	MethodMountRemount     = "mount.remount"
@@ -77,6 +79,8 @@ const (
 	CapPortDynamicLoopback = "port.dynamic_loopback"
 	CapPortAnyBind         = "port.any_bind"
 	CapNetDial             = "net.dial"
+	CapNATPolicyRead       = "net.policy.read"
+	CapNATPolicyWrite      = "net.policy.write"
 	CapMountList           = "mount.list"
 	CapMountTmpfs          = "mount.tmpfs"
 	CapMountRemount        = "mount.remount"
@@ -114,6 +118,8 @@ var allKnownCapabilities = []string{
 	CapPortDynamicLoopback,
 	CapPortAnyBind,
 	CapNetDial,
+	CapNATPolicyRead,
+	CapNATPolicyWrite,
 	CapMountList,
 	CapMountTmpfs,
 	CapMountRemount,
@@ -175,15 +181,16 @@ func ParsePolicy(raw string) (Policy, error) {
 }
 
 var readOnlyCapabilities = map[string]bool{
-	CapPing:      true,
-	CapInspect:   true,
-	CapStats:     true,
-	CapEvents:    true,
-	CapFSExport:  true,
-	CapPortList:  true,
-	CapMountList: true,
-	CapProcList:  true,
-	CapKernelLog: true,
+	CapPing:          true,
+	CapInspect:       true,
+	CapStats:         true,
+	CapEvents:        true,
+	CapFSExport:      true,
+	CapPortList:      true,
+	CapNATPolicyRead: true,
+	CapMountList:     true,
+	CapProcList:      true,
+	CapKernelLog:     true,
 }
 
 var checkpointOnlyCapabilities = map[string]bool{
@@ -213,6 +220,8 @@ var methodRequiredCap = map[string]string{
 	MethodPortAdd:          CapPortDynamicLoopback,
 	MethodPortRemove:       CapPortRemove,
 	MethodNetDial:          CapNetDial,
+	MethodNATPolicyGet:     CapNATPolicyRead,
+	MethodNATPolicySet:     CapNATPolicyWrite,
 	MethodMountList:        CapMountList,
 	MethodMountAdd:         CapMountTmpfs, // checked per-kind as well
 	MethodMountRemount:     CapMountRemount,
@@ -550,6 +559,12 @@ type NetDialRequest struct {
 // NetDialResponse confirms connection establishment to the guest endpoint.
 type NetDialResponse struct {
 	RemoteAddr string `json:"remote_addr"`
+}
+
+// NATPolicyState carries a NAT policy. A get result contains null if no policy
+// is installed. A set request requires a policy object.
+type NATPolicyState struct {
+	Policy json.RawMessage `json:"policy"`
 }
 
 // MountInfo describes one guest mount entry.

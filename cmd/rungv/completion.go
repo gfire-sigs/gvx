@@ -63,7 +63,7 @@ _rungv_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local top_cmds="run exec pause unpause cp export update port port-forward pf mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help"
+    local top_cmds="run exec pause unpause cp export update port port-forward pf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help"
     local image_cmds="ls list pull rm remove rmi inspect tag save load prune"
     local volume_cmds="create ls list inspect compact rm remove prune"
     local system_cmds="info df prune"
@@ -102,6 +102,17 @@ _rungv_completions() {
                 return 0
             fi
             ;;
+        net-policy)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "get replace" -- "${cur}") )
+            elif [[ "${prev}" == --file || "${prev}" == -file ]]; then
+                COMPREPLY=( $(compgen -f -- "${cur}") )
+            elif [[ "${cur}" == -* ]]; then
+                local flags="-S --control-socket -n --name --token --token-file --timeout --help"
+                [[ "${COMP_WORDS[2]}" == replace ]] && flags+=" --file"
+                COMPREPLY=( $(compgen -W "${flags}" -- "${cur}") )
+            fi
+            ;;
         mount)
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=( $(compgen -W "${mount_cmds}" -- "${cur}") )
@@ -122,6 +133,10 @@ _rungv_completions() {
             ;;
         run)
             case "${prev}" in
+                --nat-policy-file|-nat-policy-file)
+                    COMPREPLY=( $(compgen -f -- "${cur}") )
+                    return 0
+                    ;;
                 --backend|-backend)
                     COMPREPLY=( $(compgen -W "auto whpx hvf systrap" -- "${cur}") )
                     return 0
@@ -140,7 +155,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --dynamic-ports -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --dynamic-ports -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --nat-policy-file --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -157,8 +172,10 @@ _rungv_completions() {
             fi
             ;;
         restore|resume)
-            if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--net-tx-bps --net-rx-bps" -- "${cur}") )
+            if [[ "${prev}" == --nat-policy-file || "${prev}" == -nat-policy-file ]]; then
+                COMPREPLY=( $(compgen -f -- "${cur}") )
+            elif [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--net-tx-bps --net-rx-bps --nat-policy-file" -- "${cur}") )
             fi
             ;;
     esac
@@ -180,6 +197,7 @@ _rungv() {
         'update:Update live resource limits and mutable tunables'
         'port:Manage published ports of a running sandbox'
         'port-forward:Forward local ports into a sandbox over the control socket'
+        'net-policy:Read or replace the host NAT firewall policy'
         'mount:Manage runtime mounts of a running sandbox'
         'status:Inspect a running sandbox over its control socket'
         'sandbox:Inspect a running sandbox'
@@ -238,6 +256,24 @@ _rungv() {
         port)
             (( CURRENT == 3 )) && compadd -a port_cmds
             ;;
+        net-policy)
+            if (( CURRENT == 3 )); then
+                compadd get replace
+            else
+                local -a flags
+                flags=(
+                    '-S[Control socket]:socket:'
+                    '--control-socket[Control socket]:socket:'
+                    '(-n --name)'{-n,--name}'[Sandbox name]:name:'
+                    '--token[Control token]:token:'
+                    '--token-file[Control token file]:file:_files'
+                    '--timeout[RPC timeout]:duration:'
+                    '--help[Print command usage]'
+                )
+                [[ "${words[3]}" == replace ]] && flags+=('--file[Replacement NAT firewall policy]:file:_files')
+                _arguments "${flags[@]}"
+            fi
+            ;;
         mount)
             (( CURRENT == 3 )) && compadd -a mount_cmds
             ;;
@@ -277,11 +313,18 @@ _rungv() {
                 '--net[Network mode]:mode:(nat wg none)' \
                 '--net-tx-bps[Limit NAT traffic from guest to host]:bps:' \
                 '--net-rx-bps[Limit NAT traffic from host to guest]:bps:' \
+                '--nat-policy-file[Read host NAT firewall policy]:file:_files' \
                 '--backend[Execution backend]:backend:(auto whpx hvf systrap)' \
                 '--platform[Target image platform]:platform:(linux/amd64 linux/arm64)' \
                 '--pull[Image pull policy]:policy:(missing always never)'
             ;;
-        restore|resume|update)
+        restore|resume)
+            _arguments \
+                '--net-tx-bps[Limit NAT traffic from guest to host]:bps:' \
+                '--net-rx-bps[Limit NAT traffic from host to guest]:bps:' \
+                '--nat-policy-file[Read host NAT firewall policy]:file:_files'
+            ;;
+        update)
             _arguments \
                 '--net-tx-bps[Limit NAT traffic from guest to host]:bps:' \
                 '--net-rx-bps[Limit NAT traffic from host to guest]:bps:'
@@ -295,7 +338,7 @@ compdef _rungv rungv
 const fishCompletionScript = `# fish completion for rungv
 complete -c rungv -f
 
-set -l __rungv_top_cmds run exec pause unpause cp export update port port-forward pf mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help
+set -l __rungv_top_cmds run exec pause unpause cp export update port port-forward pf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help
 
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a run -d "Run a command in a new sandbox"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a exec -d "Execute a command inside a running sandbox"
@@ -306,6 +349,7 @@ complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a expo
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a update -d "Update live resource limits"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a port -d "Manage published sandbox ports"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a port-forward -d "Tunnel local ports over control socket"
+complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a net-policy -d "Read or replace the host NAT firewall policy"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a mount -d "Manage runtime sandbox mounts"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a status -d "Inspect a running sandbox"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a sandbox -d "Inspect a running sandbox"
@@ -341,11 +385,16 @@ complete -c rungv -n "__fish_seen_subcommand_from image; and not __fish_seen_sub
 complete -c rungv -n "__fish_seen_subcommand_from volume; and not __fish_seen_subcommand_from create ls list inspect compact rm remove prune" -a "create ls inspect compact rm prune"
 complete -c rungv -n "__fish_seen_subcommand_from system; and not __fish_seen_subcommand_from info df prune" -a "info df prune"
 complete -c rungv -n "__fish_seen_subcommand_from port; and not __fish_seen_subcommand_from ls list add rm remove" -a "ls add rm"
+complete -c rungv -n "__fish_seen_subcommand_from net-policy; and not __fish_seen_subcommand_from get replace" -a "get replace"
+complete -c rungv -n "__fish_seen_subcommand_from net-policy; and __fish_seen_subcommand_from get replace" -s S -l control-socket -r -d "Control socket"
+complete -c rungv -n "__fish_seen_subcommand_from net-policy; and __fish_seen_subcommand_from get replace" -s n -l name -r -d "Sandbox name"
+complete -c rungv -n "__fish_seen_subcommand_from net-policy; and __fish_seen_subcommand_from replace" -l file -rF -d "Replacement NAT firewall policy"
 complete -c rungv -n "__fish_seen_subcommand_from mount; and not __fish_seen_subcommand_from ls list add remount rm remove serve" -a "ls add remount rm serve"
 complete -c rungv -n "__fish_seen_subcommand_from sandbox; and not __fish_seen_subcommand_from inspect" -a "inspect"
 complete -c rungv -n "__fish_seen_subcommand_from completion" -a "bash zsh fish powershell"
 complete -c rungv -n "__fish_seen_subcommand_from run restore resume update" -l net-tx-bps -r -d "Limit NAT traffic from guest to host"
 complete -c rungv -n "__fish_seen_subcommand_from run restore resume update" -l net-rx-bps -r -d "Limit NAT traffic from host to guest"
+complete -c rungv -n "__fish_seen_subcommand_from run restore resume" -l nat-policy-file -rF -d "Read host NAT firewall policy"
 `
 
 const powershellCompletionScript = `# PowerShell completion for rungv
@@ -353,7 +402,7 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
     $tokens = $commandAst.CommandElements | ForEach-Object { $_.Extent.Text }
-    $topCmds = @('run','exec','pause','unpause','cp','export','update','port','port-forward','pf','mount','status','sandbox','stats','top','kill','stop','dmesg','events','ping','debug','pull','images','rmi','inspect','tag','save','load','login','logout','image','volume','system','info','tune','checkpoint','snapshot','restore','resume','version','license','completion','help')
+    $topCmds = @('run','exec','pause','unpause','cp','export','update','port','port-forward','pf','net-policy','mount','status','sandbox','stats','top','kill','stop','dmesg','events','ping','debug','pull','images','rmi','inspect','tag','save','load','login','logout','image','volume','system','info','tune','checkpoint','snapshot','restore','resume','version','license','completion','help')
 
     if ($tokens.Count -le 1 -or ($tokens.Count -eq 2 -and $wordToComplete -ne '')) {
         $topCmds | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -364,7 +413,17 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
 
     $sub = $tokens[1]
     if ($sub -in @('run','restore','resume','update') -and $wordToComplete -like '-*') {
-        @('--net-tx-bps','--net-rx-bps') | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        $flags = @('--net-tx-bps','--net-rx-bps')
+        if ($sub -ne 'update') { $flags += '--nat-policy-file' }
+        $flags | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
+        }
+        return
+    }
+    if ($sub -eq 'net-policy' -and $tokens.Count -ge 3 -and $wordToComplete -like '-*') {
+        $flags = @('-S','--control-socket','-n','--name','--token','--token-file','--timeout','--help')
+        if ($tokens[2] -eq 'replace') { $flags += '--file' }
+        $flags | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
             [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
         }
         return
@@ -374,6 +433,7 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
         'volume'     { @('create','ls','list','inspect','compact','rm','remove','prune') }
         'system'     { @('info','df','prune') }
         'port'       { @('ls','list','add','rm','remove') }
+        'net-policy' { @('get','replace') }
         'mount'      { @('ls','list','add','remount','rm','remove','serve') }
         'sandbox'    { @('inspect') }
         'completion' { @('bash','zsh','fish','powershell') }

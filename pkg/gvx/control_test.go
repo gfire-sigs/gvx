@@ -919,16 +919,32 @@ func TestControlNATCustomInterceptorRetainsLANIsolationUpdates(t *testing.T) {
 }
 
 func TestControlCheckpointStreamAndRestoreRoundTrip(t *testing.T) {
+	t.Run("no_policy", func(t *testing.T) { testControlCheckpointStreamAndRestore(t, false) })
+	t.Run("nat_policy", func(t *testing.T) { testControlCheckpointStreamAndRestore(t, true) })
+}
+
+func testControlCheckpointStreamAndRestore(t *testing.T, protectNAT bool) {
+	t.Helper()
 	cacheDir, regURL, imgRef := buildControlTestImage(t)
 	// Start WITHOUT CheckpointDir: streaming checkpoint works with zero pre-opened dir.
-	rs := startControlTestSandbox(t, Config{
+	cfg := Config{
 		Name:            "stream-ckpt",
 		OCIImage:        imgRef,
 		OCICacheDir:     cacheDir,
 		RegistryBaseURL: regURL,
-	})
+	}
+	if protectNAT {
+		cfg.NetworkMode = NetModeNAT
+	}
+	rs := startControlTestSandbox(t, cfg)
 	rs.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	ctx := context.Background()
+	if protectNAT {
+		raw := json.RawMessage(`{"egress":{"default":"deny"},"ingress":{"default":"deny"}}`)
+		if err := rs.client.Call(ctx, control.MethodNATPolicySet, control.NATPolicyState{Policy: raw}, nil); err != nil {
+			t.Fatalf("install NAT policy before checkpoint: %v", err)
+		}
+	}
 
 	st, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{
 		LeaveRunning: false,
@@ -986,6 +1002,19 @@ func TestControlCheckpointStreamAndRestoreRoundTrip(t *testing.T) {
 	restoredCfg.Stdin = strings.NewReader("after-stream-restore\n")
 	restoredCfg.Stdout = &restoredOut
 	restoredCfg.Stderr = io.Discard
+	if protectNAT {
+		_, err := Restore(ctx, restoredCfg, RestoreOptions{Dir: bundleDir})
+		if !errors.Is(err, ErrCheckpointManifest) || !strings.Contains(err.Error(), "requires a NAT policy") {
+			t.Fatalf("restore without a policy = %v, want a required NAT policy error", err)
+		}
+		// The host selects a new policy, not the policy in use at checkpoint time.
+		cfg, err := ParseNATPolicy(strings.NewReader(`{"egress":{"default":"allow"},"ingress":{"default":"deny"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		restoredCfg.NetworkMode = NetModeNAT
+		restoredCfg.NetworkPolicy = &cfg
+	}
 
 	restoredSB, err := Restore(ctx, restoredCfg, RestoreOptions{Dir: bundleDir})
 	if err != nil {
@@ -1009,7 +1038,8 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 		OCIImage:        imgRef,
 		OCICacheDir:     cacheDir,
 		RegistryBaseURL: regURL,
-		ControlPolicy:   control.PolicyReadOnly,
+		ControlPolicy:   control.Policy(" READONLY "),
+		NetworkMode:     NetModeNAT,
 	})
 	rs.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	ctx := context.Background()
@@ -1029,6 +1059,14 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 	if err := rs.client.Call(ctx, control.MethodPause, control.PauseRequest{}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
 		t.Fatalf("pause under readonly policy = %v, want FORBIDDEN_BY_POLICY", err)
 	}
+	var networkPolicy control.NATPolicyState
+	if err := rs.client.Call(ctx, control.MethodNATPolicyGet, nil, &networkPolicy); err != nil || string(networkPolicy.Policy) != "null" {
+		t.Fatalf("read initial NAT policy under readonly = %s, %v; want null", networkPolicy.Policy, err)
+	}
+	raw := json.RawMessage(`{"ingress":{"default":"deny"},"egress":{"default":"deny"}}`)
+	if err := rs.client.Call(ctx, control.MethodNATPolicySet, control.NATPolicyState{Policy: raw}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
+		t.Fatalf("set NAT policy under readonly = %v, want FORBIDDEN_BY_POLICY", err)
+	}
 
 	// Verify Pause directly followed by context cancellation never deadlocks Run().
 	if err := rs.sb.Pause(ctx, true); err != nil {
@@ -1039,6 +1077,18 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 	case <-rs.runDone:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Sandbox.Run deadlocked when context was canceled while paused")
+	}
+}
+
+func TestControlTCPListenerRequiresToken(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	_, err = New(t.Context(), Config{ControlListener: ln})
+	if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "requires a control token") {
+		t.Fatalf("New with an unauthenticated TCP listener = %v, want a token error", err)
 	}
 }
 

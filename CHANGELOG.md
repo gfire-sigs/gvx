@@ -4,10 +4,11 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
-This release adds per-sandbox transmit and receive limits for the NAT backend.
+This release adds an optional host firewall and per-sandbox bandwidth limits to the NAT backend.
 
 - Set limits with `--net-tx-bps` and `--net-rx-bps` on `rungv run` or `rungv restore`.
 - Change either rate on a running sandbox with `rungv update` over `gvx-ctrl/2`.
+- Install a NAT policy from a JSON file. Replace it at runtime with `rungv net-policy replace`.
 
 ## [v0.20.10012026111600] - 2026-11-23
 

@@ -313,7 +313,13 @@ func (l *listenContext) startHandshake(s *segment, opts header.TCPSynOptions, qu
 // established endpoint is returned.
 //
 // Precondition: if l.listenEP != nil, l.listenEP.mu must be locked.
-func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*Endpoint, tcpip.Error) {
+func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner, cancel <-chan struct{}) (*Endpoint, tcpip.Error) {
+	select {
+	case <-cancel:
+		return nil, &tcpip.ErrAborted{}
+	default:
+	}
+
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
 	queue.EventRegister(&waitEntry)
 	defer queue.EventUnregister(&waitEntry)
@@ -323,10 +329,17 @@ func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, 
 		return nil, err
 	}
 
-	// performHandshake is used by the Forwarder which will block till the
-	// handshake either succeeds or fails. We do this by registering for
-	// events above and block on the notification channel.
-	<-notifyCh
+	// A private relay can stop waiting for the guest ACK when its context ends.
+	select {
+	case <-notifyCh:
+	case <-cancel:
+	}
+	select {
+	case <-cancel:
+		h.ep.Abort()
+		return nil, &tcpip.ErrAborted{}
+	default:
+	}
 
 	ep := h.ep
 	ep.mu.Lock()

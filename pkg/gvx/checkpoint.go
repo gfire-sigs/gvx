@@ -48,8 +48,11 @@ var ErrCheckpointRPCFSActive = errors.New("gvx: unmount active rpcfs proxy mount
 var ErrCheckpointNATTunnelActive = errors.New("gvx: close active NAT control tunnels that used bandwidth limits before checkpointing")
 
 const (
-	// CheckpointManifestVersion identifies the schema version of manifest.json.
+	// CheckpointManifestVersion is the version for bundles without a NAT policy.
 	CheckpointManifestVersion = 1
+
+	// A runtime that cannot require an explicit policy must reject this bundle.
+	checkpointManifestNATPolicyVersion = 2
 
 	checkpointManifestFileName  = "manifest.json"
 	checkpointStateFileName     = "state.img"
@@ -271,8 +274,12 @@ func (s *Sandbox) buildCheckpointManifest() CheckpointManifest {
 	plat := s.plat
 	platName := s.platName
 	s.mu.Unlock()
+	version := CheckpointManifestVersion
+	if s.natPolicy.RequiredOnRestore() {
+		version = checkpointManifestNATPolicyVersion
+	}
 	return CheckpointManifest{
-		Version:          CheckpointManifestVersion,
+		Version:          version,
 		GOOS:             runtime.GOOS,
 		GOARCH:           runtime.GOARCH,
 		Platform:         platName,

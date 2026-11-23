@@ -454,6 +454,10 @@ Each sandbox owns one transmit bucket and one receive bucket. The NAT relay, pub
 
 The buckets do not belong to the guest network stack or the host operating system. The checkpoint does not store their state or rates.
 
+The NAT firewall owns a separate immutable policy. The host replaces it over `gvx-ctrl/2`. Relays evaluate the actual endpoints before dialing, and the policy cancels relays that a replacement denies. The private peer also filters IP traffic outside those relays.
+
+A protected checkpoint requires the host to supply a policy on restore. It does not include rules or record which policy to use.
+
 #### Track B: L3 In-Memory WireGuard Tunnel (`wireguard_endpoint.go` and `pkg/tcpip/link/wgtun`) (Descriptive Module)
 
 In `-net=wg` mode, `wireguard_endpoint.go` attaches a shared `wgtun.Endpoint` (`pkg/tcpip/link/wgtun`, default MTU 1420) directly to `golang.zx2c4.com/wireguard/device` in Go memory. `wgtun.Endpoint` implements both `stack.LinkEndpoint` and `wireguard-go`'s `tun.Device` with 16-packet batch reads and `Suspend`/`Resume` lifecycle hooks, serving both host `-net=wg` tunnels and in-guest `genetlink/wireguard` interfaces. Before `hostlockdown.Apply()` locks down the process, `wireguard_endpoint.go` opens one host UDP socket (`net.ListenPacket("udp", ":0")`) and passes it to `wireguard_bind.go`. Outbound guest IP packets enter `wireguard-go` in memory for ChaCha20-Poly1305 encryption and exit exclusively through that pre-bound UDP socket. Guest DNS queries to `10.0.2.3:53` resolve through `dns_relay.go`.

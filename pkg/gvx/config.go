@@ -166,6 +166,12 @@ type Config struct {
 	// rate leaves that direction unlimited.
 	NetworkBandwidth netbackend.BandwidthRates
 
+	// NetworkPolicy supplies the initial host policy for NAT. A nil policy
+	// leaves the firewall off until a control client installs a policy.
+	NetworkPolicy *netbackend.NATPolicyConfig
+
+	compiledNATPolicy *netbackend.CompiledNATPolicy
+
 	// IsolateLAN blocks outbound NAT connections to RFC1918, loopback, and
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
@@ -487,6 +493,16 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if c.StreamInterceptor != nil && c.NetworkBandwidth != (netbackend.BandwidthRates{}) {
 		return fmt.Errorf("%w: NAT bandwidth limits and a custom stream interceptor cannot be combined", ErrInvalidConfig)
 	}
+	if c.NetworkPolicy != nil {
+		if c.NetworkMode != NetModeNAT || c.StreamInterceptor != nil {
+			return fmt.Errorf("%w: NAT policy requires NAT without a custom stream interceptor", ErrInvalidConfig)
+		}
+		compiled, err := netbackend.CompileNATPolicy(c.NetworkPolicy)
+		if err != nil {
+			return fmt.Errorf("%w: NAT policy: %w", ErrInvalidConfig, err)
+		}
+		c.compiledNATPolicy = compiled
+	}
 	for _, pf := range c.PortForwards {
 		if pf.HostSocket != "" && pf.Protocol != "" && pf.Protocol != "tcp" {
 			return fmt.Errorf("%w: the Unix socket %s forwards tcp only, not %s", ErrInvalidConfig, pf.HostSocket, pf.Protocol)
@@ -521,8 +537,17 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if p := c.Resources.PidsLimit; p < 0 || p > maxPidsLimit {
 		return fmt.Errorf("%w: pids limit %d out of range [0, %d]", ErrInvalidConfig, p, maxPidsLimit)
 	}
-	if _, err := control.ParsePolicy(string(c.ControlPolicy)); err != nil {
+	ctrlPolicy, err := control.ParsePolicy(string(c.ControlPolicy))
+	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	c.ControlPolicy = ctrlPolicy
+	ln := c.ControlListener
+	if ln == nil {
+		ln = c.CheckpointListener
+	}
+	if ln != nil && c.ControlToken == "" && (runtime.GOOS == "windows" || ln.Addr().Network() != "unix") {
+		return fmt.Errorf("%w: this control listener requires a control token", ErrInvalidConfig)
 	}
 	if err := control.ValidateDisableList(c.ControlDisable); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)

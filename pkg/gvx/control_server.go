@@ -116,6 +116,7 @@ func (s *Sandbox) ControlCapabilities() []string {
 	s.mu.Lock()
 	locked := s.lockdown.Applied
 	hasCkptDir := s.ckptFiles != nil
+	hasNATPolicy := s.natPolicy != nil
 	cfg := s.cfg
 	s.mu.Unlock()
 
@@ -149,6 +150,9 @@ func (s *Sandbox) ControlCapabilities() []string {
 	}
 	if hasCkptDir {
 		avail = append(avail, control.CapCheckpointLocal)
+	}
+	if hasNATPolicy {
+		avail = append(avail, control.CapNATPolicyRead, control.CapNATPolicyWrite)
 	}
 	if cfg.NetworkMode == NetModeNAT {
 		avail = append(avail, control.CapResourceNetwork, control.CapPortList, control.CapPortRemove)
@@ -278,6 +282,10 @@ func (s *Sandbox) HandleStream(ctx context.Context, stream *control.Stream, req 
 		return s.handlePortRemove(ctx, stream, req.Params)
 	case control.MethodNetDial:
 		return s.handleNetDial(ctx, stream, req.Params)
+	case control.MethodNATPolicyGet:
+		return s.handleNATPolicyGet(ctx, stream)
+	case control.MethodNATPolicySet:
+		return s.handleNATPolicySet(ctx, stream, req.Params)
 	case control.MethodMountList:
 		return s.handleMountList(ctx, stream)
 	case control.MethodMountAdd:

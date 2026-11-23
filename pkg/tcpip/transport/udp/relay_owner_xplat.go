@@ -21,3 +21,12 @@ func (e *endpoint) NATRelayOwner() *stack.NATRelayOwner {
 	owner, _ := e.net.PacketOwner().(*stack.NATRelayOwner)
 	return owner
 }
+
+// Release drops the retained datagram if CreateEndpoint has not consumed it.
+// It does not change the handler's ICMP disposition.
+func (r *ForwarderRequest) Release() {
+	if r.pkt != nil {
+		r.pkt.DecRef()
+		r.pkt = nil
+	}
+}

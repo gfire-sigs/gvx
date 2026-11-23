@@ -226,6 +226,9 @@ seam pkg/tcpip/stack/route.go
 # identifies relays by selected endpoints and sets their owners before registration.
 seam pkg/tcpip/transport/tcp/forwarder.go
 seam pkg/tcpip/transport/udp/forwarder.go
+# The private NAT peer can abort a pending TCP handshake when its policy denies
+# the flow. The ordinary TCP forwarder does not pass a cancellation channel.
+seam pkg/tcpip/transport/tcp/accept.go
 # A NIC with MTU bounds loses IPv6 below an MTU of 1280, as in Linux
 # (pkg/tcpip/stack/nic_mtu_xplat.go). The seams are one call in SetNICMTU (stack.go), one test
 # in enable, and one in addAddress (nic.go).

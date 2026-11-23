@@ -72,7 +72,7 @@ Every control endpoint restricts access to the local owner account.
 | Policy | Permitted Capabilities |
 | :--- | :--- |
 | `default` | All capabilities compatible with the active host lockdown and runtime flags. |
-| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log` (excludes `kernel.log_clear`). |
+| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log` (without `kernel.log_clear`), and `net.policy.read`. |
 | `checkpoint-only` | `system.ping`, `sandbox.inspect`, `checkpoint.local`, `checkpoint.stream`. |
 
 ### 2.3 Lockdown Compatibility Matrix
@@ -84,6 +84,7 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | `exec`, `pause`, `unpause`, `stop`, `kill` | Allowed; operates purely inside the Sentry kernel. | None. |
 | `cp`, `export`, `checkpoint -o` | Allowed; the unlocked client performs all host disk I/O over framed tar streams. | None. |
 | `update` (`-m`, `--cpus`, `--pids-limit`, `--isolate-lan`, `--net-tx-bps`, `--net-rx-bps`, `--tune`) | Allowed; modifies per-sandbox Sentry limits, root CPU bandwidth, root cgroup2 `pids.max`, and NAT settings. | None. |
+| `net-policy` | Reads or replaces the NAT policy in memory. The client reads policy files outside lockdown. | NAT without a custom stream interceptor. |
 | `port-forward` (`net.dial`) | Allowed; the unlocked client binds host sockets and tunnels TCP streams into the guest stack. | None. |
 | `port add` | Allowed on `127.0.0.1` or `[::1]` only when loopback binds are pre-authorized; non-loopback and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports` or `--auto-publish`. |
 | `mount add --type tmpfs`, `mount rm` | Allowed; no host path opens occur. | None. |
@@ -118,6 +119,8 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `port.add` | Unary | Bind dynamic host-to-guest port rules on the sandbox forwarder. |
 | `port.remove` | Unary | Close dynamic or specified host-to-guest port rules. |
 | `net.dial` | Bidirectional stream | Dial a guest TCP endpoint inside the sandbox network stack and relay bytes on channel `0`. |
+| `net.policy_get` | Unary | Read the active host NAT policy. Requires `net.policy.read`. |
+| `net.policy_set` | Unary | Replace the active host NAT policy. Requires `net.policy.write`. |
 | `mount.list` | Unary | List active guest mounts and mutability status. |
 | `mount.add` | Unary (optional FD) | Mount a `tmpfs`, `SCM_RIGHTS` `ext4lite` volume, or `-lockdown=false` bind mount. |
 | `mount.remount` | Unary | Toggle a mount between read-only and read-write. |
@@ -136,6 +139,12 @@ The `net_qos` feature in `HELLO` identifies support for the NAT bandwidth fields
 | `net_rx_bps` | Optional unsigned integer | Guest receive limit in bits per second. |
 
 An omitted field leaves that rate unchanged. A value of `0` removes the limit for that direction. The server installs both requested rates as one pair. `sandbox.inspect` and a successful `resource.update` report the effective rates in the resource snapshot.
+
+`net.policy_get` returns an object with a `policy` field. The value is the active JSON policy or `null` before the first installation. `net.policy_set` accepts the same object with a non-null policy. The server validates the complete document before replacing the rules. It returns the installed document.
+
+The encoded request and response must fit the negotiated frame size. Keep the default frame size to use the full 64 KiB policy limit.
+
+The `net.policy` group disables both capabilities. The `readonly` profile permits `net.policy.read` but not `net.policy.write`. Policy changes leave `resource.update` bandwidth values unchanged.
 
 ### 3.1 Structured Error Codes
 

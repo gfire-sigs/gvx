@@ -448,7 +448,7 @@ func TestNATDNSBandwidthCountsUpstreamFallbackOnlyOnce(t *testing.T) {
 				done := make(chan struct{})
 				go func() {
 					defer close(done)
-					nf.serveUDPDNS(ctx, relay)
+					nf.serveUDPDNS(ctx, relay, virtualDNSFlow(false))
 				}()
 				defer func() {
 					cancel()
@@ -933,7 +933,7 @@ func TestNATForwarderServeUDPDNSClosesConnOnIdleTimeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		nf.serveUDPDNS(nf.ctx, tracked)
+		nf.serveUDPDNS(nf.ctx, tracked, virtualDNSFlow(false))
 	}()
 
 	req := buildDNSQuery(0x3131, "idle.example.test", dnsTypeA)

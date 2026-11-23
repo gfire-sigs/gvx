@@ -34,6 +34,7 @@ func (*NATRelayOwner) KGID() uint32 { return 0 }
 type NATPacketMeter interface {
 	Enabled() bool
 	Enqueue(pkt *PacketBuffer, bytes int, deliver func(*PacketBuffer), release func())
+	Allows(*PacketBuffer) bool
 	Run(deliver func()) bool
 }
 
@@ -114,7 +115,11 @@ func (h NATReassemblyTimeout) OnReassemblyTimeout(pkt *PacketBuffer) { h(pkt) }
 func (in *NATPacketInput) GuardReassemblyTimeout(deliver func(*PacketBuffer)) NATReassemblyTimeout {
 	return func(pkt *PacketBuffer) {
 		if pkt != nil {
-			in.scope.meter.Run(func() { deliver(pkt) })
+			in.scope.meter.Run(func() {
+				if in.scope.meter.Allows(pkt) {
+					deliver(pkt)
+				}
+			})
 		}
 	}
 }

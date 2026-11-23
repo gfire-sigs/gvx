@@ -245,6 +245,11 @@ func (c *Conn) activeStreams() int {
 func (c *Conn) writeFrame(f Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.writeFrameLocked(f)
+}
+
+// writeFrameLocked requires writeMu through both the frame and any descriptors.
+func (c *Conn) writeFrameLocked(f Frame) error {
 	if len(f.FDs) > 0 {
 		f.Flags |= FlagHasFDs
 	}
@@ -577,6 +582,12 @@ func (s *Stream) ID() uint32 {
 	return s.id
 }
 
+// PeerAddr returns the transport connection's remote address, not an address
+// supplied by the RPC peer. Callers must not modify the address.
+func (s *Stream) PeerAddr() net.Addr {
+	return s.conn.raw.RemoteAddr()
+}
+
 // Context returns the stream context, canceled when the stream or connection ends.
 func (s *Stream) Context() context.Context {
 	return s.ctx
@@ -754,13 +765,22 @@ func (s *Stream) sendResponse(result any, flags FrameFlags) error {
 		}
 		raw = b
 	}
+	payload, err := json.Marshal(ResponseEnvelope{OK: true, Result: raw})
+	if err != nil {
+		return fmt.Errorf("control: marshal response envelope: %w", err)
+	}
+	if len(payload) > s.conn.maxFrameBytes {
+		return NewError(CodeLimitExceeded, "response exceeds the negotiated frame size")
+	}
 	if !s.respSent.CompareAndSwap(false, true) {
 		return nil
 	}
-	return s.conn.writeResponseEnvelope(s.id, ResponseEnvelope{
-		OK:     true,
-		Result: raw,
-	}, flags)
+	return s.conn.writeFrame(Frame{
+		Type:     FrameResponse,
+		Flags:    flags,
+		StreamID: s.id,
+		Payload:  payload,
+	})
 }
 
 // SendError sends a terminal error response if no response has been sent yet.
@@ -822,6 +842,7 @@ func (s *Stream) WaitResponse(ctx context.Context, out any) error {
 
 // WriteData writes p to channel ch, respecting flow-control credits and chunking
 // payloads to stay under the negotiated MaxFrameBytes.
+// Cancellation prevents subsequent frames without truncating a committed frame.
 func (s *Stream) WriteData(ctx context.Context, ch Channel, p []byte, compress bool) error {
 	_, err := s.writeData(ctx, ch, p, compress)
 	return err
@@ -847,7 +868,7 @@ func (s *Stream) writeData(ctx context.Context, ch Channel, p []byte, compress b
 		if compress {
 			flags |= FlagCompressedZstd
 		}
-		if err := s.conn.writeFrame(Frame{
+		if err := s.writeDataFrame(ctx, Frame{
 			Type:     FrameData,
 			Flags:    flags,
 			Channel:  ch,
@@ -859,6 +880,17 @@ func (s *Stream) writeData(ctx context.Context, ch Channel, p []byte, compress b
 		written += n
 	}
 	return written, nil
+}
+
+func (s *Stream) writeDataFrame(ctx context.Context, f Frame) error {
+	s.conn.writeMu.Lock()
+	defer s.conn.writeMu.Unlock()
+	// This check commits the frame. Cancellation after it must not split the frame.
+	if err := ctx.Err(); err != nil {
+		s.addSendWindow(int64(len(f.Payload)))
+		return err
+	}
+	return s.conn.writeFrameLocked(f)
 }
 
 func (s *Stream) consumeSendWindow(ctx context.Context, want, maxChunk int) (int, error) {

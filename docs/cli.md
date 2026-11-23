@@ -109,6 +109,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode (`nat`, `wg`, `none`) and its options. |
 | `--net-tx-bps N`, `--net-rx-bps N` | Set guest transmit and receive limits in bits per second for NAT. `0` leaves that direction unlimited. |
+| `--nat-policy-file FILE` | Load a host-owned JSON policy for NAT on `run` or `restore`. |
 | `--privileged` | On by default. Enables `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` disables all three. Explicit per-flag values override `--privileged` (see Section 4.8). |
 | `--net-raw` | Allow guest raw sockets and `iptables` (required by `dockerd`). Defaults to `--privileged`. |
 | `--allow-packet-socket-write` | Allow guest writes on `AF_PACKET` sockets (requires `--net-raw`). Defaults to `--privileged` when `--net-raw` is on. |
@@ -361,6 +362,7 @@ A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.me
 | `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `--auto-publish`, `--dynamic-ports`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-S`/`--control` to reattach mounts, networking, or a new control listener. |
 
 The bundle does not store NAT bandwidth limits. A checkpoint that leaves the current instance running does not change its limits.
+The bundle does not store firewall rules. If you save a sandbox with a firewall, restore requires a policy file.
 
 The restore command rejects a bundle if its mount paths, `root_volume` setting, layer digests, platform, or network mode differ.
 
@@ -389,6 +391,7 @@ Every control subcommand accepts `-S`/`--control-socket SPEC` (or `GVX_CONTROL_S
 | `pause` / `unpause` | `rungv pause [--quiesce-net=true\|false]` and `rungv unpause`. Pauses and resumes all guest tasks. |
 | `cp` / `export` | `rungv cp [-a] [-L] [-q] [-z] [--no-overwrite-dir] [--user U:G] SRC DST` and `rungv export [--upper-only] [-z] [-o FILE\|-] [PATH]`. Streams tar archives while the unlocked client performs all host disk I/O with `os.Root`. |
 | `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps N] [--net-rx-bps N] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
+| `net-policy` | `rungv net-policy get` reads the active NAT policy. `rungv net-policy replace --file FILE` replaces it. Both use the existing control socket. |
 | `port` / `port-forward` | `rungv port <ls\|add\|rm>` lists, adds, and removes host-to-guest NAT rules (requiring `--dynamic-ports` or `--auto-publish` under lockdown). `rungv port-forward` (alias `pf`) listens on the client and tunnels TCP connections via `net.dial` with zero lockdown relaxation. |
 | `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, unmounts targets, or serves a host directory via `rpcfs` (`mount serve HOST_DIR:GUEST_PATH`). |
 | `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect sandbox metadata, stream resource counters and kernel logs, send signals, stop PID 1 cleanly, or adjust Sentry log verbosity. |
@@ -410,6 +413,49 @@ rungv run --net=nat --net-tx-bps 2000000 --net-rx-bps 8000000 --name app --contr
 rungv update -n app --net-tx-bps 4000000
 rungv update -n app --net-rx-bps 0
 ```
+
+### 4.14 Host NAT policy
+
+This policy runs at the NAT boundary, outside the guest. Guest `iptables` does not change the host policy. The policy applies to IPv4 and IPv6.
+
+| Field | Meaning |
+| :--- | :--- |
+| `egress`, `ingress` | Each direction has a `default` action and up to 1,024 ordered rules. The first matching rule determines the verdict. |
+| `action`, `default` | `allow` or `deny`. Use `default` for traffic that matches no rule. |
+| `cidr` | Optional range for the remote address. For egress, the address is a destination. For ingress, it is the client. |
+| `guest_cidr` | Optional range for the guest source on egress or guest target on ingress. |
+| `protocol` | `tcp`, `udp`, `icmp`, `icmpv6`, or a protocol number from 1 through 255. Omit it to match all protocols. |
+| `ports` | Optional service port or inclusive range such as `8000-8010`. It applies to TCP and UDP. |
+
+The file limit is 64 KiB. The runtime rejects unknown fields. If the runtime cannot read a field that could change the verdict, it denies the operation.
+
+Egress requires permission for the guest destination and the actual host destination when they differ. DNS requires permission for each upstream attempt. Ingress uses the actual publication client and the selected guest service, including loopback fallback. An admitted TCP or UDP relay also permits its replies.
+
+Control tunnels use the authenticated control peer address. A Unix control connection uses `127.0.0.1` as its local identity. The sandbox does not see clients of a tunnel listener on the control client's machine. An active IP policy does not admit Unix socket publications.
+
+An `allow` rule does not override `-isolate-lan`. Keep control credentials outside every guest mount. The sandbox blocks NAT dials to its own TCP control listener.
+
+Use this policy to allow outbound TCP port 443 and deny new ingress flows:
+
+```json
+{
+  "egress": {
+    "default": "deny",
+    "rules": [{"action": "allow", "protocol": "tcp", "ports": "443"}]
+  },
+  "ingress": {"default": "deny"}
+}
+```
+
+Store the policy on the host. Supply it for each start or protected restore. Pass the control socket to read or replace the active policy.
+
+```sh
+rungv run --net=nat --nat-policy-file policy.json --name app --control alpine:3.20 sleep 600
+rungv net-policy get -n app
+rungv net-policy replace -n app --file new-policy.json
+```
+
+Replacement cancels active relays that the new policy denies. The command does not write the file, change the configured bandwidth, or recall bytes the relay already sent.
 
 ## 5. Images and registries
 

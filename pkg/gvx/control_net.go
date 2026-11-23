@@ -31,6 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 )
 
@@ -268,6 +269,19 @@ func (s *Sandbox) handleNetDial(ctx context.Context, stream *control.Stream, raw
 		}
 	}
 
+	var client netip.Addr
+	if s.natPolicy != nil {
+		switch peer := stream.PeerAddr().(type) {
+		case *net.TCPAddr:
+			client = peer.AddrPort().Addr().Unmap()
+		case *net.UnixAddr:
+			// The local administration socket represents 127.0.0.1 for net.dial only.
+			client = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+		}
+	}
+
+	var flowCtx context.Context
+	var untrack func()
 	dialAddr := func(ipStr string) (*gonet.TCPConn, string, error) {
 		addr, err := netip.ParseAddr(ipStr)
 		if err != nil || !addr.Is4() {
@@ -282,48 +296,91 @@ func (s *Sandbox) handleNetDial(ctx context.Context, stream *control.Stream, raw
 			Addr: tcpip.AddrFrom4(addr.As4()),
 			Port: req.GuestPort,
 		}
-		conn, dErr := gonet.DialContextTCP(ctx, st, full, ipv4.ProtocolNumber)
+		target := addr
+		if target.IsUnspecified() {
+			// Netstack uses loopback for an unbound dial without a destination.
+			target = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+		}
+		attemptCtx, release, allowed := s.natPolicy.Track(ctx, netbackend.NATPolicyFlow{
+			Direction: netbackend.NATPolicyIngress,
+			Protocol:  uint8(header.TCPProtocolNumber),
+			Guest:     target,
+			Remote:    client,
+			Port:      req.GuestPort,
+			PortKnown: true,
+		})
+		if !allowed {
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
+			return nil, "", control.NewError(control.CodeForbiddenByPolicy, "NAT policy denied net.dial")
+		}
+		conn, dErr := gonet.DialContextTCP(attemptCtx, st, full, ipv4.ProtocolNumber)
 		if dErr != nil {
+			if cause := context.Cause(attemptCtx); cause != nil {
+				dErr = cause
+			}
+			release()
 			return nil, "", dErr
 		}
+		flowCtx, untrack = attemptCtx, release
 		return conn, net.JoinHostPort(ipStr, strconv.Itoa(int(req.GuestPort))), nil
 	}
 
 	guestConn, remoteAddr, err := dialAddr(guestIP)
-	if err != nil && fallback && guestIP != "127.0.0.1" {
+	if err != nil && fallback && guestIP != "127.0.0.1" && ctx.Err() == nil && !netDialCanceled(err) {
 		if fbConn, fbAddr, fbErr := dialAddr("127.0.0.1"); fbErr == nil {
 			guestConn, remoteAddr, err = fbConn, fbAddr, nil
+		} else if netDialCanceled(fbErr) || control.IsCode(fbErr, control.CodeForbiddenByPolicy) {
+			err = fbErr
 		}
 	}
+	if err == nil {
+		defer untrack()
+		defer guestConn.Close()
+		stop := context.AfterFunc(flowCtx, func() { _ = guestConn.Close() })
+		defer stop()
+		err = context.Cause(flowCtx)
+	}
 	if err != nil {
+		if errors.Is(err, netbackend.ErrNATPolicyRevoked) {
+			return control.NewError(control.CodeForbiddenByPolicy, "NAT policy revoked net.dial")
+		}
+		if netDialCanceled(err) || control.IsCode(err, control.CodeForbiddenByPolicy) {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return control.NewErrorf(control.CodeNotFound, "dial guest %s:%d: %v", guestIP, req.GuestPort, err)
 	}
-	defer guestConn.Close()
 
 	if err := stream.SendResponse(control.NetDialResponse{RemoteAddr: remoteAddr}); err != nil {
 		return err
 	}
-
-	stop := context.AfterFunc(ctx, func() { _ = guestConn.Close() })
-	defer stop()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	// Client -> Guest
 	go func() {
 		defer wg.Done()
-		_, _ = s.bandwidth.Copy(ctx, netbackend.BandwidthRX, guestConn, stream.ChannelReader(ctx, control.ChannelGeneric))
+		_, _ = s.bandwidth.Copy(flowCtx, netbackend.BandwidthRX, guestConn, stream.ChannelReader(flowCtx, control.ChannelGeneric))
 		_ = guestConn.CloseWrite()
 	}()
 	// Guest -> Client
 	go func() {
 		defer wg.Done()
-		w := stream.ChannelWriter(ctx, control.ChannelGeneric, false)
-		_, _ = s.bandwidth.Copy(ctx, netbackend.BandwidthTX, w, guestConn)
+		w := stream.ChannelWriter(flowCtx, control.ChannelGeneric, false)
+		_, _ = s.bandwidth.Copy(flowCtx, netbackend.BandwidthTX, w, guestConn)
 		_ = w.Close()
 	}()
 	wg.Wait()
 	return nil
+}
+
+func netDialCanceled(err error) bool {
+	return errors.Is(err, netbackend.ErrNATPolicyRevoked) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // A tunnel stays in its group until it closes. Clearing both limits starts

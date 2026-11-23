@@ -14,13 +14,25 @@
 
 package tcp
 
-import "z.gfire.dev/gvx/pkg/tcpip/stack"
+import (
+	"context"
+
+	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
+	"z.gfire.dev/gvx/pkg/waiter"
+)
 
 // NATRelayOwner identifies a private NAT endpoint. The forwarder sets its owner
 // before it registers the endpoint or sends the first SYN-ACK.
 func (e *Endpoint) NATRelayOwner() *stack.NATRelayOwner {
 	owner, _ := e.owner.(*stack.NATRelayOwner)
 	return owner
+}
+
+// CreateNATRelayEndpoint starts a handshake for an admitted private NAT flow.
+// Cancellation aborts the handshake. The caller must still complete the request.
+func (r *ForwarderRequest) CreateNATRelayEndpoint(ctx context.Context, queue *waiter.Queue) (tcpip.Endpoint, tcpip.Error) {
+	return r.createEndpoint(queue, ctx.Done(), true)
 }
 
 // CompleteNATRejection admits the retained SYN as packet-only traffic before

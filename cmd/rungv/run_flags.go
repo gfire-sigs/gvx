@@ -128,6 +128,7 @@ type sandboxFlagValues struct {
 	isolateLAN             bool
 	netTXBPS               uint64
 	netRXBPS               uint64
+	natPolicyFile          string
 	privileged             bool
 	netRaw                 bool
 	packetWrite            bool
@@ -203,6 +204,7 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	})
 	fs.BoolVar(&f.isolateLAN, "isolate-lan", false, "Block RFC1918 and loopback LAN destinations in NAT mode")
 	registerNetworkBandwidthFlags(fs, &f.netTXBPS, &f.netRXBPS)
+	fs.StringVar(&f.natPolicyFile, "nat-policy-file", "", "Read host NAT firewall policy from a JSON file")
 	fs.BoolVar(&f.privileged, "privileged", true, "Turn on --net-raw, --allow-packet-socket-write, and --allow-suid; --privileged=false turns them off")
 	fs.BoolVar(&f.netRaw, "net-raw", true, "Allow raw sockets and iptables in the guest (default from --privileged)")
 	fs.BoolVar(&f.packetWrite, "allow-packet-socket-write", true, "Allow writes on AF_PACKET sockets; needs --net-raw (default from --privileged)")
@@ -459,6 +461,20 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	if err != nil {
 		return gvx.Config{}, false, err
 	}
+	var networkPolicy *gvx.NATPolicyConfig
+	if flagVisited(fs, "nat-policy-file") {
+		if allowEmptyNet && !flagVisited(fs, "net") && !flagVisited(fs, "network") {
+			netMode = gvx.NetModeNAT
+		}
+		if netMode != gvx.NetModeNAT {
+			return gvx.Config{}, false, fmt.Errorf("--nat-policy-file requires -net=nat")
+		}
+		policy, err := readNATPolicyFile(f.natPolicyFile)
+		if err != nil {
+			return gvx.Config{}, false, fmt.Errorf("--nat-policy-file: %w", err)
+		}
+		networkPolicy = &policy
+	}
 	if flagVisited(fs, "net-tx-bps") || flagVisited(fs, "net-rx-bps") {
 		if netMode == "" {
 			// If restore inherits the mode, the bundle must use NAT.
@@ -491,6 +507,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		AllowUnconfinedSystrap: f.allowUnconfinedSystrap,
 		Architecture:           arch,
 		NetworkMode:            netMode,
+		NetworkPolicy:          networkPolicy,
 		IsolateLAN:             f.isolateLAN,
 		HostDNSServers:         *f.hostDNS,
 		NetRaw:                 priv.netRaw,

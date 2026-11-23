@@ -150,9 +150,26 @@ func readAndParseManifest(dir string) (CheckpointManifest, error) {
 	return m, nil
 }
 
+func validateManifestNATPolicy(m CheckpointManifest, supplied bool) error {
+	switch m.Version {
+	case CheckpointManifestVersion:
+		return nil
+	case checkpointManifestNATPolicyVersion:
+		if m.NetMode != NetModeNAT {
+			return fmt.Errorf("%w: version %d requires NAT", ErrCheckpointManifest, m.Version)
+		}
+		if !supplied {
+			return fmt.Errorf("%w: this bundle requires a NAT policy; pass --nat-policy-file", ErrCheckpointManifest)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported version %d", ErrCheckpointManifest, m.Version)
+	}
+}
+
 func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
-	if m.Version != CheckpointManifestVersion {
-		return fmt.Errorf("%w: unsupported version %d (want %d)", ErrCheckpointManifest, m.Version, CheckpointManifestVersion)
+	if err := validateManifestNATPolicy(m, s.cfg.NetworkPolicy != nil); err != nil {
+		return err
 	}
 	if m.GOOS != runtime.GOOS {
 		return fmt.Errorf("%w: host OS mismatch: bundle has %q, current host is %q", ErrCheckpointManifest, m.GOOS, runtime.GOOS)
@@ -281,6 +298,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 	manifest, err := readAndParseManifest(opts.Dir)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateManifestNATPolicy(manifest, cfg.NetworkPolicy != nil); err != nil {
 		return nil, err
 	}
 	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
