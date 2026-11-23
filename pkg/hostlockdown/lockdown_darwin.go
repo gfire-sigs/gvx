@@ -79,6 +79,12 @@ func BuildSeatbeltProfile(opts Options) string {
 		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, given)
 		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, real)
 	}
+	if opts.AllowBindAttach {
+		// Permit access only to paths explicitly delegated by an unlocked
+		// client via sandbox_extension_issue_file and consumed at runtime.
+		b.WriteString("(allow file-read* (extension \"com.apple.app-sandbox.read\"))\n")
+		b.WriteString("(allow file-read* file-write* (extension \"com.apple.app-sandbox.read-write\"))\n")
+	}
 	if opts.TTYPath != "" {
 		fmt.Fprintf(&b, "(allow file-ioctl (literal (param %q)))\n", "TTY_0")
 	}

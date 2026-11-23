@@ -31,3 +31,35 @@ TEXT ·addrOfSandboxFreeError(SB),NOSPLIT,$0-8
 	MOVD	$·sandboxFreeErrorTrampoline(SB), R0
 	MOVD	R0, ret+0(FP)
 	RET
+
+TEXT ·sandboxExtIssueFileTrampoline(SB),NOSPLIT,$0-0
+	JMP	libc_sandbox_extension_issue_file(SB)
+
+TEXT ·addrOfSandboxExtIssueFile(SB),NOSPLIT,$0-8
+	MOVD	$·sandboxExtIssueFileTrampoline(SB), R0
+	MOVD	R0, ret+0(FP)
+	RET
+
+TEXT ·sandboxExtConsumeTrampoline(SB),NOSPLIT,$0-0
+	JMP	libc_sandbox_extension_consume(SB)
+
+TEXT ·addrOfSandboxExtConsume(SB),NOSPLIT,$0-8
+	MOVD	$·sandboxExtConsumeTrampoline(SB), R0
+	MOVD	R0, ret+0(FP)
+	RET
+
+TEXT ·sandboxExtReleaseTrampoline(SB),NOSPLIT,$0-0
+	JMP	libc_sandbox_extension_release(SB)
+
+TEXT ·addrOfSandboxExtRelease(SB),NOSPLIT,$0-8
+	MOVD	$·sandboxExtReleaseTrampoline(SB), R0
+	MOVD	R0, ret+0(FP)
+	RET
+
+TEXT ·libcFreeTrampoline(SB),NOSPLIT,$0-0
+	JMP	libc_free(SB)
+
+TEXT ·addrOfLibcFree(SB),NOSPLIT,$0-8
+	MOVD	$·libcFreeTrampoline(SB), R0
+	MOVD	R0, ret+0(FP)
+	RET

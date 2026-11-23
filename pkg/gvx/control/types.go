@@ -83,6 +83,7 @@ const (
 	CapMountRemount        = "mount.remount"
 	CapMountRemove         = "mount.remove"
 	CapMountVolumeAttach   = "mount.volume_attach"
+	CapMountBindAttach     = "mount.bind_attach"
 	CapMountBind           = "mount.bind"
 	CapMountServe          = "mount.serve"
 	CapProcList            = "proc.list"
@@ -121,6 +122,7 @@ var allKnownCapabilities = []string{
 	CapMountRemount,
 	CapMountRemove,
 	CapMountVolumeAttach,
+	CapMountBindAttach,
 	CapMountBind,
 	CapMountServe,
 	CapProcList,
@@ -281,7 +283,7 @@ func MethodAllowed(method string, caps []string) bool {
 		return slices.Contains(caps, CapPortDynamicLoopback) || slices.Contains(caps, CapPortDynamicAny) || slices.Contains(caps, CapPortAnyBind)
 	}
 	if method == MethodMountAdd {
-		return slices.Contains(caps, CapMountTmpfs) || slices.Contains(caps, CapMountVolumeAttach) || slices.Contains(caps, CapMountBind)
+		return slices.Contains(caps, CapMountTmpfs) || slices.Contains(caps, CapMountVolumeAttach) || slices.Contains(caps, CapMountBindAttach) || slices.Contains(caps, CapMountBind)
 	}
 	req, ok := methodRequiredCap[method]
 	if !ok {
@@ -567,6 +569,8 @@ type MountAddRequest struct {
 	Target         string `json:"target"`
 	ReadOnly       bool   `json:"read_only,omitempty"`
 	TmpfsSizeBytes int64  `json:"tmpfs_size_bytes,omitempty"`
+	SingleFileName string `json:"single_file_name,omitempty"`
+	SandboxToken   string `json:"sandbox_token,omitempty"`
 }
 
 // MountRemountRequest toggles read-only status on an existing mount.

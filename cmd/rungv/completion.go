@@ -140,7 +140,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr -e --env-file -u --user -m --memory --cpus --pids-limit --net --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr -e --env-file -u --user -m --memory --cpus --pids-limit --net --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --allow-bind-attach --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -271,6 +271,7 @@ _rungv() {
                 '--control-disable[Disable control capabilities]:caps:' \
                 '--control-token-file[Control token file path]:file:_files' \
                 '--allow-volume-attach[Allow POSIX SCM_RIGHTS volume attachment under lockdown]' \
+                '--allow-bind-attach[Allow POSIX SCM_RIGHTS hostfs bind attachment under lockdown]' \
                 '--net[Network mode]:mode:(nat wg none)' \
                 '--backend[Execution backend]:backend:(auto whpx hvf systrap)' \
                 '--platform[Target image platform]:platform:(linux/amd64 linux/arm64)' \

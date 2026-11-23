@@ -47,6 +47,7 @@ func TestParseControlRunFlags(t *testing.T) {
 		"--auto-publish",
 		"--auto-publish-addr", "0.0.0.0",
 		"--allow-volume-attach",
+		"--allow-bind-attach",
 		"--pids-limit", "64",
 		"alpine:3.20",
 	)
@@ -62,8 +63,8 @@ func TestParseControlRunFlags(t *testing.T) {
 	if len(rc.cfg.ControlDisable) != 2 || rc.cfg.ControlDisable[0] != "exec" || rc.cfg.ControlDisable[1] != "net.dial" {
 		t.Errorf("ControlDisable = %v", rc.cfg.ControlDisable)
 	}
-	if !rc.cfg.DynamicPorts || !rc.cfg.AutoPublishPorts || rc.cfg.AutoPublishAddr != "0.0.0.0" || !rc.cfg.AllowVolumeAttach || rc.cfg.Resources.PidsLimit != 64 {
-		t.Errorf("flags mismatch: dyn=%v auto=%v autoAddr=%q vol=%v pids=%d", rc.cfg.DynamicPorts, rc.cfg.AutoPublishPorts, rc.cfg.AutoPublishAddr, rc.cfg.AllowVolumeAttach, rc.cfg.Resources.PidsLimit)
+	if !rc.cfg.DynamicPorts || !rc.cfg.AutoPublishPorts || rc.cfg.AutoPublishAddr != "0.0.0.0" || !rc.cfg.AllowVolumeAttach || !rc.cfg.AllowBindAttach || rc.cfg.Resources.PidsLimit != 64 {
+		t.Errorf("flags mismatch: dyn=%v auto=%v autoAddr=%q vol=%v bind=%v pids=%d", rc.cfg.DynamicPorts, rc.cfg.AutoPublishPorts, rc.cfg.AutoPublishAddr, rc.cfg.AllowVolumeAttach, rc.cfg.AllowBindAttach, rc.cfg.Resources.PidsLimit)
 	}
 	if len(rc.cfg.DynamicPortAddrs) != 2 || rc.cfg.DynamicPortAddrs[0] != "0.0.0.0" || rc.cfg.DynamicPortAddrs[1] != "127.0.0.1" {
 		t.Errorf("DynamicPortAddrs = %v, want [0.0.0.0 127.0.0.1]", rc.cfg.DynamicPortAddrs)
