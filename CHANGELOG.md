@@ -2,6 +2,18 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.21.10012026111600] - 2026-11-24
+
+This release fixes a `systrap` stub initialization panic on Linux and Android hosts with 16 KB pages and kernel-sealed mappings (`EPERM` on `munmap` or `mseal`), and hardens stub region placement and `seccomp` notification probing during startup.
+
+### Bug Fixes
+
+- **16 KB sealed-page `systrap` stub initialization (`pkg/sentry/platform/systrap`)**:
+  - `unmapSegment` now aligns recursive binary-split midpoints to `hostPageSize` instead of a fixed `4096` bytes when `SYS_MUNMAP` returns `EPERM` on sealed host regions such as `[vdso]` or `[vvar]`. On 16 KB Android devices, splitting at 4 KB boundaries produced non-page-aligned `munmap` arguments, failed with `EINVAL`, and panicked inside `openPlatform` (`gvx.New`).
+  - `forkStub` now ignores `EPERM` from the early upper-address `munmap` sweep so `unmapRange` isolates sealed holes page by page.
+  - `stubInit` rounds the fallback `parseMaps` start address down to a host page boundary, guards `avail > 0` before computing the randomized VA gap, and ignores `EPERM` from optional `SYS_MSEAL`.
+  - `initSeccompNotify` treats `ENOSYS`, `EPERM`, and `EACCES` identically to `EINVAL` when probing `SECCOMP_GET_ACTION_AVAIL` so restricted host `seccomp` sandboxes do not panic at startup.
+
 ## [v0.21.10002026111600] - 2026-11-23
 
 This release adds kept OCI image blobs, offline `rungv save`, and `rungv push` (#243). It also adds reverse Unix forwarding, live `hostfs` mounts, checkpoint and restore for live mounts, and cgroup v2 block I/O accounting (#232, #233, #235, #237). It includes opt-in non-loopback ports, `--auto-publish` events, host NAT firewall policies, and `rpcfs` fixes (#228, #231, #234, #236).

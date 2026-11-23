@@ -206,9 +206,9 @@ func initSeccompNotify() {
 	case unix.EFAULT:
 		// seccomp unotify is supported.
 		seccompNotifyIsSupported = true
-	case unix.EINVAL:
-		log.Warningf("Seccomp user-space notification mechanism isn't " +
-			"supported by the kernel (available since Linux 5.0).")
+	case unix.EINVAL, unix.ENOSYS, unix.EPERM, unix.EACCES:
+		log.Warningf("Seccomp user-space notification mechanism isn't "+
+			"supported or permitted by the host (%v).", errno)
 	default:
 		panic(fmt.Sprintf("seccomp returns unexpected code: %d", errno))
 	}

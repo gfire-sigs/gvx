@@ -18,6 +18,7 @@
 package systrap
 
 import (
+	"errors"
 	"fmt"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -113,7 +114,7 @@ func forkStub(flags uintptr, instrs []bpf.Instruction) (*thread, error) {
 		_, err := t.syscallIgnoreInterrupt(&t.initRegs, unix.SYS_MUNMAP,
 			arch.SyscallArgument{Value: stubROMapEnd},
 			arch.SyscallArgument{Value: maximumUserAddress - stubROMapEnd})
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.EPERM) {
 			return nil, err
 		}
 

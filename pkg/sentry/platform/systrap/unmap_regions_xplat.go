@@ -23,7 +23,6 @@ import (
 	"sync"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
-	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
@@ -53,25 +52,46 @@ func (s *subprocess) unmapRange(addr, length uintptr) {
 }
 
 // unmapSegment unmaps r with one call. When the host kernel refuses with EPERM,
-// it splits r in two halves until it finds the pages that the host kernel
+// it splits r in two halves until it finds the host pages that the host kernel
 // seals, and it records them in sealedHoles.
 func (s *subprocess) unmapSegment(r mapsRegion) {
-	_, err := s.syscall(
-		unix.SYS_MUNMAP,
-		arch.SyscallArgument{Value: r.start},
-		arch.SyscallArgument{Value: r.end - r.start})
+	unmapSegmentWith(
+		r,
+		hostPageSize,
+		func(start, length uintptr) error {
+			_, err := s.syscall(
+				unix.SYS_MUNMAP,
+				arch.SyscallArgument{Value: start},
+				arch.SyscallArgument{Value: length})
+			return err
+		},
+		func(hole mapsRegion) {
+			log.Debugf("The host kernel keeps the sealed page %x in the stub process.", hole.start)
+			sealedHoles.Lock()
+			sealedHoles.ranges = addRange(sealedHoles.ranges, hole)
+			sealedHoles.Unlock()
+		},
+	)
+}
+
+func unmapSegmentWith(r mapsRegion, unit uintptr, unmap func(start, length uintptr) error, recordHole func(mapsRegion)) {
+	err := unmap(r.start, r.end-r.start)
 	switch {
 	case err == nil || err == errDeadSubprocess:
-	case errors.Is(err, unix.EPERM) && r.end-r.start > hostarch.PageSize:
-		mid := r.start + (r.end-r.start)/2
-		mid -= mid % hostarch.PageSize
-		s.unmapSegment(mapsRegion{start: r.start, end: mid})
-		s.unmapSegment(mapsRegion{start: mid, end: r.end})
+	case errors.Is(err, unix.EPERM) && r.end-r.start > unit:
+		half := ((r.end - r.start) / 2) &^ (unit - 1)
+		if half == 0 {
+			half = unit
+		}
+		mid := r.start + half
+		if mid >= r.end {
+			recordHole(r)
+			return
+		}
+		unmapSegmentWith(mapsRegion{start: r.start, end: mid}, unit, unmap, recordHole)
+		unmapSegmentWith(mapsRegion{start: mid, end: r.end}, unit, unmap, recordHole)
 	case errors.Is(err, unix.EPERM):
-		log.Debugf("The host kernel keeps the sealed page %x in the stub process.", r.start)
-		sealedHoles.Lock()
-		sealedHoles.ranges = addRange(sealedHoles.ranges, r)
-		sealedHoles.Unlock()
+		recordHole(r)
 	default:
 		panic(fmt.Sprintf("munmap(%x, %x)) failed: %v", r.start, r.end-r.start, err))
 	}
