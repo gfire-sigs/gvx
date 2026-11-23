@@ -72,13 +72,81 @@ func ListenPacketLoopback(network, address string) (net.PacketConn, error) {
 	return listenHostPacketLoopback(network, address)
 }
 
-func validateLoopbackBind(address string) error {
+// ListenAllowed binds a TCP listener on a host IP address authorized by
+// Options.AllowLoopbackBind or Options.AllowedBindAddrs. Unlisted addresses
+// and non-TCP networks are rejected. Generic "tcp" is narrowed to "tcp4" or
+// "tcp6" from the IP literal so an IPv4 wildcard never opens a dual-stack IPv6
+// listener (or vice versa).
+func ListenAllowed(network, address string) (net.Listener, error) {
+	narrowNet, canonAddr, addr, err := parseAndNarrowBind("tcp", network, address)
+	if err != nil {
+		return nil, fmt.Errorf("hostlockdown: ListenAllowed: %w", err)
+	}
+	if !isBindAddrAllowed(addr) {
+		return nil, fmt.Errorf("hostlockdown: bind address %q is not allowed under host lockdown", addr.String())
+	}
+	return listenHostAllowed(narrowNet, canonAddr)
+}
+
+// ListenPacketAllowed binds a UDP packet socket on a host IP address
+// authorized by Options.AllowLoopbackBind or Options.AllowedBindAddrs.
+// Unlisted addresses and non-UDP networks are rejected. Generic "udp" is
+// narrowed to "udp4" or "udp6" from the IP literal.
+func ListenPacketAllowed(network, address string) (net.PacketConn, error) {
+	narrowNet, canonAddr, addr, err := parseAndNarrowBind("udp", network, address)
+	if err != nil {
+		return nil, fmt.Errorf("hostlockdown: ListenPacketAllowed: %w", err)
+	}
+	if !isBindAddrAllowed(addr) {
+		return nil, fmt.Errorf("hostlockdown: bind address %q is not allowed under host lockdown", addr.String())
+	}
+	return listenHostPacketAllowed(narrowNet, canonAddr)
+}
+
+func parseAndNarrowBind(base, network, address string) (narrowNet, canonAddr string, addr netip.Addr, err error) {
+	v4Net, v6Net := base+"4", base+"6"
+	switch network {
+	case base, v4Net, v6Net:
+	default:
+		return "", "", netip.Addr{}, fmt.Errorf("rejects network %q", network)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", "", netip.Addr{}, fmt.Errorf("invalid bind address %q: %w", address, err)
+	}
+	parsed, err := netip.ParseAddr(host)
+	if err != nil || parsed.Zone() != "" {
+		return "", "", netip.Addr{}, fmt.Errorf("bind address %q must use a bare IP literal", address)
+	}
+	addr = parsed.Unmap()
+	wantNet := v4Net
+	if addr.Is6() {
+		wantNet = v6Net
+	}
+	if network != base && network != wantNet {
+		return "", "", netip.Addr{}, fmt.Errorf("network %q does not match address family of %q", network, addr.String())
+	}
+	return wantNet, net.JoinHostPort(addr.String(), port), addr, nil
+}
+
+func parseBindHostAddr(address string) (netip.Addr, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		return fmt.Errorf("hostlockdown: invalid loopback bind address %q: %w", address, err)
+		return netip.Addr{}, fmt.Errorf("hostlockdown: invalid bind address %q: %w", address, err)
 	}
 	addr, err := netip.ParseAddr(host)
-	if err != nil || !addr.IsLoopback() {
+	if err != nil || addr.Zone() != "" {
+		return netip.Addr{}, fmt.Errorf("hostlockdown: bind address %q must use a bare IP literal", address)
+	}
+	return addr.Unmap(), nil
+}
+
+func validateLoopbackBind(address string) error {
+	addr, err := parseBindHostAddr(address)
+	if err != nil {
+		return err
+	}
+	if !addr.IsLoopback() {
 		return fmt.Errorf("hostlockdown: bind address %q is not a loopback IP", address)
 	}
 	return nil

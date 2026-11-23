@@ -93,6 +93,11 @@ func (s *Sandbox) handleInspect(_ context.Context, stream *control.Stream) error
 		arch = runtime.GOARCH
 	}
 
+	autoPublishAddr := cfg.AutoPublishAddr
+	if autoPublishAddr == "" && cfg.AutoPublishPorts {
+		autoPublishAddr = "127.0.0.1"
+	}
+
 	return stream.Reply(control.InspectResponse{
 		ID:                 cmp.Or(cfg.Name, "gvx-default"),
 		Name:               cfg.Name,
@@ -107,6 +112,8 @@ func (s *Sandbox) handleInspect(_ context.Context, stream *control.Stream) error
 		Resources:          s.snapshotResources(k),
 		MemoryUsedBytes:    memUsed,
 		Ports:              s.listPortRuleInfos(),
+		DynamicBindAddrs:   slices.Clone(cfg.DynamicPortAddrs),
+		AutoPublishAddr:    autoPublishAddr,
 		Mounts:             s.listMountInfos(),
 		ActiveExecSessions: s.activeExecCount(),
 		PIDCount:           pidCount,

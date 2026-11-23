@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -37,6 +38,7 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
+	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/rpcfs"
 )
 
@@ -1785,4 +1787,260 @@ func (h *testRPCFSStreamHandler) HandleStream(ctx context.Context, st *control.S
 
 func (h *testRPCFSStreamHandler) HandleLegacyCheckpoint(context.Context, control.LegacyCheckpointRequest) error {
 	return nil
+}
+
+func TestControlAutoPublishEventsAndDynamicPortAddrs(t *testing.T) {
+	// Config validation for DynamicPortAddrs and AutoPublishAddr.
+	badAuto := Config{NetworkMode: NetModeNAT, AutoPublishAddr: "0.0.0.0"}
+	if err := badAuto.normalize(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("AutoPublishAddr without AutoPublishPorts err = %v, want ErrInvalidConfig", err)
+	}
+	badIP := Config{NetworkMode: NetModeNAT, DynamicPortAddrs: []string{"not-an-ip"}}
+	if err := badIP.normalize(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid DynamicPortAddrs err = %v, want ErrInvalidConfig", err)
+	}
+	badNet := Config{NetworkMode: NetModeNone, DynamicPortAddrs: []string{"0.0.0.0"}}
+	if err := badNet.normalize(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("DynamicPortAddrs with net=none err = %v, want ErrInvalidConfig", err)
+	}
+
+	// Reserve one free port and hold one busy port on the host.
+	freeLn, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("Listen free: %v", err)
+	}
+	freePort := uint16(freeLn.Addr().(*net.TCPAddr).Port)
+	_ = freeLn.Close()
+
+	busyLn, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("Listen busy: %v", err)
+	}
+	t.Cleanup(func() { _ = busyLn.Close() })
+	busyPort := uint16(busyLn.Addr().(*net.TCPAddr).Port)
+
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	freeHTTPELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, freePort, "/etc/ready.txt", "", "")
+	if err != nil {
+		t.Fatalf("BuildGuestHTTPServerELF64(free): %v", err)
+	}
+	busyHTTPELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, busyPort, "/etc/ready.txt", "", "")
+	if err != nil {
+		t.Fatalf("BuildGuestHTTPServerELF64(busy): %v", err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "bin/httpfree", Data: freeHTTPELF, Mode: 0o755},
+		testimage.File{Name: "bin/httpbusy", Data: busyHTTPELF, Mode: 0o755},
+		testimage.File{Name: "etc/ready.txt", Data: []byte("ap-events-ready\n"), Mode: 0o644},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+	regURL := testimage.NewRegistry(t, "apev", "latest", testimage.Image{
+		Arch:       runtime.GOARCH,
+		Layers:     [][]byte{layer},
+		Entrypoint: []string{"/bin/cat"},
+		Cmd:        []string{"/etc/ready.txt", "/proc/self/fd/0"},
+	})
+
+	tv, err := (tuning.Values{}).Set("net.forward.dynamic_poll_interval", "50ms")
+	if err != nil {
+		t.Fatalf("tuning.Set: %v", err)
+	}
+	// Warnings is intentionally nil to prove control events emit without stderr warnings.
+	rs := startControlTestSandbox(t, Config{
+		Name:             "ctrl-apev",
+		OCIImage:         "apev:latest",
+		RegistryBaseURL:  regURL,
+		NetworkMode:      NetModeNAT,
+		AutoPublishPorts: true,
+		AutoPublishAddr:  "0.0.0.0",
+		DynamicPortAddrs: []string{"0.0.0.0"},
+		Tuning:           tv,
+	})
+	rs.stdout.waitForSubstring(t, "ap-events-ready\n", 15*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Inspect and ping advertise port.dynamic_any and bind addresses.
+	var ping control.PingResponse
+	if err := rs.client.Call(ctx, control.MethodPing, nil, &ping); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	if !slices.Contains(ping.Capabilities, control.CapPortDynamicAny) {
+		t.Fatalf("ping capabilities = %v, want %s", ping.Capabilities, control.CapPortDynamicAny)
+	}
+	var inspect control.InspectResponse
+	if err := rs.client.Call(ctx, control.MethodInspect, nil, &inspect); err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !slices.Equal(inspect.DynamicBindAddrs, []string{"0.0.0.0"}) || inspect.AutoPublishAddr != "0.0.0.0" {
+		t.Fatalf("inspect bind addrs = (%v, %q), want ([0.0.0.0], 0.0.0.0)", inspect.DynamicBindAddrs, inspect.AutoPublishAddr)
+	}
+
+	// Subscribe to port events before starting guest listeners.
+	evStream, err := rs.client.OpenStream(ctx, control.MethodEvents, control.EventsRequest{
+		Filters: []string{"type=port"},
+	})
+	if err != nil {
+		t.Fatalf("events open: %v", err)
+	}
+	defer evStream.Close()
+	if err := evStream.WaitResponse(ctx, nil); err != nil {
+		t.Fatalf("events wait: %v", err)
+	}
+
+	eventsCh := make(chan control.SandboxEvent, 32)
+	go func() {
+		for {
+			ev, err := evStream.RecvEvent(ctx)
+			if err != nil {
+				return
+			}
+			var se control.SandboxEvent
+			if json.Unmarshal(ev.Data, &se) == nil {
+				eventsCh <- se
+			}
+		}
+	}()
+
+	waitPortEvent := func(wantAction string, wantPort uint16) control.SandboxEvent {
+		t.Helper()
+		portStr := strconv.Itoa(int(wantPort))
+		deadline := time.After(10 * time.Second)
+		for {
+			select {
+			case se := <-eventsCh:
+				if se.Type == "port" && se.Action == wantAction &&
+					se.Attributes["source"] == "auto" &&
+					se.Attributes["guest_port"] == portStr {
+					return se
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for auto port event action=%s port=%d", wantAction, wantPort)
+			}
+		}
+	}
+
+	// 1. Start guest listener on freePort -> expect add(source=auto, host_ip=0.0.0.0).
+	freeExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+		Argv: []string{"/bin/httpfree"},
+	})
+	if err != nil {
+		t.Fatalf("exec httpfree: %v", err)
+	}
+	var freeResp control.ExecStartResponse
+	if err := freeExec.WaitResponse(ctx, &freeResp); err != nil {
+		t.Fatalf("exec httpfree wait: %v", err)
+	}
+	addEv := waitPortEvent("add", freePort)
+	if addEv.Attributes["host_ip"] != "0.0.0.0" || addEv.Attributes["proto"] != "tcp" || addEv.Attributes["host_port"] != strconv.Itoa(int(freePort)) {
+		t.Fatalf("auto add event attrs = %+v", addEv.Attributes)
+	}
+
+	// 2. Kill guest listener on freePort -> expect remove(source=auto).
+	if err := rs.client.Call(ctx, control.MethodProcSignal, control.ProcSignalRequest{
+		PID:    freeResp.PID,
+		Signal: "SIGKILL",
+	}, nil); err != nil {
+		t.Fatalf("kill httpfree: %v", err)
+	}
+	freeExec.Close()
+	rmEv := waitPortEvent("remove", freePort)
+	if rmEv.Attributes["host_ip"] != "0.0.0.0" || rmEv.Attributes["proto"] != "tcp" {
+		t.Fatalf("auto remove event attrs = %+v", rmEv.Attributes)
+	}
+
+	// 3. Start guest listener on busyPort -> expect bind_failed(source=auto, error!=empty).
+	busyExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+		Argv: []string{"/bin/httpbusy"},
+	})
+	if err != nil {
+		t.Fatalf("exec httpbusy: %v", err)
+	}
+	defer busyExec.Close()
+	if err := busyExec.WaitResponse(ctx, nil); err != nil {
+		t.Fatalf("exec httpbusy wait: %v", err)
+	}
+	failEv := waitPortEvent("bind_failed", busyPort)
+	if failEv.Attributes["host_ip"] != "0.0.0.0" || failEv.Attributes["proto"] != "tcp" || failEv.Attributes["error"] == "" {
+		t.Fatalf("auto bind_failed event attrs = %+v", failEv.Attributes)
+	}
+}
+
+func TestControlDynamicPortAddrCapabilitiesAndPolicy(t *testing.T) {
+	// 1. AutoPublishAddr=0.0.0.0 without DynamicPortAddrs does not advertise port.dynamic_any.
+	sbAuto := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			AutoPublishPorts: true,
+			AutoPublishAddr:  "0.0.0.0",
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	autoCaps := sbAuto.ControlCapabilities()
+	if slices.Contains(autoCaps, control.CapPortDynamicAny) {
+		t.Fatalf("auto-publish-addr only caps = %v, must not advertise %s", autoCaps, control.CapPortDynamicAny)
+	}
+	if !slices.Contains(autoCaps, control.CapPortDynamicLoopback) {
+		t.Fatalf("auto-publish-addr only caps = %v, want %s", autoCaps, control.CapPortDynamicLoopback)
+	}
+	if opts := sbAuto.lockdownOptions(); !slices.Contains(opts.AllowedBindAddrs, "0.0.0.0") {
+		t.Fatalf("lockdown AllowedBindAddrs = %v, want 0.0.0.0 for AutoPublishAddr", opts.AllowedBindAddrs)
+	}
+
+	// 2. --control-disable port.dynamic_any removes port.dynamic_any even with DynamicPortAddrs.
+	sbDisabled := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			DynamicPorts:     true,
+			DynamicPortAddrs: []string{"0.0.0.0"},
+			ControlDisable:   []string{control.CapPortDynamicAny},
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	disCaps := sbDisabled.ControlCapabilities()
+	if slices.Contains(disCaps, control.CapPortDynamicAny) {
+		t.Fatalf("disabled caps = %v, must not include %s", disCaps, control.CapPortDynamicAny)
+	}
+	if !slices.Contains(disCaps, control.CapPortDynamicLoopback) {
+		t.Fatalf("disabled caps = %v, want %s", disCaps, control.CapPortDynamicLoopback)
+	}
+
+	// 3. PolicyReadOnly strips all port.add capabilities.
+	sbRO := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			DynamicPorts:     true,
+			DynamicPortAddrs: []string{"0.0.0.0"},
+			ControlPolicy:    control.PolicyReadOnly,
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	if control.MethodAllowed(control.MethodPortAdd, sbRO.ControlCapabilities()) {
+		t.Fatalf("PolicyReadOnly allowed MethodPortAdd")
+	}
+
+	// 4. DynamicPortAddrs=[127.0.0.1] without DynamicPorts advertises loopback only (not dynamic_any).
+	sbLoopOnly := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			DynamicPortAddrs: []string{"127.0.0.1"},
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	loopCaps := sbLoopOnly.ControlCapabilities()
+	if slices.Contains(loopCaps, control.CapPortDynamicAny) || !slices.Contains(loopCaps, control.CapPortDynamicLoopback) {
+		t.Fatalf("loopback-only DynamicPortAddrs caps = %v", loopCaps)
+	}
+	if !dynamicBindAddrAllowed(sbLoopOnly.cfg.DynamicPortAddrs, "127.0.0.1") ||
+		dynamicBindAddrAllowed(sbLoopOnly.cfg.DynamicPortAddrs, "::1") ||
+		dynamicBindAddrAllowed(sbLoopOnly.cfg.DynamicPortAddrs, "0.0.0.0") {
+		t.Fatalf("dynamicBindAddrAllowed mismatch for [127.0.0.1]")
+	}
 }

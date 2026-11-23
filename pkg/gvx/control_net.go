@@ -68,7 +68,61 @@ func isLoopbackBindIP(ipStr string) bool {
 		return true
 	}
 	addr, err := netip.ParseAddr(ipStr)
-	return err == nil && addr.IsLoopback()
+	return err == nil && addr.Zone() == "" && addr.Unmap().IsLoopback()
+}
+
+func hasLoopbackBindAddr(addrs []string) bool {
+	for _, s := range addrs {
+		if isLoopbackBindIP(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNonLoopbackBindAddr(addrs []string) bool {
+	for _, s := range addrs {
+		if !isLoopbackBindIP(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func dynamicBindAddrAllowed(allowed []string, ipStr string) bool {
+	if len(allowed) == 0 {
+		return false
+	}
+	if ipStr == "" {
+		ipStr = "127.0.0.1"
+	}
+	target, err := netip.ParseAddr(ipStr)
+	if err != nil || target.Zone() != "" {
+		return false
+	}
+	target = target.Unmap()
+	for _, raw := range allowed {
+		a, err := netip.ParseAddr(raw)
+		if err == nil && a.Zone() == "" && a.Unmap() == target {
+			return true
+		}
+	}
+	return false
+}
+
+func portEventAttrs(source string, rule netbackend.PortForwardRule) map[string]string {
+	attrs := map[string]string{
+		"source":     source,
+		"proto":      rule.Proto,
+		"guest_port": strconv.Itoa(int(rule.GuestPort)),
+	}
+	if rule.HostSocket != "" {
+		attrs["host_socket"] = rule.HostSocket
+	} else {
+		attrs["host_ip"] = rule.HostIP
+		attrs["host_port"] = strconv.Itoa(int(rule.HostPort))
+	}
+	return attrs
 }
 
 func (s *Sandbox) handlePortAdd(_ context.Context, stream *control.Stream, raw json.RawMessage) error {
@@ -86,6 +140,7 @@ func (s *Sandbox) handlePortAdd(_ context.Context, stream *control.Stream, raw j
 	s.mu.Lock()
 	locked := s.lockdown.Applied
 	canLoopback := !locked || s.cfg.AutoPublishPorts || s.cfg.DynamicPorts
+	allowedAddrs := slices.Clone(s.cfg.DynamicPortAddrs)
 	curTune := s.cfg.Tuning
 	s.mu.Unlock()
 
@@ -98,15 +153,42 @@ func (s *Sandbox) handlePortAdd(_ context.Context, stream *control.Stream, raw j
 		}
 		for _, r := range rules {
 			if r.HostSocket != "" {
-				if locked || !slices.Contains(caps, control.CapPortAnyBind) {
+				if locked {
 					return control.NewError(control.CodeLockdownDenied, "dynamic Unix socket publishing is denied under host lockdown; use -lockdown=false or port-forward")
 				}
-			} else if !isLoopbackBindIP(r.HostIP) {
-				if locked || !slices.Contains(caps, control.CapPortAnyBind) {
-					return control.NewErrorf(control.CodeLockdownDenied, "binding non-loopback address %q is denied under host lockdown; bind 127.0.0.1 or use port-forward", r.HostIP)
+				if !slices.Contains(caps, control.CapPortAnyBind) {
+					return control.NewError(control.CodeForbiddenByPolicy, "dynamic Unix socket publishing is disabled by control policy")
 				}
-			} else if !canLoopback {
-				return control.NewError(control.CodeLockdownDenied, "dynamic loopback port publishing is disabled under lockdown; start sandbox with --dynamic-ports or --auto-publish, or use rungv port-forward")
+			} else {
+				hostIP := r.HostIP
+				if hostIP == "" {
+					hostIP = "127.0.0.1"
+				}
+				addr, err := parseBareIPAddr(hostIP)
+				if err != nil {
+					return control.NewErrorf(control.CodeInvalidArgument, "invalid bind IP %q: %v", r.HostIP, err)
+				}
+				r.HostIP = addr.String()
+				if !addr.IsLoopback() {
+					listed := dynamicBindAddrAllowed(allowedAddrs, r.HostIP)
+					if locked {
+						if !listed {
+							return control.NewErrorf(control.CodeLockdownDenied, "binding non-loopback address %q is denied under host lockdown; start sandbox with --dynamic-ports-addr %s, bind 127.0.0.1, or use port-forward", r.HostIP, r.HostIP)
+						}
+						if !slices.Contains(caps, control.CapPortDynamicAny) {
+							return control.NewErrorf(control.CodeForbiddenByPolicy, "non-loopback dynamic port publishing (%s) is disabled by control policy", control.CapPortDynamicAny)
+						}
+					} else if !slices.Contains(caps, control.CapPortAnyBind) && !(listed && slices.Contains(caps, control.CapPortDynamicAny)) {
+						return control.NewError(control.CodeForbiddenByPolicy, "non-loopback dynamic port publishing is disabled by control policy")
+					}
+				} else {
+					if !canLoopback && !dynamicBindAddrAllowed(allowedAddrs, r.HostIP) {
+						return control.NewError(control.CodeLockdownDenied, "dynamic loopback port publishing is disabled under lockdown; start sandbox with --dynamic-ports or --auto-publish, or use rungv port-forward")
+					}
+					if !slices.Contains(caps, control.CapPortDynamicLoopback) && !slices.Contains(caps, control.CapPortAnyBind) {
+						return control.NewError(control.CodeForbiddenByPolicy, "dynamic loopback port publishing is disabled by control policy")
+					}
+				}
 			}
 			parsed = append(parsed, r)
 		}
@@ -115,8 +197,8 @@ func (s *Sandbox) handlePortAdd(_ context.Context, stream *control.Stream, raw j
 	listenTCP := net.Listen
 	listenUDP := net.ListenPacket
 	if locked {
-		listenTCP = hostlockdown.ListenLoopback
-		listenUDP = hostlockdown.ListenPacketLoopback
+		listenTCP = hostlockdown.ListenAllowed
+		listenUDP = hostlockdown.ListenPacketAllowed
 	}
 
 	boundRules, err := s.portForwarder.AddDynamicRules(parsed, req.Replace, listenTCP, listenUDP)
@@ -132,12 +214,7 @@ func (s *Sandbox) handlePortAdd(_ context.Context, stream *control.Stream, raw j
 	added := make([]control.PortRuleInfo, 0, len(boundRules))
 	for _, bound := range boundRules {
 		added = append(added, toPortRuleInfo(netbackend.BoundPortRule{Rule: bound, Source: netbackend.PortSourceDynamic}))
-		s.emitEvent("port", "add", map[string]string{
-			"proto":      bound.Proto,
-			"host_ip":    bound.HostIP,
-			"host_port":  strconv.Itoa(int(bound.HostPort)),
-			"guest_port": strconv.Itoa(int(bound.GuestPort)),
-		})
+		s.emitEvent("port", "add", portEventAttrs(netbackend.PortSourceDynamic, bound))
 	}
 	return stream.Reply(control.PortAddResponse{Ports: added})
 }
@@ -188,10 +265,7 @@ func (s *Sandbox) handlePortRemove(_ context.Context, stream *control.Stream, ra
 		out := make([]control.PortRuleInfo, 0, len(removed))
 		for _, b := range removed {
 			out = append(out, toPortRuleInfo(b))
-			s.emitEvent("port", "remove", map[string]string{
-				"proto":     b.Rule.Proto,
-				"host_port": strconv.Itoa(int(b.Rule.HostPort)),
-			})
+			s.emitEvent("port", "remove", portEventAttrs(b.Source, b.Rule))
 		}
 		return stream.Reply(control.PortRemoveResponse{Removed: out})
 	}
@@ -216,10 +290,7 @@ func (s *Sandbox) handlePortRemove(_ context.Context, stream *control.Stream, ra
 		}
 		for _, b := range removed {
 			allRemoved = append(allRemoved, toPortRuleInfo(b))
-			s.emitEvent("port", "remove", map[string]string{
-				"proto":     b.Rule.Proto,
-				"host_port": strconv.Itoa(int(b.Rule.HostPort)),
-			})
+			s.emitEvent("port", "remove", portEventAttrs(b.Source, b.Rule))
 		}
 	}
 	return stream.Reply(control.PortRemoveResponse{Removed: allRemoved})

@@ -85,7 +85,7 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | `cp`, `export`, `checkpoint -o` | Allowed; the unlocked client performs all host disk I/O over framed tar streams. | None. |
 | `update` (`-m`, `--cpus`, `--pids-limit`, `--isolate-lan`, `--tune`) | Allowed; modifies per-sandbox Sentry limits, root CPU bandwidth, root cgroup2 `pids.max`, and NAT settings. | None. |
 | `port-forward` (`net.dial`) | Allowed; the unlocked client binds host sockets and tunnels TCP streams into the guest stack. | None. |
-| `port add` | Allowed on `127.0.0.1` or `[::1]` only when loopback binds are pre-authorized; non-loopback and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports` or `--auto-publish`. |
+| `port add` | Allowed on `127.0.0.1` or `[::1]` with loopback opt-in, or on listed IP literals with `--dynamic-ports-addr`. Unlisted addresses and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports`, `--auto-publish`, or `--dynamic-ports-addr IP`. |
 | `mount add --type tmpfs`, `mount rm` | Allowed; no host path opens occur. | None. |
 | `mount remount` | The server always allows remounting `rw` to `ro`; remounting `ro` to `rw` succeeds only when the host backing opened writable before lockdown. | Original writable mount. |
 | `mount add --type volume` | Allowed over POSIX `AF_UNIX` via `SCM_RIGHTS` FD transfer; server verifies `S_IFREG` before opening `ext4lite`. | `--allow-volume-attach` (Linux seccomp rule). |
@@ -103,7 +103,7 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `system.ping` | Unary | Report protocol version, sandbox ID, state, uptime, and capabilities. |
 | `sandbox.inspect` | Unary | Return full runtime configuration, limits, ports, mounts, and security posture. |
 | `sandbox.stats` | Unary or event stream | Return one-shot or periodic CPU, memory, network, block I/O, and PID counters. |
-| `sandbox.events` | Event stream | Stream filtered lifecycle events (`exec`, `lifecycle`, `port`, `mount`, `resource`, `oom`). |
+| `sandbox.events` | Event stream | Stream filtered lifecycle events (`exec`, `lifecycle`, `port`, `mount`, `resource`, `oom`). Auto-published ports emit `port` events with `source=auto` and actions `add`, `remove`, or `bind_failed`. |
 | `lifecycle.pause` | Unary | Pause all guest tasks and optionally quiesce host network forwarders. |
 | `lifecycle.unpause` | Unary | Resume a paused sandbox. |
 | `lifecycle.stop` | Unary | Send a signal to PID 1, wait up to `timeout_ms`, and escalate to `SIGKILL`. |

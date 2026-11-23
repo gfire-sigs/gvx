@@ -523,3 +523,121 @@ func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 	}
 	_ = <-sbDone
 }
+
+func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
+	requireAutoPlatform(t)
+	rungv := toolPath(t, rungvPkg)
+
+	const guestPort uint16 = 18090
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	httpELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, guestPort, "/etc/ready.txt", "", "")
+	if err != nil {
+		t.Fatalf("BuildGuestHTTPServerELF64: %v", err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "bin/httpserver", Data: httpELF, Mode: 0o755},
+		testimage.File{Name: "etc/ready.txt", Data: []byte("dyn-addr-ok\n"), Mode: 0o644},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+	regURL := testimage.NewRegistry(t, "e2edynaddr", "latest", testimage.Image{
+		Arch:       runtime.GOARCH,
+		Layers:     [][]byte{layer},
+		Entrypoint: []string{"/bin/cat"},
+		Cmd:        []string{"/etc/ready.txt", "/proc/self/fd/0"},
+	})
+
+	sockPath := controlSocketSpecForE2E(t, "dynaddr.sock")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	sbStdout := newCheckpointNotifyBuffer()
+	sbStderr := newCheckpointNotifyBuffer()
+	sbCmd := exec.CommandContext(ctx, rungv,
+		"run",
+		"-platform="+string(resolvedAutoPlatform()),
+		"-net=nat",
+		"--dynamic-ports-addr", "0.0.0.0",
+		"-cache-dir="+t.TempDir(),
+		"-registry-url="+regURL,
+		"--name=e2e-dynaddr",
+		"-S", sockPath,
+		"e2edynaddr:latest",
+	)
+	sbStdin, err := sbCmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbCmd.Stdout = sbStdout
+	sbCmd.Stderr = sbStderr
+	if err := sbCmd.Start(); err != nil {
+		t.Fatalf("start rungv: %v", err)
+	}
+	sbDone := make(chan error, 1)
+	go func() { sbDone <- sbCmd.Wait() }()
+	t.Cleanup(func() {
+		_ = sbStdin.Close()
+		cancel()
+		select {
+		case <-sbDone:
+		case <-time.After(10 * time.Second):
+			_ = sbCmd.Process.Kill()
+		}
+	})
+
+	sbStdout.waitForSubstring(t, "dyn-addr-ok\n", 30*time.Second, sbStderr)
+
+	pingOut, errS, code := runTool(t, rungv, "ping", "-S", sockPath, "-f", "json")
+	if code != 0 || !strings.Contains(pingOut, "port.dynamic_any") {
+		t.Fatalf("ping = (%d, %q, %q), want port.dynamic_any", code, pingOut, errS)
+	}
+	statusOut, errS, code := runTool(t, rungv, "status", "-S", sockPath, "-f", "json")
+	if code != 0 {
+		t.Fatalf("status = (%d, %q, %q)", code, statusOut, errS)
+	}
+	var statusResp struct {
+		DynamicBindAddrs []string `json:"dynamic_bind_addrs"`
+	}
+	if err := json.Unmarshal([]byte(statusOut), &statusResp); err != nil || len(statusResp.DynamicBindAddrs) != 1 || statusResp.DynamicBindAddrs[0] != "0.0.0.0" {
+		t.Fatalf("status dynamic_bind_addrs = (%v, %v), want [0.0.0.0]\nraw=%s", statusResp.DynamicBindAddrs, err, statusOut)
+	}
+
+	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
+		t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
+	}
+
+	hostPort := freeLoopbackPortForE2E(t)
+	spec := "0.0.0.0:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
+	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, spec); code != 0 {
+		t.Fatalf("port add 0.0.0.0 = (%d, %q)", code, errS)
+	}
+	gotBody := httpGetWithRetry(t, "http://127.0.0.1:"+strconv.Itoa(int(hostPort))+"/", 15*time.Second)
+	if gotBody != "dyn-addr-ok\n" {
+		t.Fatalf("dynamic 0.0.0.0 port HTTP body = %q, want dyn-addr-ok", gotBody)
+	}
+
+	// Unlisted IP addresses (including 127.0.0.1 without --dynamic-ports) and
+	// Unix sockets must still fail with LOCKDOWN_DENIED (exit 126).
+	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "127.0.0.1:0:80"); code != 126 {
+		t.Fatalf("port add unlisted loopback = (%d, %q), want 126", code, errS)
+	}
+	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "192.0.2.1:0:80"); code != 126 {
+		t.Fatalf("port add unlisted IP = (%d, %q), want 126", code, errS)
+	}
+	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "unix:"+filepath.Join(t.TempDir(), "deny.sock")+":80"); code != 126 {
+		t.Fatalf("port add unix socket = (%d, %q), want 126", code, errS)
+	}
+
+	if _, errS, code := runTool(t, rungv, "port", "rm", "-S", sockPath, spec); code != 0 {
+		t.Fatalf("port rm = (%d, %q)", code, errS)
+	}
+	if _, errS, code := runTool(t, rungv, "stop", "-S", sockPath, "-t", "0"); code != 0 {
+		t.Fatalf("stop -t 0 = (%d, %q)", code, errS)
+	}
+	_ = <-sbDone
+}

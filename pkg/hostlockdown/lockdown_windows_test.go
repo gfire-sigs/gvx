@@ -566,6 +566,8 @@ func runLockedChild(mode string) error {
 		return runSandboxBChild()
 	case "loopback-bind":
 		return runLoopbackBindChild()
+	case "allowed-bind":
+		return runAllowedBindChild()
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
@@ -1146,6 +1148,91 @@ func runLoopbackBindChild() error {
 	ln, err := ListenLoopback("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("ListenLoopback: %w", err)
+	}
+	defer func() { _ = ln.Close() }()
+	fmt.Println(ln.Addr().String())
+	conn, err := AcceptListener(ln)
+	if err != nil {
+		return fmt.Errorf("AcceptListener: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "ping\n" {
+		return fmt.Errorf("read = %q, %v", buf, err)
+	}
+	_, err = conn.Write([]byte("pong\n"))
+	return err
+}
+
+func TestLockdownWindowsAllowedBindAddrs(t *testing.T) {
+	ws, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), childModeEnv+"=allowed-bind", childWSEnv+"="+ws)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	var addr string
+	if _, err := fmt.Fscanln(stdout, &addr); err != nil {
+		t.Fatalf("read child addr: %v\nstderr:\n%s", err, stderr.String())
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", addr, err)
+	}
+	conn, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", port), 10*time.Second)
+	if err != nil {
+		t.Fatalf("dial child %s: %v\nstderr:\n%s", addr, err, stderr.String())
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "pong\n" {
+		t.Fatalf("read = %q, %v; want pong\\n", buf, err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("child failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+}
+
+func runAllowedBindChild() error {
+	ws := os.Getenv(childWSEnv)
+	if _, err := Apply(Options{
+		Mounts:           []HostMount{{Path: ws}},
+		AllowOutboundNet: true,
+		AllowedBindAddrs: []string{"0.0.0.0"},
+		DynamicListeners: 4,
+	}); err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	if ln, err := ListenAllowed("tcp4", "127.0.0.1:0"); err == nil {
+		_ = ln.Close()
+		return errors.New("ListenAllowed accepted unlisted 127.0.0.1:0")
+	}
+	if ln, err := ListenAllowed("tcp4", "192.0.2.1:0"); err == nil {
+		_ = ln.Close()
+		return errors.New("ListenAllowed accepted unlisted 192.0.2.1:0")
+	}
+	if pc, err := ListenPacketAllowed("udp", "0.0.0.0:0"); err != nil {
+		return fmt.Errorf("ListenPacketAllowed: %w", err)
+	} else {
+		_ = pc.Close()
+	}
+	ln, err := ListenAllowed("tcp", "0.0.0.0:0")
+	if err != nil {
+		return fmt.Errorf("ListenAllowed: %w", err)
 	}
 	defer func() { _ = ln.Close() }()
 	fmt.Println(ln.Addr().String())
