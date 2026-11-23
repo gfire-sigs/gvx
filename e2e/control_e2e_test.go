@@ -301,6 +301,10 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(serveDir, "host.txt"), []byte("locked-rpcfs-read\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	largePayload := bytes.Repeat([]byte("0123456789abcdef"), 32<<10) // 512 KiB (multi-chunk)
+	if err := os.WriteFile(filepath.Join(serveDir, "large.bin"), largePayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	serveCtx, serveCancel := context.WithCancel(ctx)
 	serveOut := newCheckpointNotifyBuffer()
 	serveErr := newCheckpointNotifyBuffer()
@@ -326,6 +330,9 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/proxy/host.txt"); code != 0 || out != "locked-rpcfs-read\n" {
 		t.Fatalf("exec read rpcfs under lockdown = (%d, %q, %q)", code, out, errS)
 	}
+	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/proxy/large.bin"); code != 0 || len(out) != len(largePayload) || out != string(largePayload) {
+		t.Fatalf("exec read 512KiB rpcfs under lockdown = (%d, len=%d want=%d, err=%q)", code, len(out), len(largePayload), errS)
+	}
 	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/writeproxy"); code != 0 {
 		t.Fatalf("exec write rpcfs under lockdown = (%d, %q)", code, errS)
 	}
@@ -333,6 +340,43 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	if err != nil || string(written) != "e2e-rpcfs-ok\n" {
 		t.Fatalf("guest rpcfs write = (%q, %v)", written, err)
 	}
+
+	// Single-file mount serve under lockdown.
+	singleHostFile := filepath.Join(t.TempDir(), "single.txt")
+	if err := os.WriteFile(singleHostFile, []byte("single-file-rpcfs\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	singleCtx, singleCancel := context.WithCancel(ctx)
+	singleOut := newCheckpointNotifyBuffer()
+	singleErr := newCheckpointNotifyBuffer()
+	singleCmd := exec.CommandContext(singleCtx, rungv, "mount", "serve", "-S", sockPath, singleHostFile+":/mnt/single.txt")
+	singleCmd.Stdout = singleOut
+	singleCmd.Stderr = singleErr
+	if err := singleCmd.Start(); err != nil {
+		singleCancel()
+		t.Fatalf("start single-file mount serve: %v", err)
+	}
+	singleDone := make(chan error, 1)
+	go func() { singleDone <- singleCmd.Wait() }()
+	t.Cleanup(func() {
+		singleCancel()
+		select {
+		case <-singleDone:
+		case <-time.After(5 * time.Second):
+			_ = singleCmd.Process.Kill()
+		}
+	})
+	singleOut.waitForSubstring(t, "Serving ", 15*time.Second, singleErr)
+	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/single.txt"); code != 0 || out != "single-file-rpcfs\n" {
+		t.Fatalf("exec read single-file rpcfs = (%d, %q, %q)", code, out, errS)
+	}
+	singleCancel()
+	select {
+	case <-singleDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("single-file mount serve did not exit promptly on cancel")
+	}
+
 	serveCancel()
 	select {
 	case <-serveDone:

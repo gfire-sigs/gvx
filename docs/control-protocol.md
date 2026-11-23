@@ -89,7 +89,7 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | `mount add --type tmpfs`, `mount rm` | Allowed; no host path opens occur. | None. |
 | `mount remount` | The server always allows remounting `rw` to `ro`; remounting `ro` to `rw` succeeds only when the host backing opened writable before lockdown. | Original writable mount. |
 | `mount add --type volume` | Allowed over POSIX `AF_UNIX` via `SCM_RIGHTS` FD transfer; server verifies `S_IFREG` before opening `ext4lite`. | `--allow-volume-attach` (Linux seccomp rule). |
-| `mount serve` (`rpcfs`) | Allowed on all host OSes; the unlocked client serves an `os.Root`-pinned directory over stream events. | None. |
+| `mount serve` (`rpcfs`) | Allowed on all host OSes; the unlocked client serves an `os.Root`-pinned directory or single file over stream events. Supports paginated `readdir` and host-to-guest `inotify` events. | None. |
 | `mount add --type bind` | Always rejected with `LOCKDOWN_DENIED` under lockdown. | `-lockdown=false` (debugging only). |
 
 ---
@@ -122,7 +122,7 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `mount.add` | Unary (optional FD) | Mount a `tmpfs`, `SCM_RIGHTS` `ext4lite` volume, or `-lockdown=false` bind mount. |
 | `mount.remount` | Unary | Toggle a mount between read-only and read-write. |
 | `mount.remove` | Unary | Unmount one guest mount point (optional `MNT_DETACH`). |
-| `mount.serve` | Bidirectional event stream | Attach an `rpcfs` proxy mount backed by client `rpcfs.req` and `rpcfs.resp` events. |
+| `mount.serve` | Bidirectional event stream | Attach an `rpcfs` directory or single-file proxy mount backed by client `rpcfs.req`, `rpcfs.resp`, and `rpcfs.notify` events. |
 | `proc.list` | Unary | Return a snapshot of guest thread groups from `TaskSet`. |
 | `proc.signal` | Unary | Send a POSIX signal to PID 1, a specific guest PID, or all guest processes. |
 | `kernel.log` | Unary or event stream | Read or follow records from the guest kernel log ring. |
