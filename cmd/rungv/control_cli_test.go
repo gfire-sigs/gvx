@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -1221,5 +1222,53 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 	}, strings.NewReader("resumed-from-stream\n"), &resOut, &resErr)
 	if resCode != 0 || resOut.String() != "resumed-from-stream\n" {
 		t.Fatalf("restore from streamed checkpoint = (code=%d out=%q err=%q)", resCode, resOut.String(), resErr.String())
+	}
+}
+
+func TestUnixForwardHelperOverflowAndFastEOFExit(t *testing.T) {
+	c2hR, c2hW := io.Pipe()
+	h2cR, h2cW := io.Pipe()
+	helperDone := make(chan int, 1)
+	go func() {
+		helperDone <- runUnixForwardHelper(context.Background(), []string{"/tmp/nonexistent.sock"}, c2hR, h2cW)
+	}()
+
+	pc := &pipeConn{r: h2cR, w: c2hW}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := control.DialConn(ctx, pc, control.DialOptions{
+		ClientName:       "test-helper-client",
+		HandshakeTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("DialConn helper: %v", err)
+	}
+
+	// ConnID = ^uint64(0) must return INVALID_ARGUMENT without panicking.
+	st, err := client.OpenStream(ctx, control.MethodUnixAccept, control.UnixAcceptRequest{ConnID: ^uint64(0)})
+	if err != nil {
+		t.Fatalf("OpenStream overflow conn_id: %v", err)
+	}
+	err = st.WaitResponse(ctx, nil)
+	st.Close()
+	var pe *control.ProtoError
+	if !errors.As(err, &pe) || pe.Code != control.CodeInvalidArgument {
+		t.Fatalf("overflow conn_id err = %v, want INVALID_ARGUMENT", err)
+	}
+
+	// Closing the client pipe must make runUnixForwardHelper exit promptly.
+	start := time.Now()
+	_ = client.Close()
+	_ = pc.Close()
+	select {
+	case code := <-helperDone:
+		if code != 0 {
+			t.Fatalf("helper exit code = %d, want 0", code)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("helper took %v to exit after pipe EOF, want <500ms", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runUnixForwardHelper hung after pipe EOF")
 	}
 }

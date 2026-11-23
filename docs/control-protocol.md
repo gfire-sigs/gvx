@@ -86,6 +86,7 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | `update` (`-m`, `--cpus`, `--pids-limit`, `--isolate-lan`, `--net-tx-bps`, `--net-rx-bps`, `--tune`) | Allowed; modifies per-sandbox Sentry limits, root CPU bandwidth, root cgroup2 `pids.max`, and NAT settings. | None. |
 | `net-policy` | Reads or replaces the NAT policy in memory. The client reads policy files outside lockdown. | NAT without a custom stream interceptor. |
 | `port-forward` (`net.dial`) | Allowed; the unlocked client binds host sockets and tunnels TCP streams into the guest stack. | None. |
+| `unix-forward` (`net.unix_forward`) | Allowed; the sandbox binds a guest Unix socket and streams each guest connection to the unlocked client, which dials the host Unix socket. | None. |
 | `port add` | Allowed on `127.0.0.1` or `[::1]` with loopback opt-in, or on listed IP literals with `--dynamic-ports-addr`. Unlisted addresses and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports`, `--auto-publish`, or `--dynamic-ports-addr IP`. |
 | `mount add --type tmpfs`, `mount rm` | Allowed; no host path opens occur. | None. |
 | `mount remount` | The server always allows remounting `rw` to `ro`; remounting `ro` to `rw` succeeds only when the host backing opened writable before lockdown. | Original writable mount. |
@@ -104,7 +105,7 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `system.ping` | Unary | Report protocol version, sandbox ID, state, uptime, and capabilities. |
 | `sandbox.inspect` | Unary | Return full runtime configuration, limits, ports, mounts, and security posture. |
 | `sandbox.stats` | Unary or event stream | Return one-shot or periodic CPU, memory, network, block I/O, and PID counters. |
-| `sandbox.events` | Event stream | Stream filtered lifecycle events (`exec`, `lifecycle`, `port`, `mount`, `resource`, `oom`). Auto-published ports emit `port` events with `source=auto` and actions `add`, `remove`, or `bind_failed`. |
+| `sandbox.events` | Event stream | Stream filtered lifecycle events (`exec`, `lifecycle`, `port`, `unix_forward`, `mount`, `resource`, `oom`). Auto-published ports emit `port` events with `source=auto` and actions `add`, `remove`, or `bind_failed`. |
 | `lifecycle.pause` | Unary | Pause all guest tasks and optionally quiesce host network forwarders. |
 | `lifecycle.unpause` | Unary | Resume a paused sandbox. |
 | `lifecycle.stop` | Unary | Send a signal to PID 1, wait up to `timeout_ms`, and escalate to `SIGKILL`. |
@@ -121,6 +122,8 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `net.dial` | Bidirectional stream | Dial a guest TCP endpoint inside the sandbox network stack and relay bytes on channel `0`. |
 | `net.policy_get` | Unary | Read the active host NAT policy. Requires `net.policy.read`. |
 | `net.policy_set` | Unary | Replace the active host NAT policy. Requires `net.policy.write`. |
+| `net.unix_forward` | Control event stream | Bind a listening Unix stream socket in the guest VFS and emit `unix.accept` events for guest connections. |
+| `net.unix_accept` | Bidirectional stream | Claim a pending guest Unix connection by `conn_id` and relay bytes on channel `0`. |
 | `mount.list` | Unary | List active guest mounts and mutability status. |
 | `mount.add` | Unary (optional FD) | Mount a `tmpfs`, `SCM_RIGHTS` `ext4lite` volume, or `-lockdown=false` bind mount. |
 | `mount.remount` | Unary | Toggle a mount between read-only and read-write. |

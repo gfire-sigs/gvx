@@ -168,6 +168,7 @@ type sandboxFlagValues struct {
 	tmpfsFlags             listFlag
 	tune                   *tuneFlags
 	portSpecs              multiStringFlag
+	unixForwardSpecs       listFlag
 	checkpointDir          string
 	controlSocket          string
 	controlAuto            bool
@@ -223,6 +224,7 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	registerAlias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&f.portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
 	})
+	fs.Var(&f.unixForwardSpecs, "unix-forward", "Forward a guest Unix socket to a host Unix socket: GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]")
 }
 
 func registerNetworkBandwidthFlags(fs *flag.FlagSet, tx, rx *uint64) {
@@ -451,6 +453,14 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	if err != nil {
 		return gvx.Config{}, false, err
 	}
+	var unixForwards []gvx.UnixForward
+	for _, spec := range f.unixForwardSpecs {
+		uf, err := gvx.ParseUnixForward(spec)
+		if err != nil {
+			return gvx.Config{}, false, fmt.Errorf("--unix-forward: %w", err)
+		}
+		unixForwards = append(unixForwards, uf)
+	}
 	envv, err := f.buildEnvv()
 	if err != nil {
 		return gvx.Config{}, false, err
@@ -520,6 +530,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		AllowPacketSocketWrite: priv.packetWrite,
 		AllowSUID:              priv.allowSUID,
 		PortForwards:           portForwards,
+		UnixForwards:           unixForwards,
 		PublishAll:             f.publishAll,
 		AutoPublishPorts:       f.autoPublish,
 		AutoPublishAddr:        strings.TrimSpace(f.autoPublishAddr),

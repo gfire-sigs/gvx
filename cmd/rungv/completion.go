@@ -63,7 +63,7 @@ _rungv_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local top_cmds="run exec pause unpause cp export update port port-forward pf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help"
+    local top_cmds="run exec pause unpause cp export update port port-forward pf unix-forward uf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help"
     local image_cmds="ls list pull rm remove rmi inspect tag save load prune"
     local volume_cmds="create ls list inspect compact rm remove prune"
     local system_cmds="info df prune"
@@ -155,7 +155,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --nat-policy-file --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --allow-bind-attach --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr --unix-forward -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --nat-policy-file --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --allow-bind-attach --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -198,6 +198,7 @@ _rungv() {
         'port:Manage published ports of a running sandbox'
         'port-forward:Forward local ports into a sandbox over the control socket'
         'net-policy:Read or replace the host NAT firewall policy'
+        'unix-forward:Forward guest Unix sockets to host Unix sockets over the control socket'
         'mount:Manage runtime mounts of a running sandbox'
         'status:Inspect a running sandbox over its control socket'
         'sandbox:Inspect a running sandbox'
@@ -299,6 +300,7 @@ _rungv() {
                 '--auto-publish-addr[Host IP literal for --auto-publish]:ip:' \
                 '--dynamic-ports[Allow runtime loopback port publishing via rungv port add]' \
                 '*--dynamic-ports-addr[Host IP literal allowed for runtime rungv port add under lockdown]:ip:' \
+                '*--unix-forward[Forward a guest Unix socket to a host Unix socket]:spec:' \
                 '*-e[Set guest environment variable]:env:' \
                 '*--env-file[Read environment variables from file]:file:_files' \
                 '-u[Guest user or UID:GID]:user:' \

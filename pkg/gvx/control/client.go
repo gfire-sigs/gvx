@@ -50,10 +50,6 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	timeout := opts.HandshakeTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
 	var dialer net.Dialer
 	nc, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
@@ -86,6 +82,22 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 			}
 		}
 	}
+	opts.Token = token
+	return dialEstablishedConn(ctx, nc, network, address, opts)
+}
+
+// DialConn performs the v2 HELLO handshake on an already-established net.Conn
+// (for example a pre-opened pipe pair to a pre-lockdown helper) and returns a
+// multiplexed Client.
+func DialConn(ctx context.Context, nc net.Conn, opts DialOptions) (*Client, error) {
+	return dialEstablishedConn(ctx, nc, "pipe", "pipe", opts)
+}
+
+func dialEstablishedConn(ctx context.Context, nc net.Conn, network, address string, opts DialOptions) (*Client, error) {
+	timeout := opts.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	deadline := time.Now().Add(timeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
@@ -98,7 +110,7 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 	}
 	helloReq := HelloRequest{
 		Version:  ProtocolVersion,
-		Token:    token,
+		Token:    opts.Token,
 		Client:   opts.ClientName,
 		Features: []string{"zstd", "scm_rights", FeatureNetQoS},
 	}

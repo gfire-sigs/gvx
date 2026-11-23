@@ -17,15 +17,18 @@
 package gvx
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/gvx/control"
@@ -73,6 +76,108 @@ const (
 	// NetworkNone is an alias for NetModeNone.
 	NetworkNone = NetModeNone
 )
+
+// UnixForward specifies a reverse Unix stream socket forward from a listening
+// socket inside the guest VFS (GuestPath) to a host Unix domain socket
+// (HostSocket) or a caller-supplied Dial callback.
+type UnixForward struct {
+	// GuestPath is the absolute path of the listening Unix socket inside the
+	// guest VFS (for example "/run/host-services/ssh-auth.sock").
+	GuestPath string
+
+	// HostSocket is the host Unix domain socket path dialed for each guest
+	// connect() when Dial is nil. Under host lockdown, Dial must be supplied by
+	// a pre-lockdown helper or the runtime net.unix_forward control RPC.
+	HostSocket string
+
+	// UID and GID set the owner of the guest Unix socket inode.
+	UID uint32
+	GID uint32
+
+	// Mode sets the permission bits (0..0777) of the guest Unix socket inode.
+	// Zero defaults to 0o666.
+	Mode uint32
+
+	// Dial establishes one host connection per accepted guest Unix socket
+	// connection. When set, HostSocket is used only as metadata.
+	Dial func(ctx context.Context) (net.Conn, error)
+}
+
+const maxUnixSocketPathLen = 107
+
+func validateUnixForwardGuestPath(guestPath string) error {
+	if err := validateGuestPath(guestPath); err != nil {
+		return err
+	}
+	if len(guestPath) > maxUnixSocketPathLen {
+		return fmt.Errorf("guest Unix socket path length %d exceeds Linux sun_path limit %d", len(guestPath), maxUnixSocketPathLen)
+	}
+	return nil
+}
+
+// ParseUnixForward parses "GUEST_PATH=HOST_SOCKET[,uid=N][,gid=N][,mode=0600]".
+func ParseUnixForward(spec string) (UnixForward, error) {
+	raw := strings.TrimSpace(spec)
+	guestPath, rhs, ok := strings.Cut(raw, "=")
+	if !ok {
+		return UnixForward{}, fmt.Errorf("gvx: invalid unix forward %q (want GUEST_PATH=HOST_SOCKET[,uid=N][,gid=N][,mode=0600])", spec)
+	}
+	guestPath = strings.TrimSpace(guestPath)
+	if err := validateUnixForwardGuestPath(guestPath); err != nil {
+		return UnixForward{}, fmt.Errorf("gvx: invalid unix forward guest path %q: %w", guestPath, err)
+	}
+	parts := strings.Split(rhs, ",")
+	hostSock := strings.TrimSpace(parts[0])
+	if hostSock == "" {
+		return UnixForward{}, fmt.Errorf("gvx: invalid unix forward %q: empty host socket path", spec)
+	}
+	if rest, hasTilde := strings.CutPrefix(hostSock, "~/"); hasTilde {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return UnixForward{}, fmt.Errorf("gvx: resolve ~ in host socket %q: %w", hostSock, err)
+		}
+		hostSock = filepath.Join(home, rest)
+	}
+	uf := UnixForward{
+		GuestPath:  guestPath,
+		HostSocket: hostSock,
+	}
+	for _, opt := range parts[1:] {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		k, v, hasEq := strings.Cut(opt, "=")
+		if !hasEq {
+			return UnixForward{}, fmt.Errorf("gvx: invalid unix forward option %q in %q (want key=value)", opt, spec)
+		}
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		switch k {
+		case "uid":
+			n, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				return UnixForward{}, fmt.Errorf("gvx: invalid unix forward uid %q: %w", v, err)
+			}
+			uf.UID = uint32(n)
+		case "gid":
+			n, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				return UnixForward{}, fmt.Errorf("gvx: invalid unix forward gid %q: %w", v, err)
+			}
+			uf.GID = uint32(n)
+		case "mode":
+			n, err := strconv.ParseUint(v, 8, 32)
+			if err != nil || n == 0 || n > 0o777 {
+				return UnixForward{}, fmt.Errorf("gvx: invalid unix forward mode %q (want octal 0001..0777)", v)
+			}
+			uf.Mode = uint32(n)
+		default:
+			return UnixForward{}, fmt.Errorf("gvx: unknown unix forward option %q (want uid, gid, or mode)", k)
+		}
+	}
+	return uf, nil
+}
 
 // PortForward specifies an inbound host-to-guest port forward (-p host:guest).
 type PortForward struct {
@@ -202,6 +307,10 @@ type Config struct {
 
 	// PortForwards lists inbound host-to-guest port forwardings (-p host:guest).
 	PortForwards []PortForward
+
+	// UnixForwards lists reverse guest-to-host Unix stream socket forwardings
+	// (--unix-forward GUEST_PATH=HOST_SOCKET[,uid=...,gid=...,mode=...]).
+	UnixForwards []UnixForward
 
 	// WireGuardConfigPath is the path to a WireGuard INI configuration file
 	// when NetworkMode is NetModeWireGuard.
@@ -536,6 +645,30 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	}
 	if len(c.PortForwards) > 0 && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: port forwards need network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+	}
+	if len(c.UnixForwards) > 0 {
+		seen := make(map[string]struct{}, len(c.UnixForwards))
+		for i := range c.UnixForwards {
+			uf := &c.UnixForwards[i]
+			if err := validateUnixForwardGuestPath(uf.GuestPath); err != nil {
+				return fmt.Errorf("%w: unix forward guest path %q: %w", ErrInvalidConfig, uf.GuestPath, err)
+			}
+			if _, dup := seen[uf.GuestPath]; dup {
+				return fmt.Errorf("%w: duplicate unix forward guest path %q", ErrInvalidConfig, uf.GuestPath)
+			}
+			seen[uf.GuestPath] = struct{}{}
+			if uf.Mode > 0o777 {
+				return fmt.Errorf("%w: unix forward mode %#o out of range [0, 0777]", ErrInvalidConfig, uf.Mode)
+			}
+			if uf.Dial == nil {
+				if strings.TrimSpace(uf.HostSocket) == "" {
+					return fmt.Errorf("%w: unix forward %q requires HostSocket or Dial", ErrInvalidConfig, uf.GuestPath)
+				}
+				if !c.DisableHostLockdown {
+					return fmt.Errorf("%w: unix forward %q without a pre-lockdown Dial callback is denied under host lockdown; use rungv --unix-forward, the net.unix_forward control RPC, or DisableHostLockdown", ErrInvalidConfig, uf.GuestPath)
+				}
+			}
+		}
 	}
 	if c.NetworkMode == NetModeWireGuard && c.WireGuardConfig == nil && c.WireGuardConfigPath == "" {
 		return fmt.Errorf("%w: network mode %q needs WireGuardConfig or WireGuardConfigPath", ErrInvalidConfig, NetModeWireGuard)

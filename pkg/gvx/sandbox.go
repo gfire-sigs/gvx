@@ -124,6 +124,13 @@ type Sandbox struct {
 	liveMemoryWake    chan struct{}
 	rpcMountsMu       sync.Mutex
 	rpcMounts         map[string]*rpcMountEntry
+	unixFwdMu         sync.Mutex
+	unixForwards      map[string]*activeUnixForward
+	pendingUnixConns  map[uint64]*pendingUnixConn
+	unixClosed        bool
+	unixCloseCh       chan struct{}
+	unixRelayWG       sync.WaitGroup
+	nextUnixConnID    atomic.Uint64
 	closed            bool
 	closeDone         chan struct{}
 	closeErr          error
@@ -144,6 +151,9 @@ func (s *Sandbox) initControlState() {
 	s.liveMemoryBytes.Store(s.cfg.Resources.MemoryBytes)
 	s.liveMemoryWake = make(chan struct{}, 1)
 	s.rpcMounts = make(map[string]*rpcMountEntry)
+	s.unixForwards = make(map[string]*activeUnixForward)
+	s.pendingUnixConns = make(map[uint64]*pendingUnixConn)
+	s.unixCloseCh = make(chan struct{})
 	if dir := strings.TrimSpace(s.cfg.CheckpointDir); dir != "" {
 		s.cleanCkptDir = filepath.Clean(dir)
 		if abs, err := filepath.Abs(s.cleanCkptDir); err == nil {
@@ -695,7 +705,10 @@ func (s *Sandbox) Close() error {
 		s.mu.Lock()
 	}
 
+	s.mu.Unlock()
 	s.closeRPCMounts()
+	s.closeUnixForwards()
+	s.mu.Lock()
 	s.closeServeMounts()
 
 	if s.cfg.ControlListener != nil {

@@ -137,6 +137,7 @@ func (s *Sandbox) ControlCapabilities() []string {
 		control.CapResourcePids,
 		control.CapResourceTuning,
 		control.CapNetDial,
+		control.CapUnixForward,
 		control.CapMountList,
 		control.CapMountTmpfs,
 		control.CapMountRemount,
@@ -299,6 +300,10 @@ func (s *Sandbox) HandleStream(ctx context.Context, stream *control.Stream, req 
 		return s.handleNATPolicyGet(ctx, stream)
 	case control.MethodNATPolicySet:
 		return s.handleNATPolicySet(ctx, stream, req.Params)
+	case control.MethodUnixForward:
+		return s.handleUnixForward(ctx, stream, req.Params)
+	case control.MethodUnixAccept:
+		return s.handleUnixAccept(ctx, stream, req.Params)
 	case control.MethodMountList:
 		return s.handleMountList(ctx, stream)
 	case control.MethodMountAdd:
