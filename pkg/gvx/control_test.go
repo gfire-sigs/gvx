@@ -650,7 +650,7 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 
 		// Verify rpcfs still reads cleanly after checkpoint -leave-running.
 		catAfter, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
-			Argv: []string{"/bin/cat", "/mnt/proxy/hello.txt"},
+			Argv: []string{"/bin/cat", "/mnt/proxy/host.txt"},
 		})
 		if err != nil {
 			t.Fatalf("exec cat after checkpoint: %v", err)

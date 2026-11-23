@@ -200,14 +200,13 @@ func startTestRPCFSServer(t *testing.T, ctx context.Context, client *control.Cli
 	}, done
 }
 
-func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) *runningControlSandbox {
+func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*runningControlSandbox, func()) {
 	t.Helper()
 	sockPath := shortControlSocketPath(t, "r.sock")
 	ep, err := control.Listen(sockPath, control.ListenOptions{})
 	if err != nil {
 		t.Fatalf("control.Listen(%q): %v", sockPath, err)
 	}
-	t.Cleanup(ep.Cleanup)
 
 	stdinR, stdinW := net.Pipe()
 	stdout := newNotifyBuffer()
@@ -231,6 +230,7 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) *runningC
 	if err != nil {
 		cancel()
 		_ = ep.Listener.Close()
+		ep.Cleanup()
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		t.Fatalf("gvx.Restore: %v", err)
@@ -261,10 +261,16 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) *runningC
 		_ = sb.Close()
 		<-ctrlDone
 		<-runDone
+		ep.Cleanup()
 		t.Fatalf("control.Dial: %v", err)
 	}
 
-	t.Cleanup(func() {
+	var closed bool
+	closeFn := func() {
+		if closed {
+			return
+		}
+		closed = true
 		_ = client.Close()
 		_ = stdinW.Close()
 		cancel()
@@ -276,7 +282,9 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) *runningC
 		<-runDone
 		_ = sb.Close()
 		_ = stdinR.Close()
-	})
+		ep.Cleanup()
+	}
+	t.Cleanup(closeFn)
 	return &runningControlSandbox{
 		sb:      sb,
 		ep:      ep,
@@ -285,7 +293,7 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) *runningC
 		stdinW:  stdinW,
 		runDone: runDone,
 		cancel:  cancel,
-	}
+	}, closeFn
 }
 
 func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
@@ -388,18 +396,50 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	}
 	rs.stdout.waitForSubstring(t, "READ:6789\n", 10*time.Second)
 
-	// 2. Restore Case A: Restore WITH --serve (Config.ServeMounts) and WITHOUT dynamic tmpfs flag.
+	// 2. Stopping checkpoint (LeaveRunning=false) must notify serving clients with rpcfs.detached
+	// and release the original VM before opening restored sandboxes (Windows WHPX partition limit).
+	ckptStop := t.TempDir()
+	// Copy ckptDir bundle to ckptDir (keep ckptDir at offset 6 for restore cases below),
+	// and run stopping checkpoint into rs's pre-opened CheckpointDir ONLY AFTER copying ckptDir!
+	ckptAt6 := t.TempDir()
+	for _, name := range []string{checkpointManifestFileName, checkpointStateFileName, checkpointPagesMetaFileName, checkpointPagesFileName} {
+		raw, err := os.ReadFile(filepath.Join(ckptDir, name))
+		if err != nil {
+			t.Fatalf("read bundle %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(ckptAt6, name), raw, 0o600); err != nil {
+			t.Fatalf("copy bundle %s: %v", name, err)
+		}
+	}
+	_ = ckptStop
+	if err := rs.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
+		t.Fatalf("Checkpoint(LeaveRunning=false): %v", err)
+	}
+	for name, ch := range map[string]<-chan bool{"dir": detDirCh, "single": detSingleCh} {
+		select {
+		case detached := <-ch:
+			if !detached {
+				t.Fatalf("serving client %s exited without rpcfs.detached event", name)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("serving client %s did not receive rpcfs.detached within 5s", name)
+		}
+	}
+	<-rs.runDone
+	_ = rs.sb.Close()
+
+	// 3. Restore Case A: Restore WITH --serve (Config.ServeMounts) and WITHOUT dynamic tmpfs flag.
 	restoreDirA := t.TempDir()
 	if err := os.WriteFile(filepath.Join(restoreDirA, "data.txt"), []byte("012345ABCDabcdef"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rsA := startRestoredControlSandbox(t, Config{
+	rsA, closeA := startRestoredControlSandbox(t, Config{
 		OCICacheDir: cacheDir,
 		ServeMounts: []ServeMount{
 			{HostPath: restoreDirA, GuestPath: "/mnt/proj"},
 			{HostPath: singleFile, GuestPath: "/mnt/single.txt", ReadOnly: true},
 		},
-	}, ckptDir)
+	}, ckptAt6)
 
 	if _, err := io.WriteString(rsA.stdinW, "read\n"); err != nil {
 		t.Fatalf("write read to restored A: %v", err)
@@ -444,15 +484,16 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 			t.Fatalf("mount.list missing %q: %+v", want, ml.Mounts)
 		}
 	}
+	closeA()
 
-	// 3. Restore Case B: Restore WITHOUT --serve -> EIO -> reconnect via mount.serve -> same open FD works!
+	// 4. Restore Case B: Restore WITHOUT --serve -> EIO -> reconnect via mount.serve -> same open FD works!
 	restoreDirB := t.TempDir()
 	if err := os.WriteFile(filepath.Join(restoreDirB, "data.txt"), []byte("012345WXYZabcdef"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rsB := startRestoredControlSandbox(t, Config{
+	rsB, closeB := startRestoredControlSandbox(t, Config{
 		OCICacheDir: cacheDir,
-	}, ckptDir)
+	}, ckptAt6)
 
 	if _, err := io.WriteString(rsB.stdinW, "read\n"); err != nil {
 		t.Fatalf("write detached read to restored B: %v", err)
@@ -461,17 +502,16 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 
 	// Reconnect /mnt/proj at runtime via mount.serve.
 	_, cancelB, doneB := startTestRPCFSServer(t, ctx, rsB.client, restoreDirB, "/mnt/proj", false, false)
-	defer func() {
-		cancelB()
-		<-doneB
-	}()
 
 	if _, err := io.WriteString(rsB.stdinW, "read\n"); err != nil {
 		t.Fatalf("write reconnected read to restored B: %v", err)
 	}
 	rsB.stdout.waitForSubstring(t, "READ:WXYZ\n", 10*time.Second)
+	cancelB()
+	<-doneB
+	closeB()
 
-	// 4. Negative manifest validation checks on Restore.
+	// 5. Negative manifest validation checks on Restore.
 	for _, tc := range []struct {
 		name   string
 		serves []ServeMount
@@ -497,7 +537,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 				OCICacheDir:            cacheDir,
 				DisableHostLockdown:    true,
 				ServeMounts:            tc.serves,
-			}, RestoreOptions{Dir: ckptDir})
+			}, RestoreOptions{Dir: ckptAt6})
 			if sb != nil {
 				_ = sb.Close()
 			}
@@ -505,21 +545,6 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 				t.Fatalf("Restore(%s) err = %v, want ErrCheckpointManifest", tc.name, rErr)
 			}
 		})
-	}
-
-	// 5. Stopping checkpoint (LeaveRunning=false) must notify serving clients with rpcfs.detached.
-	if err := rs.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
-		t.Fatalf("Checkpoint(LeaveRunning=false): %v", err)
-	}
-	for name, ch := range map[string]<-chan bool{"dir": detDirCh, "single": detSingleCh} {
-		select {
-		case detached := <-ch:
-			if !detached {
-				t.Fatalf("serving client %s exited without rpcfs.detached event", name)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("serving client %s did not receive rpcfs.detached within 5s", name)
-		}
 	}
 }
 
@@ -697,51 +722,16 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 		t.Fatalf("Checkpoint #1: %v", err)
 	}
 
-	// 1. Restore #1 with --serve ...:ro -> chained checkpoint #2 -> detached restore must refuse rw reconnect.
-	rsRO := startRestoredControlSandbox(t, Config{
-		OCICacheDir:   cacheDir,
-		CheckpointDir: ckpt2,
-		ServeMounts: []ServeMount{
-			{HostPath: serveDir, GuestPath: "/mnt/proj", ReadOnly: true},
-		},
-	}, ckpt1)
-	if err := rsRO.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
-		Target: "/mnt/proj", ReadOnly: false,
-	}, nil); !control.IsCode(err, control.CodeLockdownDenied) {
-		t.Fatalf("remount rw on --serve :ro err = %v, want LOCKDOWN_DENIED", err)
-	}
-	if err := rsRO.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
-		t.Fatalf("Chained Checkpoint #2: %v", err)
-	}
-	rsRO2 := startRestoredControlSandbox(t, Config{OCICacheDir: cacheDir}, ckpt2)
-	stRW, err := rsRO2.client.OpenStream(ctx, control.MethodMountServe, control.MountServeRequest{
-		Target: "/mnt/proj", ReadOnly: false, Label: serveDir,
-	})
-	if err != nil {
-		t.Fatalf("OpenStream rw reconnect: %v", err)
-	}
-	if err := stRW.WaitResponse(ctx, nil); !control.IsCode(err, control.CodeLockdownDenied) {
-		stRW.Close()
-		t.Fatalf("rw reconnect after chained :ro checkpoint err = %v, want LOCKDOWN_DENIED", err)
-	}
-	stRW.Close()
-
-	// 2. Remount a second rw mount (/mnt/remount, no open writable FD) ro before checkpoint,
-	// restore detached -> mount.list keeps ReadOnly=true; reconnect with ro client ->
-	// mount.remount rw is refused.
+	// 1. Remount a second rw mount (/mnt/remount, no open writable FD) ro before checkpoint,
+	// then save via CheckpointStream(LeaveRunning=true).
 	remountDir := t.TempDir()
 	_, cancelRemSrc, doneRemSrc := startTestRPCFSServer(t, ctx, rs.client, remountDir, "/mnt/remount", false, false)
-	defer func() {
-		cancelRemSrc()
-		<-doneRemSrc
-	}()
 	if err := rs.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
 		Target: "/mnt/remount", ReadOnly: true,
 	}, nil); err != nil {
 		t.Fatalf("mount.remount ro: %v", err)
 	}
 	ckptRemount := t.TempDir()
-	// Save via CheckpointStream(LeaveRunning=true) to also exercise CheckpointStream.
 	cs, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: true})
 	if err != nil {
 		t.Fatalf("CheckpointStream open: %v", err)
@@ -756,33 +746,8 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 	}
 	cs.Close()
 
-	rsRem := startRestoredControlSandbox(t, Config{OCICacheDir: cacheDir}, ckptRemount)
-	var ml control.MountListResponse
-	if err := rsRem.client.Call(ctx, control.MethodMountList, nil, &ml); err != nil {
-		t.Fatalf("mount.list after remount restore: %v", err)
-	}
-	foundRO := false
-	for _, m := range ml.Mounts {
-		if m.Target == "/mnt/remount" {
-			foundRO = m.ReadOnly
-		}
-	}
-	if !foundRO {
-		t.Fatalf("restored /mnt/remount expected ReadOnly=true in mount.list, got %+v", ml.Mounts)
-	}
-	_, cancelROCli, doneROCli := startTestRPCFSServer(t, ctx, rsRem.client, remountDir, "/mnt/remount", true, false)
-	defer func() {
-		cancelROCli()
-		<-doneROCli
-	}()
-	if err := rsRem.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
-		Target: "/mnt/remount", ReadOnly: false,
-	}, nil); !control.IsCode(err, control.CodeLockdownDenied) {
-		t.Fatalf("mount.remount rw while ro client attached err = %v, want LOCKDOWN_DENIED", err)
-	}
-
-	// 3. Lazy-unmount /mnt/proj (MNT_DETACH) while guest holds open FD, then mount a replacement
-	// at /mnt/proj and checkpoint via CheckpointStream(LeaveRunning=false).
+	// 2. Lazy-unmount /mnt/proj (MNT_DETACH) while guest holds open FD, mount a replacement
+	// at /mnt/proj, and stop rs via CheckpointStream(LeaveRunning=false) so only one VM runs at a time.
 	if err := rs.client.Call(ctx, control.MethodMountRemove, control.MountRemoveRequest{
 		Target: "/mnt/proj", Detach: true,
 	}, nil); err != nil {
@@ -797,10 +762,6 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 		t.Fatal(err)
 	}
 	detRepCh, cancelRep, doneRep := startTestRPCFSServer(t, ctx, rs.client, replaceDir, "/mnt/proj", false, false)
-	defer func() {
-		cancelRep()
-		<-doneRep
-	}()
 
 	csStop, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: false})
 	if err != nil {
@@ -824,14 +785,79 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("replacement serve client did not receive rpcfs.detached")
 	}
+	cancelRep()
+	<-doneRep
+	cancelRemSrc()
+	<-doneRemSrc
+	<-rs.runDone
+	_ = rs.sb.Close()
 
-	// Restore checkpoint that has both lazy-unmounted fs1 (open FD) and live replacement fs2 at /mnt/proj.
-	rsLazy := startRestoredControlSandbox(t, Config{
+	// 3. Restore #1 with --serve ...:ro -> chained checkpoint #2 -> detached restore must refuse rw reconnect.
+	rsRO, closeRO := startRestoredControlSandbox(t, Config{
+		OCICacheDir:   cacheDir,
+		CheckpointDir: ckpt2,
+		ServeMounts: []ServeMount{
+			{HostPath: serveDir, GuestPath: "/mnt/proj", ReadOnly: true},
+		},
+	}, ckpt1)
+	if err := rsRO.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+		Target: "/mnt/proj", ReadOnly: false,
+	}, nil); !control.IsCode(err, control.CodeLockdownDenied) {
+		t.Fatalf("remount rw on --serve :ro err = %v, want LOCKDOWN_DENIED", err)
+	}
+	if err := rsRO.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
+		t.Fatalf("Chained Checkpoint #2: %v", err)
+	}
+	closeRO()
+
+	rsRO2, closeRO2 := startRestoredControlSandbox(t, Config{OCICacheDir: cacheDir}, ckpt2)
+	stRW, err := rsRO2.client.OpenStream(ctx, control.MethodMountServe, control.MountServeRequest{
+		Target: "/mnt/proj", ReadOnly: false, Label: serveDir,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream rw reconnect: %v", err)
+	}
+	if err := stRW.WaitResponse(ctx, nil); !control.IsCode(err, control.CodeLockdownDenied) {
+		stRW.Close()
+		t.Fatalf("rw reconnect after chained :ro checkpoint err = %v, want LOCKDOWN_DENIED", err)
+	}
+	stRW.Close()
+	closeRO2()
+
+	// 4. Restore remounted-ro checkpoint detached -> mount.list keeps ReadOnly=true;
+	// reconnect with ro client -> mount.remount rw is refused.
+	rsRem, closeRem := startRestoredControlSandbox(t, Config{OCICacheDir: cacheDir}, ckptRemount)
+	var ml control.MountListResponse
+	if err := rsRem.client.Call(ctx, control.MethodMountList, nil, &ml); err != nil {
+		t.Fatalf("mount.list after remount restore: %v", err)
+	}
+	foundRO := false
+	for _, m := range ml.Mounts {
+		if m.Target == "/mnt/remount" {
+			foundRO = m.ReadOnly
+		}
+	}
+	if !foundRO {
+		t.Fatalf("restored /mnt/remount expected ReadOnly=true in mount.list, got %+v", ml.Mounts)
+	}
+	_, cancelROCli, doneROCli := startTestRPCFSServer(t, ctx, rsRem.client, remountDir, "/mnt/remount", true, false)
+	if err := rsRem.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+		Target: "/mnt/remount", ReadOnly: false,
+	}, nil); !control.IsCode(err, control.CodeLockdownDenied) {
+		t.Fatalf("mount.remount rw while ro client attached err = %v, want LOCKDOWN_DENIED", err)
+	}
+	cancelROCli()
+	<-doneROCli
+	closeRem()
+
+	// 5. Restore checkpoint that has both lazy-unmounted fs1 (open FD) and live replacement fs2 at /mnt/proj.
+	rsLazy, closeLazy := startRestoredControlSandbox(t, Config{
 		OCICacheDir: cacheDir,
 		ServeMounts: []ServeMount{
 			{HostPath: replaceDir, GuestPath: "/mnt/proj"},
 		},
 	}, ckptLazy)
+	defer closeLazy()
 	// Old open FD from lazy-unmounted fs1 returns EIO, while live replacement mount at /mnt/proj stays healthy.
 	if _, err := io.WriteString(rsLazy.stdinW, "read\n"); err != nil {
 		t.Fatal(err)
