@@ -15,6 +15,7 @@
 package gvx
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -131,7 +132,7 @@ func main() {
 		os.Exit(4)
 	}
 	defer c.Close()
-	if _, err := io.WriteString(c, msg); err != nil {
+	if _, err := io.WriteString(c, msg+"\n"); err != nil {
 		fmt.Fprintf(os.Stderr, "write: %v\n", err)
 		os.Exit(5)
 	}
@@ -158,7 +159,7 @@ func main() {
 		t.Fatalf("write main.go: %v", err)
 	}
 	outPath := filepath.Join(srcDir, "uclient")
-	cmd := exec.Command("go", "build", "-o", outPath, ".")
+	cmd := exec.Command("go", "build", "-ldflags=-linkmode=internal", "-o", outPath, ".")
 	cmd.Dir = srcDir
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -187,11 +188,12 @@ func startHostUnixEchoServer(t *testing.T) string {
 			}
 			go func(conn net.Conn) {
 				defer conn.Close()
-				req, err := io.ReadAll(conn)
-				if err != nil {
+				req, err := bufio.NewReader(conn).ReadString('\n')
+				if err != nil && !errors.Is(err, io.EOF) {
 					return
 				}
-				_, _ = io.WriteString(conn, "host-agent:"+string(req))
+				req = strings.TrimSuffix(req, "\n")
+				_, _ = io.WriteString(conn, "host-agent:"+req)
 			}(c)
 		}
 	}()
@@ -252,6 +254,7 @@ func TestUnixForwardBootAndRuntimeControlRPC(t *testing.T) {
 		t.Helper()
 		st, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
 			Argv: []string{"/bin/uclient", guestSock, msg},
+			Env:  []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 		})
 		if err != nil {
 			t.Fatalf("exec uclient open: %v", err)

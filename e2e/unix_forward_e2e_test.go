@@ -15,8 +15,10 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -59,7 +61,7 @@ func main() {
 		os.Exit(4)
 	}
 	defer c.Close()
-	if _, err := io.WriteString(c, msg); err != nil {
+	if _, err := io.WriteString(c, msg+"\n"); err != nil {
 		os.Exit(5)
 	}
 	if uc, ok := c.(*net.UnixConn); ok {
@@ -79,7 +81,7 @@ func main() {
 		t.Fatalf("write main.go: %v", err)
 	}
 	outPath := filepath.Join(srcDir, "uclient")
-	cmd := exec.Command("go", "build", "-o", outPath, ".")
+	cmd := exec.Command("go", "build", "-ldflags=-linkmode=internal", "-o", outPath, ".")
 	cmd.Dir = srcDir
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -118,11 +120,12 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 			}
 			go func(conn net.Conn) {
 				defer conn.Close()
-				req, err := io.ReadAll(conn)
-				if err != nil {
+				req, err := bufio.NewReader(conn).ReadString('\n')
+				if err != nil && !errors.Is(err, io.EOF) {
 					return
 				}
-				_, _ = io.WriteString(conn, "locked-agent:"+string(req))
+				req = strings.TrimSuffix(req, "\n")
+				_, _ = io.WriteString(conn, "locked-agent:"+req)
 			}(c)
 		}
 	}()
