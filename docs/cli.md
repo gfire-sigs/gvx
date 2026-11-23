@@ -119,7 +119,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `--allow-suid` | Obey `setuid` and `setgid` bits on guest executables (`sudo`, `su`, `passwd` for non-root users). Defaults to `--privileged`. |
 | `--host-ca-certs` | Copy host root CA certificates into the guest (off by default; see Section 4.10). |
 | `-registry-url URL` | Override the registry host of the image reference. |
-| `--host-dns IP[:PORT]` | Specify a host DNS server (repeatable). Replaces host resolver discovery for the guest DNS relay and registry pulls. Also accepted by `pull` and `save` (see Section 5.2). |
+| `--host-dns IP[:PORT]` | Specify a host DNS server (repeatable). Replaces host resolver discovery for the guest DNS relay and registry requests. Also accepted by `pull`, `push`, and `save` (see Section 5.2). |
 | `-cache-dir DIR` | Override the layer cache directory. |
 | `-keep-blobs` | Retain original image layer blobs in the cache during pull or load (default from `GVX_KEEP_BLOBS`). Enables offline `save` and `push` without a source registry. |
 | `-checkpoint-dir DIR` | Pre-open a host directory before lockdown for local checkpoint bundle files. |
@@ -522,11 +522,11 @@ The layer cache holds compiled EROFS layers, one record per image, and one recor
 | :--- | :--- |
 | `rungv image ls` (`rungv images`) | Lists cached images. `IMAGE ID` shows the first 12 hex digits of the config digest, and `SIZE` sums the EROFS layer files. Accepts `-a`, `-q`, `--no-trunc`, `--digests`, and `--format`. |
 | `rungv image pull` (`rungv pull`) | Downloads an image or archive into the layer cache. Accepts `--platform linux/ARCH`, `-arch`, `-registry-url`, `-keep-blobs`, and `--host-dns`. |
-| `rungv image push` (`rungv push`) | Uploads a cached image (`IMAGE [TARGET]`) to a registry. Checks existing blobs with `HEAD`, attempts cross-repository mounts on the same registry, and uploads the exact manifest bytes. Accepts `--platform`, `-registry-url`, `--host-dns`, `-q`, `-u`/`--username` with `--password-stdin`, `--auth-stdin`, and `--auth-fd N`. |
+| `rungv image push` (`rungv push`) | Uploads a cached image (`IMAGE [TARGET]`) to a registry. Queries existing blobs with `HEAD`, attempts cross-repository mounts on the same registry, and uploads the exact manifest bytes. Accepts `--platform`, `-registry-url`, `--host-dns`, `-q`, `-u`/`--username` with `--password-stdin`, `--auth-stdin`, and `--auth-fd N`. |
 | `rungv image inspect` (`rungv inspect`) | Prints a JSON array of image metadata, or evaluates `-f` / `--format` per image. |
 | `rungv image rm` (`rungv rmi`) | Removes a tag or an image record and deletes unreferenced EROFS layers and kept blobs. An image ID with multiple tags requires `-f`. |
 | `rungv image tag` (`rungv tag`) | Creates a second repository or tag reference for a cached image. |
-| `rungv image save` (`rungv save`) | Writes an OCI layout and `docker save` tar archive. Reads kept blobs locally first and fetches only missing blobs from the origin registry. Works offline when all blobs are kept. |
+| `rungv image save` (`rungv save`) | Writes an OCI layout and `docker save` tar archive. Reads kept blobs locally first and fetches only missing blobs from the origin registry. Works offline when the cache holds all blobs. |
 | `rungv image load` (`rungv load`) | Loads images for the selected architecture from an OCI layout or `docker save` tar archive. Accepts `-keep-blobs` to retain original layer blobs for offline `save` and `push`. |
 | `rungv image prune [-a] [-f]` | Deletes dangling images (or all images for the architecture with `-a`), sweeps orphaned layer files and kept blobs, and prints reclaimed bytes. |
 

@@ -129,6 +129,9 @@ func (c *LayerCache) SaveImages(ctx context.Context, w io.Writer, client *http.C
 					return err
 				}
 				if !copied {
+					if p.baseURL == "" {
+						return fmt.Errorf("oci: cached blob %s disappeared during save: %w", l.Digest, ErrNoRegistrySource)
+					}
 					rc, err := clientFor(p)
 					if err != nil {
 						return err

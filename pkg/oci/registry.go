@@ -25,7 +25,9 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -40,8 +42,14 @@ const (
 	// defaultIdleTimeout is how long a registry request may go without
 	// receiving a byte before it fails.
 	defaultIdleTimeout = 60 * time.Second
-	userAgent          = "gvx-oci"
+	// ociClientProtocolVersion tracks the wire protocol behavior of pkg/oci
+	// independently of product release versions to avoid fingerprinting.
+	ociClientProtocolVersion = "v1.0"
+	// oauthClientID identifies this client in OAuth2 token exchange requests.
+	oauthClientID = "gvx-oci"
 )
+
+var userAgent = fmt.Sprintf("gvx-oci/%s (%s/%s; +https://z.gfire.dev/gvx)", ociClientProtocolVersion, runtime.GOOS, runtime.GOARCH)
 
 var manifestAccept = strings.Join([]string{
 	ocispec.MediaTypeImageIndex,
@@ -167,16 +175,17 @@ func canonicalHost(u *url.URL) string {
 
 // idleBody cancels its request when no byte arrives within the idle timeout.
 type idleBody struct {
-	rc     io.ReadCloser
-	timer  *time.Timer
-	idle   time.Duration
-	cancel context.CancelFunc
-	parent context.Context
+	rc      io.ReadCloser
+	timer   *time.Timer
+	stopped *atomic.Bool
+	idle    time.Duration
+	cancel  context.CancelFunc
+	parent  context.Context
 }
 
 func (b *idleBody) Read(p []byte) (int, error) {
 	n, err := b.rc.Read(p)
-	if n > 0 {
+	if n > 0 && !b.stopped.Load() {
 		b.timer.Reset(b.idle)
 	}
 	if err != nil && !errors.Is(err, io.EOF) && b.parent.Err() == nil {
@@ -186,6 +195,7 @@ func (b *idleBody) Read(p []byte) (int, error) {
 }
 
 func (b *idleBody) Close() error {
+	b.stopped.Store(true)
 	b.timer.Stop()
 	err := b.rc.Close()
 	b.cancel()
@@ -195,14 +205,15 @@ func (b *idleBody) Close() error {
 // idleReader resets timer on every Read that makes progress, so long uploads
 // only fail when the transfer stalls.
 type idleReader struct {
-	rc    io.ReadCloser
-	timer *time.Timer
-	idle  time.Duration
+	rc      io.ReadCloser
+	timer   *time.Timer
+	stopped *atomic.Bool
+	idle    time.Duration
 }
 
 func (r *idleReader) Read(p []byte) (int, error) {
 	n, err := r.rc.Read(p)
-	if n > 0 {
+	if n > 0 && !r.stopped.Load() {
 		r.timer.Reset(r.idle)
 	}
 	return n, err
@@ -232,19 +243,27 @@ func (rc *registryClient) onceRequest(ctx context.Context, method, rawURL string
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
+	var stopped atomic.Bool
 	timer := time.AfterFunc(rc.idle, cancel)
+	stopTimer := func() {
+		stopped.Store(true)
+		timer.Stop()
+	}
 
 	var bodyReader io.Reader
 	var openedBody io.ReadCloser
-	if body != nil && body.open != nil {
+	hasNonEmptyBody := body != nil && body.open != nil && body.contentLength != 0
+	if body != nil && body.contentLength == 0 {
+		bodyReader = http.NoBody
+	} else if hasNonEmptyBody {
 		var openErr error
 		openedBody, openErr = body.open()
 		if openErr != nil {
-			timer.Stop()
+			stopTimer()
 			cancel()
 			return nil, openErr
 		}
-		bodyReader = &idleReader{rc: openedBody, timer: timer, idle: rc.idle}
+		bodyReader = &idleReader{rc: openedBody, timer: timer, stopped: &stopped, idle: rc.idle}
 	}
 
 	req, err := http.NewRequestWithContext(reqCtx, method, rawURL, bodyReader)
@@ -252,7 +271,7 @@ func (rc *registryClient) onceRequest(ctx context.Context, method, rawURL string
 		if openedBody != nil {
 			_ = openedBody.Close()
 		}
-		timer.Stop()
+		stopTimer()
 		cancel()
 		return nil, fmt.Errorf("oci: build request %s: %w", reqURL.Redacted(), err)
 	}
@@ -260,14 +279,14 @@ func (rc *registryClient) onceRequest(ctx context.Context, method, rawURL string
 		if body.contentLength >= 0 {
 			req.ContentLength = body.contentLength
 		}
-		if body.open != nil {
+		if hasNonEmptyBody {
 			openFn := body.open
 			req.GetBody = func() (io.ReadCloser, error) {
 				inner, err := openFn()
 				if err != nil {
 					return nil, err
 				}
-				return &idleReader{rc: inner, timer: timer, idle: rc.idle}, nil
+				return &idleReader{rc: inner, timer: timer, stopped: &stopped, idle: rc.idle}, nil
 			}
 		}
 	}
@@ -286,7 +305,7 @@ func (rc *registryClient) onceRequest(ctx context.Context, method, rawURL string
 
 	resp, err := rc.http.Do(req)
 	if err != nil {
-		timer.Stop()
+		stopTimer()
 		// Only the idle timer cancels reqCtx before this call does.
 		stalled := ctx.Err() == nil && reqCtx.Err() != nil
 		cancel()
@@ -295,8 +314,10 @@ func (rc *registryClient) onceRequest(ctx context.Context, method, rawURL string
 		}
 		return nil, fmt.Errorf("oci: request %s: %w", reqURL.Redacted(), err)
 	}
-	timer.Reset(rc.idle)
-	resp.Body = &idleBody{rc: resp.Body, timer: timer, idle: rc.idle, cancel: cancel, parent: ctx}
+	if !stopped.Load() {
+		timer.Reset(rc.idle)
+	}
+	resp.Body = &idleBody{rc: resp.Body, timer: timer, stopped: &stopped, idle: rc.idle, cancel: cancel, parent: ctx}
 	return resp, nil
 }
 
@@ -309,6 +330,9 @@ func (rc *registryClient) doRequest(ctx context.Context, method, rawURL string, 
 	}
 	reqURL, parseErr := url.Parse(rawURL)
 	if parseErr != nil || canonicalHost(reqURL) != canonicalHost(rc.baseURL) {
+		return resp, nil
+	}
+	if resp.Request != nil && resp.Request.URL != nil && canonicalHost(resp.Request.URL) != canonicalHost(rc.baseURL) {
 		return resp, nil
 	}
 	authHeaders := resp.Header.Values("WWW-Authenticate")
@@ -679,7 +703,7 @@ func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cr
 		form := url.Values{
 			"grant_type":    {"refresh_token"},
 			"refresh_token": {cred.IdentityToken},
-			"client_id":     {userAgent},
+			"client_id":     {oauthClientID},
 		}
 		if s := ch.params["service"]; s != "" {
 			form.Set("service", s)

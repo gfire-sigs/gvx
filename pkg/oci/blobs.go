@@ -99,6 +99,7 @@ func (c *LayerCache) openVerifiedBlob(d digest.Digest, wantSize int64) (*os.File
 	}
 	if wantSize >= 0 && info.Size() != wantSize {
 		_ = f.Close()
+		c.forgetVerifiedBlob(hexStr)
 		return nil, 0, fmt.Errorf("%w: cached blob %s has %d bytes, want %d", ErrDigestMismatch, d, info.Size(), wantSize)
 	}
 
@@ -116,6 +117,7 @@ func (c *LayerCache) openVerifiedBlob(d digest.Digest, wantSize int64) (*os.File
 	}
 	if got := digester.Digest().Encoded(); got != hexStr {
 		_ = f.Close()
+		c.forgetVerifiedBlob(hexStr)
 		return nil, 0, fmt.Errorf("%w: cached blob %s has sha256 %s", ErrDigestMismatch, d, got)
 	}
 	c.recordVerifiedBlob(hexStr, info)
@@ -128,6 +130,12 @@ func (c *LayerCache) recordVerifiedBlob(hexStr string, info os.FileInfo) {
 	c.mu.Unlock()
 }
 
+func (c *LayerCache) forgetVerifiedBlob(hexStr string) {
+	c.mu.Lock()
+	delete(c.verifiedBlobs, hexStr)
+	c.mu.Unlock()
+}
+
 // storeBlobFromReader streams src to a temporary file under blobs/sha256/,
 // verifies size (when wantSize >= 0) and SHA-256 digest d, and publishes it
 // atomically without replacing an already-valid blob.
@@ -136,11 +144,9 @@ func (c *LayerCache) storeBlobFromReader(d digest.Digest, wantSize int64, src io
 		return "", 0, err
 	}
 	hexStr := d.Encoded()
-	if c.hasBlobWithSize(d, wantSize) {
-		info, err := os.Stat(filepath.Join(c.blobsDir(), hexStr))
-		if err == nil {
-			return filepath.Join(c.blobsDir(), hexStr), info.Size(), nil
-		}
+	if f, size, err := c.openVerifiedBlob(d, wantSize); err == nil {
+		_ = f.Close()
+		return filepath.Join(c.blobsDir(), hexStr), size, nil
 	}
 	blobDir := c.blobsDir()
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {

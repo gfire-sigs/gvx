@@ -865,12 +865,15 @@ func (c *LayerCache) ImportCachedImage(src *LayerCache, baseURL, repository, ref
 		}
 		if c.KeepBlobs() {
 			dgst := digest.NewDigestFromEncoded(digest.SHA256, d)
-			if f, sz, bErr := src.openVerifiedBlob(dgst, -1); bErr == nil {
+			f, sz, bErr := src.openVerifiedBlob(dgst, -1)
+			if bErr == nil {
 				_, _, sErr := c.storeBlobFromReader(dgst, sz, io.NewSectionReader(f, 0, sz))
 				_ = f.Close()
 				if sErr != nil {
 					return nil, sErr
 				}
+			} else if !errors.Is(bErr, os.ErrNotExist) {
+				return nil, bErr
 			}
 		}
 	}

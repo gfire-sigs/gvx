@@ -67,7 +67,8 @@ func pushSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		return imageUsageError(stderr, "push", "%v", err)
 	}
 
-	creds, usageErr, readErr := readPushCredentials(username, passwordStdin, authStdin, authFD, stdin)
+	authFDSet := flagVisited(fs, "auth-fd")
+	creds, usageErr, readErr := readPushCredentials(username, passwordStdin, authStdin, authFD, authFDSet, stdin)
 	if usageErr != nil {
 		return imageUsageError(stderr, "push", "%v", usageErr)
 	}
@@ -107,17 +108,19 @@ func pushSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		}
 	} else {
 		switch {
+		case sel.Ref == nil:
+			return imageUsageError(stderr, "push", "push by image ID requires a TARGET reference")
 		case registryURL != "":
 			target, err = oci.ParseReferenceAt(imageArg, registryURL)
 			if err != nil {
 				return imageUsageError(stderr, "push", "%v", err)
 			}
-		case sel.Ref != nil:
-			target = *sel.Ref
 		default:
-			return imageUsageError(stderr, "push", "push by image ID requires a TARGET reference")
+			target = *sel.Ref
 		}
 	}
+
+	selectedImg := selectImageForPush(sel.Images, target, registryURL)
 
 	if !quiet {
 		_, _ = fmt.Fprintf(stdout, "The push refers to repository [%s]\n", target.FamiliarName())
@@ -144,7 +147,7 @@ func pushSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		}
 	}
 
-	res, err := cache.PushImage(ctx, sel.Images[0], target, opts)
+	res, err := cache.PushImage(ctx, selectedImg, target, opts)
 	if err != nil {
 		return imageFail(stderr, "push", err)
 	}
@@ -157,7 +160,31 @@ func pushSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 	return 0
 }
 
-func readPushCredentials(username string, passwordStdin, authStdin bool, authFD int, stdin io.Reader) (creds *oci.Credentials, usageErr, readErr error) {
+func selectImageForPush(images []oci.Image, target oci.Reference, registryURL string) oci.Image {
+	targetBase := strings.TrimRight(strings.TrimSpace(registryURL), "/")
+	if targetBase == "" {
+		targetBase = target.BaseURL()
+	}
+	var fallbackRegistry *oci.Image
+	for i := range images {
+		img := &images[i]
+		if img.FromArchive() || !img.Named() {
+			continue
+		}
+		if strings.EqualFold(strings.TrimRight(img.BaseURL, "/"), targetBase) {
+			return *img
+		}
+		if fallbackRegistry == nil {
+			fallbackRegistry = img
+		}
+	}
+	if fallbackRegistry != nil {
+		return *fallbackRegistry
+	}
+	return images[0]
+}
+
+func readPushCredentials(username string, passwordStdin, authStdin bool, authFD int, authFDSet bool, stdin io.Reader) (creds *oci.Credentials, usageErr, readErr error) {
 	modes := 0
 	if passwordStdin {
 		modes++
@@ -165,7 +192,7 @@ func readPushCredentials(username string, passwordStdin, authStdin bool, authFD 
 	if authStdin {
 		modes++
 	}
-	if authFD >= 0 {
+	if authFDSet {
 		modes++
 	}
 	if modes > 1 {

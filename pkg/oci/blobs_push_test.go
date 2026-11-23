@@ -27,11 +27,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -560,8 +562,9 @@ func TestPushImageCrossRepoMount(t *testing.T) {
 
 func TestPushImageAuthBearerScopeUpgradeAndExternalLocationStripsAuth(t *testing.T) {
 	var seenScopes []string
+	var seenUA []string
 	var mu sync.Mutex
-	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	tokenHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		u, p, ok := req.BasicAuth()
 		if !ok || u != "alice" || p != "secret" {
 			http.Error(w, "bad creds", http.StatusUnauthorized)
@@ -570,6 +573,7 @@ func TestPushImageAuthBearerScopeUpgradeAndExternalLocationStripsAuth(t *testing
 		scopes := req.URL.Query()["scope"]
 		mu.Lock()
 		seenScopes = append(seenScopes, strings.Join(scopes, " "))
+		seenUA = append(seenUA, req.Header.Get("User-Agent"))
 		mu.Unlock()
 		tok := "pull-token"
 		for _, sc := range scopes {
@@ -578,13 +582,17 @@ func TestPushImageAuthBearerScopeUpgradeAndExternalLocationStripsAuth(t *testing
 			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"token": tok})
-	}))
-	defer tokenSrv.Close()
+	})
 
 	var reg *fakePushRegistry
-	var extSawAuth string
+	var extAuths []string
+	var extMu sync.Mutex
 	extSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		extSawAuth = req.Header.Get("Authorization")
+		if auth := req.Header.Get("Authorization"); auth != "" {
+			extMu.Lock()
+			extAuths = append(extAuths, auth)
+			extMu.Unlock()
+		}
 		repo := req.URL.Query().Get("repo")
 		dgst := req.URL.Query().Get("digest")
 		body, err := io.ReadAll(req.Body)
@@ -604,15 +612,16 @@ func TestPushImageAuthBearerScopeUpgradeAndExternalLocationStripsAuth(t *testing
 	}))
 	defer extSrv.Close()
 
-	// Use same host for realmMayReceiveCredentials? No: tokenSrv is on another port of 127.0.0.1,
-	// so serve /token on the same httptest.Server as the registry so credentials are sent!
 	reg = newFakePushRegistry(t)
 	reg.externalUploadSrv = extSrv
 	reg.authFn = func(w http.ResponseWriter, req *http.Request) bool {
 		if req.URL.Path == "/token" {
-			tokenSrv.Config.Handler.ServeHTTP(w, req)
+			tokenHandler.ServeHTTP(w, req)
 			return false
 		}
+		mu.Lock()
+		seenUA = append(seenUA, req.Header.Get("User-Agent"))
+		mu.Unlock()
 		needPush := req.Method == http.MethodPost || req.Method == http.MethodPut
 		auth := req.Header.Get("Authorization")
 		if needPush {
@@ -651,14 +660,139 @@ func TestPushImageAuthBearerScopeUpgradeAndExternalLocationStripsAuth(t *testing
 	if res.Digest != img.digest() {
 		t.Fatalf("manifest digest = %s, want %s", res.Digest, img.digest())
 	}
-	if extSawAuth != "" {
-		t.Fatalf("external upload host received Authorization %q, want empty", extSawAuth)
+	extMu.Lock()
+	gotExtAuths := slices.Clone(extAuths)
+	extMu.Unlock()
+	if len(gotExtAuths) != 0 {
+		t.Fatalf("external upload host received Authorization headers %v, want none", gotExtAuths)
 	}
 	mu.Lock()
 	gotScopes := slices.Clone(seenScopes)
+	gotUAs := slices.Clone(seenUA)
 	mu.Unlock()
 	if len(gotScopes) < 2 || !strings.Contains(gotScopes[0], ":pull") || !strings.Contains(gotScopes[1], "pull,push") {
 		t.Fatalf("bearer scopes = %v, want pull then pull,push upgrade", gotScopes)
+	}
+	wantUA := fmt.Sprintf("gvx-oci/v1.0 (%s/%s; +https://z.gfire.dev/gvx)", runtime.GOOS, runtime.GOARCH)
+	for _, ua := range gotUAs {
+		if ua != wantUA {
+			t.Fatalf("User-Agent = %q, want %q", ua, wantUA)
+		}
+	}
+}
+
+func TestDoRequestIgnores401ChallengeFromExternalRedirectHost(t *testing.T) {
+	extSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="evil-s3"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer extSrv.Close()
+
+	var regHits int
+	regSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		regHits++
+		http.Redirect(w, req, extSrv.URL+"/signed-blob", http.StatusFound)
+	}))
+	defer regSrv.Close()
+
+	rc, err := newRegistryClient(nil, regSrv.URL, "org/app", DefaultLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.close()
+	rc.fixed = &Credentials{Username: "alice", Password: "secret"}
+	rc.authz = "Bearer original-token"
+
+	resp, err := rc.doRequest(t.Context(), http.MethodGet, regSrv.URL+"/v2/org/app/blobs/sha256:0000", nil, nil)
+	if err != nil {
+		t.Fatalf("doRequest returned unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	if rc.authz != "Bearer original-token" {
+		t.Fatalf("rc.authz was mutated by external redirect 401: %q", rc.authz)
+	}
+	if regHits != 1 {
+		t.Fatalf("registry hit count = %d, want 1 (must not retry after external host 401)", regHits)
+	}
+}
+
+func TestOnceRequestZeroByteBodySendsContentLengthZero(t *testing.T) {
+	var gotContentLength int64 = -1
+	var gotTransferEncoding []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotContentLength = req.ContentLength
+		gotTransferEncoding = req.TransferEncoding
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	rc, err := newRegistryClient(nil, srv.URL, "org/app", DefaultLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.close()
+
+	resp, err := rc.onceRequest(t.Context(), http.MethodPut, srv.URL+"/upload", nil, &requestBody{
+		contentLength: 0,
+		contentType:   "application/octet-stream",
+		open:          func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("")), nil },
+	})
+	if err != nil {
+		t.Fatalf("onceRequest 0-byte PUT: %v", err)
+	}
+	_ = resp.Body.Close()
+	if gotContentLength != 0 || len(gotTransferEncoding) != 0 {
+		t.Fatalf("0-byte PUT Content-Length=%d Transfer-Encoding=%v, want Content-Length=0 and no chunked encoding", gotContentLength, gotTransferEncoding)
+	}
+}
+
+func TestAppendDigestQueryPreservesOpaqueOrderAndEncoding(t *testing.T) {
+	raw := "https://s3.example.test/upload/1?X-Amz-Signature=deadbeef&z=first%20val&a=second"
+	d := digest.FromString("hello")
+	got, err := appendDigestQuery(raw, d)
+	if err != nil {
+		t.Fatalf("appendDigestQuery: %v", err)
+	}
+	wantPrefix := raw + "&digest="
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("appendDigestQuery = %q, want prefix %q (must preserve existing query verbatim)", got, wantPrefix)
+	}
+}
+
+func TestPushImageCrossRepoMountForbiddenFallsBackToPlainUpload(t *testing.T) {
+	reg := newFakePushRegistry(t)
+	img := twoLayerImage(t, storeArch, "A=1")
+	reg.seedImage("org/src", "v1", img)
+
+	cache := newKeepBlobsCache(t)
+	pulled, err := PullRegistryImage(t.Context(), nil, reg.srv.URL, "org/src", "v1", storeArch, cache)
+	if err != nil {
+		t.Fatalf("PullRegistryImage: %v", err)
+	}
+	_ = pulled.Close()
+
+	// Deny cross-repo mount attempts with 403 Forbidden; plain uploads remain allowed.
+	reg.authFn = func(w http.ResponseWriter, req *http.Request) bool {
+		if req.Method == http.MethodPost && req.URL.Query().Get("mount") != "" {
+			w.WriteHeader(http.StatusForbidden)
+			return false
+		}
+		return true
+	}
+
+	sel, err := cache.Select(reg.host()+"/org/src:v1", storeArch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := cache.PushImage(t.Context(), sel.Images[0], reg.ref("org/dst", "v1"), PushOptions{})
+	if err != nil {
+		t.Fatalf("PushImage after 403 mount fallback: %v", err)
+	}
+	if res.Digest != img.digest() || res.PushedBlobs != len(img.blobs)+1 || res.MountedBlobs != 0 {
+		t.Fatalf("PushResult = %+v, want %d pushed and 0 mounted", res, len(img.blobs)+1)
 	}
 }
 

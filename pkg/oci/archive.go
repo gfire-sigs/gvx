@@ -403,19 +403,44 @@ func (a *archive) dockerSaveLayerDescriptor(name string, diffID digest.Digest) (
 		return "", "", 0, fmt.Errorf("oci: read header of layer %q: %w", name, err)
 	}
 	comp := detectCompression(head[:n])
-	if comp == compressionNone {
+	var mediaType string
+	switch comp {
+	case compressionNone:
 		return diffID, ocispec.MediaTypeImageLayer, member.size, nil
+	case compressionGzip:
+		mediaType = ocispec.MediaTypeImageLayerGzip
+	case compressionZstd:
+		mediaType = ocispec.MediaTypeImageLayerZstd
+	default:
+		return "", "", 0, fmt.Errorf("oci: layer %q uses an unsupported compression format", name)
 	}
 	digester := digest.SHA256.Digester()
 	bounded := newBoundedReader(io.NewSectionReader(a.ra, member.off, member.size), fmt.Sprintf("layer %q size", name), a.cache.limits.MaxBlobBytes, nil)
 	if _, err := io.Copy(digester.Hash(), bounded); err != nil {
 		return "", "", 0, fmt.Errorf("oci: hash compressed layer %q: %w", name, err)
 	}
-	mediaType := ocispec.MediaTypeImageLayerGzip
-	if comp == compressionZstd {
-		mediaType = ocispec.MediaTypeImageLayerZstd
-	}
 	return digester.Digest(), mediaType, member.size, nil
+}
+
+func (a *archive) verifyCompressedDiffID(name string, diffID digest.Digest, image *byteBudget) error {
+	sr, ok := a.reader(name)
+	if !ok {
+		return fmt.Errorf("oci: layer %q is missing from the archive", name)
+	}
+	dec, err := openDecompressed(sr, a.cache.limits)
+	if err != nil {
+		return err
+	}
+	defer dec.Close()
+	digester := digest.SHA256.Digester()
+	bounded := newBoundedReader(dec, fmt.Sprintf("decompressed layer %q size", name), a.cache.limits.MaxLayerBytes, image)
+	if _, err := io.Copy(digester.Hash(), bounded); err != nil {
+		return fmt.Errorf("oci: verify decompressed layer %q: %w", name, err)
+	}
+	if got := digester.Digest(); got != diffID {
+		return fmt.Errorf("%w: layer %q diff ID is %s, want %s", ErrDigestMismatch, name, got, diffID)
+	}
+	return nil
 }
 
 // compileDockerSaveEntry compiles the layers of one manifest.json entry. skip
@@ -466,6 +491,11 @@ func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (
 				return nil, false, fmt.Errorf("oci: compile layer %q: %w", layer, err)
 			}
 		} else if needBlob {
+			if blobDigest != diffID {
+				if err := a.verifyCompressedDiffID(name, diffID, image); err != nil {
+					return nil, false, err
+				}
+			}
 			sr, ok := a.reader(name)
 			if !ok {
 				return nil, false, fmt.Errorf("oci: layer %q is missing from the archive", layer)

@@ -194,6 +194,15 @@ func appendDigestQuery(rawURL string, d digest.Digest) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("oci: parse upload URL: %w", err)
 	}
+	if !u.Query().Has("digest") {
+		param := "digest=" + url.QueryEscape(d.String())
+		if u.RawQuery == "" {
+			u.RawQuery = param
+		} else {
+			u.RawQuery += "&" + param
+		}
+		return u.String(), nil
+	}
 	q := u.Query()
 	q.Set("digest", d.String())
 	u.RawQuery = q.Encode()
@@ -222,27 +231,32 @@ func (rc *registryClient) startOrMountUpload(ctx context.Context, d digest.Diges
 		mountURL := startBase + "?" + q.Encode()
 		resp, err := rc.doRequest(ctx, http.MethodPost, mountURL, nil, &requestBody{contentLength: 0})
 		if err != nil {
-			return false, "", fmt.Errorf("oci: mount blob %s from %s: %w", d, fromRepo, err)
-		}
-		status := resp.StatusCode
-		locHeader := resp.Header.Get("Location")
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			return false, "", fmt.Errorf("oci: close mount response for %s: %w", d, closeErr)
-		}
-		switch status {
-		case http.StatusCreated:
-			return true, "", nil
-		case http.StatusAccepted:
-			loc, locErr := resolveUploadLocation(mountURL, locHeader)
-			if locErr != nil {
-				return false, "", locErr
+			var statusErr *StatusError
+			if !errors.As(err, &statusErr) || (statusErr.StatusCode != http.StatusUnauthorized && statusErr.StatusCode != http.StatusForbidden) {
+				return false, "", fmt.Errorf("oci: mount blob %s from %s: %w", d, fromRepo, err)
 			}
-			return false, loc, nil
-		case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed:
-			// Fall back to a plain upload session if the registry rejects mount params.
-		default:
-			return false, "", &StatusError{URL: mountURL, StatusCode: status}
+			// Token server refused cross-repo mount scope; fall back to plain upload.
+		} else {
+			status := resp.StatusCode
+			locHeader := resp.Header.Get("Location")
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				return false, "", fmt.Errorf("oci: close mount response for %s: %w", d, closeErr)
+			}
+			switch status {
+			case http.StatusCreated:
+				return true, "", nil
+			case http.StatusAccepted:
+				loc, locErr := resolveUploadLocation(mountURL, locHeader)
+				if locErr != nil {
+					return false, "", locErr
+				}
+				return false, loc, nil
+			case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed:
+				// Fall back to a plain upload session if the registry rejects mount params or cross-repo access.
+			default:
+				return false, "", &StatusError{URL: mountURL, StatusCode: status}
+			}
 		}
 	}
 
@@ -532,22 +546,18 @@ func (c *LayerCache) PushImage(ctx context.Context, img Image, target Reference,
 	for _, l := range dec.manifest.Layers {
 		layerDesc := l
 		err := pushBlob("layer", layerDesc, func() (func() (io.ReadCloser, error), func(), bool, error) {
-			f, _, openErr := c.openVerifiedBlob(layerDesc.Digest, layerDesc.Size)
+			f, size, openErr := c.openVerifiedBlob(layerDesc.Digest, layerDesc.Size)
 			if openErr != nil {
 				if errors.Is(openErr, os.ErrNotExist) {
 					return nil, nil, false, nil
 				}
 				return nil, nil, false, openErr
 			}
-			_ = f.Close()
-			blobPath := ""
-			blobPath, openErr = c.BlobPath(layerDesc.Digest.String())
-			if openErr != nil {
-				return nil, nil, false, openErr
+			cleanup := func() { _ = f.Close() }
+			openFn := func() (io.ReadCloser, error) {
+				return io.NopCloser(io.NewSectionReader(f, 0, size)), nil
 			}
-			return func() (io.ReadCloser, error) {
-				return openShared(blobPath)
-			}, nil, true, nil
+			return openFn, cleanup, true, nil
 		})
 		if err != nil {
 			return PushResult{}, err

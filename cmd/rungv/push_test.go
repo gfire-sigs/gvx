@@ -401,4 +401,15 @@ func TestCLIPushUsageErrors(t *testing.T) {
 	if res := env.run("push", "--auth-fd", "1", "alpine:3.20"); res.code != 2 {
 		t.Errorf("--auth-fd 1 code = %d, want 2", res.code)
 	}
+	if res := env.run("push", "--auth-fd", "-2", "alpine:3.20"); res.code != 2 {
+		t.Errorf("--auth-fd -2 code = %d, want 2", res.code)
+	}
+
+	// Pushing by image ID without TARGET fails with exit code 2 even with -registry-url.
+	reg := startRegistry(t, twoFiles()...)
+	env.run("pull", "-keep-blobs", reg.ref("v1")).mustSucceed(t, "pull")
+	ids := env.imageIDs()
+	if res := env.run("push", "-registry-url", reg.URL, ids[0]); res.code != 2 {
+		t.Errorf("push by ID with -registry-url without TARGET code = %d, want 2 (stderr: %s)", res.code, res.stderr)
+	}
 }
