@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -41,29 +42,79 @@ import (
 )
 
 type rpcMountEntry struct {
-	target          string
-	label           string
-	readOnly        bool
-	backingReadOnly bool
-	cancel          context.CancelFunc
-	client          *streamRPCFSClient
+	target            string
+	label             string
+	readOnly          bool
+	backingReadOnly   bool
+	singleFile        bool
+	detached          bool
+	checkpointClosing atomic.Bool
+	handle            *rpcfs.Handle
+	stream            *control.Stream
+	cancel            context.CancelFunc
+	client            rpcfs.Client
 }
 
-func (s *Sandbox) hasActiveRPCMounts() bool {
+func (s *Sandbox) rpcSaveQuiescers() []saveQuiescer {
 	s.rpcMountsMu.Lock()
 	defer s.rpcMountsMu.Unlock()
-	return len(s.rpcMounts) > 0
+	if len(s.rpcMounts) == 0 {
+		return nil
+	}
+	out := make([]saveQuiescer, 0, len(s.rpcMounts))
+	for _, e := range s.rpcMounts {
+		if e.handle != nil {
+			out = append(out, e.handle)
+		}
+	}
+	return out
+}
+
+// detachRPCMountsForStop marks every active rpcfs mount as closing for a
+// stopping checkpoint, notifies serving clients with an rpcfs.detached event,
+// detaches the clients without unmounting the VFS mount, and cancels their
+// serve streams.
+func (s *Sandbox) detachRPCMountsForStop() {
+	s.rpcMountsMu.Lock()
+	entries := make([]*rpcMountEntry, 0, len(s.rpcMounts))
+	for _, e := range s.rpcMounts {
+		e.checkpointClosing.Store(true)
+		entries = append(entries, e)
+	}
+	s.rpcMountsMu.Unlock()
+
+	for _, e := range entries {
+		if e.stream != nil {
+			notifyCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = e.stream.SendEvent(notifyCtx, "rpcfs.detached", map[string]string{
+				"target": e.target,
+				"reason": "checkpoint",
+			})
+			cancel()
+			e.stream.CloseEvents()
+		}
+		if e.handle != nil {
+			e.handle.DetachClient()
+		}
+		if e.cancel != nil {
+			e.cancel()
+		}
+	}
 }
 
 func (s *Sandbox) closeRPCMounts() {
 	s.rpcMountsMu.Lock()
 	entries := make([]*rpcMountEntry, 0, len(s.rpcMounts))
 	for k, e := range s.rpcMounts {
+		e.checkpointClosing.Store(true)
 		entries = append(entries, e)
 		delete(s.rpcMounts, k)
 	}
 	s.rpcMountsMu.Unlock()
 	for _, e := range entries {
+		if e.handle != nil {
+			e.handle.DetachClient()
+		}
 		if e.cancel != nil {
 			e.cancel()
 		}
@@ -671,8 +722,16 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 	rm := s.rpcMounts[target]
 	delete(s.rpcMounts, target)
 	s.rpcMountsMu.Unlock()
-	if rm != nil && rm.cancel != nil {
-		rm.cancel()
+	if rm != nil {
+		if rm.handle != nil {
+			rm.handle.DetachClient()
+		}
+		if rm.cancel != nil {
+			rm.cancel()
+		}
+		if rm.client != nil {
+			_ = rm.client.Close()
+		}
 	}
 
 	s.emitEvent("mount", "remove", map[string]string{"target": target})
@@ -1064,7 +1123,8 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		return control.NewErrorf(control.CodeAlreadyExists, "mount target %q already exists", target)
 	}
 	s.rpcMountsMu.Lock()
-	if _, dup := s.rpcMounts[target]; dup {
+	existing := s.rpcMounts[target]
+	if existing != nil && !existing.detached {
 		s.rpcMountsMu.Unlock()
 		return control.NewErrorf(control.CodeAlreadyExists, "mount target %q already exists", target)
 	}
@@ -1086,55 +1146,104 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	creds := auth.NewRootCredentials(k.RootUserNamespace())
 	vfsObj := k.VFS()
 
-	if req.SingleFile {
-		if err := vfsEnsureEmptyFile(sctxWithRoot, vfsObj, creds, root, target, 0o644); err != nil {
-			return control.NewErrorf(control.CodeInternal, "create rpcfs mount file %q: %v", target, err)
+	var entry *rpcMountEntry
+	if existing != nil {
+		// Reconnect to a restored detached rpcfs mount in place so existing
+		// guest file descriptors become valid again.
+		if existing.singleFile != req.SingleFile {
+			return control.NewErrorf(control.CodeInvalidArgument, "restored rpcfs mount %q single_file=%t does not match client single_file=%t", target, existing.singleFile, req.SingleFile)
+		}
+		if !req.ReadOnly && existing.backingReadOnly {
+			return control.NewErrorf(control.CodeLockdownDenied, "restored rpcfs mount %q is read-only and cannot be served read-write", target)
+		}
+		if err := existing.handle.AttachClient(rpcClient, req.ReadOnly, req.Label); err != nil {
+			return control.NewErrorf(control.CodeInternal, "reattach rpcfs at %q: %v", target, err)
+		}
+		prevLabel := existing.label
+		prevReadOnly := existing.readOnly
+		s.rpcMountsMu.Lock()
+		existing.detached = false
+		existing.readOnly = existing.backingReadOnly || req.ReadOnly
+		if req.Label != "" {
+			existing.label = req.Label
+		}
+		existing.stream = stream
+		existing.cancel = serveCancel
+		existing.client = rpcClient
+		existing.checkpointClosing.Store(false)
+		s.rpcMountsMu.Unlock()
+		entry = existing
+
+		if err := stream.SendResponse(control.MountServeResponse{Target: target}); err != nil {
+			existing.handle.DetachClient()
+			s.rpcMountsMu.Lock()
+			if s.rpcMounts[target] == existing {
+				existing.detached = true
+				existing.label = prevLabel
+				existing.readOnly = prevReadOnly
+				existing.stream = nil
+				existing.cancel = nil
+				existing.client = nil
+			}
+			s.rpcMountsMu.Unlock()
+			return err
 		}
 	} else {
-		if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
-			return control.NewErrorf(control.CodeInternal, "create rpcfs mount point %q: %v", target, err)
+		if req.SingleFile {
+			if err := vfsEnsureEmptyFile(sctxWithRoot, vfsObj, creds, root, target, 0o644); err != nil {
+				return control.NewErrorf(control.CodeInternal, "create rpcfs mount file %q: %v", target, err)
+			}
+		} else {
+			if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
+				return control.NewErrorf(control.CodeInternal, "create rpcfs mount point %q: %v", target, err)
+			}
 		}
-	}
-	fs, rootD, err := rpcfs.NewFilesystemWithOptions(sctxWithRoot, vfsObj, rpcClient, rpcfs.Options{
-		Label:      req.Label,
-		ReadOnly:   req.ReadOnly,
-		SingleFile: req.SingleFile,
-	})
-	if err != nil {
-		return control.NewErrorf(control.CodeInternal, "init rpcfs at %q: %v", target, err)
-	}
-	mnt := vfsObj.NewDisconnectedMount(fs, rootD, &vfs.MountOptions{ReadOnly: req.ReadOnly})
-	fs.DecRef(sctxWithRoot)
-	rootD.DecRef(sctxWithRoot)
+		fs, rootD, err := rpcfs.NewFilesystemWithOptions(sctxWithRoot, vfsObj, rpcClient, rpcfs.Options{
+			Target:     target,
+			Label:      req.Label,
+			ReadOnly:   req.ReadOnly,
+			SingleFile: req.SingleFile,
+		})
+		if err != nil {
+			return control.NewErrorf(control.CodeInternal, "init rpcfs at %q: %v", target, err)
+		}
+		handle, _ := rpcfs.HandleOf(fs)
+		mnt := vfsObj.NewDisconnectedMount(fs, rootD, &vfs.MountOptions{ReadOnly: req.ReadOnly})
+		fs.DecRef(sctxWithRoot)
+		rootD.DecRef(sctxWithRoot)
 
-	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
-	if err := vfsObj.ConnectMountAt(sctxWithRoot, creds, mnt, &pop); err != nil {
+		pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
+		if err := vfsObj.ConnectMountAt(sctxWithRoot, creds, mnt, &pop); err != nil {
+			mnt.DecRef(sctxWithRoot)
+			return control.NewErrorf(control.CodeInternal, "connect rpcfs mount at %q: %v", target, err)
+		}
 		mnt.DecRef(sctxWithRoot)
-		return control.NewErrorf(control.CodeInternal, "connect rpcfs mount at %q: %v", target, err)
-	}
-	mnt.DecRef(sctxWithRoot)
 
-	entry := &rpcMountEntry{
-		target:          target,
-		label:           req.Label,
-		readOnly:        req.ReadOnly,
-		backingReadOnly: req.ReadOnly,
-		cancel:          serveCancel,
-		client:          rpcClient,
-	}
-	s.rpcMountsMu.Lock()
-	s.rpcMounts[target] = entry
-	s.rpcMountsMu.Unlock()
-
-	if err := stream.SendResponse(control.MountServeResponse{Target: target}); err != nil {
-		s.rpcMountsMu.Lock()
-		if s.rpcMounts[target] == entry {
-			delete(s.rpcMounts, target)
+		entry = &rpcMountEntry{
+			target:          target,
+			label:           req.Label,
+			readOnly:        req.ReadOnly,
+			backingReadOnly: req.ReadOnly,
+			singleFile:      req.SingleFile,
+			handle:          handle,
+			stream:          stream,
+			cancel:          serveCancel,
+			client:          rpcClient,
 		}
+		s.rpcMountsMu.Lock()
+		s.rpcMounts[target] = entry
 		s.rpcMountsMu.Unlock()
-		umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
-		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
-		return err
+
+		if err := stream.SendResponse(control.MountServeResponse{Target: target}); err != nil {
+			s.rpcMountsMu.Lock()
+			if s.rpcMounts[target] == entry {
+				delete(s.rpcMounts, target)
+			}
+			s.rpcMountsMu.Unlock()
+			umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
+			_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
+			return err
+		}
 	}
 	unlockMount()
 	unlockOp()
@@ -1145,8 +1254,8 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		"read_only": strconv.FormatBool(req.ReadOnly),
 	})
 
-	// Hold the mount active until the client disconnects, sandbox exits, or
-	// mount.remove cancels serveCtx.
+	// Hold the mount active until the client disconnects, sandbox exits,
+	// checkpoint stops the sandbox, or mount.remove cancels serveCtx.
 	var sandboxExited bool
 	select {
 	case <-serveCtx.Done():
@@ -1154,12 +1263,14 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		sandboxExited = true
 	}
 
-	if sandboxExited {
-		s.rpcMountsMu.Lock()
-		if s.rpcMounts[target] == entry {
-			delete(s.rpcMounts, target)
+	if sandboxExited || entry.checkpointClosing.Load() {
+		if sandboxExited {
+			s.rpcMountsMu.Lock()
+			if s.rpcMounts[target] == entry {
+				delete(s.rpcMounts, target)
+			}
+			s.rpcMountsMu.Unlock()
 		}
-		s.rpcMountsMu.Unlock()
 		return nil
 	}
 
@@ -1168,6 +1279,11 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	// cannot observe a half-unmounted rpcfs or clobber a replacement mount.
 	s.opMu.RLock()
 	s.mountOpMu.Lock()
+	if entry.checkpointClosing.Load() {
+		s.mountOpMu.Unlock()
+		s.opMu.RUnlock()
+		return nil
+	}
 	s.mu.Lock()
 	active := s.activeKernel == k
 	s.mu.Unlock()
@@ -1178,6 +1294,9 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	if stillMounted && active {
 		umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
 		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
+	}
+	if entry.handle != nil {
+		entry.handle.DetachClient()
 	}
 	s.rpcMountsMu.Lock()
 	if s.rpcMounts[target] == entry {

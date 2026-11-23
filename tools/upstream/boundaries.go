@@ -304,7 +304,7 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/fsimpl/rpcfs",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/sync"},
+		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/state", "pkg/sync"},
 		forbidden: append([]string{"pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{

@@ -362,7 +362,7 @@ A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.me
 | :--- | :--- |
 | `rungv run -checkpoint-dir DIR -control-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before lockdown. |
 | `rungv checkpoint -S SPEC [-checkpoint-dir DIR \| -o DIR\|FILE\|-] [-leave-running] [-z] [--force]` | Connect to `SPEC` and trigger a checkpoint (`rungv snapshot` alias). `-o` streams a tar bundle over the control socket without `-checkpoint-dir`. `-z` compresses streamed frames with `zstd`. `--force` detaches active `exec` sessions before saving. |
-| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `--auto-publish`, `--dynamic-ports`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-S`/`--control` to reattach mounts, networking, or a new control listener. |
+| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `--attach-bind HOST:GUEST[:ro\|rw]`, `--serve HOST:GUEST[:ro\|rw]`, `-rootfs-volume`, `-p`, `--auto-publish`, `--dynamic-ports`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-S`/`--control` to reattach mounts, networking, or a new control listener. |
 
 The bundle does not store NAT bandwidth limits. A checkpoint that leaves the current instance running does not change its limits.
 The bundle does not store firewall rules. If you save a sandbox with a firewall, restore requires a policy file.
@@ -370,9 +370,9 @@ The bundle does not store firewall rules. If you save a sandbox with a firewall,
 The restore command rejects a bundle if its mount paths, `root_volume` setting, layer digests, platform, or network mode differ.
 
 > [!IMPORTANT]
-> Pass the same workspace, volume mounts, and `-rootfs-volume` flag on restore.
-> Pass `--net-tx-bps` and `--net-rx-bps` to set new limits on restore.
-> Close active control tunnels that used bandwidth limits before you save the sandbox.
+> Pass the same workspace, bind, volume mounts, and `-rootfs-volume` flag on restore; pass `--serve HOST:GUEST[:ro|rw]` to reattach saved `rpcfs` mounts immediately (or reconnect later with `rungv mount serve`).
+> Pass `--net-tx-bps` and `--net-rx-bps` to set new NAT bandwidth limits on restore.
+> Close active control tunnels that use bandwidth limits before you save the sandbox.
 
 1. Start a workload with `-checkpoint-dir` and `-control-socket`.
 2. Run `rungv checkpoint` in another terminal to write the bundle and stop the sandbox.

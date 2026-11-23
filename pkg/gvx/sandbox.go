@@ -71,6 +71,7 @@ type Sandbox struct {
 	rootUpperExisting bool
 	mounts            []sandboxMount
 	sandboxExtHandles []int64
+	serveMounts       []sandboxServeMount
 	netStack          *stack.Stack
 	natForwarder      *netbackend.NATForwarder
 	portForwarder     *netbackend.PortForwarder
@@ -192,6 +193,9 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	}
 	if err := cfg.normalize(); err != nil {
 		return nil, err
+	}
+	if len(cfg.ServeMounts) > 0 {
+		return nil, fmt.Errorf("%w: ServeMounts is supported only with Restore", ErrInvalidConfig)
 	}
 	applyHostMemoryDefaults()
 
@@ -692,6 +696,7 @@ func (s *Sandbox) Close() error {
 	}
 
 	s.closeRPCMounts()
+	s.closeServeMounts()
 
 	if s.cfg.ControlListener != nil {
 		if err := s.cfg.ControlListener.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, net.ErrClosed) {

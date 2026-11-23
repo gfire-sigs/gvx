@@ -50,6 +50,9 @@ const (
 	// read-only ext4lite base volume with either a persistent ext4lite upper
 	// volume or an ephemeral tmpfs upper layer.
 	MountOverlay MountKind = "overlay"
+	// MountRPCFS identifies a client-served rpcfs proxy mount recorded in a
+	// checkpoint manifest.
+	MountRPCFS MountKind = "rpcfs"
 )
 
 // MountDriver selects the filesystem of a volume mount.
@@ -465,6 +468,18 @@ func (c *Config) validateMounts() error {
 			return fmt.Errorf("%w: two mounts use the guest path %s", ErrInvalidConfig, m.GuestPath)
 		}
 		guestPaths[m.GuestPath] = struct{}{}
+	}
+	for i, sm := range c.ServeMounts {
+		if err := validateGuestPath(sm.GuestPath); err != nil {
+			return fmt.Errorf("%w: serve mount %d (%s): %w", ErrInvalidConfig, i, sm.GuestPath, err)
+		}
+		if sm.Client == nil && strings.TrimSpace(sm.HostPath) == "" {
+			return fmt.Errorf("%w: serve mount %d (%s) requires HostPath or Client", ErrInvalidConfig, i, sm.GuestPath)
+		}
+		if _, dup := guestPaths[sm.GuestPath]; dup {
+			return fmt.Errorf("%w: two mounts use the guest path %s", ErrInvalidConfig, sm.GuestPath)
+		}
+		guestPaths[sm.GuestPath] = struct{}{}
 	}
 	return c.validateVolumeConflicts("")
 }
@@ -1198,6 +1213,11 @@ func (s *Sandbox) hostMounts() []hostlockdown.HostMount {
 			list = append(list, hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly, File: m.hostFile})
 		}
 	}
+	for _, sm := range s.serveMounts {
+		if sm.hostPath != "" {
+			list = append(list, hostlockdown.HostMount{Path: sm.hostPath, ReadOnly: sm.ReadOnly, File: sm.SingleFile})
+		}
+	}
 	return list
 }
 
@@ -1209,7 +1229,39 @@ func (s *Sandbox) usesHostDirs() bool {
 			return true
 		}
 	}
+	for _, sm := range s.serveMounts {
+		if sm.hostPath != "" {
+			return true
+		}
+	}
 	return false
+}
+
+func (s *Sandbox) openServeMountsForRestore() error {
+	for _, sm := range s.cfg.ServeMounts {
+		entry := sandboxServeMount{ServeMount: sm}
+		if sm.Client == nil {
+			cli, absHost, singleFile, err := openLocalRPCFSClient(sm.HostPath, sm.ReadOnly)
+			if err != nil {
+				return err
+			}
+			entry.hostPath = absHost
+			entry.SingleFile = singleFile
+			entry.localClient = cli
+			entry.Client = cli
+		}
+		s.serveMounts = append(s.serveMounts, entry)
+	}
+	return nil
+}
+
+func (s *Sandbox) closeServeMounts() {
+	for _, sm := range s.serveMounts {
+		if sm.localClient != nil {
+			_ = sm.localClient.Close()
+		}
+	}
+	s.serveMounts = nil
 }
 
 // closeMounts closes every hostfs workspace and every ext4lite volume once. The

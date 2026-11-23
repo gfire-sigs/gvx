@@ -58,6 +58,10 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	}
 
 	flags := registerSandboxFlags(fs, flagDefaults{})
+	var serveFlags listFlag
+	var attachBindFlags listFlag
+	fs.Var(&serveFlags, "serve", "Reattach a checkpointed rpcfs proxy mount: HOST_PATH:GUEST_PATH[:ro|rw]")
+	fs.Var(&attachBindFlags, "attach-bind", "Reattach a checkpointed host bind mount: HOST_PATH:GUEST_PATH[:ro|rw]")
 	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return restoreConfig{}, 0, true
@@ -79,6 +83,25 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	cfg, autoPlatform, err := flags.buildBaseConfig(fs, stdin, stdout, stderr, true)
 	if err != nil {
 		return usageError("%v", err)
+	}
+	for _, spec := range attachBindFlags {
+		sm, err := gvx.ParseServeMount(spec)
+		if err != nil {
+			return usageError("--attach-bind: %v", err)
+		}
+		cfg.Mounts = append(cfg.Mounts, gvx.Mount{
+			Kind:      gvx.MountBind,
+			HostPath:  sm.HostPath,
+			GuestPath: sm.GuestPath,
+			ReadOnly:  sm.ReadOnly,
+		})
+	}
+	for _, spec := range serveFlags {
+		sm, err := gvx.ParseServeMount(spec)
+		if err != nil {
+			return usageError("--serve: %v", err)
+		}
+		cfg.ServeMounts = append(cfg.ServeMounts, sm)
 	}
 	ctrlSock, err := flags.resolveControlSocket()
 	if err != nil {

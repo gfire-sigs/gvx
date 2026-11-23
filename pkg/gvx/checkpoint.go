@@ -17,6 +17,7 @@ package gvx
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,11 +27,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/rpcfs"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/state/stateio"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -76,12 +79,16 @@ type AddrHoleEntry struct {
 	End   uint64 `json:"end"`
 }
 
-// ManifestMount records one configured mount in a checkpoint manifest.
+// ManifestMount records one configured or runtime-attached mount in a
+// checkpoint manifest.
 type ManifestMount struct {
-	Type      MountKind `json:"type"`
-	GuestPath string    `json:"guest_path"`
-	ReadOnly  bool      `json:"read_only"`
-	Kind      string    `json:"kind,omitempty"`
+	Type       MountKind `json:"type"`
+	GuestPath  string    `json:"guest_path"`
+	ReadOnly   bool      `json:"read_only"`
+	Kind       string    `json:"kind,omitempty"`
+	Dynamic    bool      `json:"dynamic,omitempty"`
+	Label      string    `json:"label,omitempty"`
+	SingleFile bool      `json:"single_file,omitempty"`
 }
 
 // CheckpointManifest describes the host and sandbox configuration of a saved
@@ -235,14 +242,18 @@ func sandboxManifestMounts(mounts []sandboxMount) []ManifestMount {
 	out := make([]ManifestMount, len(mounts))
 	for i, sm := range mounts {
 		kind := "tmpfs"
+		var label string
 		switch sm.Kind {
 		case MountBind:
 			kind = "hostfs"
+			label = cmp.Or(sm.hostPath, sm.HostPath)
 		case MountVolume:
 			if sm.volume != nil {
 				kind = "ext4lite"
+				label = cmp.Or(sm.VolumeName, sm.ImagePath)
 			} else {
 				kind = "hostfs"
+				label = cmp.Or(sm.VolumeName, sm.hostPath)
 			}
 		case MountOverlay:
 			if sm.upperVolume != nil {
@@ -250,12 +261,15 @@ func sandboxManifestMounts(mounts []sandboxMount) []ManifestMount {
 			} else {
 				kind = "overlay:tmpfs"
 			}
+			label = sm.Mount.volumeLabel()
 		}
 		out[i] = ManifestMount{
 			Type:      sm.Kind,
 			GuestPath: sm.GuestPath,
 			ReadOnly:  sm.ReadOnly,
 			Kind:      kind,
+			Dynamic:   sm.dynamic,
+			Label:     label,
 		}
 	}
 	return out
@@ -278,6 +292,27 @@ func (s *Sandbox) buildCheckpointManifest() CheckpointManifest {
 	if s.natPolicy.RequiredOnRestore() {
 		version = checkpointManifestNATPolicyVersion
 	}
+
+	s.rpcMountsMu.Lock()
+	if len(s.rpcMounts) > 0 {
+		rpcEntries := make([]ManifestMount, 0, len(s.rpcMounts))
+		for _, rm := range s.rpcMounts {
+			rpcEntries = append(rpcEntries, ManifestMount{
+				Type:       MountRPCFS,
+				GuestPath:  rm.target,
+				ReadOnly:   rm.readOnly,
+				Kind:       rpcfs.Name,
+				Dynamic:    true,
+				Label:      rm.label,
+				SingleFile: rm.singleFile,
+			})
+		}
+		slices.SortFunc(rpcEntries, func(a, b ManifestMount) int {
+			return cmp.Compare(a.GuestPath, b.GuestPath)
+		})
+		mounts = append(mounts, rpcEntries...)
+	}
+	s.rpcMountsMu.Unlock()
 	return CheckpointManifest{
 		Version:          version,
 		GOOS:             runtime.GOOS,
@@ -416,12 +451,10 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	if k == nil {
 		return errors.New("gvx: sandbox is not running")
 	}
-	if s.hasActiveRPCMounts() {
-		return ErrCheckpointRPCFSActive
-	}
 	if s.hasShapedNATControlTunnel() {
 		return ErrCheckpointNATTunnelActive
 	}
+	rpcQuiescers := s.rpcSaveQuiescers()
 	if s.activeExecCount() > 0 {
 		if !opts.Force {
 			return ErrCheckpointExecActive
@@ -450,6 +483,7 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	kCtx := k.SupervisorContext()
 	nicsBefore := s.guestNICCount()
 	quiescedHere := false
+	rpcQuiescedHere := false
 	defer func() {
 		if !paused {
 			return
@@ -471,6 +505,13 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 				}
 			}
 		}
+		if rpcQuiescedHere {
+			for _, q := range rpcQuiescers {
+				if err := q.ResumeAfterSave(); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("gvx: resume rpcfs mount after checkpoint: %w", err))
+				}
+			}
+		}
 		if !alreadyPaused {
 			if dog != nil {
 				dog.Start()
@@ -488,6 +529,12 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 			q.QuiesceForSave()
 		}
 		quiescedHere = true
+	}
+	if len(rpcQuiescers) > 0 {
+		for _, q := range rpcQuiescers {
+			q.QuiesceForSave()
+		}
+		rpcQuiescedHere = true
 	}
 	eth0 := s.snapshotEth0()
 
@@ -541,6 +588,7 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	}
 
 	paused = false
+	s.detachRPCMountsForStop()
 	s.checkpointStopped.Store(true)
 	s.mu.Lock()
 	s.userPaused = false
@@ -665,12 +713,10 @@ func (s *Sandbox) checkpointStreamRun(
 	if k == nil {
 		return errors.New("gvx: sandbox is not running")
 	}
-	if s.hasActiveRPCMounts() {
-		return ErrCheckpointRPCFSActive
-	}
 	if s.hasShapedNATControlTunnel() {
 		return ErrCheckpointNATTunnelActive
 	}
+	rpcQuiescers := s.rpcSaveQuiescers()
 	if s.activeExecCount() > 0 {
 		if !opts.Force {
 			return ErrCheckpointExecActive
@@ -693,6 +739,7 @@ func (s *Sandbox) checkpointStreamRun(
 	kCtx := k.SupervisorContext()
 	nicsBefore := s.guestNICCount()
 	quiescedHere := false
+	rpcQuiescedHere := false
 	resumeOrRestore := func(err error) error {
 		if !paused {
 			return err
@@ -712,6 +759,13 @@ func (s *Sandbox) checkpointStreamRun(
 			for _, q := range quiescers {
 				if rErr := q.ResumeAfterSave(); rErr != nil {
 					err = errors.Join(err, fmt.Errorf("gvx: resume network backend after checkpoint: %w", rErr))
+				}
+			}
+		}
+		if rpcQuiescedHere {
+			for _, q := range rpcQuiescers {
+				if rErr := q.ResumeAfterSave(); rErr != nil {
+					err = errors.Join(err, fmt.Errorf("gvx: resume rpcfs mount after checkpoint: %w", rErr))
 				}
 			}
 		}
@@ -738,6 +792,12 @@ func (s *Sandbox) checkpointStreamRun(
 			q.QuiesceForSave()
 		}
 		quiescedHere = true
+	}
+	if len(rpcQuiescers) > 0 {
+		for _, q := range rpcQuiescers {
+			q.QuiesceForSave()
+		}
+		rpcQuiescedHere = true
 	}
 	eth0 := s.snapshotEth0()
 
@@ -795,6 +855,7 @@ func (s *Sandbox) checkpointStreamRun(
 	streamErr := streamFn(manifestBytes, stateBuf.Bytes(), pagesMetaBuf.Bytes(), pagesBuf.Bytes())
 
 	paused = false
+	s.detachRPCMountsForStop()
 	s.checkpointStopped.Store(true)
 	s.mu.Lock()
 	s.userPaused = false
