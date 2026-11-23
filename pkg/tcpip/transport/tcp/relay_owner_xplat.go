@@ -32,7 +32,22 @@ func (e *Endpoint) NATRelayOwner() *stack.NATRelayOwner {
 // CreateNATRelayEndpoint starts a handshake for an admitted private NAT flow.
 // Cancellation aborts the handshake. The caller must still complete the request.
 func (r *ForwarderRequest) CreateNATRelayEndpoint(ctx context.Context, queue *waiter.Queue) (tcpip.Endpoint, tcpip.Error) {
-	return r.createEndpoint(queue, ctx.Done(), true)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.segment == nil {
+		return nil, &tcpip.ErrInvalidEndpointState{}
+	}
+	if ctx.Err() != nil {
+		return nil, &tcpip.ErrAborted{}
+	}
+
+	owner := r.segment.pkt.NATInput().RelayOwner()
+	ep, err := r.forwarder.listen.performHandshakeCancelable(r.segment, r.synOptions, queue, owner, ctx.Done())
+	if err != nil {
+		return nil, err
+	}
+	return ep, nil
 }
 
 // CompleteNATRejection admits the retained SYN as packet-only traffic before

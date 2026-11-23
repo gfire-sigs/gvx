@@ -313,13 +313,11 @@ func (l *listenContext) startHandshake(s *segment, opts header.TCPSynOptions, qu
 // established endpoint is returned.
 //
 // Precondition: if l.listenEP != nil, l.listenEP.mu must be locked.
-func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner, cancel <-chan struct{}) (*Endpoint, tcpip.Error) {
-	select {
-	case <-cancel:
-		return nil, &tcpip.ErrAborted{}
-	default:
-	}
+func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*Endpoint, tcpip.Error) {
+	return l.performHandshakeCancelable(s, opts, queue, owner, nil)
+}
 
+func (l *listenContext) performHandshakeCancelable(s *segment, opts header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner, cancel <-chan struct{}) (*Endpoint, tcpip.Error) {
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
 	queue.EventRegister(&waitEntry)
 	defer queue.EventUnregister(&waitEntry)
@@ -329,16 +327,19 @@ func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, 
 		return nil, err
 	}
 
-	// A private relay can stop waiting for the guest ACK when its context ends.
-	select {
-	case <-notifyCh:
-	case <-cancel:
-	}
-	select {
-	case <-cancel:
-		h.ep.Abort()
-		return nil, &tcpip.ErrAborted{}
-	default:
+	if cancel == nil {
+		<-notifyCh
+	} else {
+		select {
+		case <-notifyCh:
+		case <-cancel:
+		}
+		select {
+		case <-cancel:
+			h.ep.Abort()
+			return nil, &tcpip.ErrAborted{}
+		default:
+		}
 	}
 
 	ep := h.ep

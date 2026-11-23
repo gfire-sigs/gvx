@@ -151,10 +151,6 @@ func (r *ForwarderRequest) Complete(sendReset bool) {
 // CreateEndpoint creates a TCP endpoint for the connection request, performing
 // the 3-way handshake in the process.
 func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, tcpip.Error) {
-	return r.createEndpoint(queue, nil, false)
-}
-
-func (r *ForwarderRequest) createEndpoint(queue *waiter.Queue, cancel <-chan struct{}, natRelay bool) (tcpip.Endpoint, tcpip.Error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -163,10 +159,6 @@ func (r *ForwarderRequest) createEndpoint(queue *waiter.Queue, cancel <-chan str
 	}
 
 	f := r.forwarder
-	var owner tcpip.PacketOwner
-	if natRelay {
-		owner = r.segment.pkt.NATInput().RelayOwner()
-	}
 	ep, err := f.listen.performHandshake(r.segment, header.TCPSynOptions{
 		MSS:           r.synOptions.MSS,
 		WS:            r.synOptions.WS,
@@ -174,7 +166,7 @@ func (r *ForwarderRequest) createEndpoint(queue *waiter.Queue, cancel <-chan str
 		TSVal:         r.synOptions.TSVal,
 		TSEcr:         r.synOptions.TSEcr,
 		SACKPermitted: r.synOptions.SACKPermitted,
-	}, queue, owner, cancel)
+	}, queue, nil)
 	if err != nil {
 		return nil, err
 	}
