@@ -24,6 +24,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
@@ -41,9 +42,16 @@ import (
 const Name = "rpcfs"
 
 const (
-	rpcfsMagic   = 0x72706366 // "rpcf"
-	maxChunkSize = 64 << 10
+	rpcfsMagic       = 0x72706366 // "rpcf"
+	defaultChunkSize = 64 << 10
 )
+
+// Options configures an rpcfs filesystem instance.
+type Options struct {
+	Label      string
+	ReadOnly   bool
+	SingleFile bool
+}
 
 // Entry describes one file or directory returned by the remote client.
 type Entry struct {
@@ -58,6 +66,28 @@ type Entry struct {
 	MtimeNS    int64
 	CtimeNS    int64
 	LinkTarget string
+}
+
+// NotifyEvent describes one host-side change reported by a WatchClient.
+type NotifyEvent struct {
+	Path   string
+	Name   string
+	Mask   uint32
+	Cookie uint32
+}
+
+// ChunkSizer is an optional extension of Client that reports the maximum raw
+// payload bytes per Read or Write RPC supported by the transport.
+type ChunkSizer interface {
+	MaxChunkBytes() int64
+}
+
+// WatchClient is an optional extension of Client that relays host filesystem
+// change notifications to guest inotify watchers.
+type WatchClient interface {
+	Watch(ctx goContext.Context, relPath string) error
+	Unwatch(ctx goContext.Context, relPath string) error
+	SetNotifyHandler(fn func(NotifyEvent))
 }
 
 // Client executes filesystem RPCs against an unlocked host peer. Returned
@@ -127,11 +157,20 @@ func (FilesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *au
 	return nil, nil, linuxerr.EPERM
 }
 
-// NewFilesystem constructs an rpcfs filesystem backed by client. When readOnly
-// is true, all mutating operations fail with EROFS regardless of VFS mount
-// flags. The caller owns one reference on both the returned Filesystem and root
-// Dentry.
+// NewFilesystem constructs a directory-rooted rpcfs filesystem backed by
+// client. When readOnly is true, all mutating operations fail with EROFS
+// regardless of VFS mount flags. The caller owns one reference on both the
+// returned Filesystem and root Dentry.
 func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, client Client, label string, readOnly bool) (*vfs.Filesystem, *vfs.Dentry, error) {
+	return NewFilesystemWithOptions(ctx, vfsObj, client, Options{
+		Label:    label,
+		ReadOnly: readOnly,
+	})
+}
+
+// NewFilesystemWithOptions constructs an rpcfs filesystem backed by client with
+// explicit directory or single-file mount options.
+func NewFilesystemWithOptions(ctx context.Context, vfsObj *vfs.VirtualFilesystem, client Client, opts Options) (*vfs.Filesystem, *vfs.Dentry, error) {
 	if client == nil {
 		return nil, nil, linuxerr.EINVAL
 	}
@@ -140,15 +179,42 @@ func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, client Cl
 		Mode:  linux.S_IFDIR | 0o755,
 		Nlink: 2,
 	}
+	if opts.SingleFile {
+		rootEntry = Entry{
+			Ino:   1,
+			Mode:  linux.S_IFREG | 0o644,
+			Nlink: 1,
+		}
+	}
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
 	if err != nil {
 		return nil, nil, err
 	}
+	maxChunk := int64(defaultChunkSize)
+	if cs, ok := client.(ChunkSizer); ok {
+		if n := cs.MaxChunkBytes(); n >= 512 {
+			maxChunk = n
+		}
+	}
+	watchCtx, watchCancel := goContext.WithCancel(goContext.Background())
 	fs := &filesystem{
-		client:   client,
-		label:    label,
-		readOnly: readOnly,
-		devMinor: devMinor,
+		client:      client,
+		label:       opts.Label,
+		readOnly:    opts.ReadOnly,
+		singleFile:  opts.SingleFile,
+		devMinor:    devMinor,
+		maxChunk:    maxChunk,
+		watchCtx:    watchCtx,
+		watchCancel: watchCancel,
+		watched:     make(map[*dentry]string),
+		watchSynced: make(map[string]struct{}),
+	}
+	if wc, ok := client.(WatchClient); ok {
+		fs.watcher = wc
+		fs.watchNotify = make(chan struct{}, 1)
+		fs.watchDone = make(chan struct{})
+		wc.SetNotifyHandler(fs.deliverNotify)
+		go fs.watchLoop()
 	}
 	fs.vfsfs.Init(vfsObj, FilesystemType{}, fs)
 	fs.root = fs.newDentry(nil, "", rootEntry)
@@ -158,11 +224,14 @@ func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, client Cl
 }
 
 type filesystem struct {
-	vfsfs    vfs.Filesystem
-	client   Client
-	label    string
-	readOnly bool
-	devMinor uint32
+	vfsfs      vfs.Filesystem
+	client     Client
+	watcher    WatchClient
+	label      string
+	readOnly   bool
+	singleFile bool
+	devMinor   uint32
+	maxChunk   int64
 
 	// mu protects the dentry child maps. Lock order: fs.mu before fs.ancestryMu.
 	mu sync.Mutex
@@ -170,6 +239,219 @@ type filesystem struct {
 	// (PrependPath, IsDescendant, InotifyWithParent) and dynamic path() walks.
 	ancestryMu sync.RWMutex
 	root       *dentry
+
+	// watchOpMu serializes host Watch/Unwatch RPCs across AdmitInotifyWatch and
+	// watchLoop. Never hold watchOpMu inside VFS/Inotify callbacks (Watches,
+	// OnZeroWatches). Lock order: watchOpMu before watchMu.
+	watchOpMu sync.Mutex
+	// watchMu is a leaf lock protecting watched, watchSynced, and watchClosed.
+	// Never acquire fs.mu, fs.ancestryMu, watchOpMu, or Watches locks while
+	// holding watchMu.
+	watchMu     sync.Mutex
+	watched     map[*dentry]string
+	watchSynced map[string]struct{}
+	watchClosed bool
+	watchCtx    goContext.Context
+	watchCancel goContext.CancelFunc
+	watchNotify chan struct{}
+	watchDone   chan struct{}
+}
+
+func (fs *filesystem) maxChunkSize() int64 {
+	if fs.maxChunk > 0 {
+		return fs.maxChunk
+	}
+	return defaultChunkSize
+}
+
+func (fs *filesystem) signalWatchReconcile() {
+	if fs.watcher == nil {
+		return
+	}
+	select {
+	case fs.watchNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (fs *filesystem) watchLoop() {
+	defer close(fs.watchDone)
+	for {
+		select {
+		case <-fs.watchCtx.Done():
+			return
+		case <-fs.watchNotify:
+			fs.reconcileWatches()
+		}
+	}
+}
+
+func (fs *filesystem) reconcileWatches() {
+	fs.watchOpMu.Lock()
+	defer fs.watchOpMu.Unlock()
+
+	for {
+		if fs.watchCtx.Err() != nil {
+			return
+		}
+		var (
+			toUnwatch []string
+			toWatch   []string
+		)
+		fs.watchMu.Lock()
+		if fs.watchClosed {
+			fs.watchMu.Unlock()
+			return
+		}
+		desired := make(map[string]struct{}, len(fs.watched))
+		for _, rel := range fs.watched {
+			desired[rel] = struct{}{}
+		}
+		for rel := range fs.watchSynced {
+			if _, want := desired[rel]; !want {
+				toUnwatch = append(toUnwatch, rel)
+			}
+		}
+		for rel := range desired {
+			if _, have := fs.watchSynced[rel]; !have {
+				toWatch = append(toWatch, rel)
+			}
+		}
+		fs.watchMu.Unlock()
+
+		if len(toUnwatch) == 0 && len(toWatch) == 0 {
+			return
+		}
+		for _, rel := range toUnwatch {
+			if fs.watchCtx.Err() != nil {
+				return
+			}
+			callCtx, cancel := goContext.WithTimeout(fs.watchCtx, 5*time.Second)
+			_ = fs.watcher.Unwatch(callCtx, rel)
+			cancel()
+			fs.watchMu.Lock()
+			delete(fs.watchSynced, rel)
+			fs.watchMu.Unlock()
+		}
+		for _, rel := range toWatch {
+			if fs.watchCtx.Err() != nil {
+				return
+			}
+			callCtx, cancel := goContext.WithTimeout(fs.watchCtx, 5*time.Second)
+			err := fs.watcher.Watch(callCtx, rel)
+			cancel()
+			fs.watchMu.Lock()
+			if err == nil {
+				fs.watchSynced[rel] = struct{}{}
+			} else {
+				// Avoid spinning on a permanently rejected/missing watch path.
+				for d, wRel := range fs.watched {
+					if wRel == rel {
+						delete(fs.watched, d)
+					}
+				}
+			}
+			fs.watchMu.Unlock()
+		}
+	}
+}
+
+func (fs *filesystem) unwatchDentry(d *dentry) {
+	if fs.watcher == nil {
+		return
+	}
+	fs.watchMu.Lock()
+	_, ok := fs.watched[d]
+	if ok {
+		delete(fs.watched, d)
+	}
+	closed := fs.watchClosed
+	fs.watchMu.Unlock()
+	if ok && !closed {
+		fs.signalWatchReconcile()
+	}
+}
+
+func (fs *filesystem) unwatchDentries(list []*dentry) {
+	if fs.watcher == nil || len(list) == 0 {
+		return
+	}
+	changed := false
+	fs.watchMu.Lock()
+	closed := fs.watchClosed
+	for _, d := range list {
+		if _, ok := fs.watched[d]; ok {
+			delete(fs.watched, d)
+			changed = true
+		}
+	}
+	fs.watchMu.Unlock()
+	if changed && !closed {
+		fs.signalWatchReconcile()
+	}
+}
+
+func (fs *filesystem) rebaseWatchedPaths(oldRel, newRel string) {
+	if fs.watcher == nil || oldRel == newRel {
+		return
+	}
+	prefix := oldRel + "/"
+	changed := false
+	fs.watchMu.Lock()
+	closed := fs.watchClosed
+	if !closed && len(fs.watched) > 0 {
+		for d, rel := range fs.watched {
+			switch {
+			case rel == oldRel:
+				fs.watched[d] = newRel
+				changed = true
+			case strings.HasPrefix(rel, prefix):
+				fs.watched[d] = newRel + rel[len(oldRel):]
+				changed = true
+			}
+		}
+	}
+	fs.watchMu.Unlock()
+	if changed && !closed {
+		fs.signalWatchReconcile()
+	}
+}
+
+func cleanNotifyPath(raw string) string {
+	p := path.Clean("/" + strings.TrimPrefix(raw, "/"))
+	rel := strings.TrimPrefix(p, "/")
+	if rel == "" {
+		return "."
+	}
+	return rel
+}
+
+func (fs *filesystem) deliverNotify(ev NotifyEvent) {
+	rel := cleanNotifyPath(ev.Path)
+	var targets []*dentry
+	fs.watchMu.Lock()
+	if !fs.watchClosed {
+		for d, wRel := range fs.watched {
+			if wRel == rel && d.TryIncRef() {
+				targets = append(targets, d)
+			}
+		}
+	}
+	fs.watchMu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+	ctx := context.Background()
+	unlinked := ev.Name == "" && ev.Mask&linux.IN_DELETE_SELF != 0
+	for _, d := range targets {
+		fs.ancestryMu.RLock()
+		dead := d.dead
+		fs.ancestryMu.RUnlock()
+		if !dead {
+			d.watches.Notify(ctx, ev.Name, ev.Mask, ev.Cookie, vfs.InodeEvent, unlinked)
+		}
+		d.DecRef(ctx)
+	}
 }
 
 func (fs *filesystem) isReadOnly(mnt *vfs.Mount) bool {
@@ -225,6 +507,20 @@ func isAncestorLocked(anc, desc *dentry) bool {
 }
 
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.watchMu.Lock()
+	fs.watchClosed = true
+	clear(fs.watched)
+	fs.watchMu.Unlock()
+	if fs.watcher != nil {
+		fs.watcher.SetNotifyHandler(nil)
+	}
+	if fs.watchCancel != nil {
+		fs.watchCancel()
+	}
+	if fs.watchDone != nil {
+		<-fs.watchDone
+	}
+
 	var toDecRef []*dentry
 	fs.mu.Lock()
 	root := fs.root
@@ -337,6 +633,7 @@ func (d *dentry) TryIncRef() bool {
 
 func (d *dentry) DecRef(ctx context.Context) {
 	if d.refs.Add(-1) == 0 {
+		d.fs.unwatchDentry(d)
 		d.watches.HandleDeletion(ctx)
 	}
 }
@@ -348,15 +645,80 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 	d.fs.ancestryMu.RLock()
 	parent := d.parent
 	name := d.name
+	dead := d.dead
 	d.fs.ancestryMu.RUnlock()
 	if parent != nil && name != "" {
-		parent.watches.Notify(ctx, name, events, cookie, et, d.vfsd.IsDead())
+		parent.watches.Notify(ctx, name, events, cookie, et, dead)
 	}
-	d.watches.Notify(ctx, "", events, cookie, et, d.vfsd.IsDead())
+	d.watches.Notify(ctx, "", events, cookie, et, dead)
 }
 
-func (d *dentry) Watches() *vfs.Watches         { return &d.watches }
-func (d *dentry) OnZeroWatches(context.Context) {}
+// AdmitInotifyWatch registers a host watch synchronously before inotify_add_watch(2)
+// returns so the host peer captures its baseline before guest callers proceed.
+func (d *dentry) AdmitInotifyWatch() error {
+	fs := d.fs
+	if fs.watcher == nil {
+		return nil
+	}
+	rel := d.path()
+	fs.watchOpMu.Lock()
+	defer fs.watchOpMu.Unlock()
+
+	fs.watchMu.Lock()
+	if fs.watchClosed {
+		fs.watchMu.Unlock()
+		return nil
+	}
+	if _, synced := fs.watchSynced[rel]; synced {
+		fs.watched[d] = rel
+		fs.watchMu.Unlock()
+		return nil
+	}
+	fs.watchMu.Unlock()
+
+	callCtx, cancel := goContext.WithTimeout(fs.watchCtx, 5*time.Second)
+	err := fs.watcher.Watch(callCtx, rel)
+	cancel()
+	if err != nil {
+		if linuxerr.Equals(linuxerr.ENOSPC, err) {
+			return linuxerr.ENOSPC
+		}
+		return nil
+	}
+
+	fs.watchMu.Lock()
+	if !fs.watchClosed {
+		fs.watchSynced[rel] = struct{}{}
+		fs.watched[d] = rel
+	}
+	fs.watchMu.Unlock()
+	return nil
+}
+
+func (d *dentry) Watches() *vfs.Watches {
+	fs := d.fs
+	if fs.watcher != nil && d.refs.Load() > 0 {
+		rel := d.path()
+		fs.watchMu.Lock()
+		_, tracked := fs.watched[d]
+		closed := fs.watchClosed
+		if !tracked && !closed {
+			fs.watched[d] = rel
+		}
+		fs.watchMu.Unlock()
+		if !tracked && !closed {
+			fs.signalWatchReconcile()
+		}
+	}
+	return &d.watches
+}
+
+func (d *dentry) OnZeroWatches(context.Context) {
+	if d.watches.Size() != 0 {
+		return
+	}
+	d.fs.unwatchDentry(d)
+}
 
 func (d *dentry) isDir() bool {
 	return d.mode.Load()&linux.S_IFMT == linux.S_IFDIR
@@ -436,6 +798,7 @@ func (fs *filesystem) lookupChild(ctx context.Context, parent *dentry, name stri
 				}
 			}
 			fs.mu.Unlock()
+			fs.unwatchDentries(evicted)
 			for _, d := range evicted {
 				d.DecRef(ctx)
 			}
@@ -466,6 +829,7 @@ func (fs *filesystem) lookupChild(ctx context.Context, parent *dentry, name stri
 	parent.children[name] = child
 	fs.mu.Unlock()
 
+	fs.unwatchDentries(evicted)
 	for _, d := range evicted {
 		d.DecRef(ctx)
 	}
@@ -820,6 +1184,7 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 				}
 				cur.children[name] = nd
 				fs.mu.Unlock()
+				fs.unwatchDentries(evicted)
 				for _, oldD := range evicted {
 					oldD.DecRef(ctx)
 				}
@@ -834,6 +1199,9 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			}
 		}
 	} else {
+		if mustCreate {
+			return nil, linuxerr.EEXIST
+		}
 		d, e, err = fs.resolve(ctx, rp)
 		if err != nil {
 			return nil, err
@@ -967,6 +1335,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	var evicted []*dentry
 	var cycleAfter bool
+	var movedDentry *dentry
+	var movedIsDir bool
 	fs.mu.Lock()
 	if newParent.children != nil {
 		if existing, ok := newParent.children[newName]; ok {
@@ -991,16 +1361,29 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 				moved.parent = newParent
 				moved.name = newName
 				newParent.children[newName] = moved
+				moved.IncRef()
+				movedDentry = moved
+				movedIsDir = moved.isDir()
 				fs.ancestryMu.Unlock()
 			}
 		}
 	}
 	fs.mu.Unlock()
+	fs.unwatchDentries(evicted)
 	for _, d := range evicted {
 		d.DecRef(ctx)
 	}
 	if cycleAfter {
 		return linuxerr.EINVAL
+	}
+	fs.rebaseWatchedPaths(oldRel, newRel)
+	if movedDentry != nil {
+		if movedDentry.watches.Size() > 0 || oldParent.watches.Size() > 0 || newParent.watches.Size() > 0 {
+			vfs.InotifyRename(ctx, &movedDentry.watches, &oldParent.watches, &newParent.watches, oldName, newName, movedIsDir)
+		}
+		movedDentry.DecRef(ctx)
+	} else if oldParent.watches.Size() > 0 || newParent.watches.Size() > 0 {
+		vfs.InotifyRename(ctx, nil, &oldParent.watches, &newParent.watches, oldName, newName, false)
 	}
 	return nil
 }
@@ -1040,6 +1423,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 	fs.dropChild(ctx, parent, name)
+	parent.watches.Notify(ctx, name, linux.IN_DELETE|linux.IN_ISDIR, 0, vfs.InodeEvent, true)
 	return nil
 }
 
@@ -1074,8 +1458,40 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	}); err != nil {
 		return err
 	}
-	fs.dropChild(ctx, parent, name)
+	removed := fs.takeChild(parent, name)
+	var selfWatches *vfs.Watches
+	if removed != nil {
+		selfWatches = &removed.watches
+	}
+	vfs.InotifyRemoveChild(ctx, selfWatches, &parent.watches, name)
+	if removed != nil {
+		fs.evictDetached(ctx, removed)
+	}
 	return nil
+}
+
+func (fs *filesystem) takeChild(parent *dentry, name string) *dentry {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if parent.children == nil {
+		return nil
+	}
+	old := parent.children[name]
+	if old != nil {
+		delete(parent.children, name)
+	}
+	return old
+}
+
+func (fs *filesystem) evictDetached(ctx context.Context, d *dentry) {
+	var evicted []*dentry
+	fs.mu.Lock()
+	fs.detachSubtreeLocked(d, &evicted)
+	fs.mu.Unlock()
+	fs.unwatchDentries(evicted)
+	for _, n := range evicted {
+		n.DecRef(ctx)
+	}
 }
 
 func (fs *filesystem) dropChild(ctx context.Context, parent *dentry, name string) {
@@ -1088,6 +1504,7 @@ func (fs *filesystem) dropChild(ctx context.Context, parent *dentry, name string
 		}
 	}
 	fs.mu.Unlock()
+	fs.unwatchDentries(evicted)
 	for _, d := range evicted {
 		d.DecRef(ctx)
 	}
@@ -1110,9 +1527,13 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 		return linuxerr.EEXIST
 	}
 	rel := joinRel(parent.path(), name)
-	return callRPCErr(ctx, func(c goContext.Context) error {
+	if err := callRPCErr(ctx, func(c goContext.Context) error {
 		return fs.client.Symlink(c, target, rel)
-	})
+	}); err != nil {
+		return err
+	}
+	parent.watches.Notify(ctx, name, linux.IN_CREATE, 0, vfs.InodeEvent, false)
+	return nil
 }
 
 func (fs *filesystem) setStatDentry(ctx context.Context, creds *auth.Credentials, d *dentry, mnt *vfs.Mount, opts vfs.SetStatOptions) error {
@@ -1171,7 +1592,13 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		return err
 	}
 	defer d.DecRef(ctx)
-	return fs.setStatDentry(ctx, rp.Credentials(), d, rp.Mount(), opts)
+	if err := fs.setStatDentry(ctx, rp.Credentials(), d, rp.Mount(), opts); err != nil {
+		return err
+	}
+	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
+	}
+	return nil
 }
 
 func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
@@ -1228,8 +1655,11 @@ func (fs *filesystem) PrependPath(_ context.Context, vfsroot, vd vfs.VirtualDent
 		if mnt == vfsroot.Mount() && &d.vfsd == vfsroot.Dentry() {
 			return vfs.PrependPathAtVFSRootError{}
 		}
-		if &d.vfsd == mnt.Root() {
+		if mnt != nil && &d.vfsd == mnt.Root() {
 			return nil
+		}
+		if d.dead {
+			return vfs.PrependPathSyntheticError{}
 		}
 		if d.parent == nil {
 			return vfs.PrependPathAtNonMountRootError{}
@@ -1298,9 +1728,10 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 		return 0, nil
 	}
 	rel := fd.dentry.path()
+	maxChunk := fd.dentry.fs.maxChunkSize()
 	var total int64
 	for total < want {
-		chunkLen := min(want-total, int64(maxChunkSize))
+		chunkLen := min(want-total, maxChunk)
 		data, err := callRPC(ctx, func(c goContext.Context) ([]byte, error) {
 			return fd.dentry.fs.client.Read(c, rel, offset+total, chunkLen)
 		})
@@ -1314,17 +1745,26 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 				return total, copyErr
 			}
 		}
-		if err == io.EOF || int64(len(data)) < chunkLen {
-			if total == 0 && err != nil {
-				return 0, err
-			}
-			return total, nil
-		}
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if total > 0 {
+					return total, nil
+				}
+				return 0, io.EOF
+			}
 			if total > 0 {
 				return total, nil
 			}
 			return 0, err
+		}
+		if len(data) == 0 {
+			if total > 0 {
+				return total, nil
+			}
+			return 0, io.EOF
+		}
+		if int64(len(data)) < chunkLen {
+			return total, nil
 		}
 	}
 	return total, nil
@@ -1350,8 +1790,9 @@ func (fd *regularFD) PWrite(ctx context.Context, src usermem.IOSequence, offset 
 		return 0, nil
 	}
 	rel := fd.dentry.path()
+	maxChunk := fd.dentry.fs.maxChunkSize()
 	var total int64
-	buf := make([]byte, min(want, int64(maxChunkSize)))
+	buf := make([]byte, min(want, maxChunk))
 	for total < want {
 		step := int(min(want-total, int64(len(buf))))
 		copied, copyErr := src.DropFirst64(total).CopyIn(ctx, buf[:step])

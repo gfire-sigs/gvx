@@ -566,10 +566,11 @@ type streamRPCFSClient struct {
 	cancel context.CancelFunc
 	stream *control.Stream
 
-	nextID  atomic.Uint64
-	mu      sync.Mutex
-	pending map[uint64]chan control.RPCFSResponse
-	closed  bool
+	nextID        atomic.Uint64
+	mu            sync.Mutex
+	pending       map[uint64]chan control.RPCFSResponse
+	notifyHandler func(rpcfs.NotifyEvent)
+	closed        bool
 }
 
 func newStreamRPCFSClient(parent context.Context, stream *control.Stream) *streamRPCFSClient {
@@ -584,6 +585,28 @@ func newStreamRPCFSClient(parent context.Context, stream *control.Stream) *strea
 	return c
 }
 
+func (c *streamRPCFSClient) MaxChunkBytes() int64 {
+	maxFrame := c.stream.MaxFrameBytes()
+	if maxFrame <= 0 {
+		maxFrame = control.DefaultMaxFrameBytes
+	}
+	overhead := min(4096, maxFrame/4)
+	chunk := int64(((maxFrame - overhead) * 3) / 4)
+	if chunk < 512 {
+		return 512
+	}
+	if chunk > 1<<20 {
+		return 1 << 20
+	}
+	return chunk
+}
+
+func (c *streamRPCFSClient) SetNotifyHandler(fn func(rpcfs.NotifyEvent)) {
+	c.mu.Lock()
+	c.notifyHandler = fn
+	c.mu.Unlock()
+}
+
 func (c *streamRPCFSClient) recvLoop() {
 	defer func() {
 		_ = c.Close()
@@ -593,19 +616,35 @@ func (c *streamRPCFSClient) recvLoop() {
 		if err != nil {
 			return
 		}
-		if ev.Type != "rpcfs.resp" {
-			continue
-		}
-		var resp control.RPCFSResponse
-		if json.Unmarshal(ev.Data, &resp) != nil {
-			continue
-		}
-		c.mu.Lock()
-		ch := c.pending[resp.ID]
-		delete(c.pending, resp.ID)
-		c.mu.Unlock()
-		if ch != nil {
-			ch <- resp
+		switch ev.Type {
+		case "rpcfs.resp":
+			var resp control.RPCFSResponse
+			if json.Unmarshal(ev.Data, &resp) != nil {
+				continue
+			}
+			c.mu.Lock()
+			ch := c.pending[resp.ID]
+			delete(c.pending, resp.ID)
+			c.mu.Unlock()
+			if ch != nil {
+				ch <- resp
+			}
+		case "rpcfs.notify":
+			var nev control.RPCFSNotifyEvent
+			if json.Unmarshal(ev.Data, &nev) != nil {
+				continue
+			}
+			c.mu.Lock()
+			handler := c.notifyHandler
+			c.mu.Unlock()
+			if handler != nil {
+				handler(rpcfs.NotifyEvent{
+					Path:   nev.Path,
+					Name:   nev.Name,
+					Mask:   nev.Mask,
+					Cookie: nev.Cookie,
+				})
+			}
 		}
 	}
 }
@@ -617,6 +656,7 @@ func (c *streamRPCFSClient) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.notifyHandler = nil
 	for id, ch := range c.pending {
 		close(ch)
 		delete(c.pending, id)
@@ -736,16 +776,36 @@ func (c *streamRPCFSClient) Stat(ctx context.Context, rel string) (rpcfs.Entry, 
 	return toRPCFSEntry(*resp.Entry), nil
 }
 
+const (
+	maxRPCFSReaddirPages   = 4096
+	maxRPCFSReaddirEntries = 1 << 20
+)
+
 func (c *streamRPCFSClient) Readdir(ctx context.Context, rel string) ([]rpcfs.Entry, error) {
-	resp, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "readdir", Path: rel})
-	if err != nil {
-		return nil, err
+	var (
+		out    []rpcfs.Entry
+		offset int64
+	)
+	for range maxRPCFSReaddirPages {
+		resp, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "readdir", Path: rel, Offset: offset})
+		if err != nil {
+			return nil, err
+		}
+		if len(out)+len(resp.Entries) > maxRPCFSReaddirEntries {
+			return nil, linuxerr.EIO
+		}
+		for _, e := range resp.Entries {
+			out = append(out, toRPCFSEntry(e))
+		}
+		if !resp.HasMore {
+			return out, nil
+		}
+		if len(resp.Entries) == 0 || resp.NextOffset <= offset {
+			return nil, linuxerr.EIO
+		}
+		offset = resp.NextOffset
 	}
-	out := make([]rpcfs.Entry, len(resp.Entries))
-	for i, e := range resp.Entries {
-		out[i] = toRPCFSEntry(e)
-	}
-	return out, nil
+	return nil, linuxerr.EIO
 }
 
 func (c *streamRPCFSClient) Read(ctx context.Context, rel string, offset, length int64) ([]byte, error) {
@@ -828,6 +888,16 @@ func (c *streamRPCFSClient) Symlink(ctx context.Context, target, linkRel string)
 	return err
 }
 
+func (c *streamRPCFSClient) Watch(ctx context.Context, rel string) error {
+	_, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "watch", Path: rel})
+	return err
+}
+
+func (c *streamRPCFSClient) Unwatch(ctx context.Context, rel string) error {
+	_, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "unwatch", Path: rel})
+	return err
+}
+
 func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, raw json.RawMessage) error {
 	var req control.MountServeRequest
 	if err := decodeParams(raw, &req); err != nil {
@@ -897,10 +967,20 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	creds := auth.NewRootCredentials(k.RootUserNamespace())
 	vfsObj := k.VFS()
 
-	if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
-		return control.NewErrorf(control.CodeInternal, "create rpcfs mount point %q: %v", target, err)
+	if req.SingleFile {
+		if err := vfsEnsureEmptyFile(sctxWithRoot, vfsObj, creds, root, target, 0o644); err != nil {
+			return control.NewErrorf(control.CodeInternal, "create rpcfs mount file %q: %v", target, err)
+		}
+	} else {
+		if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
+			return control.NewErrorf(control.CodeInternal, "create rpcfs mount point %q: %v", target, err)
+		}
 	}
-	fs, rootD, err := rpcfs.NewFilesystem(sctxWithRoot, vfsObj, rpcClient, req.Label, req.ReadOnly)
+	fs, rootD, err := rpcfs.NewFilesystemWithOptions(sctxWithRoot, vfsObj, rpcClient, rpcfs.Options{
+		Label:      req.Label,
+		ReadOnly:   req.ReadOnly,
+		SingleFile: req.SingleFile,
+	})
 	if err != nil {
 		return control.NewErrorf(control.CodeInternal, "init rpcfs at %q: %v", target, err)
 	}
