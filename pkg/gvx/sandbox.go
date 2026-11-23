@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -381,9 +382,21 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 			}
 		}
 	}
-	if (s.cfg.AutoPublishPorts || s.cfg.DynamicPorts) && s.cfg.NetworkMode == NetModeNAT {
-		opts.AllowLoopbackBind = true
-		opts.DynamicListeners = s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts)
+	if s.cfg.NetworkMode == NetModeNAT {
+		var allowedBindAddrs []string
+		for _, ip := range s.cfg.DynamicPortAddrs {
+			if !slices.Contains(allowedBindAddrs, ip) {
+				allowedBindAddrs = append(allowedBindAddrs, ip)
+			}
+		}
+		if s.cfg.AutoPublishPorts && s.cfg.AutoPublishAddr != "" && !slices.Contains(allowedBindAddrs, s.cfg.AutoPublishAddr) {
+			allowedBindAddrs = append(allowedBindAddrs, s.cfg.AutoPublishAddr)
+		}
+		if s.cfg.AutoPublishPorts || s.cfg.DynamicPorts || len(allowedBindAddrs) > 0 {
+			opts.AllowLoopbackBind = s.cfg.AutoPublishPorts || s.cfg.DynamicPorts
+			opts.AllowedBindAddrs = allowedBindAddrs
+			opts.DynamicListeners = s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts)
+		}
 	}
 	if s.controlListener() != nil {
 		opts.PreboundListeners++

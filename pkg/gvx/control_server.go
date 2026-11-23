@@ -152,8 +152,11 @@ func (s *Sandbox) ControlCapabilities() []string {
 	}
 	if cfg.NetworkMode == NetModeNAT {
 		avail = append(avail, control.CapResourceNetwork, control.CapPortList, control.CapPortRemove)
-		if !locked || cfg.AutoPublishPorts || cfg.DynamicPorts {
+		if !locked || cfg.AutoPublishPorts || cfg.DynamicPorts || hasLoopbackBindAddr(cfg.DynamicPortAddrs) {
 			avail = append(avail, control.CapPortDynamicLoopback)
+		}
+		if hasNonLoopbackBindAddr(cfg.DynamicPortAddrs) {
+			avail = append(avail, control.CapPortDynamicAny)
 		}
 		if !locked {
 			avail = append(avail, control.CapPortAnyBind)

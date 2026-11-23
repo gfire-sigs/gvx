@@ -33,13 +33,17 @@ const (
 	defaultDynamicPollInterval = 200 * time.Millisecond
 )
 
-// DynamicForwardOptions configures automatic host loopback publishing of guest
-// TCP listeners and iptables NAT DNAT published ports.
+// DynamicForwardOptions configures automatic host publishing of guest TCP
+// listeners and iptables NAT DNAT published ports.
 type DynamicForwardOptions struct {
-	// ListenTCP binds a host loopback TCP listener. Defaults to net.Listen.
+	// BindIP sets the host IP address that automatic listeners bind. Defaults
+	// to "127.0.0.1".
+	BindIP string
+
+	// ListenTCP binds a host TCP listener. Defaults to net.Listen.
 	ListenTCP func(network, address string) (net.Listener, error)
 
-	// ListenUDP binds a host loopback UDP socket. Defaults to net.ListenPacket.
+	// ListenUDP binds a host UDP socket. Defaults to net.ListenPacket.
 	ListenUDP func(network, address string) (net.PacketConn, error)
 
 	// MaxPorts bounds how many dynamic host listeners may stay open at once.
@@ -52,7 +56,7 @@ type DynamicForwardOptions struct {
 	// (added=false).
 	OnPublish func(rule PortForwardRule, added bool)
 
-	// OnBindError is called once per guest port when binding on 127.0.0.1 fails.
+	// OnBindError is called once per guest port when binding fails.
 	OnBindError func(proto string, port uint16, err error)
 }
 
@@ -73,6 +77,9 @@ type dnatTargetMarker interface {
 // guest TCP listeners and iptables NAT DNAT ports. Static rules bound by
 // PreBind take precedence and are never shadowed by dynamic binds.
 func (pf *PortForwarder) EnableDynamicLoopback(opts DynamicForwardOptions) {
+	if opts.BindIP == "" {
+		opts.BindIP = "127.0.0.1"
+	}
 	if opts.ListenTCP == nil {
 		opts.ListenTCP = net.Listen
 	}
@@ -276,10 +283,18 @@ func (pf *PortForwarder) reconcileDynamicPorts() {
 }
 
 func (pf *PortForwarder) bindDynamicCandidate(s *stack.Stack, opts DynamicForwardOptions, cand dynCandidate) {
-	bindAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(cand.key.port)))
+	bindIP := opts.BindIP
+	if bindIP == "" {
+		bindIP = "127.0.0.1"
+	}
+	tcpNet, udpNet := "tcp4", "udp4"
+	if addr, err := netip.ParseAddr(bindIP); err == nil && addr.Unmap().Is6() {
+		tcpNet, udpNet = "tcp6", "udp6"
+	}
+	bindAddr := net.JoinHostPort(bindIP, strconv.Itoa(int(cand.key.port)))
 	rule := PortForwardRule{
 		Proto:     cand.key.proto,
-		HostIP:    "127.0.0.1",
+		HostIP:    bindIP,
 		HostPort:  cand.key.port,
 		GuestIP:   cand.guestIP,
 		GuestPort: cand.key.port,
@@ -287,7 +302,7 @@ func (pf *PortForwarder) bindDynamicCandidate(s *stack.Stack, opts DynamicForwar
 
 	switch cand.key.proto {
 	case "tcp":
-		ln, err := opts.ListenTCP("tcp4", bindAddr)
+		ln, err := opts.ListenTCP(tcpNet, bindAddr)
 		if err != nil {
 			pf.recordDynamicBindError(opts, cand.key, err)
 			return
@@ -313,7 +328,7 @@ func (pf *PortForwarder) bindDynamicCandidate(s *stack.Stack, opts DynamicForwar
 		}
 
 	case "udp":
-		pc, err := opts.ListenUDP("udp4", bindAddr)
+		pc, err := opts.ListenUDP(udpNet, bindAddr)
 		if err != nil {
 			pf.recordDynamicBindError(opts, cand.key, err)
 			return

@@ -106,7 +106,7 @@ func (s *Sandbox) initNATStack() error {
 // and enables dynamic loopback publishing when Config.AutoPublishPorts is set.
 func (s *Sandbox) initPortForwarder() error {
 	s.forwards = s.effectivePortForwards()
-	if len(s.forwards) == 0 && !s.cfg.AutoPublishPorts && !s.cfg.DynamicPorts && s.controlListener() == nil {
+	if len(s.forwards) == 0 && !s.cfg.AutoPublishPorts && !s.cfg.DynamicPorts && len(s.cfg.DynamicPortAddrs) == 0 && s.controlListener() == nil {
 		return nil
 	}
 	pf := netbackend.NewPortForwarder(s.cfg.Tuning)
@@ -129,16 +129,33 @@ func (s *Sandbox) initPortForwarder() error {
 		}
 	}
 	if s.cfg.AutoPublishPorts {
+		autoBindIP := s.cfg.AutoPublishAddr
+		if autoBindIP == "" {
+			autoBindIP = "127.0.0.1"
+		}
 		dynOpts := netbackend.DynamicForwardOptions{
+			BindIP:       autoBindIP,
 			MaxPorts:     s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts),
 			PollInterval: s.cfg.Tuning.Duration(tuning.ForwardDynamicPollInterval),
 		}
 		if !s.cfg.DisableHostLockdown {
-			dynOpts.ListenTCP = hostlockdown.ListenLoopback
-			dynOpts.ListenUDP = hostlockdown.ListenPacketLoopback
+			dynOpts.ListenTCP = hostlockdown.ListenAllowed
+			dynOpts.ListenUDP = hostlockdown.ListenPacketAllowed
 		}
-		if w := s.cfg.Warnings; w != nil {
-			dynOpts.OnPublish = func(rule netbackend.PortForwardRule, added bool) {
+		w := s.cfg.Warnings
+		dynOpts.OnPublish = func(rule netbackend.PortForwardRule, added bool) {
+			action := "add"
+			if !added {
+				action = "remove"
+			}
+			s.emitEvent("port", action, map[string]string{
+				"source":     netbackend.PortSourceAuto,
+				"proto":      rule.Proto,
+				"host_ip":    rule.HostIP,
+				"host_port":  strconv.Itoa(int(rule.HostPort)),
+				"guest_port": strconv.Itoa(int(rule.GuestPort)),
+			})
+			if w != nil {
 				host := net.JoinHostPort(rule.HostIP, strconv.Itoa(int(rule.HostPort)))
 				if added {
 					_, _ = fmt.Fprintf(w, "gvx: auto-published %s -> %d/%s\n", host, rule.GuestPort, rule.Proto)
@@ -146,8 +163,19 @@ func (s *Sandbox) initPortForwarder() error {
 					_, _ = fmt.Fprintf(w, "gvx: unpublished %s -> %d/%s\n", host, rule.GuestPort, rule.Proto)
 				}
 			}
-			dynOpts.OnBindError = func(proto string, port uint16, err error) {
-				_, _ = fmt.Fprintf(w, "gvx: warning: could not auto-publish 127.0.0.1:%d/%s: %v\n", port, proto, err)
+		}
+		dynOpts.OnBindError = func(proto string, port uint16, err error) {
+			s.emitEvent("port", "bind_failed", map[string]string{
+				"source":     netbackend.PortSourceAuto,
+				"proto":      proto,
+				"host_ip":    autoBindIP,
+				"host_port":  strconv.Itoa(int(port)),
+				"guest_port": strconv.Itoa(int(port)),
+				"error":      err.Error(),
+			})
+			if w != nil {
+				host := net.JoinHostPort(autoBindIP, strconv.Itoa(int(port)))
+				_, _ = fmt.Fprintf(w, "gvx: warning: could not auto-publish %s/%s: %v\n", host, proto, err)
 			}
 		}
 		pf.EnableDynamicLoopback(dynOpts)
