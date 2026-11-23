@@ -47,9 +47,8 @@ const (
 	ociClientProtocolVersion = "v1.0"
 	// oauthClientID identifies this client in OAuth2 token exchange requests.
 	oauthClientID = "gvx-oci"
+	userAgent     = "gvx-oci/" + ociClientProtocolVersion + " (gvisor-everywhere; not-a-whale; " + runtime.GOOS + "/" + runtime.GOARCH + "; +https://z.gfire.dev/gvx; plz-no-429)"
 )
-
-var userAgent = fmt.Sprintf("gvx-oci/%s (gvisor-everywhere; not-a-whale; %s/%s; +https://z.gfire.dev/gvx; plz-no-429)", ociClientProtocolVersion, runtime.GOOS, runtime.GOARCH)
 
 var manifestAccept = strings.Join([]string{
 	ocispec.MediaTypeImageIndex,

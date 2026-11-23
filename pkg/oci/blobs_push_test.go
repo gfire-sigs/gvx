@@ -673,7 +673,7 @@ func TestPushImageAuthBearerScopeUpgradeAndExternalLocationStripsAuth(t *testing
 	if len(gotScopes) < 2 || !strings.Contains(gotScopes[0], ":pull") || !strings.Contains(gotScopes[1], "pull,push") {
 		t.Fatalf("bearer scopes = %v, want pull then pull,push upgrade", gotScopes)
 	}
-	wantUA := fmt.Sprintf("gvx-oci/v1.0 (gvisor-everywhere; not-a-whale; %s/%s; +https://z.gfire.dev/gvx; plz-no-429)", runtime.GOOS, runtime.GOARCH)
+	const wantUA = "gvx-oci/v1.0 (gvisor-everywhere; not-a-whale; " + runtime.GOOS + "/" + runtime.GOARCH + "; +https://z.gfire.dev/gvx; plz-no-429)"
 	for _, ua := range gotUAs {
 		if ua != wantUA {
 			t.Fatalf("User-Agent = %q, want %q", ua, wantUA)
