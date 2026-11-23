@@ -997,18 +997,8 @@ func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *
 		return layerFD, nil
 	}
 	layerFlags := layerFD.StatusFlags()
-	fd := &regularFileFD{
-		copiedUp:    isUpper,
-		cachedFD:    layerFD,
-		cachedFlags: layerFlags,
-	}
-	fd.LockFD.Init(&d.locks)
 	layerFDOpts := layerFD.Options()
-	if err := fd.vfsfd.Init(fd, layerFlags, rp.Credentials(), mnt, &d.vfsd, &layerFDOpts); err != nil {
-		layerFD.DecRef(ctx)
-		return nil, err
-	}
-	return &fd.vfsfd, nil
+	return d.fs.initRegularFileFD(ctx, rp, mnt, d, isUpper, layerFD, layerFlags, &layerFDOpts)
 }
 
 // Preconditions:
@@ -1075,20 +1065,14 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	// it for some reason).
 	parent.dirents = nil
 	upperFlags := upperFD.StatusFlags()
-	fd := &regularFileFD{
-		copiedUp:    true,
-		cachedFD:    upperFD,
-		cachedFlags: upperFlags,
-	}
-	fd.LockFD.Init(&child.locks)
 	upperFDOpts := upperFD.Options()
-	if err := fd.vfsfd.Init(fd, upperFlags, rp.Credentials(), mnt, &child.vfsd, &upperFDOpts); err != nil {
-		upperFD.DecRef(ctx)
+	vfsfd, err := fs.initRegularFileFD(ctx, rp, mnt, child, true, upperFD, upperFlags, &upperFDOpts)
+	if err != nil {
 		return nil, err
 	}
 	parent.watches.Notify(withDropList(ctx, ds), childName, linux.IN_CREATE, 0 /* cookie */, vfs.PathEvent, false /* unlinked */)
-	fd.vfsfd.SetCreated()
-	return &fd.vfsfd, nil
+	vfsfd.SetCreated()
+	return vfsfd, nil
 }
 
 // ReadlinkAt implements vfs.FilesystemImpl.ReadlinkAt.

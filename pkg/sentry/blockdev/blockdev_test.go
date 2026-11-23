@@ -15,11 +15,14 @@
 package blockdev
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
@@ -294,5 +297,97 @@ func TestFirstTouchParallelClaimsCountEachPageOnce(t *testing.T) {
 	wg.Wait()
 	if got, want := total.Load(), uint64(pages*PageSize); got != want {
 		t.Errorf("eight overlapping claimers counted %d bytes, want %d", got, want)
+	}
+}
+
+type countingAccountant struct {
+	bytes atomic.Uint64
+	ios   atomic.Uint64
+}
+
+func (c *countingAccountant) AccountIO(_ gvcontext.Context, _, _ uint32, _ Op, nbytes, ios uint64) {
+	c.bytes.Add(nbytes)
+	c.ios.Add(ios)
+}
+
+func TestRegistryConcurrentAccountIOBindOrderingAndWeakGC(t *testing.T) {
+	// 1. Concurrent Of(v), AccountIO, and Add on one VFS must be race-free.
+	v := &vfs.VirtualFilesystem{}
+	if err := v.Init(gvcontext.Background()); err != nil {
+		t.Fatalf("v.Init: %v", err)
+	}
+	acc := &countingAccountant{}
+	Of(v).SetIOAccountant(acc)
+
+	const workers = 16
+	const iters = 200
+	var wg sync.WaitGroup
+	wg.Add(workers + 1)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			ctx := gvcontext.Background()
+			for range iters {
+				AccountIO(ctx, v, Major, 0, Write, 4096, 1)
+			}
+		}()
+	}
+	go func() {
+		defer wg.Done()
+		_, _ = Of(v).Add(Options{Stats: NewStats(nil), SectorsCount: 1024})
+	}()
+	wg.Wait()
+	if got, want := acc.bytes.Load(), uint64(workers*iters*4096); got != want {
+		t.Fatalf("concurrent AccountIO bytes = %d, want %d", got, want)
+	}
+
+	// 2. Bind preserves IOAccountant in both restore orderings.
+	// Order A: Of(vA).SetIOAccountant before Bind(vA, rA).
+	vA := &vfs.VirtualFilesystem{}
+	if err := vA.Init(gvcontext.Background()); err != nil {
+		t.Fatalf("vA.Init: %v", err)
+	}
+	accA := &countingAccountant{}
+	Of(vA).SetIOAccountant(accA)
+	rA := &Registry{}
+	Bind(vA, rA)
+	AccountIO(gvcontext.Background(), vA, Major, 0, Read, 512, 1)
+	if accA.bytes.Load() != 512 {
+		t.Fatalf("order A Bind lost IOAccountant: bytes=%d", accA.bytes.Load())
+	}
+
+	// Order B: Bind(vB, rB) before Of(vB).SetIOAccountant.
+	vB := &vfs.VirtualFilesystem{}
+	if err := vB.Init(gvcontext.Background()); err != nil {
+		t.Fatalf("vB.Init: %v", err)
+	}
+	rB := &Registry{}
+	Bind(vB, rB)
+	accB := &countingAccountant{}
+	Of(vB).SetIOAccountant(accB)
+	AccountIO(gvcontext.Background(), vB, Major, 0, Read, 1024, 1)
+	if accB.bytes.Load() != 1024 {
+		t.Fatalf("order B Bind lost IOAccountant: bytes=%d", accB.bytes.Load())
+	}
+
+	// 3. Weak VFS reference allows dropped VirtualFilesystem instances to be GC'd.
+	var refs []weak.Pointer[vfs.VirtualFilesystem]
+	for range 32 {
+		tmp := &vfs.VirtualFilesystem{}
+		_ = tmp.Init(gvcontext.Background())
+		_ = Of(tmp)
+		refs = append(refs, weak.Make(tmp))
+	}
+	for range 5 {
+		runtime.GC()
+	}
+	leaked := 0
+	for _, r := range refs {
+		if r.Value() != nil {
+			leaked++
+		}
+	}
+	if leaked != 0 {
+		t.Fatalf("%d of %d VirtualFilesystem instances stayed reachable via blockdev.Registry", leaked, len(refs))
 	}
 }

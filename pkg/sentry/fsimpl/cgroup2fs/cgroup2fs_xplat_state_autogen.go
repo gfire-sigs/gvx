@@ -44,6 +44,202 @@ func (b *cpuBandwidth) StateLoadValue(ctx context.Context, stateSlot int, stateV
 	}
 }
 
+func (s *ioDevStats) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroup2fs.ioDevStats"
+}
+
+func (s *ioDevStats) StateFields() []string {
+	return []string{
+		"rbytes",
+		"wbytes",
+		"rios",
+		"wios",
+		"dbytes",
+		"dios",
+	}
+}
+
+func (s *ioDevStats) beforeSave() {}
+
+// +checklocksignore
+func (s *ioDevStats) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.SaveUint64(0, &s.rbytes)
+	stateSinkObject.SaveUint64(1, &s.wbytes)
+	stateSinkObject.SaveUint64(2, &s.rios)
+	stateSinkObject.SaveUint64(3, &s.wios)
+	stateSinkObject.SaveUint64(4, &s.dbytes)
+	stateSinkObject.SaveUint64(5, &s.dios)
+}
+
+func (s *ioDevStats) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (s *ioDevStats) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.LoadUint64(0, &s.rbytes)
+	stateSourceObject.LoadUint64(1, &s.wbytes)
+	stateSourceObject.LoadUint64(2, &s.rios)
+	stateSourceObject.LoadUint64(3, &s.wios)
+	stateSourceObject.LoadUint64(4, &s.dbytes)
+	stateSourceObject.LoadUint64(5, &s.dios)
+}
+
+func (r *ioMaxRule) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroup2fs.ioMaxRule"
+}
+
+func (r *ioMaxRule) StateFields() []string {
+	return []string{
+		"rbps",
+		"wbps",
+		"riops",
+		"wiops",
+	}
+}
+
+func (r *ioMaxRule) beforeSave() {}
+
+// +checklocksignore
+func (r *ioMaxRule) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.SaveUint64(0, &r.rbps)
+	stateSinkObject.SaveUint64(1, &r.wbps)
+	stateSinkObject.SaveUint64(2, &r.riops)
+	stateSinkObject.SaveUint64(3, &r.wiops)
+}
+
+func (r *ioMaxRule) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (r *ioMaxRule) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.LoadUint64(0, &r.rbps)
+	stateSourceObject.LoadUint64(1, &r.wbps)
+	stateSourceObject.LoadUint64(2, &r.riops)
+	stateSourceObject.LoadUint64(3, &r.wiops)
+}
+
+func (ic *ioCtrl) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroup2fs.ioCtrl"
+}
+
+func (ic *ioCtrl) StateFields() []string {
+	return []string{
+		"c",
+		"parent",
+		"detached",
+		"stats",
+		"defaultWeight",
+		"weights",
+		"maxRules",
+	}
+}
+
+func (ic *ioCtrl) beforeSave() {}
+
+// +checklocksignore
+func (ic *ioCtrl) StateSave(stateSinkObject state.Sink) {
+	ic.beforeSave()
+	stateSinkObject.Save(0, &ic.c)
+	stateSinkObject.Save(1, &ic.parent)
+	stateSinkObject.Save(2, &ic.detached)
+	stateSinkObject.Save(3, &ic.stats)
+	stateSinkObject.SaveUint64(4, &ic.defaultWeight)
+	stateSinkObject.Save(5, &ic.weights)
+	stateSinkObject.Save(6, &ic.maxRules)
+}
+
+func (ic *ioCtrl) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (ic *ioCtrl) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &ic.c)
+	stateSourceObject.Load(1, &ic.parent)
+	stateSourceObject.Load(2, &ic.detached)
+	stateSourceObject.Load(3, &ic.stats)
+	stateSourceObject.LoadUint64(4, &ic.defaultWeight)
+	stateSourceObject.Load(5, &ic.weights)
+	stateSourceObject.Load(6, &ic.maxRules)
+}
+
+func (is *ioStat) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroup2fs.ioStat"
+}
+
+func (is *ioStat) StateFields() []string {
+	return []string{
+		"io",
+	}
+}
+
+func (is *ioStat) beforeSave() {}
+
+// +checklocksignore
+func (is *ioStat) StateSave(stateSinkObject state.Sink) {
+	is.beforeSave()
+	stateSinkObject.Save(0, &is.io)
+}
+
+// +checklocksignore
+func (is *ioStat) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &is.io)
+	stateSourceObject.AfterLoadTo(is)
+}
+
+// +checklocksignore
+func (is *ioStat) StateAfterLoad(ctx context.Context) {
+	is.afterLoad(ctx)
+}
+
+func (iw *ioWeight) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroup2fs.ioWeight"
+}
+
+func (iw *ioWeight) StateFields() []string {
+	return []string{
+		"io",
+	}
+}
+
+func (iw *ioWeight) beforeSave() {}
+
+// +checklocksignore
+func (iw *ioWeight) StateSave(stateSinkObject state.Sink) {
+	iw.beforeSave()
+	stateSinkObject.Save(0, &iw.io)
+}
+
+func (iw *ioWeight) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (iw *ioWeight) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &iw.io)
+}
+
+func (im *ioMax) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroup2fs.ioMax"
+}
+
+func (im *ioMax) StateFields() []string {
+	return []string{
+		"io",
+	}
+}
+
+func (im *ioMax) beforeSave() {}
+
+// +checklocksignore
+func (im *ioMax) StateSave(stateSinkObject state.Sink) {
+	im.beforeSave()
+	stateSinkObject.Save(0, &im.io)
+}
+
+func (im *ioMax) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (im *ioMax) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &im.io)
+}
+
 func (c *cgroupRootXplatState) StateTypeName() string {
 	return "pkg/sentry/fsimpl/cgroup2fs.cgroupRootXplatState"
 }
@@ -246,6 +442,12 @@ func (o *MemoryEnforcerOptions) StateLoad(ctx context.Context, stateSourceObject
 
 func init() {
 	state.RegisterNoHooks((*cpuBandwidth)(nil))
+	state.RegisterNoHooks((*ioDevStats)(nil))
+	state.RegisterNoHooks((*ioMaxRule)(nil))
+	state.RegisterNoHooks((*ioCtrl)(nil))
+	state.RegisterStruct((*ioStat)(nil))
+	state.RegisterNoHooks((*ioWeight)(nil))
+	state.RegisterNoHooks((*ioMax)(nil))
 	state.RegisterNoHooks((*cgroupRootXplatState)(nil))
 	state.RegisterStruct((*memoryStat)(nil))
 	state.RegisterNoHooks((*oomState)(nil))

@@ -38,6 +38,8 @@ const (
 	Cgroup2PIDs
 	// Cgroup2CPUSet represents the cpuset controller.
 	Cgroup2CPUSet
+	// Cgroup2IO represents the block I/O controller.
+	Cgroup2IO
 	// Cgroup2NumControllers is the total number of cgroup v2 controllers currently supported.
 	Cgroup2NumControllers
 )

@@ -484,6 +484,9 @@ func (fs *filesystem) resolveKernel(ctx context.Context) *kernel.Kernel {
 
 // CompleteRestore implements vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
 func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestoreOptions) error {
+	if vfsfs := fs.VFSFilesystem(); vfsfs != nil {
+		fs.bindIOAccountant(vfsfs.VirtualFilesystem())
+	}
 	k := fs.resolveKernel(ctx)
 	pr := fs.memEnforcer.pendingRestore
 	fs.memEnforcer.pendingRestore = nil
@@ -529,6 +532,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 // releaseXplat stops the memory enforcer goroutine and removes active CPU
 // bandwidth limits when the filesystem releases its root tree.
 func (fs *filesystem) releaseXplat() {
+	fs.unbindIOAccountant()
 	fs.stopMemoryEnforcer()
 	var ctrls []*cpu
 	seen := make(map[*cpu]struct{})

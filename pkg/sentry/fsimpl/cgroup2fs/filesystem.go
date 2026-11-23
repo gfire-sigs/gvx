@@ -186,7 +186,7 @@ func SetNSDelegate(k *kernel.Kernel, v bool) {
 func InitHierarchy(ctx context.Context, k *kernel.Kernel) (*vfs.Mount, error) {
 	cg2Mount := NewInternalMount(k)
 	SetNSDelegate(k, true)
-	if err := k.Cgroup2FS().RootCgroup().WriteControl(ctx, "cgroup.subtree_control", "+cpu +memory +pids +cpuset"); err != nil {
+	if err := k.Cgroup2FS().RootCgroup().WriteControl(ctx, "cgroup.subtree_control", "+cpu +memory +pids +cpuset +io"); err != nil {
 		cg2Mount.DecRef(ctx)
 		return nil, fmt.Errorf("enabling root cgroup2 controllers: %w", err)
 	}
@@ -223,6 +223,7 @@ func NewFilesystem(ctx context.Context, k *kernel.Kernel, vfsObj *vfs.VirtualFil
 	rootD := &kernfs.Dentry{}
 	rootD.InitRoot(&fs.Filesystem, rootInode)
 	fs.root = rootD
+	fs.bindIOAccountant(vfsObj)
 
 	return fs.VFSFilesystem(), nil
 }

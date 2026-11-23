@@ -650,7 +650,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:           "pkg/sentry/fsimpl/cgroup2fs",
 		tier:          Tier2Sibling,
-		allowed:       []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/kernel", "pkg/sentry/usage", "pkg/sentry/vfs"},
+		allowed:       []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel", "pkg/sentry/usage", "pkg/sentry/vfs", "pkg/usermem"},
 		forbidden:     append([]string{xSysWindows}, append(slices.Clone(platformSiblings), tier2UpperBans...)...),
 		forbiddenProd: []string{"pkg/sentry/platform/*"},
 	},
@@ -664,7 +664,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:           "pkg/sentry/fsimpl/erofs",
 		tier:          Tier2Sibling,
-		allowed:       []string{"pkg/abi/linux", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel/auth", "pkg/sentry/vfs"},
+		allowed:       []string{"pkg/abi/linux", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel/auth", "pkg/sentry/vfs"},
 		forbidden:     append([]string{xSysWindows}, append(slices.Clone(platformSiblings), without(tier2UpperBans, "pkg/oci/*")...)...),
 		forbiddenProd: []string{"pkg/sentry/platform/*", "pkg/oci/*"},
 	},
@@ -677,7 +677,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/fsimpl/overlay",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/sentry/uniqueid", "pkg/sentry/vfs", "pkg/state"},
+		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/sentry/blockdev", "pkg/sentry/uniqueid", "pkg/sentry/vfs", "pkg/state", "pkg/usermem"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
