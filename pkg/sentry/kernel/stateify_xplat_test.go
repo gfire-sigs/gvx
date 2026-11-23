@@ -17,11 +17,15 @@ package kernel
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	gvcontext "z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/state"
 	"z.gfire.dev/gvx/pkg/waiter"
 )
@@ -37,6 +41,58 @@ func roundTripState[T any](t *testing.T, loadCtx context.Context, src T) T {
 		t.Fatalf("state.Load: %v", err)
 	}
 	return dst
+}
+
+func TestPrivateMemoryFilesRestoreGraphAndWire(t *testing.T) {
+	prevGraph := state.GraphEngineEnabled()
+	t.Cleanup(func() { state.EnableGraphEngine(prevGraph) })
+	for _, mode := range []struct {
+		name  string
+		graph bool
+	}{{"graph", true}, {"wire", false}} {
+		t.Run(mode.name, func(t *testing.T) {
+			state.EnableGraphEngine(mode.graph)
+			ctx := gvcontext.Background()
+			newMemoryFile := func() *pgalloc.MemoryFile {
+				f, err := os.CreateTemp(t.TempDir(), "pages")
+				if err != nil {
+					t.Fatalf("create MemoryFile backing: %v", err)
+				}
+				mf, err := pgalloc.NewMemoryFile(f, pgalloc.MemoryFileOpts{
+					DisableIMAWorkAround:    true,
+					DisableMemoryAccounting: true,
+				})
+				if err != nil {
+					if closeErr := f.Close(); closeErr != nil {
+						t.Errorf("close MemoryFile backing: %v", closeErr)
+					}
+					t.Fatalf("pgalloc.NewMemoryFile: %v", err)
+				}
+				t.Cleanup(func() {
+					mf.Destroy()
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := mf.WaitBackingClosed(ctx); err != nil {
+						t.Errorf("destroy MemoryFile: %v", err)
+					}
+				})
+				return mf
+			}
+			id := checkpoint.ResourceID{ContainerName: "container", Path: "/cache"}
+			var metadata bytes.Buffer
+			saved := map[checkpoint.ResourceID]*pgalloc.MemoryFile{id: newMemoryFile()}
+			if err := savePrivateMFs(ctx, &metadata, saved, &pgalloc.SaveOpts{}); err != nil {
+				t.Fatalf("save private MemoryFile for %v: %v", id, err)
+			}
+			restored := map[checkpoint.ResourceID]*pgalloc.MemoryFile{id: newMemoryFile()}
+			if err := loadPrivateMemoryFiles(ctx, &metadata, restored, nil, &pgalloc.LoadOpts{}); err != nil {
+				t.Fatalf("restore private MemoryFile for %v: %v", id, err)
+			}
+			if metadata.Len() != 0 {
+				t.Errorf("restore left %d bytes of private MemoryFile metadata", metadata.Len())
+			}
+		})
+	}
 }
 
 func TestKernelLogSaveLoadRoundTrip(t *testing.T) {

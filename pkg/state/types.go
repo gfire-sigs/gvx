@@ -52,8 +52,18 @@ func makeTypeEncodeDatabase() typeEncodeDatabase {
 	}
 }
 
+type loadTypes []reflect.Type
+
+func (allowed loadTypes) verify(t reflect.Type) {
+	if allowed != nil && !slices.Contains(allowed, t) {
+		Failf("type %v is not allowed in this state stream", t)
+	}
+}
+
 // typeDecodeDatabase is an internal TypeInfo database for decoding.
 type typeDecodeDatabase struct {
+	allowed loadTypes
+
 	// byID maps by ID to type.
 	byID []*reconciledTypeEntry
 
@@ -62,11 +72,6 @@ type typeDecodeDatabase struct {
 	// used to lookup types by name, since they may not be reconciled and
 	// there's little value to deleting from this map.
 	pending []*wire.Type
-}
-
-// makeTypeDecodeDatabase makes a typeDatabase.
-func makeTypeDecodeDatabase() typeDecodeDatabase {
-	return typeDecodeDatabase{}
 }
 
 // lookupTypeInfo extracts the metadata for a type.
@@ -135,6 +140,9 @@ func (tdb *typeEncodeDatabase) Lookup(typ reflect.Type) (*typeEntry, bool) {
 // Register adds a typeID entry.
 func (tbd *typeDecodeDatabase) Register(typ *wire.Type) {
 	tbd.pending = append(tbd.pending, typ)
+	if tbd.allowed != nil {
+		tbd.allowed.verify(tbd.LookupType(typeID(len(tbd.pending))))
+	}
 }
 
 // LookupName looks up the type name by ID.

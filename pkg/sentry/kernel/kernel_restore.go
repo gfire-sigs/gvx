@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/context"
@@ -262,13 +263,18 @@ func (w *CheckpointWaitable) signal(gen CheckpointGeneration, err error) {
 	}
 }
 
+var privateMemoryFileTypes = []reflect.Type{
+	reflect.TypeFor[privateMemoryFileMetadata](),
+	reflect.TypeFor[checkpoint.ResourceID](),
+}
+
 // loadPrivateMemoryFiles loads the private MemoryFiles from mfmap and it reads
 // private MemoryFile metadata from `r`. This consumes bytes from `r`, so this
 // must be called only once.
 func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile, fsCheckpointed map[checkpoint.ResourceID]struct{}, opts *pgalloc.LoadOpts) error {
 	// Load the metadata.
 	var meta privateMemoryFileMetadata
-	if _, err := state.Load(ctx, r, &meta); err != nil {
+	if _, err := state.LoadWithTypes(ctx, r, &meta, privateMemoryFileTypes...); err != nil {
 		return err
 	}
 	// Ensure that it is consistent with mfmap, unless we are restoring from

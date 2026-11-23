@@ -72,8 +72,9 @@ type graphObjectDecodeState struct {
 
 // graphDecodeState is the state of Load.
 type graphDecodeState struct {
-	ctx context.Context
-	in  decBuf
+	ctx     context.Context
+	in      decBuf
+	allowed loadTypes
 
 	types []*typeInfo
 	// typeNames are the names of named types, which may not be registered.
@@ -187,6 +188,9 @@ func (ds *graphDecodeState) readTypes() {
 			var ok bool
 			if t = globalTypeDatabase[name]; t == nil {
 				if t, ok = primitiveTypeDatabase[name]; !ok {
+					if ds.allowed != nil {
+						Failf("type %q is not allowed in this state stream", name)
+					}
 					// The type may be the root's, which need not be
 					// registered.
 					continue
@@ -219,6 +223,7 @@ func (ds *graphDecodeState) readTypes() {
 		default:
 			Failf("invalid type tag %d", tag)
 		}
+		ds.allowed.verify(t)
 		ds.types[i] = typeInfoOf(t)
 	}
 }

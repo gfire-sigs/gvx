@@ -412,9 +412,10 @@ func (gd *graphStructDecoder) afterLoadTo(l AfterLoader) {
 	}
 }
 
-func loadGraph(ctx context.Context, r io.Reader, rootPtr any, length uint64, start int64) (Stats, error) {
+func loadGraph(ctx context.Context, r io.Reader, rootPtr any, length uint64, start int64, allowed loadTypes) (Stats, error) {
 	ds := newGraphDecodeState(ctx)
 	defer ds.release()
+	ds.allowed = allowed
 	ds.stats.used = true
 	ds.stats.enabled = collectStats.Load()
 	if length > maxStreamLength {

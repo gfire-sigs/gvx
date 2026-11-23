@@ -443,28 +443,32 @@ func (ds *decodeState) decodeArray(ods *objectDecodeState, obj reflect.Value, en
 
 // findType finds the type for the given wire.TypeSpecs.
 func (ds *decodeState) findType(t wire.TypeSpec) reflect.Type {
+	var typ reflect.Type
 	switch x := t.(type) {
 	case wire.TypeID:
-		typ := ds.types.LookupType(typeID(x))
-		rte := ds.types.Lookup(typeID(x), typ)
-		return rte.LocalType
+		typ = ds.types.LookupType(typeID(x))
+		typ = ds.types.Lookup(typeID(x), typ).LocalType
 	case *wire.TypeSpecPointer:
-		return reflect.PointerTo(ds.findType(x.Type))
+		typ = reflect.PointerTo(ds.findType(x.Type))
 	case *wire.TypeSpecArray:
-		return reflect.ArrayOf(int(x.Count), ds.findType(x.Type))
+		typ = reflect.ArrayOf(int(x.Count), ds.findType(x.Type))
 	case *wire.TypeSpecSlice:
-		return reflect.SliceOf(ds.findType(x.Type))
+		typ = reflect.SliceOf(ds.findType(x.Type))
 	case *wire.TypeSpecMap:
-		return reflect.MapOf(ds.findType(x.Key), ds.findType(x.Value))
+		typ = reflect.MapOf(ds.findType(x.Key), ds.findType(x.Value))
 	default:
 		// Should not happen.
 		Failf("unknown type %#v", t)
 	}
-	panic("unreachable")
+	ds.types.allowed.verify(typ)
+	return typ
 }
 
 // decodeInterface decodes an interface value.
 func (ds *decodeState) decodeInterface(ods *objectDecodeState, obj reflect.Value, encoded *wire.Interface) {
+	if ds.types.allowed != nil && obj.Kind() != reflect.Interface {
+		Failf("cannot decode an interface into %v", obj.Type())
+	}
 	if _, ok := encoded.Type.(wire.TypeSpecNil); ok {
 		// Special case; the nil object. Just decode directly, which
 		// will read nil from the wire (if encoded correctly).

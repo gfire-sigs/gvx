@@ -53,6 +53,7 @@ import (
 	"io"
 	"reflect"
 	"runtime"
+	"slices"
 	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/gohacks"
@@ -132,6 +133,28 @@ func Save(ctx context.Context, w io.Writer, rootPtr any) (Stats, error) {
 
 // Load loads a checkpoint.
 func Load(ctx context.Context, r io.Reader, rootPtr any) (Stats, error) {
+	return load(ctx, r, rootPtr, nil)
+}
+
+// LoadWithTypes loads a checkpoint and limits explicitly encoded types to allowed.
+// Include the root value type in allowed. Allowed structs must use RegisterNoHooks.
+func LoadWithTypes(ctx context.Context, r io.Reader, rootPtr any, allowed ...reflect.Type) (Stats, error) {
+	root := reflect.ValueOf(rootPtr)
+	if root.Kind() != reflect.Pointer || root.IsNil() {
+		return Stats{}, fmt.Errorf("LoadWithTypes requires a non-nil pointer, got %T", rootPtr)
+	}
+	if typ := root.Type().Elem(); !slices.Contains(allowed, typ) {
+		return Stats{}, fmt.Errorf("root type %v is not allowed in this state stream", typ)
+	}
+	for _, typ := range allowed {
+		if typ == nil || (typ.Kind() == reflect.Struct && !isNoHooks(typ)) {
+			return Stats{}, fmt.Errorf("type %v is not a hook-free state type", typ)
+		}
+	}
+	return load(ctx, r, rootPtr, allowed)
+}
+
+func load(ctx context.Context, r io.Reader, rootPtr any, allowed loadTypes) (Stats, error) {
 	start := gohacks.Nanotime()
 	wr := wire.Reader{Reader: r}
 	hdr, err := ReadHeaderMode(&wr)
@@ -142,13 +165,13 @@ func Load(ctx context.Context, r io.Reader, rootPtr any) (Stats, error) {
 		return Stats{}, fmt.Errorf("expected an object graph, got %d bytes of raw data", hdr.Length)
 	}
 	if hdr.Graph {
-		return loadGraph(ctx, r, rootPtr, hdr.Length, start)
+		return loadGraph(ctx, r, rootPtr, hdr.Length, start, allowed)
 	}
 	// Create the decoding state.
 	ds := decodeState{
 		ctx:      ctx,
 		r:        wr,
-		types:    makeTypeDecodeDatabase(),
+		types:    typeDecodeDatabase{allowed: allowed},
 		deferred: make(map[objectID]wire.Object),
 	}
 
