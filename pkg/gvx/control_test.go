@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -32,8 +33,11 @@ import (
 
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
+	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/rpcfs"
 )
 
 func shortControlSocketPath(t *testing.T, filename string) string {
@@ -1729,4 +1733,182 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 			t.Fatal("sandbox did not exit after proc.signal(all=true, SIGKILL)")
 		}
 	}
+}
+
+func TestControlInotifyConstantsMatchLinuxABI(t *testing.T) {
+	checks := []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"IN_MODIFY", control.LinuxInModify, linux.IN_MODIFY},
+		{"IN_ATTRIB", control.LinuxInAttrib, linux.IN_ATTRIB},
+		{"IN_MOVED_FROM", control.LinuxInMovedFrom, linux.IN_MOVED_FROM},
+		{"IN_MOVED_TO", control.LinuxInMovedTo, linux.IN_MOVED_TO},
+		{"IN_CREATE", control.LinuxInCreate, linux.IN_CREATE},
+		{"IN_DELETE", control.LinuxInDelete, linux.IN_DELETE},
+		{"IN_DELETE_SELF", control.LinuxInDeleteSelf, linux.IN_DELETE_SELF},
+		{"IN_ISDIR", control.LinuxInIsDir, linux.IN_ISDIR},
+	}
+	for _, tc := range checks {
+		if tc.got != tc.want {
+			t.Errorf("%s: control=%#x, linux=%#x", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+func TestStreamRPCFSClientReaddirPaginationAndNotifyRelay(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	const smallMaxFrame = 4096
+	const totalEntries = 120
+
+	clientReady := make(chan *streamRPCFSClient, 1)
+	srv := control.NewServer(ln, control.ServerConfig{
+		SandboxID:     "rpcfs-stream-test",
+		Token:         "secret",
+		Capabilities:  []string{control.CapMountServe},
+		MaxFrameBytes: smallMaxFrame,
+		Handler: &testRPCFSStreamHandler{
+			onServe: func(ctx context.Context, st *control.Stream) error {
+				if err := st.SendResponse(control.MountServeResponse{Target: "/mnt/p"}); err != nil {
+					return err
+				}
+				rc := newStreamRPCFSClient(ctx, st)
+				defer rc.Close()
+				clientReady <- rc
+				<-ctx.Done()
+				return nil
+			},
+		},
+	})
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	go func() { _ = srv.Serve(srvCtx) }()
+	defer srv.Close()
+
+	dialed, err := control.Dial(context.Background(), control.DialOptions{
+		Endpoint: "tcp://" + ln.Addr().String(),
+		Token:    "secret",
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer dialed.Close()
+
+	peerCtx, peerCancel := context.WithCancel(context.Background())
+	defer peerCancel()
+	peerSt, err := dialed.OpenStream(peerCtx, control.MethodMountServe, control.MountServeRequest{Target: "/mnt/p"})
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer peerSt.Close()
+	if err := peerSt.WaitResponse(peerCtx, nil); err != nil {
+		t.Fatalf("WaitResponse: %v", err)
+	}
+
+	// Peer serves paginated readdir (25 entries per page) and watch/unwatch.
+	go func() {
+		for {
+			ev, err := peerSt.RecvEvent(peerCtx)
+			if err != nil {
+				return
+			}
+			if ev.Type != "rpcfs.req" {
+				continue
+			}
+			var req control.RPCFSRequest
+			if json.Unmarshal(ev.Data, &req) != nil {
+				continue
+			}
+			resp := control.RPCFSResponse{ID: req.ID}
+			switch req.Op {
+			case "readdir":
+				if req.Path == "bad-loop" {
+					resp.Entries = []control.RPCFSEntry{{Name: "stuck"}}
+					resp.HasMore = true
+					resp.NextOffset = req.Offset // non-advancing offset must fail with EIO
+				} else {
+					start := int(req.Offset)
+					end := min(start+25, totalEntries)
+					for i := start; i < end; i++ {
+						resp.Entries = append(resp.Entries, control.RPCFSEntry{
+							Name: fmt.Sprintf("f-%03d.txt", i),
+							Ino:  uint64(i + 2),
+							Mode: control.LinuxSIFREG | 0o644,
+						})
+					}
+					if end < totalEntries {
+						resp.HasMore = true
+						resp.NextOffset = int64(end)
+					}
+				}
+			case "watch", "unwatch":
+			}
+			_ = peerSt.SendEvent(peerCtx, "rpcfs.resp", resp)
+		}
+	}()
+
+	rc := <-clientReady
+	if gotChunk := rc.MaxChunkBytes(); gotChunk != 2304 {
+		t.Fatalf("MaxChunkBytes(4096 frame) = %d, want 2304", gotChunk)
+	}
+
+	entries, err := rc.Readdir(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("paginated Readdir: %v", err)
+	}
+	if len(entries) != totalEntries {
+		t.Fatalf("Readdir count = %d, want %d", len(entries), totalEntries)
+	}
+	if entries[0].Name != "f-000.txt" || entries[totalEntries-1].Name != fmt.Sprintf("f-%03d.txt", totalEntries-1) {
+		t.Fatalf("Readdir boundary names = (%q, %q)", entries[0].Name, entries[totalEntries-1].Name)
+	}
+
+	// Non-advancing pagination must fail closed with EIO rather than spinning forever.
+	if _, err := rc.Readdir(context.Background(), "bad-loop"); !linuxerr.Equals(linuxerr.EIO, err) {
+		t.Fatalf("non-advancing Readdir err = %v, want EIO", err)
+	}
+
+	// Notify relay delivers rpcfs.notify events to registered handler.
+	gotNotify := make(chan rpcfs.NotifyEvent, 1)
+	rc.SetNotifyHandler(func(ev rpcfs.NotifyEvent) {
+		gotNotify <- ev
+	})
+	if err := rc.Watch(context.Background(), "one.txt"); err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if err := peerSt.SendEvent(peerCtx, "rpcfs.notify", control.RPCFSNotifyEvent{
+		Path: "one.txt",
+		Mask: control.LinuxInModify,
+	}); err != nil {
+		t.Fatalf("SendEvent rpcfs.notify: %v", err)
+	}
+	select {
+	case ev := <-gotNotify:
+		if ev.Path != "one.txt" || ev.Mask != linux.IN_MODIFY {
+			t.Fatalf("received notify = %+v, want one.txt IN_MODIFY", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for rpcfs.notify event")
+	}
+	if err := rc.Unwatch(context.Background(), "one.txt"); err != nil {
+		t.Fatalf("Unwatch: %v", err)
+	}
+}
+
+type testRPCFSStreamHandler struct {
+	onServe func(ctx context.Context, st *control.Stream) error
+}
+
+func (h *testRPCFSStreamHandler) HandleStream(ctx context.Context, st *control.Stream, _ control.RequestEnvelope, _ []int) error {
+	return h.onServe(ctx, st)
+}
+
+func (h *testRPCFSStreamHandler) HandleLegacyCheckpoint(context.Context, control.LegacyCheckpointRequest) error {
+	return nil
 }

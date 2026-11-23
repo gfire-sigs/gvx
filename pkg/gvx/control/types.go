@@ -604,9 +604,10 @@ type MountRemoveRequest struct {
 
 // MountServeRequest attaches a client-served proxy filesystem at Target.
 type MountServeRequest struct {
-	Target   string `json:"target"`
-	ReadOnly bool   `json:"read_only,omitempty"`
-	Label    string `json:"label,omitempty"`
+	Target     string `json:"target"`
+	ReadOnly   bool   `json:"read_only,omitempty"`
+	Label      string `json:"label,omitempty"`
+	SingleFile bool   `json:"single_file,omitempty"`
 }
 
 // MountServeResponse confirms attachment of the proxy mount.
@@ -618,7 +619,7 @@ type MountServeResponse struct {
 // a connected `mount serve` client over FrameEvent / FrameData.
 type RPCFSRequest struct {
 	ID       uint64 `json:"id"`
-	Op       string `json:"op"` // "stat", "readdir", "read", "write", "create", "mkdir", "unlink", "rmdir", "rename", "truncate", "chmod", "utimens", "readlink", "symlink"
+	Op       string `json:"op"` // "stat", "readdir", "read", "write", "create", "mkdir", "unlink", "rmdir", "rename", "truncate", "chmod", "utimens", "readlink", "symlink", "watch", "unwatch"
 	Path     string `json:"path"`
 	NewPath  string `json:"new_path,omitempty"`
 	Offset   int64  `json:"offset,omitempty"`
@@ -651,23 +652,45 @@ type RPCFSEntry struct {
 
 // RPCFSResponse is the client reply to one RPCFSRequest.
 type RPCFSResponse struct {
-	ID      uint64       `json:"id"`
-	Errno   int          `json:"errno,omitempty"`
-	Error   string       `json:"error,omitempty"`
-	Entry   *RPCFSEntry  `json:"entry,omitempty"`
-	Entries []RPCFSEntry `json:"entries,omitempty"`
-	Data    []byte       `json:"data,omitempty"`
-	Written int64        `json:"written,omitempty"`
+	ID         uint64       `json:"id"`
+	Errno      int          `json:"errno,omitempty"`
+	Error      string       `json:"error,omitempty"`
+	Entry      *RPCFSEntry  `json:"entry,omitempty"`
+	Entries    []RPCFSEntry `json:"entries,omitempty"`
+	HasMore    bool         `json:"has_more,omitempty"`
+	NextOffset int64        `json:"next_offset,omitempty"`
+	Data       []byte       `json:"data,omitempty"`
+	EOF        bool         `json:"eof,omitempty"`
+	Written    int64        `json:"written,omitempty"`
 }
 
-// Canonical Linux open(2) flags, mode_t file-type bits, and errno numbers
-// transmitted in rpcfs wire payloads across heterogeneous host OSes.
+// RPCFSNotifyEvent reports one host-side change on a watched rpcfs path to the
+// sandbox over an "rpcfs.notify" stream event.
+type RPCFSNotifyEvent struct {
+	Path   string `json:"path"`
+	Name   string `json:"name,omitempty"`
+	Mask   uint32 `json:"mask"`
+	Cookie uint32 `json:"cookie,omitempty"`
+}
+
+// Canonical Linux open(2) flags, mode_t file-type bits, inotify(7) event bits,
+// and errno numbers transmitted in rpcfs wire payloads across heterogeneous
+// host OSes.
 const (
 	LinuxOExcl  uint32 = 0o200
 	LinuxSIFMT  uint32 = 0o170000
 	LinuxSIFDIR uint32 = 0o040000
 	LinuxSIFREG uint32 = 0o100000
 	LinuxSIFLNK uint32 = 0o120000
+
+	LinuxInModify     uint32 = 0x00000002
+	LinuxInAttrib     uint32 = 0x00000004
+	LinuxInMovedFrom  uint32 = 0x00000040
+	LinuxInMovedTo    uint32 = 0x00000080
+	LinuxInCreate     uint32 = 0x00000100
+	LinuxInDelete     uint32 = 0x00000200
+	LinuxInDeleteSelf uint32 = 0x00000400
+	LinuxInIsDir      uint32 = 0x40000000
 
 	LinuxEPERM        = 1
 	LinuxENOENT       = 2

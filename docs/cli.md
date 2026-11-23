@@ -393,7 +393,7 @@ Every control subcommand accepts `-S`/`--control-socket SPEC` (or `GVX_CONTROL_S
 | `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps N] [--net-rx-bps N] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
 | `net-policy` | `rungv net-policy get` reads the active NAT policy. `rungv net-policy replace --file FILE` replaces it. Both use the existing control socket. |
 | `port` / `port-forward` | `rungv port <ls\|add\|rm>` lists, adds, and removes host-to-guest NAT rules (requiring `--dynamic-ports` or `--auto-publish` under lockdown). `rungv port-forward` (alias `pf`) listens on the client and tunnels TCP connections via `net.dial` with zero lockdown relaxation. |
-| `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, unmounts targets, or serves a host directory via `rpcfs` (`mount serve HOST_DIR:GUEST_PATH`). |
+| `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, and unmounts targets. `mount serve HOST_PATH:GUEST_PATH` serves a host directory or regular file via `rpcfs` with paginated `readdir` and host-to-guest `inotify` events. |
 | `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect sandbox metadata, stream resource counters and kernel logs, send signals, stop PID 1 cleanly, or adjust Sentry log verbosity. |
 
 ### 4.13 NAT bandwidth limits

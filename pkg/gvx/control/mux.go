@@ -582,6 +582,11 @@ func (s *Stream) ID() uint32 {
 	return s.id
 }
 
+// MaxFrameBytes returns the negotiated maximum payload length per wire frame.
+func (s *Stream) MaxFrameBytes() int {
+	return s.conn.maxFrameBytes
+}
+
 // Context returns the stream context, canceled when the stream or connection ends.
 func (s *Stream) Context() context.Context {
 	return s.ctx

@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -307,7 +308,7 @@ func mountRemoveSubcommand(ctx context.Context, args []string, stdout, stderr io
 func parseServeMountSpec(raw string) (hostDir, guestTarget string, err error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return "", "", errors.New("empty mount specification (want HOST_DIR:GUEST_PATH)")
+		return "", "", errors.New("empty mount specification (want HOST_PATH:GUEST_PATH)")
 	}
 	searchStart := 0
 	if hasWindowsDrivePrefix(s) {
@@ -315,15 +316,58 @@ func parseServeMountSpec(raw string) (hostDir, guestTarget string, err error) {
 	}
 	idx := strings.IndexByte(s[searchStart:], ':')
 	if idx < 0 {
-		return "", "", fmt.Errorf("invalid mount spec %q (want HOST_DIR:GUEST_PATH)", raw)
+		return "", "", fmt.Errorf("invalid mount spec %q (want HOST_PATH:GUEST_PATH)", raw)
 	}
 	split := searchStart + idx
 	hostDir = strings.TrimSpace(s[:split])
 	guestTarget = strings.TrimSpace(s[split+1:])
 	if hostDir == "" || guestTarget == "" {
-		return "", "", fmt.Errorf("invalid mount spec %q (want HOST_DIR:GUEST_PATH)", raw)
+		return "", "", fmt.Errorf("invalid mount spec %q (want HOST_PATH:GUEST_PATH)", raw)
 	}
 	return hostDir, guestTarget, nil
+}
+
+func openRPCFSServeRoot(absHost string) (root *os.Root, singleFile bool, leafName string, err error) {
+	fi, err := os.Stat(absHost)
+	if err != nil {
+		return nil, false, "", fmt.Errorf("open host path %q: %w", absHost, err)
+	}
+	if fi.IsDir() {
+		root, err := os.OpenRoot(absHost)
+		if err != nil {
+			return nil, false, "", fmt.Errorf("open host directory %q: %w", absHost, err)
+		}
+		return root, false, "", nil
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, false, "", fmt.Errorf("open host path %q: must be a directory or regular file", absHost)
+	}
+	resolved, err := filepath.EvalSymlinks(absHost)
+	if err != nil {
+		return nil, false, "", fmt.Errorf("resolve host file %q: %w", absHost, err)
+	}
+	parentDir := filepath.Dir(resolved)
+	leafName = filepath.Base(resolved)
+	root, err = os.OpenRoot(parentDir)
+	if err != nil {
+		return nil, false, "", fmt.Errorf("open host parent directory %q: %w", parentDir, err)
+	}
+	return root, true, leafName, nil
+}
+
+func sendRPCFSResponse(ctx context.Context, stream *control.Stream, resp control.RPCFSResponse) error {
+	err := stream.SendEvent(ctx, "rpcfs.resp", resp)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, control.ErrFrameTooLarge) {
+		return stream.SendEvent(ctx, "rpcfs.resp", control.RPCFSResponse{
+			ID:    resp.ID,
+			Errno: control.LinuxEIO,
+			Error: "response exceeds max_frame_bytes",
+		})
+	}
+	return err
 }
 
 func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -332,26 +376,26 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 	target := addControlFlags(fs, 0)
 	var readOnly bool
 	registerAlias([]string{"ro", "readonly"}, func(n string) {
-		fs.BoolVar(&readOnly, n, false, "Serve the host directory read-only")
+		fs.BoolVar(&readOnly, n, false, "Serve the host path read-only")
 	})
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
 	}
 	if fs.NArg() != 1 {
-		return controlUsageError(stderr, cmdName, "specify HOST_DIR:GUEST_PATH")
+		return controlUsageError(stderr, cmdName, "specify HOST_PATH:GUEST_PATH")
 	}
 
-	hostDir, guestTarget, err := parseServeMountSpec(fs.Arg(0))
+	hostPath, guestTarget, err := parseServeMountSpec(fs.Arg(0))
 	if err != nil {
 		return controlUsageError(stderr, cmdName, "%v", err)
 	}
-	absHost, err := filepath.Abs(hostDir)
+	absHost, err := filepath.Abs(hostPath)
 	if err != nil {
 		return controlFail(stderr, cmdName, err)
 	}
-	root, err := os.OpenRoot(absHost)
+	root, singleFile, leafName, err := openRPCFSServeRoot(absHost)
 	if err != nil {
-		return controlFail(stderr, cmdName, fmt.Errorf("open host directory %q: %w", absHost, err))
+		return controlFail(stderr, cmdName, err)
 	}
 	defer root.Close()
 
@@ -362,9 +406,10 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 	defer client.Close()
 
 	stream, err := client.OpenStream(ctx, control.MethodMountServe, control.MountServeRequest{
-		Target:   guestTarget,
-		ReadOnly: readOnly,
-		Label:    absHost,
+		Target:     guestTarget,
+		ReadOnly:   readOnly,
+		Label:      absHost,
+		SingleFile: singleFile,
 	})
 	if err != nil {
 		return controlFail(stderr, cmdName, err)
@@ -381,19 +426,60 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 	}
 	_, _ = fmt.Fprintf(stdout, "Serving %s at %s (%s)\n", absHost, resp.Target, mode)
 
+	maxFrameBytes := client.MaxFrameBytes()
+	if maxFrameBytes <= 0 {
+		maxFrameBytes = control.DefaultMaxFrameBytes
+	}
+	overhead := min(4096, maxFrameBytes/4)
 	// Bound raw read payload so base64 + JSON envelope stays below max_frame_bytes.
-	maxReadBytes := int64((client.MaxFrameBytes()*3)/4 - 4096)
-	if maxReadBytes < 4096 {
-		maxReadBytes = 4096
+	maxReadBytes := int64(max(512, ((maxFrameBytes-overhead)*3)/4))
+	maxEventBytes := max(512, maxFrameBytes-overhead)
+
+	serveCtx, serveCancel := context.WithCancel(ctx)
+	defer serveCancel()
+
+	watcher := newRPCFSHostWatcher(root, singleFile, leafName, defaultRPCFSWatchInterval, defaultRPCFSMaxWatches, func(ev control.RPCFSNotifyEvent) {
+		_ = stream.SendEvent(serveCtx, "rpcfs.notify", ev)
+	})
+	defer watcher.Close()
+
+	cfg := rpcfsServeConfig{
+		root:          root,
+		singleFile:    singleFile,
+		leafName:      leafName,
+		readOnly:      readOnly,
+		maxReadBytes:  maxReadBytes,
+		maxEventBytes: maxEventBytes,
+		watcher:       watcher,
 	}
 
-	for {
-		ev, err := stream.RecvEvent(ctx)
-		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-			return 0
+	workerLimit := min(max(runtime.GOMAXPROCS(0), 4), 16)
+	sem := make(chan struct{}, workerLimit)
+	var (
+		wg        sync.WaitGroup
+		sendErrMu sync.Mutex
+		sendErr   error
+	)
+	recordSendErr := func(err error) {
+		if err == nil || serveCtx.Err() != nil {
+			return
 		}
+		sendErrMu.Lock()
+		if sendErr == nil {
+			sendErr = err
+		}
+		sendErrMu.Unlock()
+		serveCancel()
+	}
+
+	var recvErr error
+	for {
+		ev, err := stream.RecvEvent(serveCtx)
 		if err != nil {
-			return controlFail(stderr, cmdName, err)
+			if !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				recvErr = err
+			}
+			break
 		}
 		if ev.Type != "rpcfs.req" {
 			continue
@@ -402,14 +488,37 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 		if err := json.Unmarshal(ev.Data, &req); err != nil {
 			continue
 		}
-		rpcResp := serveRPCFSRequest(root, readOnly, maxReadBytes, req)
-		if err := stream.SendEvent(ctx, "rpcfs.resp", rpcResp); err != nil {
-			if ctx.Err() != nil {
-				return 0
-			}
-			return controlFail(stderr, cmdName, err)
+		select {
+		case sem <- struct{}{}:
+		case <-serveCtx.Done():
 		}
+		if serveCtx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(r control.RPCFSRequest) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			rpcResp := serveRPCFSRequestWithConfig(cfg, r)
+			if err := sendRPCFSResponse(serveCtx, stream, rpcResp); err != nil {
+				recordSendErr(err)
+			}
+		}(req)
 	}
+	serveCancel()
+	wg.Wait()
+	watcher.Close()
+
+	sendErrMu.Lock()
+	sErr := sendErr
+	sendErrMu.Unlock()
+	if sErr != nil {
+		return controlFail(stderr, cmdName, sErr)
+	}
+	if recvErr != nil {
+		return controlFail(stderr, cmdName, recvErr)
+	}
+	return 0
 }
 
 func cleanRPCFSRelPath(raw string) (string, bool) {
@@ -553,30 +662,101 @@ func entryFromFileInfo(rel, name string, fi os.FileInfo, root *os.Root) control.
 	}
 }
 
+type rpcfsServeConfig struct {
+	root          *os.Root
+	singleFile    bool
+	leafName      string
+	readOnly      bool
+	maxReadBytes  int64
+	maxEventBytes int
+	watcher       *rpcfsHostWatcher
+}
+
 func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req control.RPCFSRequest) control.RPCFSResponse {
+	return serveRPCFSRequestWithConfig(rpcfsServeConfig{
+		root:          root,
+		readOnly:      readOnly,
+		maxReadBytes:  maxReadBytes,
+		maxEventBytes: control.DefaultMaxFrameBytes - 4096,
+	}, req)
+}
+
+func serveRPCFSRequestWithConfig(cfg rpcfsServeConfig, req control.RPCFSRequest) control.RPCFSResponse {
 	resp := control.RPCFSResponse{ID: req.ID}
 	rel, ok := cleanRPCFSRelPath(req.Path)
 	if !ok {
 		resp.Errno = control.LinuxEINVAL
 		return resp
 	}
+	root := cfg.root
+	readOnly := cfg.readOnly
+	maxReadBytes := cfg.maxReadBytes
 	if maxReadBytes <= 0 {
 		maxReadBytes = 128 << 10
+	}
+	maxEventBytes := cfg.maxEventBytes
+	if maxEventBytes <= 0 {
+		maxEventBytes = control.DefaultMaxFrameBytes - 4096
+	}
+
+	hostRel := rel
+	if cfg.singleFile {
+		if rel != "." {
+			resp.Errno = control.LinuxENOTDIR
+			return resp
+		}
+		switch req.Op {
+		case "readdir", "create", "mkdir", "symlink":
+			resp.Errno = control.LinuxENOTDIR
+			return resp
+		case "unlink", "rmdir", "rename":
+			resp.Errno = control.LinuxEBUSY
+			return resp
+		case "readlink":
+			resp.Errno = control.LinuxEINVAL
+			return resp
+		}
+		hostRel = cfg.leafName
+	}
+
+	beginMut := func(paths ...string) func() {
+		if cfg.watcher == nil {
+			return func() {}
+		}
+		targets := cfg.watcher.BeginMutation(paths...)
+		return func() {
+			cfg.watcher.EndMutation(targets)
+		}
 	}
 
 	switch req.Op {
 	case "stat":
-		fi, err := root.Lstat(rel)
+		fi, err := root.Lstat(hostRel)
 		if err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 			return resp
 		}
-		entry := entryFromFileInfo(rel, path.Base(rel), fi, root)
+		name := path.Base(rel)
+		statRoot := root
+		if cfg.singleFile {
+			name = ""
+			statRoot = nil
+		}
+		entry := entryFromFileInfo(hostRel, name, fi, statRoot)
+		if cfg.singleFile {
+			entry.Ino = 1
+		} else {
+			entry.Ino = stablePathIno(rel)
+		}
 		resp.Entry = &entry
 		return resp
 
 	case "readdir":
-		f, err := root.Open(rel)
+		if req.Offset < 0 {
+			resp.Errno = control.LinuxEINVAL
+			return resp
+		}
+		f, err := root.Open(hostRel)
 		if err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 			return resp
@@ -587,8 +767,20 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 			return resp
 		}
-		entries := make([]control.RPCFSEntry, 0, len(des))
-		for _, de := range des {
+		sortDirEntriesByName(des)
+		if req.Offset >= int64(len(des)) {
+			return resp
+		}
+		budget := maxEventBytes - 256
+		if budget < 1024 {
+			budget = 1024
+		}
+		var (
+			entries []control.RPCFSEntry
+			used    int
+		)
+		for i := int(req.Offset); i < len(des); i++ {
+			de := des[i]
 			childRel := de.Name()
 			if rel != "." {
 				childRel = rel + "/" + de.Name()
@@ -597,7 +789,24 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			if err != nil {
 				continue
 			}
-			entries = append(entries, entryFromFileInfo(childRel, de.Name(), fi, root))
+			entry := entryFromFileInfo(childRel, de.Name(), fi, root)
+			encoded, mErr := json.Marshal(entry)
+			if mErr != nil {
+				continue
+			}
+			entrySize := len(encoded) + 1
+			if used+entrySize > budget {
+				if len(entries) == 0 {
+					resp.Errno = control.LinuxEIO
+					resp.Error = "directory entry exceeds max_frame_bytes"
+					return resp
+				}
+				resp.HasMore = true
+				resp.NextOffset = int64(i)
+				break
+			}
+			entries = append(entries, entry)
+			used += entrySize
 		}
 		resp.Entries = entries
 		return resp
@@ -607,7 +816,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEINVAL
 			return resp
 		}
-		if errno := lstatRegularInRoot(root, rel); errno != 0 {
+		if errno := lstatRegularInRoot(root, hostRel); errno != 0 {
 			resp.Errno = errno
 			return resp
 		}
@@ -618,7 +827,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 		if length > maxReadBytes {
 			length = maxReadBytes
 		}
-		f, err := root.Open(rel)
+		f, err := root.Open(hostRel)
 		if err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 			return resp
@@ -631,6 +840,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			return resp
 		}
 		resp.Data = buf[:n]
+		resp.EOF = errors.Is(err, io.EOF)
 		return resp
 
 	case "write":
@@ -642,11 +852,12 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEINVAL
 			return resp
 		}
-		if errno := lstatRegularInRoot(root, rel); errno != 0 {
+		if errno := lstatRegularInRoot(root, hostRel); errno != 0 {
 			resp.Errno = errno
 			return resp
 		}
-		f, err := root.OpenFile(rel, os.O_WRONLY, 0)
+		defer beginMut(rel)()
+		f, err := root.OpenFile(hostRel, os.O_WRONLY, 0)
 		if err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 			return resp
@@ -669,6 +880,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEROFS
 			return resp
 		}
+		defer beginMut(rel)()
 		perm := os.FileMode(req.Mode & 0o777)
 		flags := os.O_CREATE | os.O_RDWR
 		if req.Flags&control.LinuxOExcl != 0 {
@@ -694,6 +906,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEROFS
 			return resp
 		}
+		defer beginMut(rel)()
 		perm := os.FileMode(req.Mode & 0o777)
 		if err := root.Mkdir(rel, perm); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
@@ -722,6 +935,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEISDIR
 			return resp
 		}
+		defer beginMut(rel)()
 		if err := root.Remove(rel); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 		}
@@ -741,6 +955,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxENOTDIR
 			return resp
 		}
+		defer beginMut(rel)()
 		if err := root.Remove(rel); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 		}
@@ -774,6 +989,7 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 				return resp
 			}
 		}
+		defer beginMut(rel, newRel)()
 		if err := root.Rename(rel, newRel); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 		}
@@ -784,11 +1000,12 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEROFS
 			return resp
 		}
-		if errno := lstatRegularInRoot(root, rel); errno != 0 {
+		if errno := lstatRegularInRoot(root, hostRel); errno != 0 {
 			resp.Errno = errno
 			return resp
 		}
-		f, err := root.OpenFile(rel, os.O_WRONLY, 0)
+		defer beginMut(rel)()
+		f, err := root.OpenFile(hostRel, os.O_WRONLY, 0)
 		if err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 			return resp
@@ -807,7 +1024,14 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEROFS
 			return resp
 		}
-		if err := root.Chmod(rel, os.FileMode(req.Mode&0o777)); err != nil {
+		if cfg.singleFile {
+			if errno := lstatRegularInRoot(root, hostRel); errno != 0 {
+				resp.Errno = errno
+				return resp
+			}
+		}
+		defer beginMut(rel)()
+		if err := root.Chmod(hostRel, os.FileMode(req.Mode&0o777)); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 		}
 		return resp
@@ -817,6 +1041,12 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEROFS
 			return resp
 		}
+		if cfg.singleFile {
+			if errno := lstatRegularInRoot(root, hostRel); errno != 0 {
+				resp.Errno = errno
+				return resp
+			}
+		}
 		var atime, mtime time.Time
 		if req.SetAtime {
 			atime = time.Unix(0, req.AtimeNS)
@@ -824,7 +1054,8 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 		if req.SetMtime {
 			mtime = time.Unix(0, req.MtimeNS)
 		}
-		if err := root.Chtimes(rel, atime, mtime); err != nil {
+		defer beginMut(rel)()
+		if err := root.Chtimes(hostRel, atime, mtime); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
 		}
 		return resp
@@ -859,8 +1090,23 @@ func serveRPCFSRequest(root *os.Root, readOnly bool, maxReadBytes int64, req con
 			resp.Errno = control.LinuxEPERM
 			return resp
 		}
+		defer beginMut(rel)()
 		if err := root.Symlink(req.Target, rel); err != nil {
 			resp.Errno = control.HostErrorToLinuxErrno(err)
+		}
+		return resp
+
+	case "watch":
+		if cfg.watcher == nil {
+			resp.Errno = control.LinuxEOPNOTSUPP
+			return resp
+		}
+		resp.Errno = cfg.watcher.Add(rel)
+		return resp
+
+	case "unwatch":
+		if cfg.watcher != nil {
+			cfg.watcher.Remove(rel)
 		}
 		return resp
 
