@@ -262,7 +262,14 @@ func restorePlatform(goos string, requested PlatformType, manifestPlatform strin
 // Restore fails, it closes the listener.
 func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
-	if ln := cfg.CheckpointListener; ln != nil {
+	if ln := cfg.ControlListener; ln != nil {
+		defer func() {
+			if retErr != nil {
+				_ = ln.Close()
+			}
+		}()
+	}
+	if ln := cfg.CheckpointListener; ln != nil && ln != cfg.ControlListener {
 		defer func() {
 			if retErr != nil {
 				_ = ln.Close()
@@ -303,6 +310,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		runDone:        make(chan struct{}),
 		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
 	}
+	sb.initControlState()
 	if cfg.HostCACerts {
 		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
 		if err != nil {

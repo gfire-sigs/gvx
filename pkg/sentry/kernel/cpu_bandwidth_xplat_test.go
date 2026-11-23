@@ -660,3 +660,95 @@ func TestCPUBandwidthRefillTimerDoesNotKeepNodeAlive(t *testing.T) {
 		t.Errorf("the refill timer of a dropped node armed %d new timers, want 0", len(clock.timers))
 	}
 }
+
+func TestSandboxCPULimitEnforcesLiveUpdatesAndIsolation(t *testing.T) {
+	var clock fakeBandwidthClock
+	kA, kB := &Kernel{}, &Kernel{}
+
+	// Unconfigured kernel reports unlimited and zero throttling stats.
+	if q, p, limited := kA.SandboxCPULimit(); limited || q != -1 || p != 0 {
+		t.Fatalf("initial SandboxCPULimit = (%v, %v, %v), want (-1, 0, false)", q, p, limited)
+	}
+	if st := kA.SandboxCPUBandwidthStats(); st != (CPUBandwidthStats{}) {
+		t.Fatalf("initial SandboxCPUBandwidthStats = %+v, want zero", st)
+	}
+
+	// Attach a fake-clock root CPUBandwidth node on kA so SetSandboxCPULimit
+	// drives deterministic throttling without sleeping or spinning host CPUs.
+	bwA := newCPUBandwidth(nil, clock.clock())
+	extA := kA.ensureExtState()
+	extA.mu.Lock()
+	extA.sandboxCPU = bwA
+	bandwidthCountersOf(kA).sandboxRoot.Store(bwA)
+	extA.mu.Unlock()
+	t.Cleanup(func() { kA.SetSandboxCPULimit(-1, period) })
+
+	// 1. Live quota 30 ms / 100 ms throttles after 41 ms (above 10 ms slack) and
+	// isolates kB completely.
+	kA.SetSandboxCPULimit(30*time.Millisecond, period)
+	if q, p, limited := kA.SandboxCPULimit(); !limited || q != 30*time.Millisecond || p != period {
+		t.Fatalf("SandboxCPULimit after set = (%v, %v, %v), want (30ms, 100ms, true)", q, p, limited)
+	}
+	if !kA.cpuBandwidthLimited() {
+		t.Fatal("kA.cpuBandwidthLimited() = false after SetSandboxCPULimit")
+	}
+	if kB.cpuBandwidthLimited() {
+		t.Fatal("kB.cpuBandwidthLimited() = true when only kA has a sandbox CPU limit")
+	}
+	ran(&clock, bwA, 41*ms)
+	if !bwA.Throttled() {
+		t.Fatal("sandbox root node not throttled after 41ms of 30ms quota")
+	}
+	wake := bwA.throttleWake()
+	if wake == nil {
+		t.Fatal("throttleWake() = nil while throttled")
+	}
+
+	// 2. Live quota raise to 80 ms / 100 ms immediately ends throttling and wakes waiters.
+	kA.SetSandboxCPULimit(80*time.Millisecond, period)
+	if bwA.Throttled() {
+		t.Fatal("sandbox root node stayed throttled after live quota increase to 80ms")
+	}
+	select {
+	case <-wake:
+	default:
+		t.Fatal("throttled waiters did not wake on live quota increase")
+	}
+
+	// 3. Tighten quota to 20 ms / 100 ms, exceed it, and verify SandboxCPUBandwidthStats.
+	kA.SetSandboxCPULimit(20*time.Millisecond, period)
+	ran(&clock, bwA, 31*ms)
+	if !bwA.Throttled() {
+		t.Fatal("sandbox root node not throttled after tightening quota to 20ms")
+	}
+	clock.advance(period)
+	stats := kA.SandboxCPUBandwidthStats()
+	if stats.Throttled == 0 || stats.ThrottledTime <= 0 {
+		t.Fatalf("SandboxCPUBandwidthStats = %+v, want Throttled > 0 and ThrottledTime > 0", stats)
+	}
+	if stB := kB.SandboxCPUBandwidthStats(); stB != (CPUBandwidthStats{}) {
+		t.Fatalf("kB SandboxCPUBandwidthStats = %+v, want zero", stB)
+	}
+
+	// 4. Clearing quota with -1 while throttled immediately unthrottles and clears limited count.
+	ran(&clock, bwA, 40*ms)
+	if !bwA.Throttled() {
+		t.Fatal("expected throttled state before clearing limit")
+	}
+	wake2 := bwA.throttleWake()
+	kA.SetSandboxCPULimit(-1, period)
+	if bwA.Throttled() {
+		t.Fatal("still throttled after SetSandboxCPULimit(-1)")
+	}
+	select {
+	case <-wake2:
+	default:
+		t.Fatal("waiters did not wake when sandbox CPU limit was cleared")
+	}
+	if _, _, limited := kA.SandboxCPULimit(); limited {
+		t.Fatal("SandboxCPULimit still reports limited after -1 clear")
+	}
+	if kA.cpuBandwidthLimited() {
+		t.Fatal("kA.cpuBandwidthLimited() = true after clearing sandbox CPU limit")
+	}
+}

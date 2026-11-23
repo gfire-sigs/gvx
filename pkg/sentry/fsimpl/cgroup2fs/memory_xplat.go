@@ -517,6 +517,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 		}
 	}
 	if k != nil {
+		k.ActivateRestoredSandboxCPUBandwidth(now)
 		fs.memEnforcer.saveKernel = weak.Make(k)
 		if len(fs.limitedMemory()) > 0 {
 			fs.armMemoryEnforcer(k)

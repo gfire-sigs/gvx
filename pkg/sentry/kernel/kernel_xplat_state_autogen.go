@@ -165,6 +165,7 @@ func (e *kernelExtState) StateFields() []string {
 		"hasReportedMemory",
 		"reportedMemory",
 		"logEntry",
+		"sandboxCPU",
 		"values",
 	}
 }
@@ -178,7 +179,8 @@ func (e *kernelExtState) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveBool(1, &e.hasReportedMemory)
 	stateSinkObject.SaveUint64(2, &e.reportedMemory)
 	stateSinkObject.Save(3, &e.logEntry)
-	stateSinkObject.Save(4, &e.values)
+	stateSinkObject.Save(4, &e.sandboxCPU)
+	stateSinkObject.Save(5, &e.values)
 }
 
 // +checklocksignore
@@ -187,7 +189,8 @@ func (e *kernelExtState) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.LoadBool(1, &e.hasReportedMemory)
 	stateSourceObject.LoadUint64(2, &e.reportedMemory)
 	stateSourceObject.Load(3, &e.logEntry)
-	stateSourceObject.Load(4, &e.values)
+	stateSourceObject.Load(4, &e.sandboxCPU)
+	stateSourceObject.Load(5, &e.values)
 	stateSourceObject.AfterLoadTo(e)
 }
 

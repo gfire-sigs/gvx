@@ -706,6 +706,92 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 	return img, nil
 }
 
+// BuildGuestForkELF64 synthesizes a position-independent (ET_DYN) Linux ELF64
+// executable for targetArch ("arm64" or "amd64") that invokes SYS_clone with
+// SIGCHLD. The child exits 0 immediately; the parent waits for the child and
+// exits 0. When SYS_clone fails (for example with EAGAIN under pids.max), the
+// executable exits with the positive Linux errno value.
+func BuildGuestForkELF64(targetArch string) ([]byte, error) {
+	const codeOffset = 0x100
+	var code []byte
+	var machine uint16
+
+	switch targetArch {
+	case "arm64", "aarch64":
+		machine = uint16(elf.EM_AARCH64)
+		words := []uint32{
+			0xd2800000 | (17 << 5),  // 0: MOVZ X0, #17 (SIGCHLD)
+			0xd2800001,              // 1: MOVZ X1, #0 (child_stack)
+			0xd2800002,              // 2: MOVZ X2, #0 (ptid)
+			0xd2800003,              // 3: MOVZ X3, #0 (tls)
+			0xd2800004,              // 4: MOVZ X4, #0 (ctid)
+			0xd2800008 | (220 << 5), // 5: MOVZ X8, #220 (SYS_clone)
+			0xd4000001,              // 6: SVC #0
+			0xb4000000 | (7 << 5),   // 7: CBZ X0, done_ok (14)
+			0xb7f80000 | (9 << 5),   // 8: TBNZ X0, #63, done_err (17)
+			0xd2800001,              // 9 (parent): MOVZ X1, #0 (wstatus)
+			0xd2800002,              // 10: MOVZ X2, #0 (options)
+			0xd2800003,              // 11: MOVZ X3, #0 (rusage)
+			0xd2800008 | (260 << 5), // 12: MOVZ X8, #260 (SYS_wait4)
+			0xd4000001,              // 13: SVC #0
+			0xd2800000,              // 14 (done_ok): MOVZ X0, #0
+			0xd2800bc8,              // 15: MOVZ X8, #94 (SYS_exit_group)
+			0xd4000001,              // 16: SVC #0
+			0xcb0003e0,              // 17 (done_err): SUB X0, XZR, X0 (negate -errno)
+			0xd2800bc8,              // 18: MOVZ X8, #94 (SYS_exit_group)
+			0xd4000001,              // 19: SVC #0
+		}
+		code = encodeARM64Words(words)
+
+	case "amd64", "x86_64":
+		machine = uint16(elf.EM_X86_64)
+		code = append(code,
+			0x48, 0xc7, 0xc7, 0x11, 0x00, 0x00, 0x00, // MOV RDI, 17 (SIGCHLD)
+			0x48, 0x31, 0xf6, // XOR RSI, RSI (child_stack)
+			0x48, 0x31, 0xd2, // XOR RDX, RDX (ptid)
+			0x4d, 0x31, 0xd2, // XOR R10, R10 (ctid)
+			0x4d, 0x31, 0xc0, // XOR R8, R8 (tls)
+			0x48, 0xc7, 0xc0, 0x38, 0x00, 0x00, 0x00, // MOV RAX, 56 (SYS_clone)
+			0x0f, 0x05, // SYSCALL
+			0x48, 0x85, 0xc0, // TEST RAX, RAX
+		)
+		jzOkPos := len(code)
+		code = append(code, 0x0f, 0x84, 0, 0, 0, 0) // JZ done_ok
+		jsErrPos := len(code)
+		code = append(code, 0x0f, 0x88, 0, 0, 0, 0) // JS done_err
+		code = append(code,
+			0x48, 0x89, 0xc7, // MOV RDI, RAX (child pid)
+			0x48, 0x31, 0xf6, // XOR RSI, RSI
+			0x48, 0x31, 0xd2, // XOR RDX, RDX
+			0x4d, 0x31, 0xd2, // XOR R10, R10
+			0x48, 0xc7, 0xc0, 0x3d, 0x00, 0x00, 0x00, // MOV RAX, 61 (SYS_wait4)
+			0x0f, 0x05, // SYSCALL
+		)
+		doneOkPos := len(code)
+		code = append(code,
+			0x48, 0x31, 0xff, // XOR RDI, RDI
+			0x48, 0xc7, 0xc0, 0xe7, 0x00, 0x00, 0x00, // MOV RAX, 231 (SYS_exit_group)
+			0x0f, 0x05, // SYSCALL
+		)
+		doneErrPos := len(code)
+		code = append(code,
+			0x48, 0xf7, 0xd8, // NEG RAX
+			0x48, 0x89, 0xc7, // MOV RDI, RAX
+			0x48, 0xc7, 0xc0, 0xe7, 0x00, 0x00, 0x00, // MOV RAX, 231 (SYS_exit_group)
+			0x0f, 0x05, // SYSCALL
+		)
+		binary.LittleEndian.PutUint32(code[jzOkPos+2:jzOkPos+6], uint32(int32(doneOkPos-(jzOkPos+6))))
+		binary.LittleEndian.PutUint32(code[jsErrPos+2:jsErrPos+6], uint32(int32(doneErrPos-(jsErrPos+6))))
+
+	default:
+		return nil, fmt.Errorf("gvx: unsupported ELF64 target architecture %q", targetArch)
+	}
+
+	img := makeSingleSegmentELF64(uint16(elf.ET_DYN), machine, 0, uint32(elf.PF_R|elf.PF_X))
+	copy(img[codeOffset:], code)
+	return img, nil
+}
+
 func encodeARM64Words(words []uint32) []byte {
 	out := make([]byte, len(words)*4)
 	for i, w := range words {

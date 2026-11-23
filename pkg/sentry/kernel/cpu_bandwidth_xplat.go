@@ -53,6 +53,10 @@ type cpuBandwidthCounters struct {
 	// last ran under an older generation starts a new account, so the time
 	// before the first quota is never charged.
 	generation atomic.Int32
+
+	// sandboxRoot holds the host-enforced per-sandbox CPU bandwidth budget
+	// above all guest cgroups. Guest root cannot raise or remove this budget.
+	sandboxRoot atomic.Pointer[CPUBandwidth]
 }
 
 // kernelBandwidth maps each Kernel to its counters. The map does not keep the

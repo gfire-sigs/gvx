@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 	"unicode"
@@ -27,6 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -442,7 +444,7 @@ func (t *ttyState) read(ctx gvcontext.Context, dst usermem.IOSequence) (int64, e
 		err := t.hostErr
 		t.mu.Unlock()
 		if err != nil {
-			return 0, err
+			return 0, translateHostReadErr(err)
 		}
 		return 0, io.EOF
 	}
@@ -618,9 +620,26 @@ func (f *stdioFD) Read(ctx gvcontext.Context, dst usermem.IOSequence, _ vfs.Read
 		return int64(copied), nil
 	}
 	if rErr != nil {
-		return 0, rErr
+		return 0, translateHostReadErr(rErr)
 	}
 	return 0, io.EOF
+}
+
+// translateHostReadErr converts an arbitrary host io.Reader error into a
+// Sentry-safe VFS error (io.EOF or a linuxerr) so kernel.ExtractErrno never
+// panics on raw Go or transport errors such as io.ErrClosedPipe or net.ErrClosed.
+func translateHostReadErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, control.ErrStreamClosed) ||
+		errors.Is(err, context.Canceled) {
+		return io.EOF
+	}
+	return linuxerr.EIO
 }
 
 func (f *stdioFD) PRead(ctx gvcontext.Context, dst usermem.IOSequence, _ int64, opts vfs.ReadOptions) (int64, error) {

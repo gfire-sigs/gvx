@@ -160,6 +160,17 @@ func (c *Config) validateGPU(goos, goarch, macOS string) error {
 	return nil
 }
 
+// refuseGPUCheckpointLocked rejects a checkpoint of a sandbox with a GPU.
+// The bundle would not hold the renderer state. The control socket can ask
+// for a checkpoint stream without Config.CheckpointDir, so validateGPU alone
+// does not stop it. The caller holds s.mu.
+func (s *Sandbox) refuseGPUCheckpointLocked() error {
+	if s.gpu == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: a sandbox with a GPU cannot make a checkpoint: the renderer state is not saved", ErrInvalidConfig)
+}
+
 // refuseGPURestore rejects a restore configuration that asks for a GPU or sets
 // GPU companion fields. Renderer state (Vulkan objects and GPU memory) is not
 // part of a bundle.

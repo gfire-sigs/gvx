@@ -399,3 +399,16 @@ func TestRendererMode(t *testing.T) {
 	}()
 	_ = rendererMode(GPUOff)
 }
+
+// TestCheckpointRefusesGPUSandbox verifies that the file and stream
+// checkpoint paths refuse a sandbox with a GPU. The control socket can ask
+// for a stream without Config.CheckpointDir.
+func TestCheckpointRefusesGPUSandbox(t *testing.T) {
+	s := &Sandbox{gpu: &gpuHost{}}
+	if err := s.Checkpoint(context.Background(), CheckpointOptions{}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Checkpoint error = %v, want ErrInvalidConfig", err)
+	}
+	if err := s.CheckpointStream(context.Background(), CheckpointOptions{}, nil); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("CheckpointStream error = %v, want ErrInvalidConfig", err)
+	}
+}

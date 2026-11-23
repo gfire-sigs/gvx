@@ -30,6 +30,7 @@ import (
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 )
 
 func shortSocketDir(t *testing.T) string {
@@ -253,9 +254,9 @@ func TestParseRestoreArgs(t *testing.T) {
 func TestListenCheckpointSocketPermissionsAndValidation(t *testing.T) {
 	sockDir := shortSocketDir(t)
 	sockPath := filepath.Join(sockDir, "sub", "ctrl.sock")
-	ep, err := listenCheckpointSocket(sockPath)
+	ep, err := control.Listen(sockPath, control.ListenOptions{})
 	if err != nil {
-		t.Fatalf("listenCheckpointSocket(%q): %v", sockPath, err)
+		t.Fatalf("control.Listen(%q): %v", sockPath, err)
 	}
 	defer ep.Cleanup()
 	defer ep.Listener.Close()
@@ -275,13 +276,13 @@ func TestListenCheckpointSocketPermissionsAndValidation(t *testing.T) {
 	if err := os.WriteFile(regFile, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := listenCheckpointSocket(regFile); err == nil {
-		t.Fatal("listenCheckpointSocket succeeded on regular file, want error")
+	if _, err := control.Listen(regFile, control.ListenOptions{}); err == nil {
+		t.Fatal("control.Listen succeeded on regular file, want error")
 	}
 
 	// Rejects non-loopback TCP addresses.
-	if _, err := listenCheckpointSocket("tcp://8.8.8.8:9999"); err == nil {
-		t.Fatal("listenCheckpointSocket accepted non-loopback TCP address, want error")
+	if _, err := control.Listen("tcp://8.8.8.8:9999", control.ListenOptions{}); err == nil {
+		t.Fatal("control.Listen accepted non-loopback TCP address, want error")
 	}
 }
 

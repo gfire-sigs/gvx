@@ -15,7 +15,6 @@
 package gvx
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"os"
@@ -91,12 +90,7 @@ func (s *Sandbox) initNATStack() error {
 		Tuning:            s.cfg.Tuning,
 	}
 	if !s.cfg.DisableHostLockdown {
-		dialTimeout := s.cfg.Tuning.Duration(tuning.NATDialTimeout)
-		natCfg.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dctx, cancel := context.WithTimeout(ctx, dialTimeout)
-			defer cancel()
-			return hostlockdown.DialContext(dctx, network, addr)
-		}
+		natCfg.DialContext = hostlockdown.DialContext
 	}
 	st, fwd, err := netbackend.NewNATStack(natCfg)
 	if err != nil {
@@ -112,7 +106,7 @@ func (s *Sandbox) initNATStack() error {
 // and enables dynamic loopback publishing when Config.AutoPublishPorts is set.
 func (s *Sandbox) initPortForwarder() error {
 	s.forwards = s.effectivePortForwards()
-	if len(s.forwards) == 0 && !s.cfg.AutoPublishPorts {
+	if len(s.forwards) == 0 && !s.cfg.AutoPublishPorts && !s.cfg.DynamicPorts && s.controlListener() == nil {
 		return nil
 	}
 	pf := netbackend.NewPortForwarder(s.cfg.Tuning)

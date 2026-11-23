@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
@@ -156,6 +157,7 @@ type sandboxFlagValues struct {
 	name                   string
 	memory                 string
 	cpus                   string
+	pidsLimit              int64
 	hostCACerts            bool
 	readOnlyRoot           bool
 	rootVolume             string
@@ -166,6 +168,12 @@ type sandboxFlagValues struct {
 	portSpecs              multiStringFlag
 	checkpointDir          string
 	controlSocket          string
+	controlAuto            bool
+	controlPolicy          string
+	controlDisable         multiStringFlag
+	controlTokenFile       string
+	dynamicPorts           bool
+	allowVolumeAttach      bool
 }
 
 // registerAlias binds a registration callback to each flag name in names.
@@ -205,6 +213,7 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	f.hostDNS = addHostDNSFlag(fs)
 	fs.BoolVar(&f.publishAll, "P", false, "Publish every port that the image exposes to a free port of 127.0.0.1")
 	fs.BoolVar(&f.autoPublish, "auto-publish", false, "Automatically publish guest TCP listeners and iptables NAT DNAT ports on host 127.0.0.1")
+	fs.BoolVar(&f.dynamicPorts, "dynamic-ports", false, "Allow runtime loopback port publishing via `rungv port add` under host lockdown")
 	registerAlias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&f.portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
 	})
@@ -259,9 +268,17 @@ func (f *sandboxFlagValues) registerResourceAndCheckpointFlags(fs *flag.FlagSet)
 		fs.StringVar(&f.memory, n, "", "Memory limit, such as 512m or 1g")
 	})
 	fs.StringVar(&f.cpus, "cpus", "", "CPU quota, such as 1.5")
+	fs.Int64Var(&f.pidsLimit, "pids-limit", 0, "Maximum number of guest processes/tasks (0 means unlimited)")
 	f.tune = addTuneFlags(fs)
 	fs.StringVar(&f.checkpointDir, "checkpoint-dir", "", "Host directory pre-opened before lockdown for checkpoint output")
-	fs.StringVar(&f.controlSocket, "control-socket", "", "Host path or loopback address for the control listener")
+	registerAlias([]string{"control-socket", "S"}, func(n string) {
+		fs.StringVar(&f.controlSocket, n, "", "Host path or loopback address for the control listener")
+	})
+	fs.BoolVar(&f.controlAuto, "control", false, "Bind an owner-only control socket automatically for --name")
+	fs.StringVar(&f.controlPolicy, "control-policy", string(control.PolicyDefault), "Control capability profile: default, readonly, or checkpoint-only")
+	fs.Var(&f.controlDisable, "control-disable", "Comma-separated control capabilities or groups to disable (e.g. exec,net.dial)")
+	fs.StringVar(&f.controlTokenFile, "control-token-file", "", "Path for the control authentication token file (forces token auth on POSIX Unix sockets)")
+	fs.BoolVar(&f.allowVolumeAttach, "allow-volume-attach", false, "Allow POSIX SCM_RIGHTS ext4lite volume attachment via `rungv mount add --type volume` under lockdown")
 }
 
 // buildPortForwards parses repeatable -p / --publish flags with tuning applied.
@@ -326,7 +343,7 @@ func (f *sandboxFlagValues) buildMounts() ([]gvx.Mount, error) {
 	return mounts, nil
 }
 
-// buildResources parses -m / --memory and --cpus limits.
+// buildResources parses -m / --memory, --cpus, and --pids-limit limits.
 func (f *sandboxFlagValues) buildResources() (gvx.Resources, error) {
 	var resources gvx.Resources
 	if f.memory != "" {
@@ -343,7 +360,25 @@ func (f *sandboxFlagValues) buildResources() (gvx.Resources, error) {
 		}
 		resources.CPUMillis = n
 	}
+	if f.pidsLimit < 0 {
+		return gvx.Resources{}, fmt.Errorf("--pids-limit must be >= 0, got %d", f.pidsLimit)
+	}
+	resources.PidsLimit = f.pidsLimit
 	return resources, nil
+}
+
+func (f *sandboxFlagValues) resolveControlSocket() (string, error) {
+	if s := strings.TrimSpace(f.controlSocket); s != "" {
+		return s, nil
+	}
+	if f.controlAuto {
+		name := strings.TrimSpace(f.name)
+		if name == "" {
+			return "", fmt.Errorf("--control requires --name <NAME> (or specify -S/--control-socket)")
+		}
+		return control.NamedSocketPath(name)
+	}
+	return "", nil
 }
 
 // resolveBackendAndNetwork validates backend, platform, architecture, network mode, and pull policy.
@@ -425,6 +460,10 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		return gvx.Config{}, false, fmt.Errorf("-gpu: %w", err)
 	}
 	priv := resolvePrivileges(fs, f.privileged, f.netRaw, f.packetWrite, f.allowSUID)
+	ctrlPolicy, err := control.ParsePolicy(f.controlPolicy)
+	if err != nil {
+		return gvx.Config{}, false, fmt.Errorf("--control-policy: %w", err)
+	}
 	rootVolume := strings.TrimSpace(f.rootVolume)
 	if flagVisited(fs, "rootfs-volume") && rootVolume == "" {
 		return gvx.Config{}, false, fmt.Errorf("--rootfs-volume must not be empty")
@@ -477,10 +516,17 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		TTY:                    f.tty || f.it,
 		DisableHostLockdown:    !f.lockdown,
 		CheckpointDir:          strings.TrimSpace(f.checkpointDir),
+		ControlPolicy:          ctrlPolicy,
+		ControlDisable:         append([]string(nil), f.controlDisable...),
+		DynamicPorts:           f.dynamicPorts,
+		AllowVolumeAttach:      f.allowVolumeAttach,
 		GPU: gvx.GPUConfig{
 			Mode:         gpuMode,
 			RendererPath: strings.TrimSpace(f.gpuRenderer),
 		},
+	}
+	if err := control.ValidateDisableList(cfg.ControlDisable); err != nil {
+		return gvx.Config{}, false, fmt.Errorf("--control-disable: %w", err)
 	}
 	return cfg, backend == gvx.PlatformAuto, nil
 }

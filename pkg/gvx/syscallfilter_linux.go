@@ -218,13 +218,19 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 			seccomp.EqualTo(unix.LOCK_UN),
 		})
 	}
-	if cfg.CheckpointListener != nil {
-		// AcceptCheckpointConn accepts a connection on the pre-bound
-		// CheckpointListener socket. A TCP listener configures keepalive
-		// and TCP_NODELAY on the accepted connection.
+	if cfg.CheckpointListener != nil || cfg.ControlListener != nil {
+		// AcceptControlConn / AcceptCheckpointConn accepts connections on the
+		// pre-bound control listener, verifies Unix peer UID via SO_PEERCRED,
+		// and configures keepalive / TCP_NODELAY on TCP sockets.
 		rules.Add(unix.SYS_ACCEPT4, seccomp.MatchAll{})
+		rules.Add(unix.SYS_GETEUID, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETSOCKNAME, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETPEERNAME, seccomp.MatchAll{})
+		rules.Add(unix.SYS_GETSOCKOPT, seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(unix.SOL_SOCKET),
+			seccomp.EqualTo(unix.SO_PEERCRED),
+		})
 		rules.Add(unix.SYS_SETSOCKOPT, seccomp.Or{
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
@@ -252,6 +258,24 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 				seccomp.EqualTo(unix.TCP_KEEPCNT),
 			},
 		})
+		if cfg.AllowVolumeAttach {
+			// SCM_RIGHTS ext4lite volume attachment receives pre-opened regular
+			// file descriptors over the control Unix socket and acquires
+			// non-blocking advisory flock locks on them.
+			rules.Add(unix.SYS_RECVMSG, seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+			})
+			for _, op := range []uintptr{
+				unix.LOCK_SH | unix.LOCK_NB,
+				unix.LOCK_EX | unix.LOCK_NB,
+				unix.LOCK_UN,
+			} {
+				rules.Add(unix.SYS_FLOCK, seccomp.PerArg{
+					seccomp.NonNegativeFD{},
+					seccomp.EqualTo(op),
+				})
+			}
+		}
 	}
 	switch cfg.NetworkMode {
 	case NetModeNAT:

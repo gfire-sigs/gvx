@@ -113,8 +113,11 @@ func guestCPUs(quotaMillis int64, hostCPUs int) int {
 // keeps guest memory in a memory file, and no host mechanism counts that memory
 // on every host OS, so the guard compares the Sentry accounting with the limit.
 type memoryGuard struct {
-	// limit is the largest allowed use in bytes. It must be above zero.
+	// limit is the largest allowed use in bytes. It must be above zero unless
+	// limitFn is set.
 	limit uint64
+	// limitFn optionally overrides limit dynamically for live resource updates.
+	limitFn func() uint64
 	// used returns the current use in bytes.
 	used func() uint64
 	// flushScan clears the commit-scan rate limit before the final scan that
@@ -125,20 +128,77 @@ type memoryGuard struct {
 	idleActivity func() (<-chan struct{}, bool)
 	// interval is the time between two readings.
 	interval time.Duration
+	// intervalFn optionally overrides interval dynamically for live tuning updates.
+	intervalFn func() time.Duration
+	// wakeCh wakes run immediately when the live limit or poll interval changes.
+	wakeCh <-chan struct{}
 	// kill stops the guest. The guard calls it once.
 	kill func()
+}
+
+func (g memoryGuard) currentLimit() uint64 {
+	if g.limitFn != nil {
+		return g.limitFn()
+	}
+	return g.limit
+}
+
+func (g memoryGuard) currentInterval() time.Duration {
+	if g.intervalFn != nil {
+		if d := g.intervalFn(); d > 0 {
+			return d
+		}
+	}
+	if g.interval > 0 {
+		return g.interval
+	}
+	return 250 * time.Millisecond
 }
 
 // run reads the use every interval until ctx ends or the use passes the limit.
 // It calls kill and returns true in the second case. When every guest task is
 // asleep, run completes one unthrottled scan and parks until a task wakes.
 func (g memoryGuard) run(ctx context.Context) bool {
-	timer := time.NewTimer(g.interval)
+	timer := time.NewTimer(g.currentInterval())
 	defer timer.Stop()
 	for {
+		lim := g.currentLimit()
+		if lim == 0 {
+			if g.wakeCh == nil {
+				return false
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case <-g.wakeCh:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(0)
+				continue
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return false
+		case <-g.wakeCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if g.flushScan != nil {
+				g.flushScan()
+			}
+			if curLim := g.currentLimit(); curLim > 0 && g.used() > curLim {
+				g.kill()
+				return true
+			}
+			timer.Reset(g.currentInterval())
 		case <-timer.C:
 			var (
 				idleCh  <-chan struct{}
@@ -150,7 +210,7 @@ func (g memoryGuard) run(ctx context.Context) bool {
 					g.flushScan()
 				}
 			}
-			if g.used() > g.limit {
+			if curLim := g.currentLimit(); curLim > 0 && g.used() > curLim {
 				g.kill()
 				return true
 			}
@@ -158,10 +218,18 @@ func (g memoryGuard) run(ctx context.Context) bool {
 				select {
 				case <-ctx.Done():
 					return false
+				case <-g.wakeCh:
+					if g.flushScan != nil {
+						g.flushScan()
+					}
+					if curLim := g.currentLimit(); curLim > 0 && g.used() > curLim {
+						g.kill()
+						return true
+					}
 				case <-idleCh:
 				}
 			}
-			timer.Reset(g.interval)
+			timer.Reset(g.currentInterval())
 		}
 	}
 }

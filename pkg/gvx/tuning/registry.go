@@ -38,25 +38,25 @@ var (
 	NATUDPSessions = defineInt("net.nat.udp_sessions", 512, 1, 1<<20, "sessions",
 		"Number of guest UDP flows that the NAT relays at once; a new flow ends the oldest one.")
 	// UDPIdleTimeout ends a UDP session without traffic.
-	UDPIdleTimeout = defineDuration("net.udp.idle_timeout", 30*time.Second, 10*time.Millisecond, 24*time.Hour,
+	UDPIdleTimeout = defineMutableDuration("net.udp.idle_timeout", 30*time.Second, 10*time.Millisecond, 24*time.Hour,
 		"Time without a datagram in either direction after which the NAT or a published UDP port ends a session.")
 	// NATDialTimeout bounds a host connection that the NAT opens.
-	NATDialTimeout = defineDuration("net.nat.dial_timeout", 10*time.Second, 100*time.Millisecond, 10*time.Minute,
+	NATDialTimeout = defineMutableDuration("net.nat.dial_timeout", 10*time.Second, 100*time.Millisecond, 10*time.Minute,
 		"Time that the NAT waits for a host TCP connection before it refuses the guest connection.")
 	// NATSynBacklog is the number of guest TCP connections that wait for a host dial.
 	NATSynBacklog = defineInt("net.nat.syn_backlog", 1024, 1, 1<<20, "connections",
 		"Number of guest TCP connection requests that the NAT holds while it dials the host.")
 	// DNSTimeout bounds a request of the guest to the DNS relay.
-	DNSTimeout = defineDuration("net.dns.timeout", 4*time.Second, 100*time.Millisecond, time.Minute,
+	DNSTimeout = defineMutableDuration("net.dns.timeout", 4*time.Second, 100*time.Millisecond, time.Minute,
 		"Time that the DNS relay at 10.0.2.3 waits for a guest query, a host lookup, and a reply.")
 	// DNSUpstreamTimeout bounds one exchange with one host DNS server.
-	DNSUpstreamTimeout = defineDuration("net.dns.upstream_timeout", 2*time.Second, 100*time.Millisecond, time.Minute,
+	DNSUpstreamTimeout = defineMutableDuration("net.dns.upstream_timeout", 2*time.Second, 100*time.Millisecond, time.Minute,
 		"Time that one exchange of the DNS relay with one host DNS server may take.")
 	// ForwardUDPSessions is the number of client sessions of one published UDP port.
 	ForwardUDPSessions = defineInt("net.forward.udp_sessions", 1024, 1, 1<<20, "sessions",
 		"Number of host client sessions that one published UDP port relays at once.")
 	// ForwardGuestDialWindow bounds the wait of a published TCP port for the guest listener.
-	ForwardGuestDialWindow = defineDuration("net.forward.guest_dial_window", 3*time.Second, 10*time.Millisecond, 10*time.Minute,
+	ForwardGuestDialWindow = defineMutableDuration("net.forward.guest_dial_window", 3*time.Second, 10*time.Millisecond, 10*time.Minute,
 		"Time that a published TCP port waits for the guest to listen before it closes the host client.")
 	// ForwardGuestDialInterval is the pause between two dials of the guest listener.
 	ForwardGuestDialInterval = defineDuration("net.forward.guest_dial_interval", 15*time.Millisecond, time.Millisecond, 10*time.Second,
@@ -68,7 +68,7 @@ var (
 	ForwardMaxDynamicPorts = defineInt("net.forward.max_dynamic_ports", 64, 1, 256, "ports",
 		"Largest number of host loopback ports that auto-publish opens at once.")
 	// ForwardDynamicPollInterval sets how often --auto-publish inspects guest listeners and NAT rules.
-	ForwardDynamicPollInterval = defineDuration("net.forward.dynamic_poll_interval", 200*time.Millisecond, 20*time.Millisecond, 10*time.Second,
+	ForwardDynamicPollInterval = defineMutableDuration("net.forward.dynamic_poll_interval", 200*time.Millisecond, 20*time.Millisecond, 10*time.Second,
 		"Pause between two scans of guest listeners and iptables NAT rules when auto-publish is on.")
 	// WGQueueLength is the length of the packet queue of eth0 in the network mode "wg".
 	WGQueueLength = defineInt("net.wg.queue_length", 512, 1, 1<<20, "packets",
@@ -78,10 +78,10 @@ var (
 		"Time that the sandbox waits to resolve the host name of the WireGuard peer endpoint.")
 
 	// MemoryGuardPollInterval is the poll interval of the memory limit of the sandbox.
-	MemoryGuardPollInterval = defineDuration("memory.guard.poll_interval", 5*time.Millisecond, time.Millisecond, 10*time.Second,
+	MemoryGuardPollInterval = defineMutableDuration("memory.guard.poll_interval", 5*time.Millisecond, time.Millisecond, 10*time.Second,
 		"Time between two readings of the guest memory use when the sandbox has a memory limit.")
 	// MemoryGuardHostPollInterval is the poll interval when the limit is the host RAM.
-	MemoryGuardHostPollInterval = defineDuration("memory.guard.host_poll_interval", 100*time.Millisecond, time.Millisecond, 10*time.Second,
+	MemoryGuardHostPollInterval = defineMutableDuration("memory.guard.host_poll_interval", 100*time.Millisecond, time.Millisecond, 10*time.Second,
 		"Time between two readings of the guest memory use when the limit is the RAM of the host.")
 	// MemoryCgroupPollInterval is the poll interval of a cgroup near its memory.max.
 	MemoryCgroupPollInterval = defineDuration("memory.cgroup.poll_interval", 5*time.Millisecond, time.Millisecond, 10*time.Second,
@@ -124,4 +124,17 @@ var (
 	// OCIRegistryIdleTimeout ends a registry request without data.
 	OCIRegistryIdleTimeout = defineDuration("oci.registry_idle_timeout", time.Minute, time.Second, 24*time.Hour,
 		"Time that a registry request may go without data before the pull fails.")
+
+	// ControlMaxConnections bounds concurrent connections on the control socket.
+	ControlMaxConnections = defineInt("control.max_connections", 64, 1, 1024, "connections",
+		"Largest number of concurrent client connections accepted on the control socket.")
+	// ControlMaxExecSessions bounds concurrent exec sessions in one sandbox.
+	ControlMaxExecSessions = defineInt("control.max_exec_sessions", 32, 1, 512, "sessions",
+		"Largest number of concurrent exec sessions running in one sandbox.")
+	// ControlHandshakeTimeout bounds the control protocol handshake and auth exchange.
+	ControlHandshakeTimeout = defineDuration("control.handshake_timeout", 10*time.Second, 100*time.Millisecond, 5*time.Minute,
+		"Time allowed for a control client to complete the initial handshake.")
+	// ControlMaxFrameBytes bounds one payload frame on the control socket.
+	ControlMaxFrameBytes = defineSize("control.max_frame_bytes", 256*kib, 16*kib, 4*mib,
+		"Largest payload frame accepted on the control socket.")
 )

@@ -14,6 +14,23 @@
 
 package overlay
 
+import "z.gfire.dev/gvx/pkg/sentry/vfs"
+
+// UpperRoot returns the writable upper root VirtualDentry of an overlay
+// filesystem with an extra reference owned by the caller. It returns false when
+// fs is not an overlay filesystem or has no upper layer.
+func UpperRoot(fs *vfs.Filesystem) (vfs.VirtualDentry, bool) {
+	if fs == nil {
+		return vfs.VirtualDentry{}, false
+	}
+	ovfs, ok := fs.Impl().(*filesystem)
+	if !ok || !ovfs.opts.UpperRoot.Ok() {
+		return vfs.VirtualDentry{}, false
+	}
+	ovfs.opts.UpperRoot.IncRef()
+	return ovfs.opts.UpperRoot, true
+}
+
 // userMountUpperFSNames lists the filesystem type names that a guest overlay
 // mount accepts for its upper layer.
 //

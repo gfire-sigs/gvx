@@ -147,12 +147,16 @@ type NATForwarder struct {
 	paused *atomic.Bool
 	// tcpRelaySem and dnsFlowSem count the running TCP relays and DNS flows.
 	// A nil channel means no limit.
-	tcpRelaySem chan struct{}
-	dnsFlowSem  chan struct{}
-	udpIdle     time.Duration
-	udpSessions *udpSessionTable
-	ctx         context.Context
-	cancel      context.CancelFunc
+	tcpRelaySem          chan struct{}
+	dnsFlowSem           chan struct{}
+	isolateOverride      atomic.Int32 // 0 = use cfg.IsolateLAN, 1 = false, 2 = true
+	dialTimeoutNS        atomic.Int64
+	udpIdleNS            atomic.Int64
+	dnsTimeoutNS         atomic.Int64
+	dnsUpstreamTimeoutNS atomic.Int64
+	udpSessions          *udpSessionTable
+	ctx                  context.Context
+	cancel               context.CancelFunc
 
 	// mu guards closed and guestStack, stopping spawn from calling wg.Add during wg.Wait.
 	mu         sync.Mutex
@@ -442,7 +446,7 @@ func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, ep, peer stack.LinkEndpo
 
 func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 	if cfg.DialContext == nil {
-		dialer := &net.Dialer{Timeout: cfg.Tuning.Duration(tuning.NATDialTimeout)}
+		dialer := &net.Dialer{}
 		cfg.DialContext = dialer.DialContext
 	}
 	upstream := dedupeStrings(cfg.DNSServers)
@@ -458,7 +462,7 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		log = discardLogger
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &NATForwarder{
+	nf := &NATForwarder{
 		stack:       s,
 		cfg:         cfg,
 		log:         log,
@@ -469,11 +473,90 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		paused:      new(atomic.Bool),
 		tcpRelaySem: make(chan struct{}, maxNATTCPRelays),
 		dnsFlowSem:  make(chan struct{}, maxNATDNSFlows),
-		udpIdle:     cfg.Tuning.Duration(tuning.UDPIdleTimeout),
 		udpSessions: newUDPSessionTable(cfg.Tuning.Int(tuning.NATUDPSessions)),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
+	nf.SetIsolateLAN(cfg.IsolateLAN)
+	nf.dialTimeoutNS.Store(int64(cfg.Tuning.Duration(tuning.NATDialTimeout)))
+	nf.udpIdleNS.Store(int64(cfg.Tuning.Duration(tuning.UDPIdleTimeout)))
+	nf.dnsTimeoutNS.Store(int64(cfg.Tuning.Duration(tuning.DNSTimeout)))
+	nf.dnsUpstreamTimeoutNS.Store(int64(cfg.Tuning.Duration(tuning.DNSUpstreamTimeout)))
+	return nf
+}
+
+// IsolateLAN reports whether private/loopback outbound NAT blocking is active.
+func (nf *NATForwarder) IsolateLAN() bool {
+	switch nf.isolateOverride.Load() {
+	case 1:
+		return false
+	case 2:
+		return true
+	default:
+		return nf.cfg.IsolateLAN
+	}
+}
+
+// SetIsolateLAN updates private/loopback outbound NAT blocking live for new
+// connections, DNS lookups, and ICMP packets.
+func (nf *NATForwarder) SetIsolateLAN(v bool) {
+	if v {
+		nf.isolateOverride.Store(2)
+	} else {
+		nf.isolateOverride.Store(1)
+	}
+}
+
+// SetDialTimeout updates the outbound NAT dial timeout for new connections.
+func (nf *NATForwarder) SetDialTimeout(d time.Duration) {
+	if d > 0 {
+		nf.dialTimeoutNS.Store(int64(d))
+	}
+}
+
+// SetUDPIdleTimeout updates the UDP NAT session idle timeout for new sessions.
+func (nf *NATForwarder) SetUDPIdleTimeout(d time.Duration) {
+	if d > 0 {
+		nf.udpIdleNS.Store(int64(d))
+	}
+}
+
+// SetDNSTimeouts updates the DNS relay timeout and upstream DNS timeout live.
+func (nf *NATForwarder) SetDNSTimeouts(timeout, upstream time.Duration) {
+	if timeout > 0 {
+		nf.dnsTimeoutNS.Store(int64(timeout))
+	}
+	if upstream > 0 {
+		nf.dnsUpstreamTimeoutNS.Store(int64(upstream))
+	}
+}
+
+func (nf *NATForwarder) dialTimeout() time.Duration {
+	if d := time.Duration(nf.dialTimeoutNS.Load()); d > 0 {
+		return d
+	}
+	return nf.cfg.Tuning.Duration(tuning.NATDialTimeout)
+}
+
+func (nf *NATForwarder) udpIdleTimeout() time.Duration {
+	if d := time.Duration(nf.udpIdleNS.Load()); d > 0 {
+		return d
+	}
+	return nf.cfg.Tuning.Duration(tuning.UDPIdleTimeout)
+}
+
+func (nf *NATForwarder) dnsTimeout() time.Duration {
+	if d := time.Duration(nf.dnsTimeoutNS.Load()); d > 0 {
+		return d
+	}
+	return nf.cfg.Tuning.Duration(tuning.DNSTimeout)
+}
+
+func (nf *NATForwarder) dnsUpstreamTimeout() time.Duration {
+	if d := time.Duration(nf.dnsUpstreamTimeoutNS.Load()); d > 0 {
+		return d
+	}
+	return nf.cfg.Tuning.Duration(tuning.DNSUpstreamTimeout)
 }
 
 func registerNATTransportHandlers(s *stack.Stack, nf *NATForwarder) {
@@ -783,7 +866,7 @@ func (nf *NATForwarder) ResolveOutboundTarget(dstIP netip.Addr, dstPort uint16) 
 	guestIP := netip.MustParseAddr(DefaultGuestIPv4)
 
 	if dstIP == gatewayIP {
-		if nf.cfg.IsolateLAN {
+		if nf.IsolateLAN() {
 			return "", fmt.Errorf("netbackend: outbound access to host gateway %s blocked by -isolate-lan", dstIP)
 		}
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(dstPort))), nil
@@ -793,7 +876,7 @@ func (nf *NATForwarder) ResolveOutboundTarget(dstIP netip.Addr, dstPort uint16) 
 		return "", fmt.Errorf("netbackend: %s is an address of the guest itself, and no guest socket listens on it; use the host gateway %s to reach the host", dstIP, gatewayIP)
 	}
 
-	if nf.cfg.IsolateLAN {
+	if nf.IsolateLAN() {
 		if dstIP.IsPrivate() || dstIP.IsLinkLocalUnicast() || dstIP.IsLinkLocalMulticast() {
 			return "", fmt.Errorf("netbackend: outbound access to private/local address %s blocked by -isolate-lan", dstIP)
 		}
@@ -864,7 +947,9 @@ func (nf *NATForwarder) handleTCP(r *tcp.ForwarderRequest) {
 // relayTCP dials targetAddr on the host and relays it to the guest connection
 // that r requests. It completes r in every case.
 func (nf *NATForwarder) relayTCP(r *tcp.ForwarderRequest, targetAddr string) {
-	hostConn, err := nf.cfg.DialContext(nf.ctx, "tcp", targetAddr)
+	dctx, cancel := context.WithTimeout(nf.ctx, nf.dialTimeout())
+	hostConn, err := nf.cfg.DialContext(dctx, "tcp", targetAddr)
+	cancel()
 	if err != nil {
 		nf.answerFailedDial(r, targetAddr, err)
 		return
@@ -930,7 +1015,9 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 		return false
 	}
 
-	hostConn, err := nf.cfg.DialContext(nf.ctx, "udp", targetAddr)
+	dctx, cancel := context.WithTimeout(nf.ctx, nf.dialTimeout())
+	hostConn, err := nf.cfg.DialContext(dctx, "udp", targetAddr)
+	cancel()
 	if err != nil {
 		nf.log.Debug("netbackend: dial host UDP target", "target", targetAddr, "error", err)
 		return false
@@ -949,7 +1036,7 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 	nf.udpSessions.add(sess)
 	if !nf.spawn(func() {
 		defer nf.udpSessions.remove(sess)
-		relayDatagramsWithClock(nf.ctx, guestConn, hostConn, nf.udpIdle, sess.clock)
+		relayDatagramsWithClock(nf.ctx, guestConn, hostConn, nf.udpIdleTimeout(), sess.clock)
 	}) {
 		nf.udpSessions.remove(sess)
 		sess.close()
