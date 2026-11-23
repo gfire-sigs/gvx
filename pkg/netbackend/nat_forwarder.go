@@ -26,7 +26,6 @@ import (
 	"net"
 	"net/netip"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +125,19 @@ type NATConfig struct {
 	// StreamInterceptor optionally relays traffic between guestConn and hostConn.
 	StreamInterceptor StreamInterceptor
 
+	// ControlTCPAddr blocks outbound TCP dials to the management listener
+	// independently of Policy. An invalid address adds no restriction.
+	ControlTCPAddr netip.AddrPort
+
+	// Bandwidth is the sandbox-owned shaper for this NAT forwarder. A nil
+	// value disables shaping. A shaper cannot observe custom interception
+	// or resolver traffic, so StreamInterceptor and LookupHost must be nil.
+	Bandwidth *BandwidthShaper
+
+	// Policy authorizes NAT traffic. A non-nil controller can activate a policy
+	// later, so custom stream interception and host lookup are not supported.
+	Policy *NATPolicy
+
 	// Stack selects the optional features of the guest network stack.
 	Stack StackOptions
 }
@@ -144,7 +156,9 @@ type NATForwarder struct {
 	dnsSem      chan struct{}
 	// paused is true between QuiesceForSave and ResumeAfterSave. While it is
 	// true, both ends of the eth0 link drop every packet.
-	paused *atomic.Bool
+	paused     *atomic.Bool
+	relayOwner stack.NATRelayOwner
+	packetLink atomic.Pointer[natBandwidthLink]
 	// tcpRelaySem and dnsFlowSem count the running TCP relays and DNS flows.
 	// A nil channel means no limit.
 	tcpRelaySem          chan struct{}
@@ -170,6 +184,8 @@ var discardLogger = slog.New(slog.DiscardHandler)
 
 // hostGatewayAddr is the IPv4 address of the virtual NAT gateway (10.0.2.2).
 var hostGatewayAddr = tcpip.AddrFrom4([4]byte{10, 0, 2, 2})
+
+var natVirtualDNSIP = netip.MustParseAddr(HostDNSIPv4)
 
 type natLinkEndpoint struct {
 	stack.LinkEndpoint
@@ -198,9 +214,11 @@ func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 	if e.nf.paused != nil && e.nf.paused.Load() {
 		return pkts.Len(), nil
 	}
+	if e.nf.cfg.Policy != nil {
+		return e.LinkEndpoint.WritePackets(pkts)
+	}
 	var filtered stack.PacketBufferList
 	dropped := 0
-	dnsIP := netip.MustParseAddr(HostDNSIPv4)
 	for _, pkt := range pkts.AsSlice() {
 		if pkt.NetworkProtocolNumber == ipv4.ProtocolNumber {
 			netHdr := pkt.NetworkHeader().Slice()
@@ -209,8 +227,8 @@ func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 				if ipHdr.TransportProtocol() == header.ICMPv4ProtocolNumber {
 					dstAddr := ipHdr.DestinationAddress()
 					dstIP, ok := netip.AddrFromSlice(dstAddr.AsSlice())
-					if ok && dstIP != dnsIP {
-						if _, err := e.nf.ResolveOutboundTarget(dstIP, 0); err != nil {
+					if ok && dstIP != natVirtualDNSIP {
+						if _, err := e.nf.resolveOutboundTarget(0, dstIP, 0); err != nil {
 							dropped++
 							continue
 						}
@@ -250,10 +268,16 @@ func (nf *NATForwarder) QuiesceForSave() {
 	if nf.paused != nil {
 		nf.paused.Store(true)
 	}
+	if link := nf.packetLink.Load(); link != nil {
+		link.stop(false)
+	}
 }
 
 // ResumeAfterSave restores the packet flow that QuiesceForSave stopped.
 func (nf *NATForwarder) ResumeAfterSave() error {
+	if link := nf.packetLink.Load(); link != nil {
+		link.start()
+	}
 	if nf.paused != nil {
 		nf.paused.Store(false)
 	}
@@ -311,6 +335,15 @@ func AttachRestoredLoopbackStack(restored *stack.Stack) error {
 // therefore routes as a Linux host does: it can forward the packets of a
 // bridge or a network namespace to eth0 and translate them with iptables.
 func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
+	if cfg.Bandwidth != nil && cfg.StreamInterceptor != nil {
+		return nil, nil, errors.New("netbackend: NAT bandwidth and stream interception are mutually exclusive")
+	}
+	if cfg.Bandwidth != nil && cfg.LookupHost != nil {
+		return nil, nil, errors.New("netbackend: NAT bandwidth and custom host lookup are mutually exclusive")
+	}
+	if cfg.Policy != nil && (cfg.StreamInterceptor != nil || cfg.LookupHost != nil) {
+		return nil, nil, errors.New("netbackend: NAT policy requires built-in stream and DNS relays")
+	}
 	s, err := NewLoopbackStack(cfg.Stack)
 	if err != nil {
 		return nil, nil, err
@@ -320,14 +353,14 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 	// tunnels from it: flannel uses the MTU of eth0 minus 50 for vxlan and
 	// minus 80 for WireGuard. The loopback device keeps the MTU of 65536.
 	guestEP, hostEP := pipe.New("", "", uint32(cfg.Tuning.Int(tuning.NATMTU)))
-	paused := new(atomic.Bool)
-	hostStack, err := newNATHostStack(pausableLink{checksumOffloadEndpoint{hostEP}, paused})
+	fwd := newNATForwarder(cfg)
+	hostStack, err := newNATHostStack(fwd.hostLink(checksumOffloadEndpoint{hostEP}))
 	if err != nil {
+		_ = fwd.Close()
 		s.Close()
 		return nil, nil, err
 	}
-	fwd := newNATForwarder(hostStack, cfg)
-	fwd.paused = paused
+	fwd.stack = hostStack
 	fwd.guestStack = s
 	if err := configureNATNIC(s, Eth0NICID, checksumOffloadEndpoint{guestEP}, checksumOffloadEndpoint{hostEP}, fwd); err != nil {
 		_ = fwd.Close()
@@ -444,7 +477,7 @@ func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, ep, peer stack.LinkEndpo
 	return nil
 }
 
-func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
+func newNATForwarder(cfg NATConfig) *NATForwarder {
 	if cfg.DialContext == nil {
 		dialer := &net.Dialer{}
 		cfg.DialContext = dialer.DialContext
@@ -463,7 +496,6 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	nf := &NATForwarder{
-		stack:       s,
 		cfg:         cfg,
 		log:         log,
 		upstreamDNS: upstream,
@@ -561,9 +593,13 @@ func (nf *NATForwarder) dnsUpstreamTimeout() time.Duration {
 
 func registerNATTransportHandlers(s *stack.Stack, nf *NATForwarder) {
 	tcpFwd := tcp.NewForwarder(s, defaultTCPReceiveWindow, nf.cfg.Tuning.Int(tuning.NATSynBacklog), nf.handleTCP)
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
-
 	udpFwd := udp.NewForwarder(s, nf.handleUDP)
+	if nf.cfg.Bandwidth != nil || nf.cfg.Policy != nil {
+		s.SetNATRelayTransportHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+		s.SetNATRelayTransportHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+		return
+	}
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 }
 
@@ -755,11 +791,7 @@ func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth
 	nf.mu.Unlock()
 
 	guestEP, hostEP := pipe.New("", "", uint32(nf.cfg.Tuning.Int(tuning.NATMTU)))
-	hostLink := stack.LinkEndpoint(checksumOffloadEndpoint{hostEP})
-	if nf.paused != nil {
-		hostLink = pausableLink{hostLink, nf.paused}
-	}
-	if err := nf.rebindHostNIC(hostLink); err != nil {
+	if err := nf.rebindHostNIC(nf.hostLink(checksumOffloadEndpoint{hostEP})); err != nil {
 		guestEP.Close()
 		hostEP.Close()
 		return err
@@ -805,8 +837,11 @@ func (nf *NATForwarder) Close() error {
 	nf.closed = true
 	nf.mu.Unlock()
 	nf.cancel()
+	if link := nf.packetLink.Swap(nil); link != nil {
+		link.stop(true)
+	}
 	nf.wg.Wait()
-	if !wasClosed {
+	if !wasClosed && nf.stack != nil {
 		nf.stack.Close()
 	}
 	return nil
@@ -855,139 +890,217 @@ func (nf *NATForwarder) spawn(fn func()) bool {
 	return spawnTracked(&nf.mu, &nf.closed, &nf.wg, fn)
 }
 
-// ResolveOutboundTarget maps a guest destination IP and port to a host network
-// address. An address of the guest itself (loopback, the guest IP, or the
-// unspecified address) never leaves the guest: Netstack hands such a SYN to
-// the TCP forwarder when no guest socket listens, and a dial would reach a
-// host service on the same port. The method rejects those addresses. It also
-// enforces the IsolateLAN policy when enabled.
+// ResolveOutboundTarget maps a guest TCP destination to a host address.
+// It rejects guest-local addresses and applies IsolateLAN and the control
+// listener exclusion.
 func (nf *NATForwarder) ResolveOutboundTarget(dstIP netip.Addr, dstPort uint16) (string, error) {
-	gatewayIP := netip.MustParseAddr(HostGatewayIPv4)
-	guestIP := netip.MustParseAddr(DefaultGuestIPv4)
-
-	if dstIP == gatewayIP {
-		if nf.IsolateLAN() {
-			return "", fmt.Errorf("netbackend: outbound access to host gateway %s blocked by -isolate-lan", dstIP)
-		}
-		return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(dstPort))), nil
+	target, err := nf.resolveOutboundTarget(header.TCPProtocolNumber, dstIP, dstPort)
+	if err != nil {
+		return "", err
 	}
+	return target.String(), nil
+}
 
-	if dstIP == guestIP || dstIP.IsLoopback() || dstIP.IsUnspecified() {
-		return "", fmt.Errorf("netbackend: %s is an address of the guest itself, and no guest socket listens on it; use the host gateway %s to reach the host", dstIP, gatewayIP)
+func (nf *NATForwarder) resolveOutboundTarget(proto tcpip.TransportProtocolNumber, dstIP netip.Addr, dstPort uint16) (netip.AddrPort, error) {
+	dstIP = dstIP.Unmap()
+	if !dstIP.IsValid() {
+		return netip.AddrPort{}, errors.New("netbackend: invalid outbound address")
 	}
-
+	if dstIP == dnsGuestAddr || dstIP.IsLoopback() || dstIP.IsUnspecified() {
+		return netip.AddrPort{}, fmt.Errorf("netbackend: %s is an address of the guest itself, and no guest socket listens on it; use the host gateway %s to reach the host", dstIP, dnsGatewayAddr)
+	}
 	if nf.IsolateLAN() {
-		if dstIP.IsPrivate() || dstIP.IsLinkLocalUnicast() || dstIP.IsLinkLocalMulticast() {
-			return "", fmt.Errorf("netbackend: outbound access to private/local address %s blocked by -isolate-lan", dstIP)
+		switch {
+		case dstIP == dnsGatewayAddr:
+			return netip.AddrPort{}, fmt.Errorf("netbackend: outbound access to host gateway %s blocked by -isolate-lan", dstIP)
+		case dstIP.IsPrivate(), dstIP.IsLinkLocalUnicast(), dstIP.IsLinkLocalMulticast():
+			return netip.AddrPort{}, fmt.Errorf("netbackend: outbound access to private/local address %s blocked by -isolate-lan", dstIP)
 		}
 	}
+	if dstIP == dnsGatewayAddr {
+		dstIP = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	}
+	target := netip.AddrPortFrom(dstIP, dstPort)
+	if !allowsNATHostDial(proto, target, nf.cfg.Policy, nf.cfg.ControlTCPAddr) {
+		return netip.AddrPort{}, errNATOutboundDenied
+	}
+	return target, nil
+}
 
-	return net.JoinHostPort(dstIP.String(), strconv.Itoa(int(dstPort))), nil
+func allowsNATHostDial(proto tcpip.TransportProtocolNumber, target netip.AddrPort, policy *NATPolicy, controlTCPAddr netip.AddrPort) bool {
+	return proto != header.TCPProtocolNumber || target.Port() == 0 ||
+		(policy.AllowsHostDial(proto, target) && allowsNATControlTCPDial(controlTCPAddr, target))
+}
+
+var errNATOutboundDenied = errors.New("netbackend: NAT denies outbound target")
+
+func natEgressFlow(id stack.TransportEndpointID, protocol uint8, remote netip.Addr) NATPolicyFlow {
+	guest, _ := netip.AddrFromSlice(id.RemoteAddress.AsSlice())
+	return NATPolicyFlow{
+		Direction: NATPolicyEgress,
+		Protocol:  protocol,
+		Guest:     guest,
+		Remote:    remote,
+		Port:      id.LocalPort,
+		PortKnown: true,
+	}
 }
 
 func (nf *NATForwarder) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
 	dstIP, ok := netip.AddrFromSlice(id.LocalAddress.AsSlice())
 	if !ok {
-		r.Complete(true)
+		r.CompleteNATRejection(nil)
 		return
 	}
 
+	flow := natEgressFlow(id, uint8(header.TCPProtocolNumber), dstIP)
 	// Intercept TCP DNS queries to the virtual DNS relay (10.0.2.3:53).
-	if dstIP == netip.MustParseAddr(HostDNSIPv4) && id.LocalPort == 53 {
+	if dstIP.Unmap() == natVirtualDNSIP && id.LocalPort == DefaultDNSPort {
+		ctx, release, allowed := nf.cfg.Policy.Track(nf.ctx, flow)
+		if !allowed {
+			r.Complete(false)
+			return
+		}
 		if !tryAcquire(nf.dnsFlowSem) {
+			release()
 			nf.log.Debug("netbackend: reject guest DNS connection: too many DNS flows")
-			r.Complete(true)
+			r.CompleteNATRejection(nil)
 			return
 		}
-		var wq waiter.Queue
-		ep, tcpErr := r.CreateEndpoint(&wq)
-		if tcpErr != nil {
-			releaseSlot(nf.dnsFlowSem)
-			r.Complete(true)
-			return
-		}
-		guestConn := gonet.NewTCPConn(&wq, ep)
 		if !nf.spawn(func() {
 			defer releaseSlot(nf.dnsFlowSem)
-			nf.serveTCPDNS(nf.ctx, guestConn)
+			defer release()
+			var wq waiter.Queue
+			ep, tcpErr := r.CreateNATRelayEndpoint(ctx, &wq)
+			if tcpErr != nil {
+				if ctx.Err() != nil {
+					r.Complete(false)
+				} else {
+					r.CompleteNATRejection(nil)
+				}
+				return
+			}
+			r.Complete(false)
+			if ctx.Err() != nil {
+				ep.Abort()
+				return
+			}
+			nf.serveTCPDNS(ctx, gonet.NewTCPConn(&wq, ep), flow)
 		}) {
 			releaseSlot(nf.dnsFlowSem)
-			_ = guestConn.Close()
-			r.Complete(true)
-			return
+			release()
+			r.CompleteNATRejection(nil)
 		}
-		r.Complete(false)
 		return
 	}
 
-	targetAddr, err := nf.ResolveOutboundTarget(dstIP, id.LocalPort)
+	target, err := nf.resolveOutboundTarget(header.TCPProtocolNumber, dstIP, id.LocalPort)
 	if err != nil {
 		nf.log.Debug("netbackend: reject guest TCP connection", "error", err)
-		r.Complete(true)
+		if errors.Is(err, errNATOutboundDenied) {
+			r.Complete(false)
+		} else {
+			r.CompleteNATRejection(nil)
+		}
 		return
 	}
+	if target.Addr() != dstIP {
+		flow.RemoteAlias = target.Addr()
+	}
+	targetAddr := target.String()
 
 	if !tryAcquire(nf.tcpRelaySem) {
 		nf.log.Debug("netbackend: reject guest TCP connection: too many relays", "target", targetAddr)
-		r.Complete(true)
+		r.CompleteNATRejection(nil)
 		return
 	}
 	// Dial the outbound host target on a dedicated goroutine so that slow or
 	// unreachable remote hosts never block the Netstack packet demuxer.
 	if !nf.spawn(func() {
 		defer releaseSlot(nf.tcpRelaySem)
-		nf.relayTCP(r, targetAddr)
+		nf.relayTCP(r, targetAddr, flow)
 	}) {
 		releaseSlot(nf.tcpRelaySem)
-		r.Complete(true)
+		r.CompleteNATRejection(nil)
 	}
 }
 
 // relayTCP dials targetAddr on the host and relays it to the guest connection
 // that r requests. It completes r in every case.
-func (nf *NATForwarder) relayTCP(r *tcp.ForwarderRequest, targetAddr string) {
-	dctx, cancel := context.WithTimeout(nf.ctx, nf.dialTimeout())
+func (nf *NATForwarder) relayTCP(r *tcp.ForwarderRequest, targetAddr string, flow NATPolicyFlow) {
+	ctx, release, allowed := nf.cfg.Policy.Track(nf.ctx, flow)
+	if !allowed {
+		r.Complete(false)
+		return
+	}
+	defer release()
+	if ctx.Err() != nil {
+		r.Complete(false)
+		return
+	}
+	dctx, cancel := context.WithTimeout(ctx, nf.dialTimeout())
 	hostConn, err := nf.cfg.DialContext(dctx, "tcp", targetAddr)
 	cancel()
+	if ctx.Err() != nil {
+		if hostConn != nil {
+			_ = hostConn.Close()
+		}
+		r.Complete(false)
+		return
+	}
 	if err != nil {
 		nf.answerFailedDial(r, targetAddr, err)
 		return
 	}
 
+	defer hostConn.Close()
+
 	var wq waiter.Queue
-	ep, tcpErr := r.CreateEndpoint(&wq)
+	ep, tcpErr := r.CreateNATRelayEndpoint(ctx, &wq)
 	if tcpErr != nil {
-		_ = hostConn.Close()
-		r.Complete(true)
+		if ctx.Err() != nil {
+			r.Complete(false)
+		} else {
+			r.CompleteNATRejection(nil)
+		}
 		return
 	}
 	r.Complete(false)
 
+	if ctx.Err() != nil {
+		ep.Abort()
+		return
+	}
 	guestConn := gonet.NewTCPConn(&wq, ep)
-	defer func() {
-		_ = guestConn.Close()
-		_ = hostConn.Close()
-	}()
+	defer guestConn.Close()
 	if nf.cfg.StreamInterceptor != nil {
-		if err := nf.cfg.StreamInterceptor(nf.ctx, targetAddr, guestConn, hostConn); err != nil {
+		if err := nf.cfg.StreamInterceptor(ctx, targetAddr, guestConn, hostConn); err != nil {
 			nf.log.Warn("netbackend: stream interceptor failed", "target", targetAddr, "error", err)
 		}
 		return
 	}
-	relayBidirectional(nf.ctx, guestConn, hostConn)
+	relayBidirectional(ctx, guestConn, hostConn, nf.cfg.Bandwidth)
 }
 
 func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
+	defer r.Release()
 	id := r.ID()
 	dstIP, ok := netip.AddrFromSlice(id.LocalAddress.AsSlice())
 	if !ok {
 		return false
 	}
 
+	flow := natEgressFlow(id, uint8(header.UDPProtocolNumber), dstIP)
 	// Intercept UDP DNS queries to the virtual DNS relay (10.0.2.3:53).
-	if dstIP == netip.MustParseAddr(HostDNSIPv4) && id.LocalPort == 53 {
+	if dstIP.Unmap() == natVirtualDNSIP && id.LocalPort == DefaultDNSPort {
+		ctx, release, allowed := nf.cfg.Policy.Track(nf.ctx, flow)
+		if !allowed {
+			// A policy denial is a drop, not an unknown-port ICMP error.
+			return true
+		}
 		if !tryAcquire(nf.dnsFlowSem) {
+			release()
 			nf.log.Debug("netbackend: drop guest DNS flow: too many DNS flows")
 			return false
 		}
@@ -995,30 +1108,53 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 		ep, tcpErr := r.CreateEndpoint(&wq)
 		if tcpErr != nil {
 			releaseSlot(nf.dnsFlowSem)
+			release()
 			return false
 		}
 		guestConn := gonet.NewUDPConn(&wq, ep)
 		if !nf.spawn(func() {
 			defer releaseSlot(nf.dnsFlowSem)
-			nf.serveUDPDNS(nf.ctx, guestConn)
+			defer release()
+			nf.serveUDPDNS(ctx, guestConn, flow)
 		}) {
 			releaseSlot(nf.dnsFlowSem)
+			release()
 			_ = guestConn.Close()
 			return false
 		}
 		return true
 	}
 
-	targetAddr, err := nf.ResolveOutboundTarget(dstIP, id.LocalPort)
+	target, err := nf.resolveOutboundTarget(header.UDPProtocolNumber, dstIP, id.LocalPort)
 	if err != nil {
 		nf.log.Debug("netbackend: reject guest UDP flow", "error", err)
 		return false
 	}
+	if target.Addr() != dstIP {
+		flow.RemoteAlias = target.Addr()
+	}
+	ctx, release, allowed := nf.cfg.Policy.Track(nf.ctx, flow)
+	if !allowed {
+		return true
+	}
+	if ctx.Err() != nil {
+		release()
+		return true
+	}
+	targetAddr := target.String()
 
-	dctx, cancel := context.WithTimeout(nf.ctx, nf.dialTimeout())
+	dctx, cancel := context.WithTimeout(ctx, nf.dialTimeout())
 	hostConn, err := nf.cfg.DialContext(dctx, "udp", targetAddr)
 	cancel()
+	if ctx.Err() != nil {
+		release()
+		if hostConn != nil {
+			_ = hostConn.Close()
+		}
+		return true
+	}
 	if err != nil {
+		release()
 		nf.log.Debug("netbackend: dial host UDP target", "target", targetAddr, "error", err)
 		return false
 	}
@@ -1027,6 +1163,7 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 	var wq waiter.Queue
 	ep, tcpErr := r.CreateEndpoint(&wq)
 	if tcpErr != nil {
+		release()
 		_ = hostConn.Close()
 		return false
 	}
@@ -1035,9 +1172,11 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 	sess := &udpSession{guest: guestConn, host: hostConn, clock: newActivityClock()}
 	nf.udpSessions.add(sess)
 	if !nf.spawn(func() {
+		defer release()
 		defer nf.udpSessions.remove(sess)
-		relayDatagramsWithClock(nf.ctx, guestConn, hostConn, nf.udpIdleTimeout(), sess.clock)
+		relayDatagramsWithClock(ctx, guestConn, hostConn, nf.udpIdleTimeout(), sess.clock, nf.cfg.Bandwidth)
 	}) {
+		release()
 		nf.udpSessions.remove(sess)
 		sess.close()
 		return false
@@ -1045,68 +1184,49 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 	return true
 }
 
-// relayBidirectional copies a to b and b to a until both directions end or ctx
-// ends. It returns after both copy goroutines return, so callers can track
-// the relay with a WaitGroup. EOF in one direction half-closes the other
-// connection. A copy error closes both connections.
-func relayBidirectional(ctx context.Context, a, b net.Conn) {
-	stop := context.AfterFunc(ctx, func() {
-		_ = a.Close()
-		_ = b.Close()
-	})
+// relayBidirectional copies guest to host and host to guest until both pumps
+// end or ctx ends. EOF half-closes the other connection. A copy error closes both.
+func relayBidirectional(ctx context.Context, guest, host net.Conn, shaper *BandwidthShaper) {
+	closeBoth := func() {
+		_ = guest.Close()
+		_ = host.Close()
+	}
+	stop := context.AfterFunc(ctx, closeBoth)
 	defer stop()
 
+	abort := closeBoth
+	if shaper != nil {
+		// A peer can be waiting for bandwidth instead of in a socket operation.
+		flowCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		ctx = flowCtx
+		abort = func() {
+			cancel()
+			closeBoth()
+		}
+	}
+
 	var wg sync.WaitGroup
-	pump := func(dst, src net.Conn) {
+	pump := func(dir BandwidthDirection, dst, src net.Conn) {
 		defer wg.Done()
-		_, err := io.Copy(dst, src)
+		var err error
+		if shaper == nil {
+			_, err = io.Copy(dst, src)
+		} else {
+			_, err = shaper.Copy(ctx, dir, dst, src)
+		}
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok && err == nil {
 			if cw.CloseWrite() == nil {
 				return
 			}
 		}
 		// A copy error, or a connection without half-close, ends both directions.
-		_ = a.Close()
-		_ = b.Close()
+		abort()
 	}
 	wg.Add(2)
-	go pump(a, b)
-	go pump(b, a)
+	go pump(BandwidthRX, guest, host)
+	go pump(BandwidthTX, host, guest)
 	wg.Wait()
-}
-
-// activityClock records the last datagram time of a UDP session. Both
-// directions of the session share one clock, so one active direction keeps
-// the session alive.
-type activityClock struct {
-	start time.Time
-	// last is the offset from start in nanoseconds. The offset uses the
-	// monotonic clock, so wall clock changes do not expire a session.
-	last atomic.Int64
-}
-
-func newActivityClock() *activityClock {
-	return &activityClock{start: time.Now()}
-}
-
-// touch records activity now. It never moves the last time backward.
-func (c *activityClock) touch() {
-	now := int64(time.Since(c.start))
-	for {
-		old := c.last.Load()
-		if now <= old || c.last.CompareAndSwap(old, now) {
-			return
-		}
-	}
-}
-
-// deadline returns the time at which the session expires without more activity.
-func (c *activityClock) deadline(idle time.Duration) time.Time {
-	return c.start.Add(time.Duration(c.last.Load()) + idle)
-}
-
-func (c *activityClock) expired(idle time.Duration) bool {
-	return time.Since(c.start)-time.Duration(c.last.Load()) >= idle
 }
 
 // isTimeout reports whether err is a deadline error. The gonet adapter returns
@@ -1145,7 +1265,7 @@ func pumpDatagrams(src net.Conn, send func([]byte) error, clock *activityClock, 
 			case errors.Is(err, net.ErrClosed), errors.Is(err, io.EOF):
 				return
 			case isTimeout(err):
-				if clock.expired(idle) {
+				if clock.expire(idle) {
 					return
 				}
 			default:
@@ -1157,8 +1277,12 @@ func pumpDatagrams(src net.Conn, send func([]byte) error, clock *activityClock, 
 			continue
 		}
 		transient = 0
-		clock.touch()
-		if err := send(buf[:n]); errors.Is(err, net.ErrClosed) {
+		if !clock.beginSend() {
+			return
+		}
+		err = send(buf[:n])
+		clock.finishSend(!errors.Is(err, errBandwidthQueueFull) && !errors.Is(err, net.ErrClosed))
+		if errors.Is(err, net.ErrClosed) {
 			return
 		}
 	}
@@ -1168,15 +1292,16 @@ func pumpDatagrams(src net.Conn, send func([]byte) error, clock *activityClock, 
 // directions stay idle for idle, either connection closes, or ctx ends. It
 // closes both connections and returns after both pump goroutines return.
 func relayDatagrams(ctx context.Context, guestConn, hostConn net.Conn, idle time.Duration) {
-	relayDatagramsWithClock(ctx, guestConn, hostConn, idle, newActivityClock())
+	relayDatagramsWithClock(ctx, guestConn, hostConn, idle, newActivityClock(), nil)
 }
 
 // relayDatagramsWithClock is relayDatagrams with the activity clock of the
 // session, which the session table reads to find the oldest session.
-func relayDatagramsWithClock(ctx context.Context, guestConn, hostConn net.Conn, idle time.Duration, clock *activityClock) {
+func relayDatagramsWithClock(ctx context.Context, guestConn, hostConn net.Conn, idle time.Duration, clock *activityClock, shaper *BandwidthShaper) {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
+			clock.stop()
 			_ = guestConn.Close()
 			_ = hostConn.Close()
 		})
@@ -1185,16 +1310,20 @@ func relayDatagramsWithClock(ctx context.Context, guestConn, hostConn net.Conn, 
 	defer stop()
 
 	var wg sync.WaitGroup
-	pump := func(dst, src net.Conn) {
+	pump := func(dir BandwidthDirection, dst, src net.Conn) {
 		defer wg.Done()
 		defer closeBoth()
 		pumpDatagrams(src, func(p []byte) error {
-			_, err := dst.Write(p)
-			return err
+			return sendRelayDatagram(ctx, clock, shaper, dir, len(p), func() (int, error) {
+				if ctx.Err() != nil {
+					return 0, net.ErrClosed
+				}
+				return dst.Write(p)
+			})
 		}, clock, idle)
 	}
 	wg.Add(2)
-	go pump(hostConn, guestConn)
-	go pump(guestConn, hostConn)
+	go pump(BandwidthTX, hostConn, guestConn)
+	go pump(BandwidthRX, guestConn, hostConn)
 	wg.Wait()
 }

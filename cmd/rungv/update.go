@@ -31,8 +31,8 @@ import (
 func init() {
 	register(command{
 		name:    "update",
-		summary: "Update live resource limits, LAN isolation, or mutable tunables of a running sandbox.",
-		usage:   []string{"rungv update -S <socket>|-n <name> [-m SIZE] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--tune KEY=VAL]..."},
+		summary: "Update live resource limits, NAT settings, or mutable tunables of a running sandbox.",
+		usage:   []string{"rungv update -S <socket>|-n <name> [-m SIZE] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps BPS] [--net-rx-bps BPS] [--tune KEY=VAL]..."},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return updateSubcommand(ctx, args, streams.stdout, streams.stderr)
 		},
@@ -47,6 +47,7 @@ func updateSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	var memory, cpus, pidsLimit, cpuQuotaStr, format string
 	var forceMemory, isolateLAN bool
 	var cpuPeriod int64
+	var netTXBPS, netRXBPS uint64
 	var tunePairs listFlag
 
 	registerAlias([]string{"m", "memory"}, func(n string) {
@@ -58,6 +59,7 @@ func updateSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	fs.StringVar(&cpuQuotaStr, "cpu-quota", "", "CFS CPU quota per period in microseconds (-1 or max for unlimited)")
 	fs.StringVar(&pidsLimit, "pids-limit", "", "Maximum guest processes/tasks (0 or -1 for unlimited)")
 	fs.BoolVar(&isolateLAN, "isolate-lan", false, "Block RFC1918 and loopback LAN destinations in NAT mode")
+	registerNetworkBandwidthFlags(fs, &netTXBPS, &netRXBPS)
 	fs.Var(&tunePairs, "tune", "Update a mutable host-side tunable (KEY=VALUE, repeatable)")
 	registerAlias([]string{"f", "format"}, func(n string) {
 		fs.StringVar(&format, n, "", "Format applied snapshot using table, json, or a Go template")
@@ -139,6 +141,14 @@ func updateSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 		req.IsolateLAN = &v
 		changed = true
 	}
+	if flagVisited(fs, "net-tx-bps") {
+		req.NetTXBPS = &netTXBPS
+		changed = true
+	}
+	if flagVisited(fs, "net-rx-bps") {
+		req.NetRXBPS = &netRXBPS
+		changed = true
+	}
 	if len(tunePairs) > 0 {
 		req.Tuning = make(map[string]string, len(tunePairs))
 		for _, pair := range tunePairs {
@@ -176,6 +186,10 @@ func updateSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 		_, _ = fmt.Fprintf(tw, "CPU Quota:\t%d us / %d us (%d mCPU, %d guest CPUs)\n", snap.CPUQuotaUSec, snap.CPUPeriodUSec, snap.CPUMillis, snap.GuestCPUs)
 		_, _ = fmt.Fprintf(tw, "PIDs Limit:\t%d\n", snap.PidsLimit)
 		_, _ = fmt.Fprintf(tw, "Isolate LAN:\t%v\n", snap.IsolateLAN)
+		if client.HasFeature(control.FeatureNetQoS) {
+			_, _ = fmt.Fprintf(tw, "Network TX:\t%s\n", formatBandwidth(snap.NetTXBPS))
+			_, _ = fmt.Fprintf(tw, "Network RX:\t%s\n", formatBandwidth(snap.NetRXBPS))
+		}
 		return tw.Flush()
 	})
 	if usageErr != nil {
@@ -192,4 +206,11 @@ func formatLimitBytes(n int64) string {
 		return "unlimited"
 	}
 	return humanBytes(uint64(n))
+}
+
+func formatBandwidth(bps uint64) string {
+	if bps == 0 {
+		return "unlimited"
+	}
+	return strconv.FormatUint(bps, 10) + " bps"
 }

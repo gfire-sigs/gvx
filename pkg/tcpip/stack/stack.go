@@ -49,6 +49,7 @@ const (
 type transportProtocolState struct {
 	proto          TransportProtocol
 	defaultHandler func(id TransportEndpointID, pkt *PacketBuffer) bool `state:"nosave"`
+	natRelay       bool                                                 `state:"nosave"`
 }
 
 // RestoredEndpoint is an endpoint that needs to be restored.
@@ -622,6 +623,7 @@ func (s *Stack) SetTransportProtocolHandler(p tcpip.TransportProtocolNumber, h f
 	state := s.transportProtocols[p]
 	if state != nil {
 		state.defaultHandler = h
+		state.natRelay = false
 	}
 }
 

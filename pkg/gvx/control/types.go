@@ -42,6 +42,8 @@ const (
 	MethodPortAdd          = "port.add"
 	MethodPortRemove       = "port.remove"
 	MethodNetDial          = "net.dial"
+	MethodNATPolicyGet     = "net.policy_get"
+	MethodNATPolicySet     = "net.policy_set"
 	MethodMountList        = "mount.list"
 	MethodMountAdd         = "mount.add"
 	MethodMountRemount     = "mount.remount"
@@ -78,6 +80,8 @@ const (
 	CapPortDynamicAny      = "port.dynamic_any"
 	CapPortAnyBind         = "port.any_bind"
 	CapNetDial             = "net.dial"
+	CapNATPolicyRead       = "net.policy.read"
+	CapNATPolicyWrite      = "net.policy.write"
 	CapMountList           = "mount.list"
 	CapMountTmpfs          = "mount.tmpfs"
 	CapMountRemount        = "mount.remount"
@@ -117,6 +121,8 @@ var allKnownCapabilities = []string{
 	CapPortDynamicAny,
 	CapPortAnyBind,
 	CapNetDial,
+	CapNATPolicyRead,
+	CapNATPolicyWrite,
 	CapMountList,
 	CapMountTmpfs,
 	CapMountRemount,
@@ -179,15 +185,16 @@ func ParsePolicy(raw string) (Policy, error) {
 }
 
 var readOnlyCapabilities = map[string]bool{
-	CapPing:      true,
-	CapInspect:   true,
-	CapStats:     true,
-	CapEvents:    true,
-	CapFSExport:  true,
-	CapPortList:  true,
-	CapMountList: true,
-	CapProcList:  true,
-	CapKernelLog: true,
+	CapPing:          true,
+	CapInspect:       true,
+	CapStats:         true,
+	CapEvents:        true,
+	CapFSExport:      true,
+	CapPortList:      true,
+	CapNATPolicyRead: true,
+	CapMountList:     true,
+	CapProcList:      true,
+	CapKernelLog:     true,
 }
 
 var checkpointOnlyCapabilities = map[string]bool{
@@ -217,6 +224,8 @@ var methodRequiredCap = map[string]string{
 	MethodPortAdd:          CapPortDynamicLoopback,
 	MethodPortRemove:       CapPortRemove,
 	MethodNetDial:          CapNetDial,
+	MethodNATPolicyGet:     CapNATPolicyRead,
+	MethodNATPolicySet:     CapNATPolicyWrite,
 	MethodMountList:        CapMountList,
 	MethodMountAdd:         CapMountTmpfs, // checked per-kind as well
 	MethodMountRemount:     CapMountRemount,
@@ -291,6 +300,9 @@ func MethodAllowed(method string, caps []string) bool {
 	}
 	return slices.Contains(caps, req)
 }
+
+// FeatureNetQoS advertises support for NAT bandwidth fields in resource updates.
+const FeatureNetQoS = "net_qos"
 
 // HelloRequest is sent by the client as the first v2 frame on StreamID 0.
 type HelloRequest struct {
@@ -474,14 +486,17 @@ type FSImportResponse struct {
 
 // ResourceUpdateRequest updates live sandbox resource limits and mutable tunables.
 type ResourceUpdateRequest struct {
-	MemoryBytes   *int64            `json:"memory_bytes,omitempty"`
-	ForceMemory   bool              `json:"force_memory,omitempty"`
-	CPUMillis     *int64            `json:"cpu_millis,omitempty"`
-	CPUQuotaUSec  *int64            `json:"cpu_quota_usec,omitempty"`
-	CPUPeriodUSec *int64            `json:"cpu_period_usec,omitempty"`
-	PidsLimit     *int64            `json:"pids_limit,omitempty"`
-	IsolateLAN    *bool             `json:"isolate_lan,omitempty"`
-	Tuning        map[string]string `json:"tuning,omitempty"`
+	MemoryBytes   *int64 `json:"memory_bytes,omitempty"`
+	ForceMemory   bool   `json:"force_memory,omitempty"`
+	CPUMillis     *int64 `json:"cpu_millis,omitempty"`
+	CPUQuotaUSec  *int64 `json:"cpu_quota_usec,omitempty"`
+	CPUPeriodUSec *int64 `json:"cpu_period_usec,omitempty"`
+	PidsLimit     *int64 `json:"pids_limit,omitempty"`
+	IsolateLAN    *bool  `json:"isolate_lan,omitempty"`
+	// Rates are guest-relative bits per second. Nil leaves a rate unchanged; zero clears it.
+	NetTXBPS *uint64           `json:"net_tx_bps,omitempty"`
+	NetRXBPS *uint64           `json:"net_rx_bps,omitempty"`
+	Tuning   map[string]string `json:"tuning,omitempty"`
 }
 
 // ResourceSnapshot describes active sandbox resource limits.
@@ -493,6 +508,8 @@ type ResourceSnapshot struct {
 	GuestCPUs     int               `json:"guest_cpus"`
 	PidsLimit     int64             `json:"pids_limit"`
 	IsolateLAN    bool              `json:"isolate_lan"`
+	NetTXBPS      uint64            `json:"net_tx_bps"` // Guest to host; zero is unlimited.
+	NetRXBPS      uint64            `json:"net_rx_bps"` // Host to guest; zero is unlimited.
 	Tuning        map[string]string `json:"tuning,omitempty"`
 }
 
@@ -546,6 +563,12 @@ type NetDialRequest struct {
 // NetDialResponse confirms connection establishment to the guest endpoint.
 type NetDialResponse struct {
 	RemoteAddr string `json:"remote_addr"`
+}
+
+// NATPolicyState carries a NAT policy. A get result contains null if no policy
+// is installed. A set request requires a policy object.
+type NATPolicyState struct {
+	Policy json.RawMessage `json:"policy"`
 }
 
 // MountInfo describes one guest mount entry.

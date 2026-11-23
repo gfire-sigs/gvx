@@ -15,6 +15,7 @@
 package netbackend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
+	"z.gfire.dev/gvx/pkg/waiter"
 )
 
 const (
@@ -41,6 +43,8 @@ const (
 	acceptBackoffMin = 5 * time.Millisecond
 	acceptBackoffMax = time.Second
 )
+
+var errPublishedTCPDenied = errors.New("netbackend: NAT policy denied every target for published TCP connection")
 
 // PortSource identifies how a published port forward rule was created.
 const (
@@ -341,12 +345,30 @@ type boundUDPForward struct {
 	sessions map[netip.AddrPort]*udpForwardSession
 }
 
+// detachSessions invalidates queued sends before the caller closes the sessions.
+// The caller holds PortForwarder.mu.
+func (b *boundUDPForward) detachSessions(dst []*udpForwardSession) []*udpForwardSession {
+	for _, sess := range b.sessions {
+		dst = append(dst, sess)
+	}
+	clear(b.sessions)
+	return dst
+}
+
 // udpForwardSession carries the datagrams of one host client. It owns one
 // guest UDP endpoint, so the guest sees one stable source port per client.
 type udpForwardSession struct {
 	client netip.AddrPort
 	guest  *gonet.UDPConn
+	ep     tcpip.Endpoint
+	ctx    context.Context
 	clock  *activityClock
+	rx     BandwidthFlow
+}
+
+func (s *udpForwardSession) close() {
+	s.clock.stop()
+	_ = s.guest.Close()
 }
 
 // PortForwarder binds host TCP listeners and UDP packet sockets prior to
@@ -361,6 +383,14 @@ type PortForwarder struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
+	// Set before starting the relay workers. The sandbox owns the shaper.
+	bandwidth *BandwidthShaper
+	// Set before starting the relay workers. The sandbox owns the policy.
+	natPolicy *NATPolicy
+
+	// UDP sends share this gate. Save, rebind, and close drain active guest writes.
+	// Acquire it before mu when an operation needs both.
+	udpHandoff sync.RWMutex
 
 	// udpIdle is the time without a datagram after which a UDP session ends.
 	udpIdle time.Duration
@@ -600,6 +630,26 @@ func (pf *PortForwarder) SetAccept(fn func(net.Listener) (net.Conn, error)) {
 	pf.accept = fn
 }
 
+// SetBandwidthShaper shares the sandbox's bandwidth budget with all port rules.
+// It has no effect after the forwarder starts or closes.
+func (pf *PortForwarder) SetBandwidthShaper(shaper *BandwidthShaper) {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	if !pf.started && !pf.closed {
+		pf.bandwidth = shaper
+	}
+}
+
+// SetNATPolicy shares the sandbox's ingress policy with all port rules.
+// It has no effect after the forwarder starts or closes.
+func (pf *PortForwarder) SetNATPolicy(policy *NATPolicy) {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	if !pf.started && !pf.closed {
+		pf.natPolicy = policy
+	}
+}
+
 // Start launches background relay workers for all pre-bound TCP and UDP ports
 // targeting the given Netstack instance. It does nothing after Close and
 // after the first call.
@@ -640,6 +690,8 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 	if s == nil {
 		return errors.New("netbackend: restored stack is nil")
 	}
+	pf.udpHandoff.Lock()
+	defer pf.udpHandoff.Unlock()
 	pf.mu.Lock()
 	if pf.closed {
 		pf.mu.Unlock()
@@ -673,28 +725,19 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 	}
 	pf.stack = s
 	clear(pf.dynFailed)
-	var staleGuests []*gonet.UDPConn
+	var stale []*udpForwardSession
 	for _, b := range pf.udpList {
-		for client, sess := range b.sessions {
-			staleGuests = append(staleGuests, sess.guest)
-			delete(b.sessions, client)
-		}
+		stale = b.detachSessions(stale)
 	}
 	for _, b := range pf.manualUDP {
-		for client, sess := range b.sessions {
-			staleGuests = append(staleGuests, sess.guest)
-			delete(b.sessions, client)
-		}
+		stale = b.detachSessions(stale)
 	}
 	for _, b := range pf.dynUDP {
-		for client, sess := range b.sessions {
-			staleGuests = append(staleGuests, sess.guest)
-			delete(b.sessions, client)
-		}
+		stale = b.detachSessions(stale)
 	}
 	pf.mu.Unlock()
-	for _, g := range staleGuests {
-		_ = g.Close()
+	for _, sess := range stale {
+		sess.close()
 	}
 	return nil
 }
@@ -720,6 +763,8 @@ func (pf *PortForwarder) targetStack() *stack.Stack {
 // during the pause waits in the listener backlog, and a datagram waits in the
 // socket buffer.
 func (pf *PortForwarder) QuiesceForSave() {
+	pf.udpHandoff.Lock()
+	defer pf.udpHandoff.Unlock()
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
 	if pf.resumed == nil {
@@ -738,9 +783,8 @@ func (pf *PortForwarder) ResumeAfterSave() error {
 	return nil
 }
 
-// waitResumed blocks while the forwarder is quiesced. It returns when the
-// pause ends or the forwarder closes.
-func (pf *PortForwarder) waitResumed() {
+// waitResumed blocks while the forwarder is quiesced or until ctx ends.
+func (pf *PortForwarder) waitResumed(ctx context.Context) {
 	pf.mu.Lock()
 	ch := pf.resumed
 	pf.mu.Unlock()
@@ -749,7 +793,7 @@ func (pf *PortForwarder) waitResumed() {
 	}
 	select {
 	case <-ch:
-	case <-pf.ctx.Done():
+	case <-ctx.Done():
 	}
 }
 
@@ -757,12 +801,16 @@ func (pf *PortForwarder) waitResumed() {
 // the pause of PortForwarder.QuiesceForSave.
 type quiescedGuestConn struct {
 	*gonet.TCPConn
-	wait func()
+	ctx  context.Context
+	wait func(context.Context)
 }
 
 // Write implements net.Conn.Write.
 func (c quiescedGuestConn) Write(p []byte) (int, error) {
-	c.wait()
+	c.wait(c.ctx)
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
 	return c.TCPConn.Write(p)
 }
 
@@ -810,13 +858,20 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 			continue
 		}
 		backoff = 0
-		pf.waitResumed()
+		pf.waitResumed(pf.ctx)
 		pf.mu.Lock()
 		r := b.rule
 		pf.mu.Unlock()
 		guestAddr := parseGuestFullAddr(r.GuestIP, r.GuestPort)
 		fallback := allowsLoopbackFallback(r.GuestIP)
-		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, fallback, hostConn) }) {
+		var client netip.Addr
+		if pf.natPolicy != nil && r.HostSocket == "" {
+			if addr, ok := hostConn.RemoteAddr().(*net.TCPAddr); ok {
+				client = addr.AddrPort().Addr().Unmap()
+			}
+		}
+		// Unix publications have no IP identity. Track them as unknown so that activating policy revokes them.
+		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, fallback, client, hostConn) }) {
 			_ = hostConn.Close()
 			return
 		}
@@ -826,7 +881,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 // relayTCPClient connects hostConn to the guest endpoint and relays both
 // streams. The guest may start listening after the host client connects, so
 // the dial retries during the guest dial window.
-func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bool, hostConn net.Conn) {
+func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bool, client netip.Addr, hostConn net.Conn) {
 	defer func() { _ = hostConn.Close() }()
 
 	pf.mu.Lock()
@@ -835,22 +890,34 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bo
 	pf.mu.Unlock()
 	ctx, cancel := context.WithTimeout(pf.ctx, dialWindow)
 	defer cancel()
-	var guestConn *gonet.TCPConn
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
 			timer.Stop()
 		}
 	}()
-	for {
+	for ctx.Err() == nil {
 		var err error
 		if s := pf.targetStack(); s != nil {
-			guestConn, err = dialGuestTCP(ctx, s, guestAddr, fallback)
-			if err == nil {
-				break
+			guestConn, flowCtx, untrack, dialErr := pf.dialGuestTCP(ctx, s, guestAddr, fallback, client)
+			if dialErr == nil {
+				cancel()
+				defer untrack()
+				defer func() { _ = guestConn.Close() }()
+				if flowCtx.Err() == nil {
+					relayBidirectional(flowCtx, quiescedGuestConn{TCPConn: guestConn, ctx: flowCtx, wait: pf.waitResumed}, hostConn, pf.bandwidth)
+				}
+				return
 			}
+			if dialErr == errPublishedTCPDenied {
+				return
+			}
+			err = dialErr
 		} else {
 			err = errors.New("target stack is nil")
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		if timer == nil {
 			timer = time.NewTimer(dialInterval)
@@ -864,21 +931,61 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bo
 		case <-timer.C:
 		}
 	}
-	defer func() { _ = guestConn.Close() }()
-	relayBidirectional(pf.ctx, hostConn, quiescedGuestConn{TCPConn: guestConn, wait: pf.waitResumed})
 }
 
-func dialGuestTCP(ctx context.Context, s *stack.Stack, guestAddr tcpip.FullAddress, fallback bool) (*gonet.TCPConn, error) {
-	primary := guestAddr
-	secondary := guestLoopbackAddr(guestAddr.Port)
-	if fallback && prefersGuestLoopback(s, header.TCPProtocolNumber, guestAddr) {
-		primary, secondary = secondary, primary
+func (pf *PortForwarder) dialGuestTCP(ctx context.Context, s *stack.Stack, guestAddr tcpip.FullAddress, fallback bool, client netip.Addr) (*gonet.TCPConn, context.Context, func(), error) {
+	targets := [2]tcpip.FullAddress{guestAddr}
+	count := 1
+	if fallback {
+		targets[1] = guestLoopbackAddr(guestAddr.Port)
+		count++
+		if prefersGuestLoopback(s, header.TCPProtocolNumber, guestAddr) {
+			targets[0], targets[1] = targets[1], targets[0]
+		}
 	}
-	conn, err := gonet.DialContextTCP(ctx, s, primary, ipv4.ProtocolNumber)
-	if err == nil || !fallback || ctx.Err() != nil {
-		return conn, err
+	lastErr := errPublishedTCPDenied
+	for _, target := range targets[:count] {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		flowCtx, untrack, allowed := pf.trackPublishedFlow(header.TCPProtocolNumber, client, target)
+		if !allowed {
+			continue
+		}
+		dialCtx := ctx
+		var cancel context.CancelFunc
+		if pf.natPolicy != nil {
+			// The dial window must not end an established relay.
+			deadline, _ := ctx.Deadline()
+			dialCtx, cancel = context.WithDeadline(flowCtx, deadline)
+		}
+		conn, err := gonet.DialContextTCP(dialCtx, s, target, ipv4.ProtocolNumber)
+		if cancel != nil {
+			cancel()
+		}
+		if err == nil {
+			return conn, flowCtx, untrack, nil
+		}
+		lastErr = err
+		untrack()
 	}
-	return gonet.DialContextTCP(ctx, s, secondary, ipv4.ProtocolNumber)
+	return nil, nil, nil, lastErr
+}
+
+func (pf *PortForwarder) trackPublishedFlow(proto tcpip.TransportProtocolNumber, client netip.Addr, target tcpip.FullAddress) (context.Context, func(), bool) {
+	guest := target.Addr
+	if guest.Unspecified() {
+		// Netstack connects an unbound endpoint with an unspecified destination to loopback.
+		guest = guestLoopbackIPv4
+	}
+	return pf.natPolicy.Track(pf.ctx, NATPolicyFlow{
+		Direction: NATPolicyIngress,
+		Protocol:  uint8(proto),
+		Guest:     netip.AddrFrom4(guest.As4()),
+		Remote:    client,
+		Port:      target.Port,
+		PortKnown: true,
+	})
 }
 
 func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
@@ -915,16 +1022,64 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 			continue
 		}
 		backoff = 0
-		pf.waitResumed()
+		pf.waitResumed(pf.ctx)
 		sess := pf.udpSession(b, client)
 		if sess == nil {
 			continue
 		}
-		sess.clock.touch()
-		if _, err := sess.guest.Write(buf[:n]); err != nil {
-			pf.log.Debug("netbackend: write forwarded datagram to guest", "client", client, "error", err)
-		}
+		pf.forwardUDPToGuest(b, sess, buf[:n])
 	}
+}
+
+func (pf *PortForwarder) forwardUDPToGuest(b *boundUDPForward, sess *udpForwardSession, p []byte) {
+	if sess.ctx.Err() != nil || !sess.clock.beginSend() {
+		return
+	}
+	shaper := pf.bandwidth
+	if shaper.Enabled(BandwidthRX) || sess.rx.Pending() {
+		ctx, ok := sess.clock.sendContext(sess.ctx)
+		if !ok {
+			sess.clock.finishSend(false)
+			return
+		}
+		pkt := bytes.Clone(p)
+		var attempted bool
+		shaper.EnqueueOrdered(ctx, BandwidthRX, &sess.rx, len(pkt), func() (int, error) {
+			n, err := pf.sendPublishedDatagram(b, sess, pkt)
+			attempted = !errors.Is(err, net.ErrClosed)
+			return n, err
+		}, func() { sess.clock.finishSend(attempted) })
+		return
+	}
+	var err error
+	if sess.ctx.Err() != nil {
+		err = net.ErrClosed
+	} else if shaper == nil {
+		_, err = sess.guest.Write(p)
+	} else {
+		_, err = pf.sendPublishedDatagram(b, sess, p)
+	}
+	sess.clock.finishSend(!errors.Is(err, net.ErrClosed))
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		pf.log.Debug("netbackend: write forwarded datagram to guest", "client", sess.client, "error", err)
+	}
+}
+
+func (pf *PortForwarder) sendPublishedDatagram(b *boundUDPForward, sess *udpForwardSession, p []byte) (int, error) {
+	pf.udpHandoff.RLock()
+	defer pf.udpHandoff.RUnlock()
+	pf.mu.Lock()
+	active := !pf.closed && pf.resumed == nil && b.sessions[sess.client] == sess
+	pf.mu.Unlock()
+	if !active || sess.ctx.Err() != nil {
+		return 0, net.ErrClosed
+	}
+	// The scheduler must not wait on gonet's writable event when the endpoint cannot send.
+	n, err := sess.ep.Write(bytes.NewReader(p), tcpip.WriteOptions{Atomic: true})
+	if err != nil {
+		return int(n), errors.New(err.String())
+	}
+	return int(n), nil
 }
 
 // udpSession returns the session of client. It creates the session and its
@@ -937,8 +1092,11 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, client netip.AddrPort) *
 		return nil
 	}
 	if sess, ok := b.sessions[client]; ok {
-		pf.mu.Unlock()
-		return sess
+		if sess.ctx.Err() == nil {
+			pf.mu.Unlock()
+			return sess
+		}
+		delete(b.sessions, client)
 	}
 	if len(b.sessions) >= pf.udpMaxSessions {
 		hostPort := b.rule.HostPort
@@ -956,46 +1114,83 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, client netip.AddrPort) *
 	if fallback && prefersGuestLoopback(s, header.UDPProtocolNumber, guestAddr) {
 		target = guestLoopbackAddr(guestAddr.Port)
 	}
-	guest, err := gonet.DialUDP(s, nil, &target, ipv4.ProtocolNumber)
-	if err != nil {
-		pf.log.Debug("netbackend: open guest UDP endpoint", "client", client, "error", err)
+	flowCtx, untrack, allowed := pf.trackPublishedFlow(header.UDPProtocolNumber, client.Addr().Unmap(), target)
+	if !allowed {
 		return nil
 	}
-	sess := &udpForwardSession{client: client, guest: guest, clock: newActivityClock()}
+	var ep tcpip.Endpoint
+	var guest *gonet.UDPConn
+	if pf.bandwidth == nil {
+		var err error
+		guest, err = gonet.DialUDP(s, nil, &target, ipv4.ProtocolNumber)
+		if err != nil {
+			untrack()
+			pf.log.Debug("netbackend: open guest UDP endpoint", "client", client, "error", err)
+			return nil
+		}
+	} else {
+		var wq waiter.Queue
+		var err tcpip.Error
+		ep, err = s.NewEndpoint(header.UDPProtocolNumber, ipv4.ProtocolNumber, &wq)
+		if err != nil {
+			untrack()
+			pf.log.Debug("netbackend: open guest UDP endpoint", "client", client, "error", err.String())
+			return nil
+		}
+		if err := ep.Connect(target); err != nil {
+			ep.Close()
+			untrack()
+			pf.log.Debug("netbackend: connect guest UDP endpoint", "client", client, "error", err.String())
+			return nil
+		}
+		guest = gonet.NewUDPConn(&wq, ep)
+	}
+	sess := &udpForwardSession{client: client, guest: guest, ep: ep, ctx: flowCtx, clock: newActivityClock()}
 
 	// Only this rule's serveUDP goroutine inserts sessions, so the earlier
 	// lookup cannot race with another insert for the same key.
 	pf.mu.Lock()
-	if pf.closed || b.closed || pf.stack != s || b.rule != r {
+	if pf.closed || b.closed || pf.stack != s || b.rule != r || flowCtx.Err() != nil {
 		pf.mu.Unlock()
+		untrack()
 		_ = guest.Close()
 		return nil
 	}
 	b.sessions[client] = sess
 	pf.wg.Add(1)
 	pf.mu.Unlock()
-	go pf.runUDPSession(b, sess)
+	go pf.runUDPSession(b, sess, untrack)
 	return sess
 }
 
 // runUDPSession forwards every guest reply to the host client until the
 // session is idle in both directions or its guest endpoint closes.
-func (pf *PortForwarder) runUDPSession(b *boundUDPForward, sess *udpForwardSession) {
+func (pf *PortForwarder) runUDPSession(b *boundUDPForward, sess *udpForwardSession, untrack func()) {
 	defer pf.wg.Done()
+	defer untrack()
+	if pf.natPolicy != nil {
+		stop := context.AfterFunc(sess.ctx, func() { _ = sess.guest.Close() })
+		defer stop()
+	}
 	defer func() {
 		pf.mu.Lock()
 		if b.sessions[sess.client] == sess {
 			delete(b.sessions, sess.client)
 		}
 		pf.mu.Unlock()
-		_ = sess.guest.Close()
+		sess.close()
 	}()
 	pf.mu.Lock()
 	udpIdle := pf.udpIdle
 	pf.mu.Unlock()
 	pumpDatagrams(sess.guest, func(p []byte) error {
-		_, err := b.packetConn.WriteToUDPAddrPort(p, sess.client)
-		if err != nil && !errors.Is(err, net.ErrClosed) {
+		err := sendRelayDatagram(sess.ctx, sess.clock, pf.bandwidth, BandwidthTX, len(p), func() (int, error) {
+			if sess.ctx.Err() != nil {
+				return 0, net.ErrClosed
+			}
+			return b.packetConn.WriteToUDPAddrPort(p, sess.client)
+		})
+		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, errBandwidthQueueFull) {
 			pf.log.Debug("netbackend: write guest reply to host client", "client", sess.client, "error", err)
 		}
 		return err
@@ -1050,9 +1245,11 @@ func parseGuestFullAddr(ipStr string, port uint16) tcpip.FullAddress {
 // waits for active relays. It closes the session endpoints before it waits,
 // so a guest that never answers cannot block Close.
 func (pf *PortForwarder) Close() error {
+	pf.udpHandoff.Lock()
 	pf.mu.Lock()
 	if pf.closed {
 		pf.mu.Unlock()
+		pf.udpHandoff.Unlock()
 		return nil
 	}
 	pf.closed = true
@@ -1075,24 +1272,20 @@ func (pf *PortForwarder) Close() error {
 		}
 	}
 	clear(pf.dynTCP)
-	var guests []*gonet.UDPConn
+	var sessions []*udpForwardSession
 	for _, b := range pf.udpList {
 		b.closed = true
 		if err := b.packetConn.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		for _, sess := range b.sessions {
-			guests = append(guests, sess.guest)
-		}
+		sessions = b.detachSessions(sessions)
 	}
 	for _, b := range pf.manualUDP {
 		b.closed = true
 		if err := b.packetConn.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		for _, sess := range b.sessions {
-			guests = append(guests, sess.guest)
-		}
+		sessions = b.detachSessions(sessions)
 	}
 	pf.manualUDP = nil
 	for _, b := range pf.dynUDP {
@@ -1100,15 +1293,14 @@ func (pf *PortForwarder) Close() error {
 		if err := b.packetConn.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		for _, sess := range b.sessions {
-			guests = append(guests, sess.guest)
-		}
+		sessions = b.detachSessions(sessions)
 	}
 	clear(pf.dynUDP)
 	clear(pf.dynFailed)
 	pf.mu.Unlock()
-	for _, g := range guests {
-		_ = g.Close()
+	pf.udpHandoff.Unlock()
+	for _, sess := range sessions {
+		sess.close()
 	}
 	pf.wg.Wait()
 	return errors.Join(errs...)

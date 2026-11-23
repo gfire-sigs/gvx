@@ -122,6 +122,96 @@ func TestRelayDatagramsForwardsBothDirections(t *testing.T) {
 	}
 }
 
+func TestRelayDatagramsLiveBandwidthKeepsPendingSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = 100 * time.Millisecond
+		ctx, cancel := context.WithCancel(t.Context())
+		guest, guestRelay := net.Pipe()
+		host, hostRelay := net.Pipe()
+		shaper := NewBandwidthShaper(BandwidthRates{})
+		defer shaper.Close()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			relayDatagramsWithClock(ctx, guestRelay, hostRelay, idle, newActivityClock(), shaper)
+		}()
+		defer func() {
+			cancel()
+			_ = guest.Close()
+			_ = host.Close()
+			<-done
+		}()
+		synctest.Wait()
+
+		shaper.SetRates(BandwidthRates{TXBPS: 8})
+		const packet = "queued datagram"
+		type result struct {
+			payload string
+			err     error
+		}
+		received := make(chan result, 1)
+		go func() {
+			var buf [64]byte
+			n, err := host.Read(buf[:])
+			received <- result{payload: string(buf[:n]), err: err}
+		}()
+		if _, err := guest.Write([]byte(packet)); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		time.Sleep(2 * idle)
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("relay expired while the datagram was waiting for bandwidth")
+		case got := <-received:
+			t.Fatalf("host read %+v before bandwidth was cleared", got)
+		default:
+		}
+		shaper.SetRates(BandwidthRates{})
+		_ = host.SetReadDeadline(time.Now().Add(idle))
+		if got := <-received; got.err != nil || got.payload != packet {
+			t.Fatalf("host read = (%q, %v), want the whole pending datagram %q", got.payload, got.err, packet)
+		}
+	})
+}
+
+func TestRelayDatagramsQueueOverflowDoesNotRefreshIdle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = 100 * time.Millisecond
+		ctx, cancel := context.WithCancel(t.Context())
+		shaper := NewBandwidthShaper(BandwidthRates{TXBPS: 1})
+		defer shaper.Close()
+		for shaper.Enqueue(ctx, BandwidthTX, 1, func() (int, error) { return 1, nil }, nil) {
+		}
+
+		guest, guestRelay := net.Pipe()
+		host, hostRelay := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			relayDatagramsWithClock(ctx, guestRelay, hostRelay, idle, newActivityClock(), shaper)
+		}()
+		defer func() {
+			cancel()
+			_ = guest.Close()
+			_ = host.Close()
+			<-done
+		}()
+		time.Sleep(3 * idle / 4)
+		if _, err := guest.Write([]byte("queue is full")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(idle / 4)
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("a rejected datagram extended the UDP idle timeout")
+		}
+	})
+}
+
 func TestRelayDatagramsKeepsSessionWhileOneDirectionIsActive(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const idle = 1500 * time.Millisecond
@@ -392,29 +482,6 @@ func TestIsTimeoutRecognizesGonetDeadlines(t *testing.T) {
 	}
 }
 
-func TestActivityClock(t *testing.T) {
-	c := newActivityClock()
-	const idle = time.Hour
-	if c.expired(idle) {
-		t.Fatal("new clock is expired")
-	}
-	d1 := c.deadline(idle)
-	c.touch()
-	d2 := c.deadline(idle)
-	if d2.Before(d1) {
-		t.Fatalf("touch moved the deadline back from %v to %v", d1, d2)
-	}
-	if !c.expired(0) {
-		t.Fatal("clock with zero idle time is not expired")
-	}
-	// touch never moves the last activity time backward.
-	c.last.Store(int64(10 * time.Hour))
-	c.touch()
-	if got := time.Duration(c.last.Load()); got != 10*time.Hour {
-		t.Fatalf("touch moved last activity back to %v", got)
-	}
-}
-
 // recordedConn wraps a net.Conn and reports when it closes.
 type recordedConn struct {
 	net.Conn
@@ -573,7 +640,7 @@ func TestRelayBidirectionalHalfClosesAndReturnsAfterBothDirectionsEnd(t *testing
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		relayBidirectional(t.Context(), a2, b2)
+		relayBidirectional(t.Context(), a2, b2, nil)
 	}()
 
 	if _, err := a1.Write([]byte("to-b")); err != nil {

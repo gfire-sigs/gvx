@@ -442,7 +442,7 @@ func (m *mockCLIControlHandler) HandleLegacyCheckpoint(context.Context, control.
 	return nil
 }
 
-func startMockCLIServer(t *testing.T, caps []string, fn func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error) *control.Endpoint {
+func startMockCLIServer(t *testing.T, caps []string, fn func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error, features ...string) *control.Endpoint {
 	t.Helper()
 	isolateControlTokenDir(t)
 	addr := freeLoopbackAddr(t)
@@ -455,6 +455,7 @@ func startMockCLIServer(t *testing.T, caps []string, fn func(ctx context.Context
 		SandboxID:    "mock-sbx",
 		Token:        ep.Token,
 		Capabilities: caps,
+		Features:     features,
 		Handler:      &mockCLIControlHandler{onStream: fn},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -583,7 +584,7 @@ func TestControlCLIFlagValidationAndV1Fallback(t *testing.T) {
 	var gotCPUQuota atomic.Int64
 	gotCPUQuota.Store(-999)
 
-	ep := startMockCLIServer(t, []string{control.CapStop, control.CapResourceMemory, control.CapResourceCPU, control.CapPing}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+	ep := startMockCLIServer(t, []string{control.CapStop, control.CapResourceMemory, control.CapResourceCPU, control.CapResourceNetwork, control.CapPing}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
 		switch req.Method {
 		case control.MethodStop:
 			var p control.StopRequest
@@ -620,6 +621,22 @@ func TestControlCLIFlagValidationAndV1Fallback(t *testing.T) {
 	// update --cpu-quota=max sends CPUQuotaUSec == 0.
 	if code, _, errS := runCLI("update", "-S", "tcp://"+ep.Address, "--cpu-quota=max"); code != 0 || gotCPUQuota.Load() != 0 {
 		t.Fatalf("update --cpu-quota=max = (code=%d, quota=%d, stderr=%q), want (0, 0)", code, gotCPUQuota.Load(), errS)
+	}
+
+	if code, _, errS := runCLI("update", "-S", "tcp://"+ep.Address, "--cpu-quota=40000", "--net-tx-bps=0"); code != 1 ||
+		!strings.Contains(errS, string(control.CodeUnsupported)) || gotCPUQuota.Load() != 0 {
+		t.Fatalf("mixed update against old control server = (code=%d, quota=%d, stderr=%q), want unsupported and no CPU change", code, gotCPUQuota.Load(), errS)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	legacyClient, err := control.Dial(ctx, control.DialOptions{Endpoint: ep.Address, Token: ep.Token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyClient.Close()
+	rawUpdate := json.RawMessage(`{"cpu_quota_usec":45000,"net_rx_bps":0}`)
+	if err := legacyClient.Call(ctx, control.MethodResourceUpdate, rawUpdate, nil); !control.IsCode(err, control.CodeUnsupported) || gotCPUQuota.Load() != 0 {
+		t.Fatalf("raw mixed update = %v, CPU quota = %d; want unsupported and unchanged CPU quota", err, gotCPUQuota.Load())
 	}
 
 	// kill --pid 5 --all and --pid -1 return exit 2.
@@ -689,6 +706,27 @@ func TestControlCLIFlagValidationAndV1Fallback(t *testing.T) {
 	// With explicit token (no local error), v2 handshake fails on wire and falls back to v1.
 	if code, _, errS := runCLI("checkpoint", "-S", "tcp://"+v1Ln.Addr().String(), "--token", "tok123", "-checkpoint-dir=ckpt"); code != 0 || v1Hits.Load() != 1 {
 		t.Fatalf("checkpoint v1 fallback = (code=%d, v1Hits=%d, stderr=%q), want (0, 1)", code, v1Hits.Load(), errS)
+	}
+}
+
+func TestCLIUpdateClearsOnlySpecifiedNATRate(t *testing.T) {
+	ep := startMockCLIServer(t, []string{control.CapResourceNetwork}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+		var params control.ResourceUpdateRequest
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		if params.NetTXBPS == nil || *params.NetTXBPS != 0 || params.NetRXBPS != nil {
+			return control.NewErrorf(control.CodeInvalidArgument, "expected explicit TX zero and omitted RX, got %s", req.Params)
+		}
+		return stream.Reply(control.ResourceSnapshot{NetRXBPS: 10_000})
+	}, control.FeatureNetQoS)
+	var stdout, stderr bytes.Buffer
+	if code := executeCLI(t.Context(), []string{"update", "-S", "tcp://" + ep.Address, "--net-tx-bps=0", "-f", "json"}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("update TX bandwidth returned %d: %s", code, &stderr)
+	}
+	var snapshot control.ResourceSnapshot
+	if err := json.Unmarshal(stdout.Bytes(), &snapshot); err != nil || snapshot.NetTXBPS != 0 || snapshot.NetRXBPS != 10_000 {
+		t.Fatalf("update snapshot = %s (err=%v), want TX 0, RX 10000 bps", &stdout, err)
 	}
 }
 
@@ -1095,6 +1133,9 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 		if err := json.Unmarshal([]byte(out), &snap); err != nil || snap.CPUQuotaUSec != 0 {
 			t.Fatalf("update --cpu-quota=max snap = (%+v, %v)", snap, err)
 		}
+	}
+	if code, _, errS := runCmd(nil, "update", "-S", sockPath, "--net-rx-bps=0"); code != 1 || !strings.Contains(errS, string(control.CodeUnsupported)) {
+		t.Fatalf("clear bandwidth in non-NAT mode = (%d, %q), want UNSUPPORTED", code, errS)
 	}
 
 	// mount add tmpfs (small size < 6m allowed!) -> remount ro -> rw -> rm

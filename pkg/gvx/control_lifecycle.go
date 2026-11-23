@@ -28,6 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
+	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/cgroup2fs"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 )
@@ -256,13 +257,37 @@ func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stre
 	if err := decodeParams(raw, &req); err != nil {
 		return err
 	}
-	k, _, err := s.activeKernelChecked(ctx)
+	snapshot, err := s.updateResources(ctx, req)
 	if err != nil {
 		return err
 	}
+	return stream.Reply(snapshot)
+}
+
+func (s *Sandbox) updateResources(ctx context.Context, req control.ResourceUpdateRequest) (control.ResourceSnapshot, error) {
+	k, _, err := s.activeKernelChecked(ctx)
+	if err != nil {
+		return control.ResourceSnapshot{}, err
+	}
+	updateQoS := req.NetTXBPS != nil || req.NetRXBPS != nil
+	if updateQoS {
+		s.opMu.RLock()
+		defer s.opMu.RUnlock()
+		k, _, err = s.activeKernelNow()
+		if err != nil {
+			return control.ResourceSnapshot{}, err
+		}
+	}
 	s.resourceMu.Lock()
 	defer s.resourceMu.Unlock()
+	if err := s.applyResourceUpdate(k, req, updateQoS); err != nil {
+		return control.ResourceSnapshot{}, err
+	}
+	return s.snapshotResources(k), nil
+}
 
+// applyResourceUpdate requires resourceMu and, for QoS, a read lock on opMu.
+func (s *Sandbox) applyResourceUpdate(k *kernel.Kernel, req control.ResourceUpdateRequest, updateQoS bool) error {
 	caps := s.ControlCapabilities()
 	hasCap := func(c string) bool { return slices.Contains(caps, c) }
 
@@ -323,12 +348,28 @@ func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stre
 			return control.NewErrorf(control.CodeInvalidArgument, "pids limit %d out of range [0, %d]", *req.PidsLimit, maxPidsLimit)
 		}
 	}
-	if req.IsolateLAN != nil {
+	if updateQoS && s.bandwidth == nil {
+		return control.NewError(control.CodeUnsupported, "NAT bandwidth shaping is unavailable for this sandbox")
+	}
+	if req.IsolateLAN != nil || updateQoS {
 		if !hasCap(control.CapResourceNetwork) {
 			return control.NewError(control.CodeForbiddenByPolicy, "network policy updates are disabled by policy")
 		}
-		if s.natForwarder == nil {
+		if req.IsolateLAN != nil && s.natForwarder == nil {
 			return control.NewError(control.CodeUnsupported, "--isolate-lan requires -net=nat")
+		}
+	}
+	var rates netbackend.BandwidthRates
+	if updateQoS {
+		rates = s.bandwidth.Rates()
+		if req.NetTXBPS != nil {
+			rates.TXBPS = *req.NetTXBPS
+		}
+		if req.NetRXBPS != nil {
+			rates.RXBPS = *req.NetRXBPS
+		}
+		if err := rates.Validate(); err != nil {
+			return control.NewError(control.CodeInvalidArgument, err.Error())
 		}
 	}
 
@@ -465,9 +506,18 @@ func (s *Sandbox) handleResourceUpdate(ctx context.Context, stream *control.Stre
 		}
 		attrs["tuning_keys"] = strconv.Itoa(len(req.Tuning))
 	}
+	if updateQoS {
+		s.setNATBandwidth(rates)
+		if req.NetTXBPS != nil {
+			attrs["net_tx_bps"] = strconv.FormatUint(rates.TXBPS, 10)
+		}
+		if req.NetRXBPS != nil {
+			attrs["net_rx_bps"] = strconv.FormatUint(rates.RXBPS, 10)
+		}
+	}
 
 	s.emitEvent("resource", "update", attrs)
-	return stream.Reply(s.snapshotResources(k))
+	return nil
 }
 
 func (s *Sandbox) snapshotResources(k *kernel.Kernel) control.ResourceSnapshot {
@@ -478,6 +528,10 @@ func (s *Sandbox) snapshotResources(k *kernel.Kernel) control.ResourceSnapshot {
 	s.mu.Unlock()
 	if s.natForwarder != nil {
 		isolateLAN = s.natForwarder.IsolateLAN()
+	}
+	var rates netbackend.BandwidthRates
+	if s.bandwidth != nil {
+		rates = s.bandwidth.Rates()
 	}
 	var quotaUS, periodUS int64
 	if k != nil {
@@ -512,6 +566,8 @@ func (s *Sandbox) snapshotResources(k *kernel.Kernel) control.ResourceSnapshot {
 		GuestCPUs:     guestCPU,
 		PidsLimit:     res.PidsLimit,
 		IsolateLAN:    isolateLAN,
+		NetTXBPS:      rates.TXBPS,
+		NetRXBPS:      rates.RXBPS,
 		Tuning:        overrides,
 	}
 }

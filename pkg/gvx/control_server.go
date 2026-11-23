@@ -116,6 +116,7 @@ func (s *Sandbox) ControlCapabilities() []string {
 	s.mu.Lock()
 	locked := s.lockdown.Applied
 	hasCkptDir := s.ckptFiles != nil
+	hasNATPolicy := s.natPolicy != nil
 	cfg := s.cfg
 	s.mu.Unlock()
 
@@ -149,6 +150,9 @@ func (s *Sandbox) ControlCapabilities() []string {
 	}
 	if hasCkptDir {
 		avail = append(avail, control.CapCheckpointLocal)
+	}
+	if hasNATPolicy {
+		avail = append(avail, control.CapNATPolicyRead, control.CapNATPolicyWrite)
 	}
 	if cfg.NetworkMode == NetModeNAT {
 		avail = append(avail, control.CapResourceNetwork, control.CapPortList, control.CapPortRemove)
@@ -196,11 +200,16 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 	ln := s.controlListener()
 	locked := s.lockdown.Applied
 	cfg := s.cfg
+	hasBandwidth := s.bandwidth != nil
 	s.mu.Unlock()
 	if ln == nil {
 		return fmt.Errorf("%w: Config.ControlListener is nil", ErrInvalidConfig)
 	}
 	caps := s.ControlCapabilities()
+	var features []string
+	if hasBandwidth {
+		features = append(features, control.FeatureNetQoS)
+	}
 	srv := control.NewServer(lockedControlListener{Listener: ln, locked: locked}, control.ServerConfig{
 		SandboxID:        cmp.Or(cfg.Name, "gvx-default"),
 		Token:            cfg.ControlToken,
@@ -210,6 +219,7 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 		MaxFrameBytes:    int(cfg.Tuning.Size(tuning.ControlMaxFrameBytes)),
 		HandshakeTimeout: cfg.Tuning.Duration(tuning.ControlHandshakeTimeout),
 		Handler:          s,
+		Features:         features,
 	})
 	s.mu.Lock()
 	if s.closed {
@@ -285,6 +295,10 @@ func (s *Sandbox) HandleStream(ctx context.Context, stream *control.Stream, req 
 		return s.handlePortRemove(ctx, stream, req.Params)
 	case control.MethodNetDial:
 		return s.handleNetDial(ctx, stream, req.Params)
+	case control.MethodNATPolicyGet:
+		return s.handleNATPolicyGet(ctx, stream)
+	case control.MethodNATPolicySet:
+		return s.handleNATPolicySet(ctx, stream, req.Params)
 	case control.MethodMountList:
 		return s.handleMountList(ctx, stream)
 	case control.MethodMountAdd:
@@ -410,7 +424,7 @@ func mapControlErr(err error) error {
 	switch {
 	case errors.Is(err, ErrCheckpointExecActive):
 		return control.NewError(control.CodeExecActive, err.Error())
-	case errors.Is(err, ErrCheckpointRPCFSActive):
+	case errors.Is(err, ErrCheckpointRPCFSActive), errors.Is(err, ErrCheckpointNATTunnelActive):
 		return control.NewError(control.CodeBusy, err.Error())
 	case errors.Is(err, ErrInvalidConfig):
 		return control.NewError(control.CodeInvalidArgument, err.Error())

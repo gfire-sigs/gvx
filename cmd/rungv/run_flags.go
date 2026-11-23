@@ -126,6 +126,9 @@ type sandboxFlagValues struct {
 	arch                   string
 	net                    string
 	isolateLAN             bool
+	netTXBPS               uint64
+	netRXBPS               uint64
+	natPolicyFile          string
 	privileged             bool
 	netRaw                 bool
 	packetWrite            bool
@@ -203,6 +206,8 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 		fs.StringVar(&f.net, n, defs.netDefault, "Network backend: nat (or bridge), wg, or none")
 	})
 	fs.BoolVar(&f.isolateLAN, "isolate-lan", false, "Block RFC1918 and loopback LAN destinations in NAT mode")
+	registerNetworkBandwidthFlags(fs, &f.netTXBPS, &f.netRXBPS)
+	fs.StringVar(&f.natPolicyFile, "nat-policy-file", "", "Read host NAT firewall policy (.json, .yaml, or .yml)")
 	fs.BoolVar(&f.privileged, "privileged", true, "Turn on --net-raw, --allow-packet-socket-write, and --allow-suid; --privileged=false turns them off")
 	fs.BoolVar(&f.netRaw, "net-raw", true, "Allow raw sockets and iptables in the guest (default from --privileged)")
 	fs.BoolVar(&f.packetWrite, "allow-packet-socket-write", true, "Allow writes on AF_PACKET sockets; needs --net-raw (default from --privileged)")
@@ -218,6 +223,11 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	registerAlias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&f.portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
 	})
+}
+
+func registerNetworkBandwidthFlags(fs *flag.FlagSet, tx, rx *uint64) {
+	fs.Uint64Var(tx, "net-tx-bps", 0, "NAT bandwidth from guest to host in bits per second (0 for unlimited)")
+	fs.Uint64Var(rx, "net-rx-bps", 0, "NAT bandwidth from host to guest in bits per second (0 for unlimited)")
 }
 
 func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
@@ -457,6 +467,29 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	if err != nil {
 		return gvx.Config{}, false, err
 	}
+	var networkPolicy *gvx.NATPolicyConfig
+	if flagVisited(fs, "nat-policy-file") {
+		if allowEmptyNet && !flagVisited(fs, "net") && !flagVisited(fs, "network") {
+			netMode = gvx.NetModeNAT
+		}
+		if netMode != gvx.NetModeNAT {
+			return gvx.Config{}, false, fmt.Errorf("--nat-policy-file requires -net=nat")
+		}
+		policy, err := readNATPolicyFile(f.natPolicyFile)
+		if err != nil {
+			return gvx.Config{}, false, fmt.Errorf("--nat-policy-file: %w", err)
+		}
+		networkPolicy = &policy
+	}
+	if flagVisited(fs, "net-tx-bps") || flagVisited(fs, "net-rx-bps") {
+		if netMode == "" {
+			// If restore inherits the mode, the bundle must use NAT.
+			netMode = gvx.NetModeNAT
+		}
+		if netMode != gvx.NetModeNAT {
+			return gvx.Config{}, false, fmt.Errorf("--net-tx-bps and --net-rx-bps require -net=nat")
+		}
+	}
 	priv := resolvePrivileges(fs, f.privileged, f.netRaw, f.packetWrite, f.allowSUID)
 	ctrlPolicy, err := control.ParsePolicy(f.controlPolicy)
 	if err != nil {
@@ -480,6 +513,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		AllowUnconfinedSystrap: f.allowUnconfinedSystrap,
 		Architecture:           arch,
 		NetworkMode:            netMode,
+		NetworkPolicy:          networkPolicy,
 		IsolateLAN:             f.isolateLAN,
 		HostDNSServers:         *f.hostDNS,
 		NetRaw:                 priv.netRaw,
@@ -521,6 +555,10 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		DynamicPortAddrs:       append([]string(nil), f.dynamicPortAddrs...),
 		AllowVolumeAttach:      f.allowVolumeAttach,
 		AllowBindAttach:        f.allowBindAttach,
+	}
+	cfg.NetworkBandwidth.TXBPS, cfg.NetworkBandwidth.RXBPS = f.netTXBPS, f.netRXBPS
+	if err := cfg.NetworkBandwidth.Validate(); err != nil {
+		return gvx.Config{}, false, err
 	}
 	if err := control.ValidateDisableList(cfg.ControlDisable); err != nil {
 		return gvx.Config{}, false, fmt.Errorf("--control-disable: %w", err)

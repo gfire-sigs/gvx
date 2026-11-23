@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"slices"
@@ -32,6 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 )
 
@@ -314,6 +314,13 @@ func (s *Sandbox) handleNetDial(ctx context.Context, stream *control.Stream, raw
 	if _, _, err := s.activeKernelChecked(ctx); err != nil {
 		return err
 	}
+	tunnels, err := s.admitNATControlTunnel()
+	if err != nil {
+		return err
+	}
+	if tunnels != nil {
+		defer s.releaseNATControlTunnel(tunnels)
+	}
 	s.mu.Lock()
 	st := s.netStack
 	netMode := s.cfg.NetworkMode
@@ -333,6 +340,19 @@ func (s *Sandbox) handleNetDial(ctx context.Context, stream *control.Stream, raw
 		}
 	}
 
+	var client netip.Addr
+	if s.natPolicy != nil {
+		switch peer := stream.PeerAddr().(type) {
+		case *net.TCPAddr:
+			client = peer.AddrPort().Addr().Unmap()
+		case *net.UnixAddr:
+			// The local administration socket represents 127.0.0.1 for net.dial only.
+			client = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+		}
+	}
+
+	var flowCtx context.Context
+	var untrack func()
 	dialAddr := func(ipStr string) (*gonet.TCPConn, string, error) {
 		addr, err := netip.ParseAddr(ipStr)
 		if err != nil || !addr.Is4() {
@@ -347,46 +367,156 @@ func (s *Sandbox) handleNetDial(ctx context.Context, stream *control.Stream, raw
 			Addr: tcpip.AddrFrom4(addr.As4()),
 			Port: req.GuestPort,
 		}
-		conn, dErr := gonet.DialContextTCP(ctx, st, full, ipv4.ProtocolNumber)
+		target := addr
+		if target.IsUnspecified() {
+			// Netstack uses loopback for an unbound dial without a destination.
+			target = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+		}
+		attemptCtx, release, allowed := s.natPolicy.Track(ctx, netbackend.NATPolicyFlow{
+			Direction: netbackend.NATPolicyIngress,
+			Protocol:  uint8(header.TCPProtocolNumber),
+			Guest:     target,
+			Remote:    client,
+			Port:      req.GuestPort,
+			PortKnown: true,
+		})
+		if !allowed {
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
+			return nil, "", control.NewError(control.CodeForbiddenByPolicy, "NAT policy denied net.dial")
+		}
+		conn, dErr := gonet.DialContextTCP(attemptCtx, st, full, ipv4.ProtocolNumber)
 		if dErr != nil {
+			if cause := context.Cause(attemptCtx); cause != nil {
+				dErr = cause
+			}
+			release()
 			return nil, "", dErr
 		}
+		flowCtx, untrack = attemptCtx, release
 		return conn, net.JoinHostPort(ipStr, strconv.Itoa(int(req.GuestPort))), nil
 	}
 
 	guestConn, remoteAddr, err := dialAddr(guestIP)
-	if err != nil && fallback && guestIP != "127.0.0.1" {
+	if err != nil && fallback && guestIP != "127.0.0.1" && ctx.Err() == nil && !netDialCanceled(err) {
 		if fbConn, fbAddr, fbErr := dialAddr("127.0.0.1"); fbErr == nil {
 			guestConn, remoteAddr, err = fbConn, fbAddr, nil
+		} else if netDialCanceled(fbErr) || control.IsCode(fbErr, control.CodeForbiddenByPolicy) {
+			err = fbErr
 		}
 	}
+	if err == nil {
+		defer untrack()
+		defer guestConn.Close()
+		stop := context.AfterFunc(flowCtx, func() { _ = guestConn.Close() })
+		defer stop()
+		err = context.Cause(flowCtx)
+	}
 	if err != nil {
+		if errors.Is(err, netbackend.ErrNATPolicyRevoked) {
+			return control.NewError(control.CodeForbiddenByPolicy, "NAT policy revoked net.dial")
+		}
+		if netDialCanceled(err) || control.IsCode(err, control.CodeForbiddenByPolicy) {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return control.NewErrorf(control.CodeNotFound, "dial guest %s:%d: %v", guestIP, req.GuestPort, err)
 	}
-	defer guestConn.Close()
 
 	if err := stream.SendResponse(control.NetDialResponse{RemoteAddr: remoteAddr}); err != nil {
 		return err
 	}
-
-	stop := context.AfterFunc(ctx, func() { _ = guestConn.Close() })
-	defer stop()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	// Client -> Guest
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(guestConn, stream.ChannelReader(ctx, control.ChannelGeneric))
+		_, _ = s.bandwidth.Copy(flowCtx, netbackend.BandwidthRX, guestConn, stream.ChannelReader(flowCtx, control.ChannelGeneric))
 		_ = guestConn.CloseWrite()
 	}()
 	// Guest -> Client
 	go func() {
 		defer wg.Done()
-		w := stream.ChannelWriter(ctx, control.ChannelGeneric, false)
-		_, _ = io.Copy(w, guestConn)
+		w := stream.ChannelWriter(flowCtx, control.ChannelGeneric, false)
+		_, _ = s.bandwidth.Copy(flowCtx, netbackend.BandwidthTX, w, guestConn)
 		_ = w.Close()
 	}()
 	wg.Wait()
 	return nil
+}
+
+func netDialCanceled(err error) bool {
+	return errors.Is(err, netbackend.ErrNATPolicyRevoked) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// A tunnel stays in its group until it closes. Clearing both limits starts
+// a new group without releasing old tunnels that can still have queued writes.
+type natTunnelGroup struct {
+	active int
+	shaped bool
+}
+
+func (s *Sandbox) admitNATControlTunnel() (*natTunnelGroup, error) {
+	if s.bandwidth == nil {
+		return nil, nil
+	}
+	if !s.opMu.TryRLock() {
+		return nil, control.NewError(control.CodeBusy, "sandbox lifecycle operation is active")
+	}
+	defer s.opMu.RUnlock() // +checklocksforce: TryRLock succeeds on this path.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.activeKernel == nil {
+		return nil, control.NewError(control.CodeBusy, "sandbox is not running")
+	}
+	if s.natTunnelGroup == nil {
+		s.natTunnelGroup = &natTunnelGroup{shaped: s.bandwidth.Rates() != (netbackend.BandwidthRates{})}
+	}
+	g := s.natTunnelGroup
+	g.active++
+	if g.shaped {
+		s.shapedNATTunnels++
+	}
+	return g, nil
+}
+
+func (s *Sandbox) releaseNATControlTunnel(g *natTunnelGroup) {
+	s.mu.Lock()
+	g.active--
+	if g.shaped {
+		s.shapedNATTunnels--
+	}
+	if g.active == 0 && g == s.natTunnelGroup {
+		s.natTunnelGroup = nil
+	}
+	s.mu.Unlock()
+}
+
+// The caller holds opMu for reading. Checkpoint takes it for writing.
+func (s *Sandbox) setNATBandwidth(rates netbackend.BandwidthRates) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if g := s.natTunnelGroup; g != nil {
+		if rates == (netbackend.BandwidthRates{}) {
+			if g.shaped {
+				s.natTunnelGroup = nil
+			}
+		} else if !g.shaped {
+			g.shaped = true
+			s.shapedNATTunnels += g.active
+		}
+	}
+	s.bandwidth.SetRates(rates)
+}
+
+// Checkpoint holds opMu to exclude rate changes and new tunnel admission.
+func (s *Sandbox) hasShapedNATControlTunnel() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shapedNATTunnels != 0
 }

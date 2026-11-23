@@ -17,6 +17,7 @@ package gvx
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -82,12 +83,35 @@ func populateDefaultEtcFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyst
 // initNATStack initializes the L4 NAT network stack and pre-binds any
 // configured host port forwarders before lockdown.
 func (s *Sandbox) initNATStack() error {
+	if s.cfg.StreamInterceptor == nil && (s.controlListener() != nil || s.cfg.NetworkBandwidth != (netbackend.BandwidthRates{})) {
+		s.bandwidth = netbackend.NewBandwidthShaper(s.cfg.NetworkBandwidth)
+	}
+	ln := s.controlListener()
+	var controlAddr netip.AddrPort
+	if ln != nil {
+		addr := ln.Addr()
+		switch addr.Network() {
+		case "tcp", "tcp4", "tcp6":
+			var err error
+			controlAddr, err = netip.ParseAddrPort(addr.String())
+			if err != nil {
+				return fmt.Errorf("%w: NAT control listener address %q: %w", ErrInvalidConfig, addr, err)
+			}
+		}
+	}
+	if s.cfg.StreamInterceptor == nil && (s.cfg.compiledNATPolicy != nil || ln != nil) {
+		s.natPolicy = netbackend.NewNATPolicy(s.cfg.compiledNATPolicy, controlAddr)
+		controlAddr = netip.AddrPort{}
+	}
 	natCfg := netbackend.NATConfig{
 		IsolateLAN:        s.cfg.IsolateLAN,
 		DNSServers:        s.cfg.HostDNSServers,
 		StreamInterceptor: s.cfg.StreamInterceptor,
 		Stack:             s.stackOptions(),
 		Tuning:            s.cfg.Tuning,
+		Bandwidth:         s.bandwidth,
+		Policy:            s.natPolicy,
+		ControlTCPAddr:    controlAddr,
 	}
 	if !s.cfg.DisableHostLockdown {
 		natCfg.DialContext = hostlockdown.DialContext
@@ -110,6 +134,8 @@ func (s *Sandbox) initPortForwarder() error {
 		return nil
 	}
 	pf := netbackend.NewPortForwarder(s.cfg.Tuning)
+	pf.SetBandwidthShaper(s.bandwidth)
+	pf.SetNATPolicy(s.natPolicy)
 	if !s.cfg.DisableHostLockdown {
 		pf.SetAccept(hostlockdown.AcceptListener)
 	}

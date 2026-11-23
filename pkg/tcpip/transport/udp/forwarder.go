@@ -91,6 +91,9 @@ func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, 
 	}()
 
 	ep := newEndpoint(r.stack, r.pkt.NetworkProtocolNumber, queue)
+	if owner := r.pkt.NATInput().RelayOwner(); owner != nil {
+		ep.SetOwner(owner)
+	}
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 

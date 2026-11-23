@@ -15,9 +15,110 @@
 package netbackend
 
 import (
+	"context"
 	"net"
 	"sync"
+	"time"
 )
+
+// An in-flight send keeps both directions alive, including time spent waiting for bandwidth.
+type activityClock struct {
+	mu      sync.Mutex
+	last    time.Time
+	pending int
+	stopped bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+func newActivityClock() *activityClock {
+	return &activityClock{last: time.Now()}
+}
+
+func (c *activityClock) beginSend() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		return false
+	}
+	c.pending++
+	return true
+}
+
+func (c *activityClock) finishSend(attempted bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending--
+	if attempted {
+		c.last = time.Now()
+	}
+}
+
+func (c *activityClock) sendContext(ctx context.Context) (context.Context, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		return nil, false
+	}
+	if c.ctx == nil {
+		c.ctx, c.cancel = context.WithCancel(ctx)
+	}
+	return c.ctx, true
+}
+
+func (c *activityClock) deadline(idle time.Duration) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	deadline := c.last.Add(idle)
+	if c.pending != 0 {
+		if now := time.Now(); !now.Before(deadline) {
+			return now.Add(idle)
+		}
+	}
+	return deadline
+}
+
+func (c *activityClock) expire(idle time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.stopped && c.pending == 0 && time.Since(c.last) >= idle {
+		c.stopped = true
+	}
+	return c.stopped
+}
+
+func (c *activityClock) stop() {
+	c.mu.Lock()
+	c.stopped = true
+	cancel := c.cancel
+	c.cancel = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (c *activityClock) lastActivity() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.last, c.pending != 0
+}
+
+func sendRelayDatagram(ctx context.Context, clock *activityClock, shaper *BandwidthShaper, dir BandwidthDirection, n int, write func() (int, error)) error {
+	if !shaper.Enabled(dir) {
+		_, err := write()
+		return err
+	}
+	sendCtx, ok := clock.sendContext(ctx)
+	if !ok {
+		return net.ErrClosed
+	}
+	_, err := shaper.ShapeDatagram(sendCtx, dir, n, write)
+	if sendCtx.Err() != nil {
+		return net.ErrClosed
+	}
+	return err
+}
 
 // udpSession is one relayed UDP flow of the guest.
 type udpSession struct {
@@ -26,6 +127,7 @@ type udpSession struct {
 }
 
 func (s *udpSession) close() {
+	s.clock.stop()
 	_ = s.guest.Close()
 	_ = s.host.Close()
 }
@@ -52,11 +154,14 @@ func newUDPSessionTable(max int) *udpSessionTable {
 // when the table is full.
 func (t *udpSessionTable) add(s *udpSession) {
 	var victim *udpSession
+	var oldest time.Time
+	var pending bool
 	t.mu.Lock()
 	if len(t.sessions) >= t.max {
 		for c := range t.sessions {
-			if victim == nil || c.clock.last.Load() < victim.clock.last.Load() {
-				victim = c
+			last, inFlight := c.clock.lastActivity()
+			if victim == nil || (pending && !inFlight) || (pending == inFlight && last.Before(oldest)) {
+				victim, oldest, pending = c, last, inFlight
 			}
 		}
 		delete(t.sessions, victim)

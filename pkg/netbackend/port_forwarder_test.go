@@ -176,6 +176,56 @@ func TestPortForwarderUDPSessionsForwardEveryReply(t *testing.T) {
 	}
 }
 
+func TestPortForwarderUDPBandwidthKeepsEstablishedSession(t *testing.T) {
+	s := newForwardStack(t)
+	seen := startGuestUDPServer(t, s, 5300, 1)
+	pf, hostAddr := preBoundUDPForward(t, 5300)
+	shaper := NewBandwidthShaper(BandwidthRates{})
+	t.Cleanup(shaper.Close)
+	pf.SetBandwidthShaper(shaper)
+	pf.Start(s)
+	client := newClientSocket(t)
+
+	exchange := func(payload string) guestSeen {
+		t.Helper()
+		if _, err := client.WriteToUDP([]byte(payload), hostAddr); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := recvFrom(t, client), payload+"#0"; got != want {
+			t.Fatalf("host received %q, want %q", got, want)
+		}
+		select {
+		case packet := <-seen:
+			if packet.payload != payload {
+				t.Fatalf("guest received %q, want %q", packet.payload, payload)
+			}
+			return packet
+		default:
+			t.Fatal("reply arrived without a matching guest datagram")
+			return guestSeen{}
+		}
+	}
+
+	first := exchange("before")
+	shaper.SetRates(BandwidthRates{TXBPS: 8_000_000, RXBPS: 8_000_000})
+	next := exchange("after")
+	if next.from != first.from {
+		t.Errorf("guest peer changed from %s to %s on live bandwidth update", first.from, next.from)
+	}
+
+	const count = 8
+	for i := range count {
+		if _, err := client.WriteToUDP([]byte(strconv.Itoa(i)), hostAddr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range count {
+		if got, want := recvFrom(t, client), strconv.Itoa(i)+"#0"; got != want {
+			t.Fatalf("bandwidth-limited burst reply %d = %q, want %q", i, got, want)
+		}
+	}
+}
+
 func TestPortForwarderUDPSessionExpiresWhenIdle(t *testing.T) {
 	s := newForwardStack(t)
 	seen := startGuestUDPServer(t, s, 5300, 1)

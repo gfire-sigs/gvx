@@ -72,7 +72,7 @@ Every control endpoint restricts access to the local owner account.
 | Policy | Permitted Capabilities |
 | :--- | :--- |
 | `default` | All capabilities compatible with the active host lockdown and runtime flags. |
-| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log` (excludes `kernel.log_clear`). |
+| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log` (without `kernel.log_clear`), and `net.policy.read`. |
 | `checkpoint-only` | `system.ping`, `sandbox.inspect`, `checkpoint.local`, `checkpoint.stream`. |
 
 ### 2.3 Lockdown Compatibility Matrix
@@ -83,7 +83,8 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | :--- | :--- | :--- |
 | `exec`, `pause`, `unpause`, `stop`, `kill` | Allowed; operates purely inside the Sentry kernel. | None. |
 | `cp`, `export`, `checkpoint -o` | Allowed; the unlocked client performs all host disk I/O over framed tar streams. | None. |
-| `update` (`-m`, `--cpus`, `--pids-limit`, `--isolate-lan`, `--tune`) | Allowed; modifies per-sandbox Sentry limits, root CPU bandwidth, root cgroup2 `pids.max`, and NAT settings. | None. |
+| `update` (`-m`, `--cpus`, `--pids-limit`, `--isolate-lan`, `--net-tx-bps`, `--net-rx-bps`, `--tune`) | Allowed; modifies per-sandbox Sentry limits, root CPU bandwidth, root cgroup2 `pids.max`, and NAT settings. | None. |
+| `net-policy` | Reads or replaces the NAT policy in memory. The client reads policy files outside lockdown. | NAT without a custom stream interceptor. |
 | `port-forward` (`net.dial`) | Allowed; the unlocked client binds host sockets and tunnels TCP streams into the guest stack. | None. |
 | `port add` | Allowed on `127.0.0.1` or `[::1]` with loopback opt-in, or on listed IP literals with `--dynamic-ports-addr`. Unlisted addresses and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports`, `--auto-publish`, or `--dynamic-ports-addr IP`. |
 | `mount add --type tmpfs`, `mount rm` | Allowed; no host path opens occur. | None. |
@@ -113,11 +114,13 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `fs.stat` | Unary | Inspect one guest filesystem entry. |
 | `fs.export` | Server data stream | Stream a guest file, directory, or root overlay upper layer (`upper_only: true`) as tar on channel `0`. |
 | `fs.import` | Client data stream | Extract a client tar stream from channel `0` into a guest directory. |
-| `resource.update` | Unary | Update live memory, CPU quota, PIDs limit, LAN isolation, or mutable tunables. |
+| `resource.update` | Unary | Update memory, CPU bandwidth, PIDs, LAN isolation, NAT bandwidth, or mutable tunables. |
 | `port.list` | Unary | List static, auto-published, and dynamic host-to-guest port rules. |
 | `port.add` | Unary | Bind dynamic host-to-guest port rules on the sandbox forwarder. |
 | `port.remove` | Unary | Close dynamic or specified host-to-guest port rules. |
 | `net.dial` | Bidirectional stream | Dial a guest TCP endpoint inside the sandbox network stack and relay bytes on channel `0`. |
+| `net.policy_get` | Unary | Read the active host NAT policy. Requires `net.policy.read`. |
+| `net.policy_set` | Unary | Replace the active host NAT policy. Requires `net.policy.write`. |
 | `mount.list` | Unary | List active guest mounts and mutability status. |
 | `mount.add` | Unary (optional FD) | Mount a `tmpfs`, `SCM_RIGHTS` `ext4lite` volume, or `-lockdown=false` bind mount. |
 | `mount.remount` | Unary | Toggle a mount between read-only and read-write. |
@@ -127,6 +130,21 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `proc.signal` | Unary | Send a POSIX signal to PID 1, a specific guest PID, or all guest processes. |
 | `kernel.log` | Unary or event stream | Read or follow records from the guest kernel log ring. |
 | `debug.log_level` | Unary | Change the active Sentry log level (`warning`, `info`, or `debug`). |
+
+The `net_qos` feature in `HELLO` identifies support for the NAT bandwidth fields in `resource.update`. The client verifies that feature before sending a request with either field. Both fields require the `resource.network` capability.
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `net_tx_bps` | Optional unsigned integer | Guest transmit limit in bits per second. |
+| `net_rx_bps` | Optional unsigned integer | Guest receive limit in bits per second. |
+
+An omitted field leaves that rate unchanged. A value of `0` removes the limit for that direction. The server installs both requested rates as one pair. `sandbox.inspect` and a successful `resource.update` report the effective rates in the resource snapshot.
+
+`net.policy_get` returns an object with a `policy` field. The value is the active JSON policy or `null` before the first installation. `net.policy_set` accepts the same object with a non-null policy. The server validates the complete document before replacing the rules. It returns the installed document.
+
+The encoded request and response must fit the negotiated frame size. Keep the default frame size to use the full 64 KiB policy limit.
+
+The `net.policy` group disables both capabilities. The `readonly` profile permits `net.policy.read` but not `net.policy.write`. Policy changes leave `resource.update` bandwidth values unchanged.
 
 ### 3.1 Structured Error Codes
 
@@ -143,7 +161,7 @@ Failed RPCs return a `ProtoError` object with a stable `code`, a diagnostic `mes
 | `NOT_PAUSED` | `1` | `lifecycle.unpause` called on a running sandbox. |
 | `NOT_FOUND` | `1` | Target PID, path, port rule, or mount does not exist. |
 | `ALREADY_EXISTS` | `1` | Conflicting port rule or mount target already exists. |
-| `BUSY` | `1` | Target mount is in use, or an `rpcfs` mount blocks checkpointing. |
+| `BUSY` | `1` | Target mount is in use, or an active `rpcfs` mount or shaped NAT tunnel blocks checkpointing. |
 | `LIMIT_EXCEEDED` | `1` | Resource limit or concurrency ceiling exceeded (for example, memory cap below usage without `--force-memory`). |
 | `EXEC_ACTIVE` | `1` | Active `exec` sessions block checkpointing without `--force`. |
 | `SANDBOX_EXITING` | `1` | Sandbox is shutting down and accepts no new streams. |

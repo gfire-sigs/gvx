@@ -99,9 +99,9 @@ func (pf *PortForwarder) rollbackDynamicRulesLocked(undos []dynamicRuleUndo) {
 		return
 	}
 	var (
-		closeTCP     []*boundTCPForward
-		closeUDP     []*boundUDPForward
-		closeUDPConn []gonetUDPCloser
+		closeTCP         []*boundTCPForward
+		closeUDP         []*boundUDPForward
+		closeUDPSessions []*udpForwardSession
 	)
 	pf.mu.Lock()
 	if pf.closed {
@@ -117,10 +117,7 @@ func (pf *PortForwarder) rollbackDynamicRulesLocked(undos []dynamicRuleUndo) {
 		case undoAddedUDP:
 			pf.manualUDP = removeUDPForwardEntry(pf.manualUDP, u.udpEntry)
 			u.udpEntry.closed = true
-			for c, s := range u.udpEntry.sessions {
-				closeUDPConn = append(closeUDPConn, s.guest)
-				delete(u.udpEntry.sessions, c)
-			}
+			closeUDPSessions = u.udpEntry.detachSessions(closeUDPSessions)
 			closeUDP = append(closeUDP, u.udpEntry)
 		case undoReplaceManualTCP:
 			u.tcpEntry.rule = u.prevRule
@@ -133,17 +130,11 @@ func (pf *PortForwarder) rollbackDynamicRulesLocked(undos []dynamicRuleUndo) {
 			pf.dynTCP[u.autoKey] = u.tcpEntry
 		case undoReplaceManualUDP:
 			u.udpEntry.rule = u.prevRule
-			for c, s := range u.udpEntry.sessions {
-				closeUDPConn = append(closeUDPConn, s.guest)
-				delete(u.udpEntry.sessions, c)
-			}
+			closeUDPSessions = u.udpEntry.detachSessions(closeUDPSessions)
 		case undoPromoteAutoUDP:
 			pf.manualUDP = removeUDPForwardEntry(pf.manualUDP, u.udpEntry)
 			u.udpEntry.rule = u.prevRule
-			for c, s := range u.udpEntry.sessions {
-				closeUDPConn = append(closeUDPConn, s.guest)
-				delete(u.udpEntry.sessions, c)
-			}
+			closeUDPSessions = u.udpEntry.detachSessions(closeUDPSessions)
 			if pf.dynUDP == nil {
 				pf.dynUDP = make(map[dynPortKey]*boundUDPForward)
 			}
@@ -158,8 +149,8 @@ func (pf *PortForwarder) rollbackDynamicRulesLocked(undos []dynamicRuleUndo) {
 	for _, b := range closeUDP {
 		_ = b.packetConn.Close()
 	}
-	for _, g := range closeUDPConn {
-		_ = g.Close()
+	for _, sess := range closeUDPSessions {
+		sess.close()
 	}
 }
 
@@ -222,8 +213,6 @@ func (pf *PortForwarder) addDynamicRuleLocked(
 		GuestPort:  rule.GuestPort,
 		HostSocket: rule.HostSocket,
 	}
-
-	var evictUDPSessions []*gonetUDPCloserHolder
 
 	pf.mu.Lock()
 	if pf.closed {
@@ -319,13 +308,10 @@ func (pf *PortForwarder) addDynamicRuleLocked(
 	if matchManualUDP != nil {
 		prev := matchManualUDP.rule
 		matchManualUDP.rule = norm
-		for c, s := range matchManualUDP.sessions {
-			evictUDPSessions = append(evictUDPSessions, &gonetUDPCloserHolder{c: s.guest})
-			delete(matchManualUDP.sessions, c)
-		}
+		stale := matchManualUDP.detachSessions(nil)
 		pf.mu.Unlock()
-		for _, h := range evictUDPSessions {
-			_ = h.c.Close()
+		for _, sess := range stale {
+			sess.close()
 		}
 		return norm, dynamicRuleUndo{
 			kind:     undoReplaceManualUDP,
@@ -337,14 +323,11 @@ func (pf *PortForwarder) addDynamicRuleLocked(
 		prev := matchDynUDP.rule
 		delete(pf.dynUDP, matchDynUDPKey)
 		matchDynUDP.rule = norm
-		for c, s := range matchDynUDP.sessions {
-			evictUDPSessions = append(evictUDPSessions, &gonetUDPCloserHolder{c: s.guest})
-			delete(matchDynUDP.sessions, c)
-		}
+		stale := matchDynUDP.detachSessions(nil)
 		pf.manualUDP = append(pf.manualUDP, matchDynUDP)
 		pf.mu.Unlock()
-		for _, h := range evictUDPSessions {
-			_ = h.c.Close()
+		for _, sess := range stale {
+			sess.close()
 		}
 		return norm, dynamicRuleUndo{
 			kind:     undoPromoteAutoUDP,
@@ -459,10 +442,6 @@ func (pf *PortForwarder) addDynamicRuleLocked(
 	return PortForwardRule{}, dynamicRuleUndo{}, fmt.Errorf("netbackend: unsupported protocol %q", proto)
 }
 
-type gonetUDPCloserHolder struct {
-	c gonetUDPCloser
-}
-
 func ruleMatchesRemoveQuery(rule, query PortForwardRule) bool {
 	if query.Proto != "" && rule.Proto != query.Proto {
 		return false
@@ -496,10 +475,10 @@ func (pf *PortForwarder) RemoveRule(query PortForwardRule, force bool) ([]BoundP
 	defer pf.dynMu.Unlock()
 
 	var (
-		removed      []BoundPortRule
-		closeTCP     []*boundTCPForward
-		closeUDP     []*boundUDPForward
-		closeUDPConn []gonetUDPCloser
+		removed          []BoundPortRule
+		closeTCP         []*boundTCPForward
+		closeUDP         []*boundUDPForward
+		closeUDPSessions []*udpForwardSession
 	)
 
 	pf.mu.Lock()
@@ -540,10 +519,7 @@ func (pf *PortForwarder) RemoveRule(query PortForwardRule, force bool) ([]BoundP
 		for _, b := range pf.udpList {
 			if ruleMatchesRemoveQuery(b.rule, query) {
 				b.closed = true
-				for c, s := range b.sessions {
-					closeUDPConn = append(closeUDPConn, s.guest)
-					delete(b.sessions, c)
-				}
+				closeUDPSessions = b.detachSessions(closeUDPSessions)
 				removed = append(removed, BoundPortRule{Rule: b.rule, Source: PortSourceStatic})
 				closeUDP = append(closeUDP, b)
 			} else {
@@ -568,10 +544,7 @@ func (pf *PortForwarder) RemoveRule(query PortForwardRule, force bool) ([]BoundP
 	for _, b := range pf.manualUDP {
 		if ruleMatchesRemoveQuery(b.rule, query) {
 			b.closed = true
-			for c, s := range b.sessions {
-				closeUDPConn = append(closeUDPConn, s.guest)
-				delete(b.sessions, c)
-			}
+			closeUDPSessions = b.detachSessions(closeUDPSessions)
 			removed = append(removed, BoundPortRule{Rule: b.rule, Source: PortSourceDynamic})
 			closeUDP = append(closeUDP, b)
 		} else {
@@ -590,10 +563,7 @@ func (pf *PortForwarder) RemoveRule(query PortForwardRule, force bool) ([]BoundP
 	for k, b := range pf.dynUDP {
 		if ruleMatchesRemoveQuery(b.rule, query) {
 			b.closed = true
-			for c, s := range b.sessions {
-				closeUDPConn = append(closeUDPConn, s.guest)
-				delete(b.sessions, c)
-			}
+			closeUDPSessions = b.detachSessions(closeUDPSessions)
 			delete(pf.dynUDP, k)
 			removed = append(removed, BoundPortRule{Rule: b.rule, Source: PortSourceAuto})
 			closeUDP = append(closeUDP, b)
@@ -607,8 +577,8 @@ func (pf *PortForwarder) RemoveRule(query PortForwardRule, force bool) ([]BoundP
 	for _, b := range closeUDP {
 		_ = b.packetConn.Close()
 	}
-	for _, g := range closeUDPConn {
-		_ = g.Close()
+	for _, sess := range closeUDPSessions {
+		sess.close()
 	}
 	if len(removed) == 0 {
 		return nil, ErrPortRuleNotFound
@@ -623,10 +593,10 @@ func (pf *PortForwarder) RemoveAllDynamic() []BoundPortRule {
 	defer pf.dynMu.Unlock()
 
 	var (
-		removed      []BoundPortRule
-		closeTCP     []*boundTCPForward
-		closeUDP     []*boundUDPForward
-		closeUDPConn []gonetUDPCloser
+		removed          []BoundPortRule
+		closeTCP         []*boundTCPForward
+		closeUDP         []*boundUDPForward
+		closeUDPSessions []*udpForwardSession
 	)
 
 	pf.mu.Lock()
@@ -638,10 +608,7 @@ func (pf *PortForwarder) RemoveAllDynamic() []BoundPortRule {
 
 	for _, b := range pf.manualUDP {
 		b.closed = true
-		for c, s := range b.sessions {
-			closeUDPConn = append(closeUDPConn, s.guest)
-			delete(b.sessions, c)
-		}
+		closeUDPSessions = b.detachSessions(closeUDPSessions)
 		removed = append(removed, BoundPortRule{Rule: b.rule, Source: PortSourceDynamic})
 		closeUDP = append(closeUDP, b)
 	}
@@ -654,8 +621,8 @@ func (pf *PortForwarder) RemoveAllDynamic() []BoundPortRule {
 	for _, b := range closeUDP {
 		_ = b.packetConn.Close()
 	}
-	for _, g := range closeUDPConn {
-		_ = g.Close()
+	for _, sess := range closeUDPSessions {
+		sess.close()
 	}
 	return removed
 }
