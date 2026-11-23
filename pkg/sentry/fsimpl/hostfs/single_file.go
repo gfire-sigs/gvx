@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"z.gfire.dev/gvx/internal/hoststorage"
 )
 
 // This file implements the single-file mode of GVXIP-001 section 4.3. A guest
@@ -50,28 +52,47 @@ import (
 // through unchanged. Workspace refuses every path other than ".".
 type singleHost struct {
 	hostBackend
-	// bound is the same backend as hostBackend. It stats the bound file without
-	// a query that needs a list right on the parent directory.
-	bound interface {
-		lstatBound(name string) (hostInfo, error)
-	}
-	// name is the host name of the file inside the pinned parent directory.
-	name string
+	bound    *hostRoot
+	name     string
+	validate func(hoststorage.StorageIdentity) error
 }
 
 func (s *singleHost) lstat(rel string) (hostInfo, error) {
-	if rel == "." {
-		return s.bound.lstatBound(s.name)
+	if rel != "." {
+		return s.hostBackend.lstat(rel)
 	}
-	return s.hostBackend.lstat(rel)
+	info, err := s.bound.lstatBound(s.name)
+	if err == nil && s.validate != nil && (info.kind != hostKindRegular || info.nlink != 1) {
+		return hostInfo{}, ErrPathTraversal
+	}
+	return info, err
 }
 
 // open opens the bound file. The call never creates the file.
 func (s *singleHost) open(rel string, flags int, perm os.FileMode) (*os.File, error) {
-	if rel == "." {
-		return s.hostBackend.open(s.name, flags&^(os.O_CREATE|os.O_EXCL), perm)
+	if rel != "." {
+		return s.hostBackend.open(rel, flags, perm)
 	}
-	return s.hostBackend.open(rel, flags, perm)
+	flags &^= os.O_CREATE | os.O_EXCL
+	if s.validate == nil {
+		return s.hostBackend.open(s.name, flags, perm)
+	}
+	f, err := s.hostBackend.open(s.name, flags&^os.O_TRUNC, perm)
+	if err != nil {
+		return nil, err
+	}
+	id, err := hoststorage.VerifyStorageFile(f)
+	if err == nil {
+		err = s.validate(id)
+	}
+	if err == nil && flags&os.O_TRUNC != 0 {
+		err = f.Truncate(0)
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func (s *singleHost) openDir(rel string) (*os.File, error) {
@@ -111,6 +132,9 @@ func (s *singleHost) syncDir(rel string) error {
 
 func (s *singleHost) chtimes(rel string, atime, mtime *time.Time) error {
 	if rel == "." {
+		if s.validate != nil {
+			return s.bound.chtimesBound(s.name, atime, mtime, s.validate)
+		}
 		return s.hostBackend.chtimes(s.name, atime, mtime)
 	}
 	return s.hostBackend.chtimes(rel, atime, mtime)

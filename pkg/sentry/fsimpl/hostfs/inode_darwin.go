@@ -17,10 +17,12 @@
 package hostfs
 
 import (
+	"fmt"
 	"os"
 	"sync"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hoststorage"
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
@@ -195,4 +197,59 @@ func statToHostInfo(st *unix.Stat_t) hostInfo {
 		ctime:  time.Unix(int64(st.Ctim.Sec), int64(st.Ctim.Nsec)),
 		btime:  time.Unix(int64(st.Btim.Sec), int64(st.Btim.Nsec)),
 	}
+}
+
+func (h *hostRoot) isolatedLstatAt(dir int, name string) (hostInfo, error) {
+	fd, err := h.openat(dir, name, unix.O_EVTONLY|unix.O_SYMLINK|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return hostInfo{}, fmt.Errorf("hostfs: stat %q: %w", name, err)
+	}
+	defer unix.Close(fd)
+	info, err := fstatInfo(fd)
+	return h.markVolumeFD(info, fd), err
+}
+
+func (h *hostRoot) readIsolatedLink(dir int, name, rel string) (string, error) {
+	info, err := h.isolatedLstatAt(dir, name)
+	if err != nil {
+		return "", err
+	}
+	if info.kind != hostKindSymlink {
+		return "", unix.EINVAL
+	}
+	return readlinkAt(dir, name, rel)
+}
+
+func (h *hostRoot) isolatedTimesAt(dir int, name string, validate func(hoststorage.StorageIdentity) error, atime, mtime *time.Time) error {
+	fd, err := h.openat(dir, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("hostfs: open %q for timestamps: %w", name, err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	info, err := fstatInfo(fd)
+	if err != nil {
+		return err
+	}
+	if validate != nil {
+		id, err := hoststorage.VerifyStorageFile(f)
+		if err != nil {
+			return err
+		}
+		if err := validate(id); err != nil {
+			return err
+		}
+	}
+	if info.kind != hostKindRegular && info.kind != hostKindDir {
+		return ErrPathTraversal
+	}
+	omit := unix.Timespec{Nsec: unix.UTIME_OMIT}
+	times := [2]unix.Timespec{omit, omit}
+	if atime != nil {
+		times[0] = unix.NsecToTimespec(atime.UnixNano())
+	}
+	if mtime != nil {
+		times[1] = unix.NsecToTimespec(mtime.UnixNano())
+	}
+	return retryEINTR(func() error { return unix.Futimens(fd, &times) })
 }

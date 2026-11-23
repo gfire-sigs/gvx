@@ -82,7 +82,11 @@ type setRefs struct {
 	released atomicbitops.Bool
 }
 
-func (r *setRefs) afterLoad(context.Context) {
+func (r *setRefs) afterLoad(ctx context.Context) {
+	stack.DeferCheckpointActivation(ctx, r, r.restoreRefs)
+}
+
+func (r *setRefs) restoreRefs() {
 	if r.reg == nil || r.released.Load() {
 		return
 	}

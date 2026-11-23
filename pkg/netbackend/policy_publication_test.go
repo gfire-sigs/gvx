@@ -24,11 +24,16 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
+	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
+	"z.gfire.dev/gvx/pkg/tcpip/transport/udp"
 )
 
 func publicationRules(lines ...string) string {
@@ -382,6 +387,76 @@ func TestPolicyPublicationUDPEvaluatesEveryDatagram(t *testing.T) {
 	commitPublicationPolicy(t, policy, publicationRules(hostLeg), publicationRules())
 	write(client, "denied request on existing session", hostAddr)
 	requireNoPublishedDatagram(t, guest)
+}
+
+func TestPolicyPublicationUDPKeepsSessionWhileEitherDirectionWaitsForTokens(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := stack.New(stack.Options{
+			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+			TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+			HandleLocal:        true,
+		})
+		defer s.Close()
+		if err := configureLoopbackNIC(s, LoopbackNICID); err != nil {
+			t.Fatal(err)
+		}
+		s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4LoopbackSubnet, NIC: LoopbackNICID}})
+		addr := guestLoopbackAddr(0)
+		guest, err := gonet.DialUDP(s, &addr, nil, ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer guest.Close()
+		addr.Port = uint16(guest.LocalAddr().(*net.UDPAddr).Port)
+		policy := schedulerPolicy(t, schedulerLimit(1), schedulerLimit(8))
+		pf := NewPortForwarderWithOptions(tuning.Values{}, PortForwardOptions{Policy: policy})
+		defer pf.Close()
+		pf.stack = s
+		pf.udpIdle = 100 * time.Millisecond
+		b := &boundUDPForward{sessions: make(map[netip.AddrPort]*udpForwardSession)}
+		client := netip.MustParseAddrPort("127.0.0.1:31001")
+		listener := netip.MustParseAddrPort("127.0.0.1:31002")
+		sess := pf.udpSession(b, addr, false, client, listener)
+		if sess == nil {
+			t.Fatal("could not open publication session")
+		}
+		defer sess.guest.Close()
+
+		payload := []byte("x")
+		pf.enqueuePublishedDatagram(b, sess, PolicyOutput, payload)
+		payload[0] = 'z' // The listener reuses the read buffer before dispatch.
+		if err := guest.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var buf [1]byte
+		n, relay, err := guest.ReadFrom(buf[:])
+		if err != nil || n != 1 || buf[0] != 'x' {
+			t.Fatalf("paced request = %q (%d bytes), %v; want x", buf, n, err)
+		}
+		if _, err := guest.WriteTo([]byte("y"), relay); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		time.Sleep(pf.udpIdle * 2)
+		synctest.Wait()
+		pf.mu.Lock()
+		active := b.sessions[client]
+		pf.mu.Unlock()
+		if active != sess {
+			t.Fatal("publication session expired while its reply waited for tokens")
+		}
+
+		if err := sess.guest.Close(); err != nil {
+			t.Fatal(err)
+		}
+		pf.wg.Wait()
+		policy.tx.mu.Lock()
+		queued := policy.tx.items
+		policy.tx.mu.Unlock()
+		if queued != 0 {
+			t.Fatalf("closed publication still has %d queued replies", queued)
+		}
+	})
 }
 
 func TestPolicyPublicationUDPAuthorizesLoopbackTarget(t *testing.T) {

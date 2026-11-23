@@ -42,7 +42,7 @@ func TestCheckpointBundleRefusesLinkOnSave(t *testing.T) {
 			dir := t.TempDir()
 			symlinkOrSkip(t, victim, filepath.Join(dir, name))
 
-			files, err := openCheckpointBundleFiles(dir)
+			files, err := openCheckpointBundleFiles(dir, nil)
 			if err == nil {
 				// The save path truncates each file before it writes.
 				_ = files.rewindAndTruncate()
@@ -62,7 +62,7 @@ func TestCheckpointBundleRefusesLinkOnSave(t *testing.T) {
 func TestCheckpointBundleOpensRegularFiles(t *testing.T) {
 	dir := t.TempDir()
 	for range 2 {
-		files, err := openCheckpointBundleFiles(dir)
+		files, err := openCheckpointBundleFiles(dir, nil)
 		if err != nil {
 			t.Fatalf("openCheckpointBundleFiles: %v", err)
 		}
@@ -102,7 +102,7 @@ func TestRestoreRefusesLinkedBundleFiles(t *testing.T) {
 	t.Run("state", func(t *testing.T) {
 		dir := t.TempDir()
 		symlinkOrSkip(t, outside, filepath.Join(dir, checkpointStateFileName))
-		f, err := openBundleFile(dir, checkpointStateFileName, os.O_RDONLY, 0)
+		f, err := openTestBundleFile(t, dir, checkpointStateFileName)
 		if err == nil {
 			_ = f.Close()
 			t.Fatal("openBundleFile opened a link")
@@ -114,10 +114,29 @@ func TestRestoreRefusesLinkedBundleFiles(t *testing.T) {
 			t.Fatalf("WriteFile: %v", err)
 		}
 		symlinkOrSkip(t, "other", filepath.Join(dir, checkpointStateFileName))
-		f, err := openBundleFile(dir, checkpointStateFileName, os.O_RDONLY, 0)
+		f, err := openTestBundleFile(t, dir, checkpointStateFileName)
 		if err == nil {
 			_ = f.Close()
 			t.Fatal("openBundleFile opened a link to a file in the bundle")
 		}
 	})
+}
+
+func readAndParseManifest(dir string) (CheckpointManifest, error) {
+	b, err := openBundleRoot(dir, false)
+	if err != nil {
+		return CheckpointManifest{}, errors.Join(ErrCheckpointManifest, err)
+	}
+	defer b.Close()
+	return b.readAndParseManifest()
+}
+
+func openTestBundleFile(t *testing.T, dir, name string) (*os.File, error) {
+	t.Helper()
+	b, err := openBundleRoot(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	return b.openFile(name, os.O_RDONLY, 0)
 }

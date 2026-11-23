@@ -568,6 +568,16 @@ func TestRestoreManifestValidationRejectsMismatch(t *testing.T) {
 		}
 	}
 
+	t.Run("legacy_requires_explicit_trust", func(t *testing.T) {
+		m := validManifest
+		m.Version = legacyCheckpointManifestVersion
+		writeManifest(t, m)
+		_, err := Restore(t.Context(), baseCfg, RestoreOptions{Dir: ckptDir})
+		if !errors.Is(err, ErrCheckpointManifest) || !strings.Contains(err.Error(), "TrustLegacyCheckpoint") {
+			t.Fatalf("Restore v1 without trust = %v, want explicit trust error", err)
+		}
+	})
+
 	t.Run("layer_digest_mismatch", func(t *testing.T) {
 		m := validManifest
 		m.LayerDigests = []string{"0000000000000000000000000000000000000000000000000000000000000000"}

@@ -124,6 +124,9 @@ func (c *restoredStackCreator) CreateStack() (inet.Stack, error) {
 		_ = nsStack.InheritForwarding(c.root)
 		nsStack.InheritRPFilter(c.root)
 		nsStack.InitConntrackLimit(c.root)
+		if c.root.Stack.IPTablesCheckpointEnabled() {
+			st.EnableIPTablesCheckpoint()
+		}
 	}
 	return nsStack, nil
 }

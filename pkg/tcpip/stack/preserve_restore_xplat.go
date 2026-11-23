@@ -14,10 +14,65 @@
 
 package stack
 
-import "z.gfire.dev/gvx/pkg/tcpip"
+import (
+	"context"
+	"fmt"
+	"reflect"
+
+	"z.gfire.dev/gvx/pkg/tcpip"
+)
 
 type restorableLinkEndpoint interface {
 	Restore()
+}
+
+type checkpointLink interface {
+	ValidateCheckpointLink(map[*Stack]struct{}) error
+}
+
+type wrappedLinkEndpoint interface {
+	Child() LinkEndpoint
+}
+
+// ValidateCheckpointLinks authorizes saved link setup only for devices that
+// are attached to one of this load's admitted network namespaces.
+func (s *Stack) ValidateCheckpointLinks(ctx context.Context, owners map[*Stack]struct{}) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var wrappers map[LinkEndpoint]struct{}
+	for id, nic := range s.preservedNICs {
+		if nic == nil || nic.stack != s || nic.NetworkLinkEndpoint == nil {
+			return fmt.Errorf("invalid checkpoint NIC %d owner or link", id)
+		}
+		for ep := nic.NetworkLinkEndpoint; ; {
+			if v := reflect.ValueOf(ep); v.Kind() != reflect.Pointer || v.IsNil() {
+				return fmt.Errorf("invalid checkpoint NIC %d endpoint", id)
+			}
+			if link, ok := ep.(checkpointLink); ok {
+				if err := link.ValidateCheckpointLink(owners); err != nil {
+					return fmt.Errorf("invalid checkpoint NIC %d: %w", id, err)
+				}
+				AuthorizeCheckpointActivation(ctx, link)
+			}
+			wrapper, ok := ep.(wrappedLinkEndpoint)
+			if !ok {
+				break
+			}
+			if wrappers == nil {
+				wrappers = make(map[LinkEndpoint]struct{})
+			}
+			full, ok := ep.(LinkEndpoint)
+			if !ok {
+				return fmt.Errorf("invalid checkpoint NIC %d link wrapper", id)
+			}
+			if _, exists := wrappers[full]; exists {
+				return fmt.Errorf("invalid checkpoint NIC %d repeated link wrapper", id)
+			}
+			wrappers[full] = struct{}{}
+			ep = wrapper.Child()
+		}
+	}
+	return nil
 }
 
 func (s *Stack) initRestoreState() {

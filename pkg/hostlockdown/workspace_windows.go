@@ -63,6 +63,7 @@ type sealedDirMount struct {
 	ntPath     string
 	readOnly   bool
 	knownDirs  map[fileIDKey]struct{}
+	strict     bool
 }
 
 // sealedFileMount holds the pre-lockdown parent identity and stored leaf name
@@ -76,6 +77,7 @@ type sealedFileMount struct {
 	parentNTPath string
 	leafName     string
 	readOnly     bool
+	strict       bool
 }
 
 // sealedMountSet holds all mounts pinned before hostlockdown.Apply() drops
@@ -118,6 +120,13 @@ func pinHostMounts(mounts []HostMount) (*sealedMountSet, []string, error) {
 			return nil, nil, err
 		}
 		mountsReal = append(mountsReal, real)
+		if m.Root != nil {
+			if err := set.pinProtectedMount(m, real); err != nil {
+				set.close()
+				return nil, nil, err
+			}
+			continue
+		}
 		if m.File {
 			fm, err := pinSingleFileMount(real, m.ReadOnly)
 			if err != nil {
@@ -135,6 +144,41 @@ func pinHostMounts(mounts []HostMount) (*sealedMountSet, []string, error) {
 		set.dirs = append(set.dirs, dm)
 	}
 	return set, mountsReal, nil
+}
+
+func (s *sealedMountSet) pinProtectedMount(m HostMount, real string) error {
+	if m.File {
+		if err := validateBrokerName(m.Leaf); err != nil {
+			return err
+		}
+	}
+	var h windows.Handle
+	proc := windows.CurrentProcess()
+	if err := windows.DuplicateHandle(proc, windows.Handle(m.Root.Fd()), proc, &h, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
+		return err
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		_ = windows.CloseHandle(h)
+		return err
+	}
+	key, ok := queryFileIDKey(h, info)
+	if !ok || info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != windows.FILE_ATTRIBUTE_DIRECTORY {
+		_ = windows.CloseHandle(h)
+		return windows.ERROR_ACCESS_DENIED
+	}
+	if m.File {
+		s.files = append(s.files, sealedFileMount{
+			mountPath: real, parentPath: filepath.Dir(real), parentHandle: h,
+			parentKey: key, parentKeyOK: true, leafName: m.Leaf, readOnly: m.ReadOnly, strict: true,
+		})
+	} else {
+		s.dirs = append(s.dirs, sealedDirMount{
+			mountPath: real, rootHandle: h, rootKey: key, rootKeyOK: true,
+			readOnly: m.ReadOnly, knownDirs: map[fileIDKey]struct{}{key: {}}, strict: true,
+		})
+	}
+	return nil
 }
 
 func pinDirectoryMount(real string, readOnly bool) (sealedDirMount, error) {

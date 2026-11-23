@@ -122,6 +122,11 @@ type endpoint struct {
 	remotePort uint16
 }
 
+// IsRelayTransportEndpoint implements stack.RelayTransportEndpoint.
+func (e *endpoint) IsRelayTransportEndpoint() bool {
+	return e.ops.UsesRelayStackHandler()
+}
+
 func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) *endpoint {
 	e := &endpoint{
 		stack:       s,
@@ -406,7 +411,17 @@ func (e *endpoint) Preflight(opts tcpip.WriteOptions) tcpip.Error {
 // +checklocksexclude:e.mu
 // +checklocksexclude:e.lastErrorMu
 func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcpip.Error) {
-	n, err := e.write(p, opts)
+	return e.WriteWithPacketPolicy(p, opts, stack.PacketPolicyOutput{})
+}
+
+// WriteWithPacketPolicy writes a locally generated datagram with private
+// output metadata. The metadata applies only to this call and its fragments.
+//
+// +checklocksexclude:e.rcvMu
+// +checklocksexclude:e.mu
+// +checklocksexclude:e.lastErrorMu
+func (e *endpoint) WriteWithPacketPolicy(p tcpip.Payloader, opts tcpip.WriteOptions, policy stack.PacketPolicyOutput) (int64, tcpip.Error) {
+	n, err := e.write(p, opts, policy)
 	switch err.(type) {
 	case nil:
 		e.stats.PacketsSent.Increment()
@@ -491,7 +506,7 @@ func (e *endpoint) prepareForWrite(p tcpip.Payloader, opts tcpip.WriteOptions) (
 // +checklocksexclude:e.rcvMu
 // +checklocksexclude:e.mu
 // +checklocksexclude:e.lastErrorMu
-func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcpip.Error) {
+func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions, policy stack.PacketPolicyOutput) (int64, tcpip.Error) {
 	// prepareForWrite releases e.mu before sending. Loopback delivery is
 	// synchronous, so an ICMP response can reenter onICMPError, which takes
 	// e.mu.RLock(). Holding e.mu for a send can deadlock, including if a writer
@@ -514,6 +529,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 		return 0, err
 	}
 	defer pkt.DecRef()
+	pkt.PacketPolicy().Output = policy
 
 	// Initialize the UDP header.
 	udp := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))

@@ -702,8 +702,10 @@ func (it *IPTables) beforeSave() {
 }
 
 // afterLoad is invoked by stateify.
-func (it *IPTables) afterLoad(context.Context) {
-	it.resumeReaper()
+func (it *IPTables) afterLoad(ctx context.Context) {
+	// GVX snapshots store rule data, never a live IPTables object. A raw
+	// object decoded during staged restore has no authorized activation.
+	DeferCheckpointActivation(ctx, it, it.resumeReaper)
 }
 
 func (it *IPTables) resumeReaper() {

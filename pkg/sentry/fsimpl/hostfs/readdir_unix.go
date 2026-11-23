@@ -52,8 +52,8 @@ var errMalformedDirent = errors.New("hostfs: malformed directory entry record")
 // reopenDir opens the directory that dir names again, with a file description
 // of its own. A listing needs it, because every getdents call moves the offset
 // of the description.
-func reopenDir(dir hostDirHandle) (*os.File, error) {
-	fd, err := openatRetry(int(dir), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+func (h *hostRoot) reopenDir(dir hostDirHandle) (*os.File, error) {
+	fd, err := h.openat(int(dir), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: reopen directory: %w", err)
 	}
@@ -72,7 +72,7 @@ func (h *hostRoot) readDir(rel string) ([]hostDirEntry, error) {
 }
 
 func (h *hostRoot) readDirAt(dir hostDirHandle) ([]hostDirEntry, error) {
-	f, err := reopenDir(dir)
+	f, err := h.reopenDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +177,7 @@ func direntKind(t uint8) (hostKind, bool) {
 }
 
 func (h *hostRoot) syncDirAt(dir hostDirHandle) error {
-	f, err := reopenDir(dir)
+	f, err := h.reopenDir(dir)
 	if err != nil {
 		return err
 	}

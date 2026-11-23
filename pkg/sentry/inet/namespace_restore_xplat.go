@@ -16,11 +16,151 @@ package inet
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/state"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
+
+// NetworkCheckpointMode controls whether a sandbox checkpoint must contain
+// saved firewall rules for every network namespace.
+type NetworkCheckpointMode uint8
+
+const (
+	RequireNetworkCheckpoint NetworkCheckpointMode = iota
+	ImportLegacyNetworkCheckpoint
+)
+
+type networkCheckpointLoad struct {
+	mode       NetworkCheckpointMode
+	namespaces []*Namespace
+	activate   []checkpointActivation
+	authorized map[any]struct{}
+}
+
+type checkpointActivation struct {
+	object any
+	run    func()
+}
+
+// WithNetworkCheckpointRestore stages the network state of a single kernel
+// load without changing unrelated state.Load callers.
+func WithNetworkCheckpointRestore(ctx gvcontext.Context, mode NetworkCheckpointMode) gvcontext.Context {
+	return gvcontext.WithValue(ctx, stack.CheckpointRestoreKey{}, &networkCheckpointLoad{mode: mode})
+}
+
+func networkCheckpointFromContext(ctx context.Context) *networkCheckpointLoad {
+	load, _ := ctx.Value(stack.CheckpointRestoreKey{}).(*networkCheckpointLoad)
+	return load
+}
+
+// IsNetworkCheckpointRestore reports whether network activation is deferred.
+func IsNetworkCheckpointRestore(ctx context.Context) bool {
+	return networkCheckpointFromContext(ctx) != nil
+}
+
+func (load *networkCheckpointLoad) StageCheckpointActivation(object any, activate func()) {
+	load.activate = append(load.activate, checkpointActivation{object: object, run: activate})
+}
+
+func (load *networkCheckpointLoad) AuthorizeCheckpointActivation(object any) {
+	if load.authorized == nil {
+		load.authorized = make(map[any]struct{})
+	}
+	load.authorized[object] = struct{}{}
+}
+
+type networkCheckpointStack interface {
+	PrepareNetworkCheckpoint(context.Context, NetworkCheckpointMode) (*stack.Stack, func(), error)
+	StageRecreatedNetworkCheckpoint() error
+}
+
+// PrepareNetworkCheckpointRestore validates every decoded namespace before
+// installing any saved tables. Callers must run the returned activation after
+// setting the kernel clocks but before configuring the root stack.
+func PrepareNetworkCheckpointRestore(ctx context.Context, root *Namespace) (func(), error) {
+	load := networkCheckpointFromContext(ctx)
+	if load == nil {
+		return nil, nil
+	}
+	if root == nil || !root.isRoot || root.root != nil || !slices.Contains(load.namespaces, root) {
+		return nil, fmt.Errorf("invalid root network namespace in checkpoint")
+	}
+	install := make([]func(), 0, len(load.namespaces))
+	seen := make(map[*stack.Stack]struct{}, len(load.namespaces))
+	for i, n := range load.namespaces {
+		if n != root && (n.isRoot || n.root != root) {
+			return nil, fmt.Errorf("network namespace %d does not belong to the restored root", i)
+		}
+		if n != root && n.stack == nil && load.mode == ImportLegacyNetworkCheckpoint {
+			continue
+		}
+		st, ok := n.stack.(networkCheckpointStack)
+		if !ok {
+			return nil, fmt.Errorf("network namespace %d is missing its saved netstack", i)
+		}
+		tcpipStack, apply, err := st.PrepareNetworkCheckpoint(ctx, load.mode)
+		if err != nil {
+			return nil, fmt.Errorf("network namespace %d: %w", i, err)
+		}
+		if _, exists := seen[tcpipStack]; exists {
+			return nil, fmt.Errorf("network namespace %d shares another namespace's saved netstack", i)
+		}
+		seen[tcpipStack] = struct{}{}
+		install = append(install, apply)
+	}
+	for st := range seen {
+		if err := st.ValidateCheckpointLinks(ctx, seen); err != nil {
+			return nil, err
+		}
+	}
+	for _, activation := range load.activate {
+		if _, ok := load.authorized[activation.object]; !ok {
+			return nil, fmt.Errorf("unowned network checkpoint activation for %T", activation.object)
+		}
+	}
+	for st := range seen {
+		st.DetachCheckpointExtensions()
+	}
+	for _, apply := range install {
+		apply()
+	}
+	for st := range seen {
+		st.PrepareStagedRestore()
+	}
+	if err := root.restoreAfterLoad(); err != nil {
+		return nil, fmt.Errorf("restoring root network namespace: %w", err)
+	}
+	for i, n := range load.namespaces {
+		if n != root {
+			recreated := n.stack == nil
+			if err := n.restoreAfterLoad(); err != nil {
+				return nil, fmt.Errorf("restoring legacy network namespace %d: %w", i, err)
+			}
+			if recreated {
+				st, ok := n.stack.(networkCheckpointStack)
+				if !ok {
+					return nil, fmt.Errorf("legacy network namespace %d could not recreate a netstack", i)
+				}
+				if err := st.StageRecreatedNetworkCheckpoint(); err != nil {
+					return nil, fmt.Errorf("legacy network namespace %d: %w", i, err)
+				}
+			}
+		}
+	}
+	load.namespaces = nil
+	activate := load.activate
+	load.activate = nil
+	load.authorized = nil
+	return func() {
+		for _, action := range activate {
+			action.run()
+		}
+	}, nil
+}
 
 // StackCreatorProvider is an optional interface implemented by Stack values
 // that supply a NetworkStackCreator during namespace creation or restore.
@@ -207,7 +347,7 @@ func (n *Namespace) subscribeInterfaceEvents() {
 	}
 }
 
-func (n *Namespace) restoreAfterLoad() {
+func (n *Namespace) restoreAfterLoad() error {
 	n.ensureInitialized()
 	if n.creator == nil && n.stack != nil {
 		n.creator = creatorFromStack(n.stack)
@@ -217,7 +357,7 @@ func (n *Namespace) restoreAfterLoad() {
 			n.subscribeInterfaceEvents()
 			n.bindStackCallbacks()
 		}
-		return
+		return nil
 	}
 	if n.root != nil {
 		n.root.registerChild(n)
@@ -227,7 +367,7 @@ func (n *Namespace) restoreAfterLoad() {
 	}
 	if n.stack != nil {
 		n.subscribeInterfaceEvents()
-		return
+		return nil
 	}
 	if n.creator != nil {
 		var (
@@ -240,11 +380,12 @@ func (n *Namespace) restoreAfterLoad() {
 			st, err = n.creator.CreateStack()
 		}
 		if err != nil {
-			panic(err)
+			return err
 		}
 		n.stack = st
 		n.subscribeInterfaceEvents()
 	}
+	return nil
 }
 
 func (n *Namespace) restoreRootStack(stack Stack) {

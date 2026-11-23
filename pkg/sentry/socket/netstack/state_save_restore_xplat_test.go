@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	gvcontext "z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/state"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/faketime"
@@ -182,24 +183,36 @@ func TestNetstackXplatStateAndPoliciesSurviveSaveLoad(t *testing.T) {
 }
 
 func TestLegacyNetstackCheckpointRestoresAndResavesIPTables(t *testing.T) {
-	roundTrip := func(loadCtx goContext.Context, original *Stack) *Stack {
+	roundTrip := func(mode inet.NetworkCheckpointMode, original *inet.Namespace) *inet.Namespace {
 		t.Helper()
 		var buf bytes.Buffer
 		if _, err := state.Save(t.Context(), &buf, &original); err != nil {
 			t.Fatalf("state.Save: %v", err)
 		}
-		var restored *Stack
-		if _, err := state.Load(loadCtx, &buf, &restored); err != nil {
+		ctx := inet.WithNetworkCheckpointRestore(gvcontext.Background(), mode)
+		var restored *inet.Namespace
+		if _, err := state.Load(ctx, &buf, &restored); err != nil {
 			t.Fatalf("state.Load: %v", err)
 		}
-		t.Cleanup(restored.Stack.Destroy)
+		st := restored.Stack().(*Stack)
+		t.Cleanup(st.Stack.Destroy)
+		if st.Stack.IPTables() != nil {
+			t.Fatal("iptables installed during decode")
+		}
+		activate, err := inet.PrepareNetworkCheckpointRestore(ctx, restored)
+		if err != nil {
+			t.Fatalf("prepare network: %v", err)
+		}
+		activate()
 		return restored
 	}
 
 	// Do not opt in to capture until the first restore.
 	legacy := NewStack(stack.New(stack.Options{Clock: faketime.NewManualClock()}), 1)
 	t.Cleanup(legacy.Stack.Destroy)
-	restored := roundTrip(WithIPTablesCheckpointRestore(gvcontext.Background()), legacy)
+	root := inet.NewRootNamespace(legacy, nil, nil)
+	restoredRoot := roundTrip(inet.ImportLegacyNetworkCheckpoint, root)
+	restored := restoredRoot.Stack().(*Stack)
 	tables := restored.Stack.IPTables()
 	if tables == nil {
 		t.Fatal("legacy iptables missing after decode")
@@ -222,7 +235,7 @@ func TestLegacyNetstackCheckpointRestoresAndResavesIPTables(t *testing.T) {
 		tables.ReplaceTable(stack.FilterID, table, ipv6)
 	}
 
-	resaved := roundTrip(t.Context(), restored)
+	resaved := roundTrip(inet.RequireNetworkCheckpoint, restoredRoot).Stack().(*Stack)
 	resavedTables := resaved.Stack.IPTables()
 	if resavedTables == nil {
 		t.Fatal("resaved iptables missing after decode")

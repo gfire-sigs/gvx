@@ -339,7 +339,7 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 	if cfg.Policy != nil {
 		packetLink = &natPacketLinkState{paused: paused}
 	}
-	hostLink := wrapNATPolicyLink(pausableLink{checksumOffloadEndpoint{hostEP}, paused}, cfg.Policy, PolicyOutput, packetLink)
+	hostLink := wrapNATPolicyLink(pausableLink{checksumOffloadEndpoint{hostEP}, paused}, cfg.Policy, packetLink)
 	hostStack, err := newNATHostStack(hostLink, cfg.Policy)
 	if err != nil {
 		s.Close()
@@ -349,13 +349,12 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 	fwd.paused = paused
 	fwd.guestStack = s
 	fwd.packetLink = packetLink
-	guestLink := wrapNATPolicyLink(checksumOffloadEndpoint{guestEP}, cfg.Policy, PolicyInput, packetLink)
-	if err := configureNATNIC(s, Eth0NICID, guestLink, checksumOffloadEndpoint{hostEP}, fwd); err != nil {
+	registerNATTransportHandlers(hostStack, fwd)
+	if err := configureNATNIC(s, Eth0NICID, checksumOffloadEndpoint{guestEP}, checksumOffloadEndpoint{hostEP}, fwd); err != nil {
 		_ = fwd.Close()
 		s.Close()
 		return nil, nil, err
 	}
-	registerNATTransportHandlers(hostStack, fwd)
 	return s, fwd, nil
 }
 
@@ -513,9 +512,13 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 
 func registerNATTransportHandlers(s *stack.Stack, nf *NATForwarder) {
 	tcpFwd := tcp.NewForwarder(s, defaultTCPReceiveWindow, nf.cfg.Tuning.Int(tuning.NATSynBacklog), nf.handleTCP)
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
-
 	udpFwd := udp.NewForwarder(s, nf.handleUDP)
+	if nf.cfg.Policy != nil {
+		s.SetTransportProtocolRelayHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+		s.SetTransportProtocolRelayHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+		return
+	}
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 }
 
@@ -718,7 +721,7 @@ func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth
 	if nf.paused != nil {
 		hostLink = pausableLink{hostLink, nf.paused}
 	}
-	hostLink = wrapNATPolicyLink(hostLink, nf.cfg.Policy, PolicyOutput, packetLink)
+	hostLink = wrapNATPolicyLink(hostLink, nf.cfg.Policy, packetLink)
 	if err := nf.rebindHostNIC(hostLink); err != nil {
 		guestEP.Close()
 		hostEP.Close()
@@ -730,8 +733,7 @@ func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth
 		hostEP.Close()
 		return err
 	}
-	guestLink := wrapNATPolicyLink(checksumOffloadEndpoint{guestEP}, nf.cfg.Policy, PolicyInput, packetLink)
-	if err := configureNATNIC(restored, Eth0NICID, guestLink, checksumOffloadEndpoint{hostEP}, nf); err != nil {
+	if err := configureNATNIC(restored, Eth0NICID, checksumOffloadEndpoint{guestEP}, checksumOffloadEndpoint{hostEP}, nf); err != nil {
 		guestEP.Close()
 		hostEP.Close()
 		return err
@@ -1078,40 +1080,6 @@ func relayStreamPair(ctx context.Context, a, b net.Conn, copyToA, copyToB func(d
 	wg.Wait()
 }
 
-// activityClock records the last datagram time of a UDP session. Both
-// directions of the session share one clock, so one active direction keeps
-// the session alive.
-type activityClock struct {
-	start time.Time
-	// last is the offset from start in nanoseconds. The offset uses the
-	// monotonic clock, so wall clock changes do not expire a session.
-	last atomic.Int64
-}
-
-func newActivityClock() *activityClock {
-	return &activityClock{start: time.Now()}
-}
-
-// touch records activity now. It never moves the last time backward.
-func (c *activityClock) touch() {
-	now := int64(time.Since(c.start))
-	for {
-		old := c.last.Load()
-		if now <= old || c.last.CompareAndSwap(old, now) {
-			return
-		}
-	}
-}
-
-// deadline returns the time at which the session expires without more activity.
-func (c *activityClock) deadline(idle time.Duration) time.Time {
-	return c.start.Add(time.Duration(c.last.Load()) + idle)
-}
-
-func (c *activityClock) expired(idle time.Duration) bool {
-	return time.Since(c.start)-time.Duration(c.last.Load()) >= idle
-}
-
 // isTimeout reports whether err is a deadline error. The gonet adapter returns
 // its own timeout type, so the check uses net.Error instead of os.ErrDeadlineExceeded.
 func isTimeout(err error) bool {
@@ -1127,30 +1095,19 @@ var datagramBuffers = sync.Pool{New: func() any {
 	return &b
 }}
 
-// pumpDatagrams reads datagrams from src and passes each one to send until the
-// session expires or src closes. A timeout ends the loop only when the shared
-// clock shows no activity in the other direction either. A read error from a
-// connected UDP socket, such as ECONNREFUSED after an ICMP port unreachable
-// message, does not end the loop. A send error drops one datagram, except that
-// net.ErrClosed ends the loop.
-func pumpDatagrams(src net.Conn, send func([]byte) error, clock *activityClock, idle time.Duration) {
+// pumpDatagrams reads until either connection closes. A send error drops one
+// datagram; a connected UDP read error is tolerated unless it persists.
+func pumpDatagrams(src net.Conn, send func([]byte) error) {
 	bp := datagramBuffers.Get().(*[]byte)
 	defer datagramBuffers.Put(bp)
 	buf := *bp
 	transient := 0
 	for {
-		if err := src.SetReadDeadline(clock.deadline(idle)); err != nil {
-			return
-		}
 		n, err := src.Read(buf)
 		if err != nil {
 			switch {
 			case errors.Is(err, net.ErrClosed), errors.Is(err, io.EOF):
 				return
-			case isTimeout(err):
-				if clock.expired(idle) {
-					return
-				}
 			default:
 				transient++
 				if transient >= maxTransientUDPErrors {
@@ -1160,7 +1117,6 @@ func pumpDatagrams(src net.Conn, send func([]byte) error, clock *activityClock, 
 			continue
 		}
 		transient = 0
-		clock.touch()
 		if err := send(buf[:n]); errors.Is(err, net.ErrClosed) {
 			return
 		}
@@ -1184,40 +1140,54 @@ func relayDatagramPumps(ctx context.Context, guestConn, hostConn net.Conn, idle 
 	var cancel context.CancelFunc
 	if policy != nil {
 		ctx, cancel = context.WithCancel(ctx)
-		defer cancel()
 	}
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
-			if cancel != nil {
-				cancel()
-			}
+			clock.stop()
 			_ = guestConn.Close()
 			_ = hostConn.Close()
 		})
 	}
 	stop := context.AfterFunc(ctx, closeBoth)
 	defer stop()
+	clock.startIdleTimer(idle, closeBoth, cancel)
+	// A custom dialer can leave a deadline behind. The session timer now
+	// owns idle expiry, so clear the socket deadline before the first read.
+	if err := hostConn.SetReadDeadline(time.Time{}); err != nil {
+		closeBoth()
+		return
+	}
 
 	var wg sync.WaitGroup
-	pump := func(dst, src net.Conn, chain PolicyChain, guest, host PolicyTuple) {
+	pump := func(dst, src net.Conn, chain PolicyChain, legs [2]PolicyTuple) {
 		defer wg.Done()
 		defer closeBoth()
 		pumpDatagrams(src, func(p []byte) error {
 			if policy != nil {
-				return policy.Send(ctx, chain, len(p), func() error {
-					return policyWrite(dst, func() error {
-						_, err := dst.Write(p)
+				return policy.sendDatagram(ctx, chain, len(p), clock, func() (int, error) {
+					var n int
+					err := policyWrite(dst, func() error {
+						var err error
+						if chain == PolicyOutput {
+							n, err = writeNATRelayDatagram(policy, dst.(*gonet.UDPConn), p, legs[:]...)
+						} else {
+							n, err = dst.Write(p)
+						}
 						return err
 					})
-				}, guest, host)
+					return n, err
+				}, legs[:]...)
+			}
+			if !clock.touch() {
+				return net.ErrClosed
 			}
 			_, err := dst.Write(p)
 			return err
-		}, clock, idle)
+		})
 	}
 	wg.Add(2)
-	go pump(hostConn, guestConn, PolicyInput, guest, host)
-	go pump(guestConn, hostConn, PolicyOutput, guest.Reverse(), host.Reverse())
+	go pump(hostConn, guestConn, PolicyInput, [2]PolicyTuple{guest, host})
+	go pump(guestConn, hostConn, PolicyOutput, [2]PolicyTuple{guest.Reverse(), host.Reverse()})
 	wg.Wait()
 }

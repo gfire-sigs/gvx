@@ -159,7 +159,7 @@ func (epsByNIC *endpointsByNIC) transportEndpoints() []TransportEndpoint {
 // handlePacket is called by the stack when new packets arrive to this transport
 // endpoint. It returns false if the packet could not be matched to any
 // transport endpoint, true otherwise.
-func (epsByNIC *endpointsByNIC) handlePacket(id TransportEndpointID, pkt *PacketBuffer) bool {
+func (epsByNIC *endpointsByNIC) handlePacket(id TransportEndpointID, pkt *PacketBuffer, policy PacketDeliveryPolicy) bool {
 	epsByNIC.mu.RLock()
 
 	mpep, ok := epsByNIC.endpoints[pkt.NICID]
@@ -179,7 +179,21 @@ func (epsByNIC *endpointsByNIC) handlePacket(id TransportEndpointID, pkt *Packet
 	}
 	// multiPortEndpoints are guaranteed to have at least one element.
 	transEP := mpep.selectEndpoint(id, epsByNIC.seed)
-	if queuedProtocol, mustQueue := mpep.demux.queuedProtocols[protocolIDs{mpep.netProto, mpep.transProto}]; mustQueue {
+	queuedProtocol, mustQueue := mpep.demux.queuedProtocols[protocolIDs{mpep.netProto, mpep.transProto}]
+	if policy != nil {
+		if !isRelayEndpoint(transEP) {
+			epsByNIC.mu.RUnlock()
+			policy.DeliverPacketOnly(pkt, func(pkt *PacketBuffer) {
+				if mustQueue {
+					queuedProtocol.QueuePacket(transEP, id, pkt)
+				} else {
+					transEP.HandlePacket(id, pkt)
+				}
+			})
+			return true
+		}
+	}
+	if mustQueue {
 		queuedProtocol.QueuePacket(transEP, id, pkt)
 		epsByNIC.mu.RUnlock()
 		return true
@@ -552,7 +566,7 @@ func (d *transportDemuxer) unregisterEndpoint(netProtos []tcpip.NetworkProtocolN
 // deliverPacket attempts to find one or more matching transport endpoints, and
 // then, if matches are found, delivers the packet to them. Returns true if
 // the packet no longer needs to be handled.
-func (d *transportDemuxer) deliverPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer, id TransportEndpointID) bool {
+func (d *transportDemuxer) deliverPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer, id TransportEndpointID, policy PacketDeliveryPolicy) bool {
 	eps, ok := d.protocol[protocolIDs{pkt.NetworkProtocolNumber, protocol}]
 	if !ok {
 		return false
@@ -569,14 +583,11 @@ func (d *transportDemuxer) deliverPacket(protocol tcpip.TransportProtocolNumber,
 			d.stack.stats.UDP.UnknownPortErrors.Increment()
 			return false
 		}
-		// handlePacket takes may modify pkt, so each endpoint needs its own
-		// copy except for the final one.
-		for _, ep := range destEPs[:len(destEPs)-1] {
-			clone := pkt.Clone()
-			ep.handlePacket(id, clone)
-			clone.DecRef()
+		if policy != nil {
+			d.deliverPolicyMulticastUDP(id, pkt, destEPs, policy)
+		} else {
+			deliverPacketToAll(id, pkt, destEPs)
 		}
-		destEPs[len(destEPs)-1].handlePacket(id, pkt)
 		return true
 	}
 
@@ -600,7 +611,60 @@ func (d *transportDemuxer) deliverPacket(protocol tcpip.TransportProtocolNumber,
 		}
 		return false
 	}
-	return ep.handlePacket(id, pkt)
+	return ep.handlePacket(id, pkt, policy)
+}
+
+func deliverPacketToAll(id TransportEndpointID, pkt *PacketBuffer, destEPs []*endpointsByNIC) {
+	// Each destination except the last needs its own copy: handlePacket
+	// may modify the packet.
+	for _, ep := range destEPs[:len(destEPs)-1] {
+		clone := pkt.Clone()
+		ep.handlePacket(id, clone, nil)
+		clone.DecRef()
+	}
+	destEPs[len(destEPs)-1].handlePacket(id, pkt, nil)
+}
+
+func isRelayEndpoint(ep TransportEndpoint) bool {
+	relay, ok := ep.(RelayTransportEndpoint)
+	return ok && relay.IsRelayTransportEndpoint()
+}
+
+func (d *transportDemuxer) deliverPolicyMulticastUDP(id TransportEndpointID, pkt *PacketBuffer, destinations []*endpointsByNIC, policy PacketDeliveryPolicy) {
+	var local []TransportEndpoint
+	for _, dst := range destinations {
+		dst.mu.RLock()
+		multi := dst.endpoints[pkt.NICID]
+		if multi == nil {
+			multi = dst.endpoints[0]
+		}
+		if multi != nil {
+			multi.mu.RLock()
+			for _, ep := range multi.endpoints {
+				if isRelayEndpoint(ep) {
+					clone := pkt.Clone()
+					// UDP does not use a queued transport protocol.
+					ep.HandlePacket(id, clone)
+					clone.DecRef()
+				} else {
+					local = append(local, ep)
+				}
+			}
+			multi.mu.RUnlock()
+		}
+		dst.mu.RUnlock()
+	}
+	if len(local) == 0 {
+		return
+	}
+	policy.DeliverPacketOnly(pkt, func(pkt *PacketBuffer) {
+		for _, ep := range local[:len(local)-1] {
+			clone := pkt.Clone()
+			ep.HandlePacket(id, clone)
+			clone.DecRef()
+		}
+		local[len(local)-1].HandlePacket(id, pkt)
+	})
 }
 
 // deliverRawPacket attempts to deliver the given packet and returns whether it

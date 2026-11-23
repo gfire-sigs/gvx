@@ -16,7 +16,9 @@ package stack
 
 import (
 	"context"
+	"fmt"
 	"maps"
+	"slices"
 
 	"z.gfire.dev/gvx/pkg/state"
 )
@@ -43,19 +45,19 @@ func (r iptablesRuleSnapshot) encode() [4]any {
 	return [4]any{r.tables, r.modified, r.config, r.limit}
 }
 
-func decodeIPTablesRules(value any) iptablesRuleSnapshot {
+func decodeIPTablesRules(value any) (iptablesRuleSnapshot, error) {
 	fields, ok := value.([4]any)
 	if !ok {
-		state.Failf("invalid iptables checkpoint value: %T", value)
+		return iptablesRuleSnapshot{}, fmt.Errorf("invalid iptables checkpoint value: %T", value)
 	}
 	tables, tablesOK := fields[0].(*[2][NumTables]Table)
 	modified, modifiedOK := fields[1].(bool)
 	config, configOK := fields[2].(*conntrackConfig)
 	limit, limitOK := fields[3].(*ConntrackLimit)
 	if !tablesOK || tables == nil || !modifiedOK || !configOK || !limitOK {
-		state.Failf("invalid iptables checkpoint fields")
+		return iptablesRuleSnapshot{}, fmt.Errorf("invalid iptables checkpoint fields")
 	}
-	return iptablesRuleSnapshot{tables: tables, modified: modified, config: config, limit: limit}
+	return iptablesRuleSnapshot{tables: tables, modified: modified, config: config, limit: limit}, nil
 }
 
 func (it *IPTables) snapshotRules() iptablesRuleSnapshot {
@@ -79,36 +81,74 @@ func (s *Stack) EnableIPTablesCheckpoint() {
 	})
 }
 
-// RestoreIPTablesCheckpoint installs decoded rules before the stack resumes.
-// It returns true only when it installs a snapshot.
-func (s *Stack) RestoreIPTablesCheckpoint() bool {
+// IPTablesCheckpointEnabled reports whether this live stack captures its rules.
+func (s *Stack) IPTablesCheckpointEnabled() bool {
+	value, _ := s.ExtensionState(iptablesCheckpointKey)
+	_, enabled := value.(iptablesCheckpoint)
+	return enabled
+}
+
+// ValidateCheckpointExtensions verifies that the decoded extension store is
+// owned by this stack. The values map is detached only once the load passes.
+func (s *Stack) ValidateCheckpointExtensions() error {
+	if s.extState != nil && s.extState.stack != s {
+		return fmt.Errorf("invalid stack extension state owner")
+	}
+	return nil
+}
+
+// DetachCheckpointExtensions separates map storage from other decoded stacks
+// before a live owner marker can be written to it.
+func (s *Stack) DetachCheckpointExtensions() {
+	e := s.ensureExtState()
+	e.mu.Lock()
+	e.values = maps.Clone(e.values)
+	e.mu.Unlock()
+}
+
+// PrepareIPTablesCheckpoint prepares decoded rules without installing them or
+// starting conntrack. A nil installer and nil error mean no snapshot was saved.
+// validate may inspect or normalize the staged tables before they are installed.
+func (s *Stack) PrepareIPTablesCheckpoint(validate func(*IPTables, bool) error) (install func(), err error) {
 	value, ok := s.ExtensionState(iptablesCheckpointKey)
 	if !ok {
-		return false
+		return nil, nil
 	}
-	if _, live := value.(iptablesCheckpoint); live {
-		return false
+	snapshot, err := decodeIPTablesRules(value)
+	if err != nil {
+		return nil, err
 	}
-	snapshot := decodeIPTablesRules(value)
-	s.ensureRNG()
+	if validate != nil {
+		for family := range snapshot.tables {
+			for id := range snapshot.tables[family] {
+				table := &snapshot.tables[family][id]
+				table.Rules = slices.Clone(table.Rules)
+			}
+		}
+	}
 	it := &IPTables{
-		connections: ConnTrack{
-			seed:  s.insecureRNG.Uint32(),
-			clock: s.clock,
-			rng:   s.insecureRNG,
-		},
 		v4Tables: snapshot.tables[0],
 		v6Tables: snapshot.tables[1],
 		modified: snapshot.modified,
 	}
-	it.connections.cfg.Store(snapshot.config)
-	it.connections.limit.Store(snapshot.limit)
-	if snapshot.modified {
-		it.connections.init()
+	if validate != nil {
+		if err := validate(it, snapshot.modified); err != nil {
+			return nil, err
+		}
 	}
-	s.tables = it
-	s.SetExtensionState(iptablesCheckpointKey, iptablesCheckpoint{owner: s, restored: true})
-	return true
+	return func() {
+		s.ensureRNG()
+		it.connections.seed = s.insecureRNG.Uint32()
+		it.connections.clock = s.clock
+		it.connections.rng = s.insecureRNG
+		it.connections.cfg.Store(snapshot.config)
+		it.connections.limit.Store(snapshot.limit)
+		if snapshot.modified {
+			it.connections.init()
+		}
+		s.tables = it
+		s.SetExtensionState(iptablesCheckpointKey, iptablesCheckpoint{owner: s, restored: true})
+	}, nil
 }
 
 func (s *Stack) hasRestoredIPTables() bool {
@@ -128,8 +168,9 @@ func (e *stackExtState) saveCheckpointValues() map[string]any {
 	e.mu.RLock()
 	values := e.values
 	checkpoint, enabled := values[iptablesCheckpointKey].(iptablesCheckpoint)
-	if enabled {
+	if _, hasRuntime := values[stackRuntimeKey]; enabled || hasRuntime {
 		values = maps.Clone(values)
+		delete(values, stackRuntimeKey)
 	}
 	e.mu.RUnlock()
 	if !enabled {

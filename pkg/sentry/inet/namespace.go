@@ -176,8 +176,15 @@ func (n *Namespace) init(restore bool) {
 }
 
 // afterLoad is invoked by stateify.
-func (n *Namespace) afterLoad(goContext.Context) {
-	n.restoreAfterLoad()
+func (n *Namespace) afterLoad(ctx goContext.Context) {
+	if load := networkCheckpointFromContext(ctx); load != nil {
+		n.ensureInitialized()
+		load.namespaces = append(load.namespaces, n)
+		return
+	}
+	if err := n.restoreAfterLoad(); err != nil {
+		panic(err)
+	}
 }
 
 // AbstractSockets returns AbstractSocketNamespace.

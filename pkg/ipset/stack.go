@@ -15,6 +15,7 @@
 package ipset
 
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"time"
@@ -70,6 +71,25 @@ func ExistingForStack(stk *stack.Stack) *Registry {
 		return nil
 	}
 	return v.(*Registry)
+}
+
+// CheckpointRegistry returns the decoded registry only if it belongs to stk.
+// Unlike the live lookup, it treats malformed extension state as an error.
+func CheckpointRegistry(stk *stack.Stack) (*Registry, error) {
+	v, ok := stk.ExtensionState(stackRegistryKey)
+	if !ok {
+		return nil, nil
+	}
+	r, ok := v.(*Registry)
+	if !ok || r == nil || r.stk != stk {
+		return nil, fmt.Errorf("invalid ipset registry owner or type")
+	}
+	for _, s := range r.sets {
+		if s != nil && (s.reg != r || s.spec == nil) {
+			return nil, fmt.Errorf("invalid saved ipset ownership or type")
+		}
+	}
+	return r, nil
 }
 
 // fallbackModules maps arbitrary non-Kernel owners in unit tests weakly to

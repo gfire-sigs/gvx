@@ -176,9 +176,11 @@ func (pf *PortForwarder) reconcileDynamicPorts() {
 	var remUDP []removedDynUDP
 	var toAdd []dynCandidate
 
+	pf.udpHandoff.Lock()
 	pf.mu.Lock()
 	if pf.closed || pf.resumed != nil || pf.stack != s {
 		pf.mu.Unlock()
+		pf.udpHandoff.Unlock()
 		return
 	}
 	for k, b := range pf.dynTCP {
@@ -233,6 +235,7 @@ func (pf *PortForwarder) reconcileDynamicPorts() {
 		toAdd = append(toAdd, dynCandidate{key: k, guestIP: discovered[k]})
 	}
 	pf.mu.Unlock()
+	pf.udpHandoff.Unlock()
 
 	for _, r := range remTCP {
 		_ = r.fwd.listener.Close()

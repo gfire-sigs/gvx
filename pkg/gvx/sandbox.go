@@ -70,6 +70,7 @@ type Sandbox struct {
 	portForwarder     *netbackend.PortForwarder
 	netPolicy         *netbackend.NATPolicy
 	netPolicyConfig   NetPolicyConfig // guarded by mu
+	policyStorage     *policyStorage
 	wgEndpoint        *netbackend.WireGuardEndpoint
 	wgPeerPort        uint16
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
@@ -129,7 +130,7 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	cleanup := func(cause error) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
 	}
-	if err := sb.initNetPolicy(""); err != nil {
+	if err := sb.initNetPolicy(nil); err != nil {
 		return cleanup(err)
 	}
 	if cfg.HostCACerts {
@@ -169,7 +170,7 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	sb.attachChunkMemory()
 
 	if cfg.CheckpointDir != "" {
-		cf, err := openCheckpointBundleFiles(cfg.CheckpointDir)
+		cf, err := sb.openCheckpointOutput()
 		if err != nil {
 			return cleanup(err)
 		}
@@ -583,6 +584,9 @@ func (s *Sandbox) Close() error {
 			errs = append(errs, err)
 		}
 		s.ckptFiles = nil
+	}
+	if s.policyStorage != nil {
+		errs = append(errs, s.policyStorage.close())
 	}
 
 	if s.cfg.CheckpointListener != nil {

@@ -18,6 +18,7 @@ import (
 	"context"
 
 	"z.gfire.dev/gvx/pkg/sync"
+	"z.gfire.dev/gvx/pkg/tcpip"
 )
 
 type preservedEndpoint interface {
@@ -71,6 +72,36 @@ func (e *stackExtState) afterLoad(context.Context) {
 			ipv6: e.bridgeIPv6,
 		})
 	}
+}
+
+const stackRuntimeKey = "gvx.stack.runtime"
+
+// Keep transient extensions out of the registered stack and extension layouts.
+type stackRuntimeState struct {
+	restoreOrder   EndpointRestoreOrder
+	stagedRestore  bool
+	relayProtocols map[tcpip.TransportProtocolNumber]struct{}
+}
+
+func (s *Stack) ensureRuntimeState() *stackRuntimeState {
+	e := s.ensureExtState()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	runtime, _ := e.values[stackRuntimeKey].(*stackRuntimeState)
+	if runtime == nil {
+		runtime = new(stackRuntimeState)
+		if e.values == nil {
+			e.values = make(map[string]any)
+		}
+		e.values[stackRuntimeKey] = runtime
+	}
+	return runtime
+}
+
+func (s *Stack) runtimeState() *stackRuntimeState {
+	value, _ := s.ExtensionState(stackRuntimeKey)
+	runtime, _ := value.(*stackRuntimeState)
+	return runtime
 }
 
 func (s *Stack) ensureExtState() *stackExtState {

@@ -1082,6 +1082,12 @@ func (*icmpReasonReassemblyTimeout) respondsToMulticast() bool {
 // returnError takes an error descriptor and generates the appropriate ICMP
 // error packet for IPv6 and sends it.
 func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer, deliveredLocally bool) tcpip.Error {
+	if metadata := pkt.PacketPolicy(); deliveredLocally && metadata.HasIngress() && !metadata.Ingress.Accounted {
+		if policy := p.stack.PacketDeliveryPolicy(); policy != nil {
+			policy.DeliverPacketOnly(pkt, func(pkt *stack.PacketBuffer) { _ = p.returnError(reason, pkt, true) })
+			return nil
+		}
+	}
 	origIPHdr := header.IPv6(pkt.NetworkHeader().Slice())
 	origIPHdrSrc := origIPHdr.SourceAddress()
 	origIPHdrDst := origIPHdr.DestinationAddress()
@@ -1254,6 +1260,12 @@ func (p *protocol) OnReassemblyTimeout(pkt *stack.PacketBuffer) {
 	//   been received, an ICMP Time Exceeded -- Fragment Reassembly Time Exceeded
 	//   message should be sent to the source of that fragment.
 	if pkt != nil {
+		if policy := p.stack.PacketDeliveryPolicy(); policy != nil && pkt.PacketPolicy().HasIngress() {
+			policy.DeliverReassemblyTimeout(pkt, func(pkt *stack.PacketBuffer) {
+				_ = p.returnError(&icmpReasonReassemblyTimeout{}, pkt, true)
+			})
+			return
+		}
 		p.returnError(&icmpReasonReassemblyTimeout{}, pkt, true /* deliveredLocally */)
 	}
 }

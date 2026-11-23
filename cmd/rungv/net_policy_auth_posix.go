@@ -49,6 +49,80 @@ func controlUnixPeerOwned(conn net.Conn) bool {
 	return uid == uint32(os.Geteuid())
 }
 
+func readCheckpointControlToken(network, address string) (string, error) {
+	return readControlToken(network, address)
+}
+
+func validateUnixControlTokenPath(string, bool) error { return nil }
+
+type pathControlTokenTarget string
+
+func (path pathControlTokenTarget) verifyRegular() error {
+	info, err := os.Lstat(string(path))
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("control token path %q is not a regular file", path)
+	}
+	return nil
+}
+
+func (path pathControlTokenTarget) open() (*os.File, error) {
+	return openControlInput(string(path), true)
+}
+
+func (path pathControlTokenTarget) create() (*os.File, error) {
+	return createControlTokenFile(string(path))
+}
+
+func (path pathControlTokenTarget) remove() error {
+	return os.Remove(string(path))
+}
+
+func (path pathControlTokenTarget) removeIfSame(f *os.File) error {
+	return removeCreatedControlToken(string(path), f)
+}
+
+func openPathControlTokenTarget(path string, create bool) (controlTokenTarget, func() error, error) {
+	dir, err := privatePolicyControlDir(filepath.Dir(path), create)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pathControlTokenTarget(filepath.Join(dir, filepath.Base(path))), nil, nil
+}
+
+func pinControlTokenFile(target controlTokenTarget, writer *os.File) (*os.File, error) {
+	created, err := writer.Stat()
+	if err != nil {
+		return nil, err
+	}
+	f, err := target.open()
+	if err != nil {
+		return nil, err
+	}
+	current, err := f.Stat()
+	if err == nil && !os.SameFile(created, current) {
+		err = errors.New("control token changed after creation")
+	}
+	if err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
+}
+
+func removeCreatedControlToken(path string, f *os.File) error {
+	current, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	created, err := f.Stat()
+	if err != nil || !os.SameFile(current, created) {
+		return err
+	}
+	return os.Remove(path)
+}
+
 func validateControlDirectory(path string) error {
 	uid := uint32(os.Geteuid())
 	for dir := path; ; dir = filepath.Dir(dir) {

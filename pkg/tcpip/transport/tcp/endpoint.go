@@ -647,6 +647,11 @@ type Endpoint struct {
 	terminateAtRestore bool
 }
 
+// IsRelayTransportEndpoint implements stack.RelayTransportEndpoint.
+func (e *Endpoint) IsRelayTransportEndpoint() bool {
+	return e.ops.UsesRelayStackHandler()
+}
+
 // calculateAdvertisedMSS calculates the MSS to advertise.
 //
 // If userMSS is non-zero and is not greater than the maximum possible MSS for
@@ -3415,9 +3420,9 @@ func (e *Endpoint) SocketOptions() *tcpip.SocketOptions {
 
 // GetTCPSendBufferLimits is used to get send buffer size limits for TCP.
 func GetTCPSendBufferLimits(sh tcpip.StackHandler) tcpip.SendBufferSizeOption {
-	// This type assertion is safe because only the TCP stack calls this
-	// function.
-	ss := sh.(*stack.Stack).TCPSendBufferLimits()
+	ss := sh.(interface {
+		TCPSendBufferLimits() tcpip.TCPSendBufferSizeRangeOption
+	}).TCPSendBufferLimits()
 	return tcpip.SendBufferSizeOption(ss)
 }
 

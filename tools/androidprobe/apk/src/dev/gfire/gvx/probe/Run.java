@@ -50,9 +50,8 @@ public final class Run extends Instrumentation {
     public void onStart() {
         Context ctx = getTargetContext();
         File files = ctx.getFilesDir();
+        String exe = arguments.getString("exe", "libandroidprobe.so");
         List<String> cmd = new ArrayList<>();
-        cmd.add(ctx.getApplicationInfo().nativeLibraryDir + "/"
-                + arguments.getString("exe", "libandroidprobe.so"));
         String args64 = arguments.getString("args64", "");
         if (!args64.isEmpty()) {
             String joined = new String(Base64.decode(args64, Base64.DEFAULT), StandardCharsets.UTF_8);
@@ -60,6 +59,11 @@ public final class Run extends Instrumentation {
                 cmd.add(a.replace("@FILES@", files.getPath()));
             }
         }
+        if (exe.equals("checkpoint-smoke")) {
+            runCheckpointSmoke(ctx, cmd);
+            return;
+        }
+        cmd.add(0, new File(ctx.getApplicationInfo().nativeLibraryDir, exe).getPath());
         int code;
         StringBuilder tail = new StringBuilder();
         try (FileWriter log = new FileWriter(new File(files, "last-run.log"))) {
@@ -93,5 +97,17 @@ public final class Run extends Instrumentation {
         result.putString(Instrumentation.REPORT_KEY_STREAMRESULT, "exit code " + code + "\n");
         result.putInt("exit", code);
         finish(code == 0 ? 0 : 1, result);
+    }
+
+    private void runCheckpointSmoke(Context ctx, List<String> args) {
+        Bundle result = new Bundle();
+        try {
+            CheckpointSmoke.run(ctx, args.get(0));
+            result.putString(Instrumentation.REPORT_KEY_STREAMRESULT, "app checkpoint ok\n");
+            finish(0, result);
+        } catch (Exception e) {
+            result.putString(Instrumentation.REPORT_KEY_STREAMRESULT, "app checkpoint failed: " + e + "\n");
+            finish(1, result);
+        }
     }
 }

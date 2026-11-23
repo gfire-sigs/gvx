@@ -164,6 +164,7 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	}
 	var sb *gvx.Sandbox
 	if control != nil {
+		defer control.closeToken()
 		defer func() {
 			if sb == nil || !sb.LockdownStatus().Applied {
 				control.Cleanup()
@@ -210,6 +211,9 @@ func bindControlSocket(cfg *gvx.Config, socketSpec, cmdPrefix string, stderr io.
 		}
 		if ep.tokenPath != "" {
 			opts.ControlPaths = []string{ep.tokenPath}
+			if ep.tokenFile != nil {
+				opts.ControlFiles = []*os.File{ep.tokenFile}
+			}
 		}
 	}
 	return ep, true

@@ -285,6 +285,7 @@ type NATPolicy struct {
 	transition atomic.Pointer[policyTransition] // stays set after Close
 	gate       sync.RWMutex
 	active     *CompiledPolicy
+	generation uint64 // distinguishes live revisions, even when reusing a compiled policy
 	release    func()
 	control    netip.AddrPort
 	dialCtx    context.Context
@@ -295,6 +296,7 @@ type NATPolicy struct {
 	streams      map[*policyStream]struct{}
 	streamCounts [2]int
 	tx, rx       policyScheduler
+	relayOutput  natRelayOutput // used only by the RX worker's synchronous UDP write
 	workers      sync.WaitGroup
 }
 
@@ -353,14 +355,7 @@ func noopPolicyRelease() {}
 
 // Begin pins the active rule snapshot for a nonblocking final handoff.
 // Call release exactly once after a permitted handoff.
-func (p *NATPolicy) Begin(chain PolicyChain, tuples ...PolicyTuple) (release func(), allowed bool) {
-	if p != nil && len(tuples) == 0 {
-		return noopPolicyRelease, false
-	}
-	return p.beginUnshaped(chain, false, tuples...)
-}
-
-func (p *NATPolicy) beginUnshaped(chain PolicyChain, requireUnlimited bool, tuples ...PolicyTuple) (func(), bool) {
+func (p *NATPolicy) Begin(chain PolicyChain, tuples ...PolicyTuple) (func(), bool) {
 	if p == nil {
 		return noopPolicyRelease, true
 	}
@@ -368,22 +363,9 @@ func (p *NATPolicy) beginUnshaped(chain PolicyChain, requireUnlimited bool, tupl
 	if release == nil {
 		return noopPolicyRelease, false
 	}
-	// Inside the synchronous TX pipe, the peer INPUT hook owns the tuple.
-	active := p.active
-	peerInput := len(tuples) == 0 && chain == PolicyInput && active != nil && active.rules != nil
-	if !peerInput && !active.allows(chain, tuples) {
+	if !p.active.allows(chain, tuples) {
 		release()
 		return noopPolicyRelease, false
-	}
-	if requireUnlimited {
-		limit := active.config.TX
-		if chain == PolicyOutput {
-			limit = active.config.RX
-		}
-		if limit.RateBPS != 0 {
-			release()
-			return noopPolicyRelease, false
-		}
 	}
 	return release, true
 }
@@ -458,6 +440,7 @@ func (p *NATPolicy) Commit(compiled *CompiledPolicy) error {
 	}
 	p.streamsMu.Unlock()
 	p.active = compiled
+	p.generation++
 	p.dialCtx, p.cancelDial = context.WithCancel(context.Background())
 	now := time.Now()
 	p.tx.bucket.last, p.rx.bucket.last = now, now

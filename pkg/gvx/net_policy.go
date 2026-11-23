@@ -53,6 +53,9 @@ type NetPolicyOptions struct {
 	// ControlPaths lists private endpoint files, such as a token sidecar,
 	// that the guest must not see. The sandbox also checks a Unix listener's path.
 	ControlPaths []string
+	// ControlFiles identifies opened control files from ControlPaths. New and
+	// Restore borrow these descriptors until they return.
+	ControlFiles []*os.File
 }
 
 // NetPolicyErrorCode returns a stable policy error code, or internal.
@@ -93,7 +96,7 @@ func (c *Config) validateNetPolicyConfig() error {
 	return nil
 }
 
-func (s *Sandbox) initNetPolicy(restoreDir string) error {
+func (s *Sandbox) initNetPolicy(input *bundleRoot) error {
 	opts := s.cfg.NetPolicy
 	s.cfg.NetPolicy = nil
 	if opts == nil {
@@ -103,8 +106,16 @@ func (s *Sandbox) initNetPolicy(restoreDir string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
+	var restoreDir string
+	if input != nil {
+		restoreDir = input.path
+	}
 	if err := s.cfg.validateNetPolicyPaths(restoreDir, unixPath, opts.ControlPaths); err != nil {
-		return fmt.Errorf("%w: %w: %w", ErrInvalidConfig, netPolicyError("invalid_policy", "unsafe network policy path"), err)
+		return unsafePolicyStorage(err)
+	}
+	s.policyStorage, err = capturePolicyStorage(opts, input, s.cfg.CheckpointDir, unixPath)
+	if err != nil {
+		return unsafePolicyStorage(err)
 	}
 	policy := opts.Policy
 	compiled, err := netbackend.CompilePolicy(policy)

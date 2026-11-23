@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -150,6 +151,38 @@ func TestControlTCPRequiresTokenAndCLIClientSendsIt(t *testing.T) {
 	ep.Cleanup()
 	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
 		t.Fatalf("token file after Cleanup: %v, want not exist", err)
+	}
+}
+
+func TestCheckpointCLIWithoutRequiredTokenDoesNotConnect(t *testing.T) {
+	isolateControlTokenDir(t)
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := listener.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+		accepted <- err
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := checkpointSubcommand(t.Context(), []string{"-control-socket=tcp://" + listener.Addr().String()}, &stdout, &stderr)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-accepted; !errors.Is(err, net.ErrClosed) {
+		t.Errorf("listener accepted a connection without a token; Accept returned %v", err)
+	}
+	if code == 0 || !strings.Contains(stderr.String(), "unauthorized") {
+		t.Errorf("checkpoint result = %d (stderr %q), want local authorization failure", code, stderr.String())
 	}
 }
 

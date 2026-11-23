@@ -116,7 +116,18 @@ func checkpointSubcommand(ctx context.Context, args []string, stdout, stderr io.
 		}
 	}
 
-	conn, err := dialCheckpointSocket(ctx, ca.controlSocket)
+	network, address, err := parseCheckpointEndpoint(ca.controlSocket)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: connect control socket: %v\n", err)
+		return 1
+	}
+	token, err := readCheckpointControlToken(network, address)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: unauthorized: %v\n", err)
+		return 1
+	}
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: connect control socket: %v\n", err)
 		return 1
@@ -128,13 +139,7 @@ func checkpointSubcommand(ctx context.Context, args []string, stdout, stderr io.
 	req := checkpointControlRequest{
 		Dir:          reqDir,
 		LeaveRunning: ca.leaveRunning,
-	}
-	if network, address, perr := parseCheckpointEndpoint(ca.controlSocket); perr == nil {
-		token, tErr := readControlToken(network, address)
-		if tErr != nil {
-			_, _ = fmt.Fprintf(stderr, "rungv checkpoint: warning: %v\n", tErr)
-		}
-		req.Token = token
+		Token:        token,
 	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: send request: %v\n", err)
@@ -221,7 +226,15 @@ type controlEndpoint struct {
 	// host lockdown, because lockdown forbids file removal.
 	Cleanup        func()
 	tokenPath      string
+	tokenFile      *os.File
+	finishToken    func(remove bool)
 	verifyUnixPeer bool
+}
+
+func (ep *controlEndpoint) closeToken() {
+	if ep.finishToken != nil {
+		ep.finishToken(false)
+	}
 }
 
 // Bind and publish credentials before host lockdown.
@@ -229,6 +242,11 @@ func listenCheckpointSocket(raw string, protected bool) (*controlEndpoint, error
 	network, address, err := parseCheckpointEndpoint(raw)
 	if err != nil {
 		return nil, err
+	}
+	if network == "unix" && !protected {
+		if err := validateUnixControlTokenPath(address, true); err != nil {
+			return nil, err
+		}
 	}
 	if protected {
 		address, err = policyControlAddress(network, address, true)
@@ -248,9 +266,10 @@ func listenCheckpointSocket(raw string, protected bool) (*controlEndpoint, error
 			}
 		}
 	}
+	var artifact controlTokenArtifact
 	removeToken := func() {
-		if tokenPath != "" {
-			_ = os.Remove(tokenPath)
+		if artifact.finish != nil {
+			artifact.finish(true)
 		}
 	}
 
@@ -269,12 +288,15 @@ func listenCheckpointSocket(raw string, protected bool) (*controlEndpoint, error
 			}
 		}
 		if tokenPath != "" {
-			if tokenPath, err = writeControlToken(tokenPath, token, protected); err != nil {
+			if artifact, err = writeControlToken(network, tokenPath, token, protected); err != nil {
 				_ = ln.Close()
 				return nil, err
 			}
 		}
-		return &controlEndpoint{Listener: ln, Token: token, Cleanup: removeToken, tokenPath: tokenPath}, nil
+		return &controlEndpoint{
+			Listener: ln, Token: token, Cleanup: removeToken,
+			tokenPath: controlTokenFileName(artifact.file), tokenFile: artifact.file, finishToken: artifact.finish,
+		}, nil
 	}
 
 	parent := filepath.Dir(address)
@@ -304,7 +326,7 @@ func listenCheckpointSocket(raw string, protected bool) (*controlEndpoint, error
 		return nil, err
 	}
 	if tokenPath != "" {
-		if tokenPath, err = writeControlToken(tokenPath, token, protected); err != nil {
+		if artifact, err = writeControlToken(network, tokenPath, token, protected); err != nil {
 			_ = ln.Close()
 			_ = os.Remove(address)
 			return nil, err
@@ -324,7 +346,8 @@ func listenCheckpointSocket(raw string, protected bool) (*controlEndpoint, error
 		removeToken()
 	}
 	return &controlEndpoint{
-		Listener: ln, Token: token, Cleanup: cleanup, tokenPath: tokenPath,
+		Listener: ln, Token: token, Cleanup: cleanup,
+		tokenPath: controlTokenFileName(artifact.file), tokenFile: artifact.file, finishToken: artifact.finish,
 		verifyUnixPeer: protected && runtime.GOOS == "darwin",
 	}, nil
 }
@@ -347,6 +370,9 @@ func policyControlAddress(network, address string, create bool) (string, error) 
 	if address == "" {
 		return "", errors.New("policy control socket path is empty")
 	}
+	if err := validateUnixControlTokenPath(address, create); err != nil {
+		return "", err
+	}
 	dir, err := privatePolicyControlDir(filepath.Dir(address), create)
 	if err != nil {
 		return "", err
@@ -363,15 +389,6 @@ func validateStalePolicySocket(address string) error {
 		return fmt.Errorf("verify stale control socket %q: %w", address, err)
 	}
 	return nil
-}
-
-func dialCheckpointSocket(ctx context.Context, raw string) (net.Conn, error) {
-	network, address, err := parseCheckpointEndpoint(raw)
-	if err != nil {
-		return nil, err
-	}
-	var d net.Dialer
-	return d.DialContext(ctx, network, address)
 }
 
 // resolveCheckpointDirs normalizes the configured checkpoint directory before

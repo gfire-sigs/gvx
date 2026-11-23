@@ -2468,13 +2468,14 @@ func (s *Stack) Restore() {
 	for _, r := range preservedRoutes {
 		s.AddRoute(r)
 	}
+	s.countStagedEndpoints(eps)
 	for _, e := range eps {
 		e.Restore(s)
 	}
 
 	// Make sure all the endpoints are loaded correctly before resuming the
 	// protocol level background workers.
-	tcpip.AsyncLoading.Wait()
+	s.waitForEndpointRestore()
 
 	// Now restore any protocol level background workers.
 	if s.shouldRestoreProtocols() {

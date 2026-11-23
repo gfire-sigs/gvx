@@ -207,6 +207,9 @@ func (l *listenContext) createConnectingEndpoint(s *segment, rcvdSynOpts header.
 	}
 
 	n = newEndpoint(l.stack, l.protocol, netProto, queue)
+	if l.listenEP == nil && l.stack.IsTransportRelayProtocol(ProtocolNumber) {
+		n.ops.InitHandler(n, l.stack.RelaySocketStackHandler(), GetTCPSendBufferLimits, GetTCPReceiveBufferLimits)
+	}
 	n.mu.Lock()
 	n.ops.SetV6Only(l.v6Only)
 	n.TransportEndpointInfo.ID = s.id

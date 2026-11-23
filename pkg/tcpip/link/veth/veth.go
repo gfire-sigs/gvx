@@ -52,6 +52,7 @@ func (v *veth) close() {
 	v.mu.Lock()
 	closed := v.closed
 	v.closed = true
+	backlog := v.backlogQueue
 	v.mu.Unlock()
 	if closed {
 		return
@@ -67,7 +68,9 @@ func (v *veth) close() {
 			action()
 		}
 	}
-	close(v.backlogQueue)
+	if backlog != nil {
+		close(backlog)
+	}
 }
 
 // +stateify savable

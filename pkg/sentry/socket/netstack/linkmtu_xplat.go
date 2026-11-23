@@ -77,8 +77,8 @@ func (l *vethLink) SetMTU(mtu uint32) {
 	l.mtu.Store(mtu + header.EthernetMinimumSize)
 }
 
-func (l *vethLink) afterLoad(goContext.Context) {
-	if l.Endpoint != nil {
+func (l *vethLink) afterLoad(ctx goContext.Context) {
+	if l.Endpoint != nil && !inet.IsNetworkCheckpointRestore(ctx) {
 		l.Endpoint.Restore()
 	}
 }

@@ -15,6 +15,7 @@
 package netbackend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -96,25 +97,37 @@ func (b *policyBucket) complete(n, written int, now time.Time) {
 }
 
 type policyWork struct {
-	prev, next *policyWork
-	queued     bool
-	n          int
-	chain      PolicyChain
-	tuples     []PolicyTuple
-	inline     [2]PolicyTuple // NAT and publication each use at most two legs
-	ctx        context.Context
-	stream     bool // capacity belongs to the staged chunk, not each write attempt
-	send       func() (int, error)
-	dispose    func()
-	done       chan error
+	prev, next      *policyWork
+	queued          bool
+	n               int
+	chain           PolicyChain
+	tuples          []PolicyTuple
+	inline          [2]PolicyTuple // NAT and publication each use at most two legs
+	fixedGeneration bool
+	generation      uint64
+	ctx             context.Context
+	stream          bool // capacity belongs to the staged chunk, not each write attempt
+	activity        *activityClock
+	payload         []byte // publication reader's buffer, cloned on admission
+	send            func() (int, error)
+	dispose         func()
+	done            chan error
 }
 
 func (w *policyWork) finish(err error) {
+	w.settleActivity(err)
 	if w.dispose != nil {
 		w.dispose()
 	}
 	if w.done != nil {
 		w.done <- err
+	}
+}
+
+func (w *policyWork) settleActivity(err error) {
+	if w.activity != nil {
+		w.activity.settle(err == nil)
+		w.activity = nil
 	}
 }
 
@@ -215,6 +228,31 @@ func (s *policyScheduler) cancel(w *policyWork) bool {
 	return true
 }
 
+func (s *policyScheduler) cancelDatagrams(activity *activityClock) {
+	s.mu.Lock()
+	var canceled *policyWork
+	for w := s.head; w != nil; {
+		next := w.next
+		if w.activity == activity {
+			s.unlink(w)
+			s.uncharge(w)
+			w.next = canceled
+			canceled = w
+		}
+		w = next
+	}
+	s.mu.Unlock()
+	if canceled != nil {
+		finishPolicyWork(canceled, net.ErrClosed)
+		s.signal()
+	}
+}
+
+func (p *NATPolicy) cancelDatagrams(activity *activityClock) {
+	p.tx.cancelDatagrams(activity)
+	p.rx.cancelDatagrams(activity)
+}
+
 func (s *policyScheduler) replace(active *CompiledPolicy, limit PolicyLimit, freeze time.Time) *policyWork {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -230,7 +268,7 @@ func (s *policyScheduler) replace(active *CompiledPolicy, limit PolicyLimit, fre
 	for w := s.head; w != nil; {
 		next := w.next
 		overCapacity := !w.stream && (w.n > maxUnit || w.n > maxBytes-kept)
-		if overCapacity || (w.stream && context.Cause(w.ctx) != nil) || !active.allows(w.chain, w.tuples) {
+		if w.fixedGeneration || overCapacity || (w.stream && context.Cause(w.ctx) != nil) || !active.allows(w.chain, w.tuples) {
 			s.unlink(w)
 			s.uncharge(w)
 			w.next = rejected
@@ -424,7 +462,7 @@ func (p *NATPolicy) submit(w *policyWork) error {
 			return ErrPolicyDenied
 		}
 	}
-	if !p.active.allows(w.chain, w.tuples) {
+	if w.fixedGeneration && w.generation != p.generation || !p.active.allows(w.chain, w.tuples) {
 		release()
 		return ErrPolicyDenied
 	}
@@ -444,6 +482,21 @@ func (p *NATPolicy) submit(w *policyWork) error {
 		release()
 		return ErrPolicyQueueFull
 	}
+	if w.activity != nil {
+		if w.ctx != nil {
+			if err := context.Cause(w.ctx); err != nil {
+				s.mu.Unlock()
+				release()
+				return err
+			}
+		}
+		if !w.activity.accept() {
+			s.mu.Unlock()
+			release()
+			return net.ErrClosed
+		}
+		w.payload = bytes.Clone(w.payload)
+	}
 	s.append(w)
 	s.mu.Unlock()
 	release()
@@ -455,6 +508,10 @@ func (p *NATPolicy) submit(w *policyWork) error {
 // Enqueue owns dispose on success and rejection. Send and dispose must finish
 // in bounded time and must not wait for a synchronous policy operation.
 func (p *NATPolicy) Enqueue(chain PolicyChain, n int, send func(), dispose func(), tuples ...PolicyTuple) bool {
+	return p.enqueue(chain, n, 0, false, send, dispose, tuples...)
+}
+
+func (p *NATPolicy) enqueue(chain PolicyChain, n int, generation uint64, fixedGeneration bool, send func(), dispose func(), tuples ...PolicyTuple) bool {
 	if p == nil {
 		send()
 		if dispose != nil {
@@ -462,7 +519,7 @@ func (p *NATPolicy) Enqueue(chain PolicyChain, n int, send func(), dispose func(
 		}
 		return true
 	}
-	w := &policyWork{n: n, chain: chain, dispose: dispose, send: func() (int, error) {
+	w := &policyWork{n: n, chain: chain, dispose: dispose, generation: generation, fixedGeneration: fixedGeneration, send: func() (int, error) {
 		send()
 		return n, nil
 	}}
@@ -494,6 +551,12 @@ func (p *NATPolicy) Send(ctx context.Context, chain PolicyChain, n int, send fun
 	return p.sendWork(w)
 }
 
+func (p *NATPolicy) sendDatagram(ctx context.Context, chain PolicyChain, n int, clock *activityClock, send func() (int, error), tuples ...PolicyTuple) error {
+	return p.sendWork(&policyWork{
+		n: n, chain: chain, tuples: tuples, ctx: ctx, done: make(chan error, 1), send: send, activity: clock,
+	})
+}
+
 func (p *NATPolicy) sendWork(w *policyWork) error {
 	if err := p.submit(w); err != nil {
 		return err
@@ -503,7 +566,9 @@ func (p *NATPolicy) sendWork(w *policyWork) error {
 		return err
 	case <-w.ctx.Done():
 		if p.scheduler(w.chain).cancel(w) {
-			return context.Cause(w.ctx)
+			err := context.Cause(w.ctx)
+			w.settleActivity(err)
+			return err
 		}
 		// A dispatched callback can still own the caller's payload buffer.
 		return <-w.done

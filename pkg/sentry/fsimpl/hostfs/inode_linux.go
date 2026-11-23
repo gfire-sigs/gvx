@@ -17,9 +17,11 @@
 package hostfs
 
 import (
+	"fmt"
 	"os"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hoststorage"
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
@@ -89,4 +91,53 @@ func statxToHostInfo(st *unix.Statx_t) hostInfo {
 		info.btime = time.Unix(st.Btime.Sec, int64(st.Btime.Nsec))
 	}
 	return info
+}
+
+func (h *hostRoot) isolatedLstatAt(dir int, name string) (hostInfo, error) {
+	var st unix.Statx_t
+	const flags = unix.AT_SYMLINK_NOFOLLOW | unix.AT_NO_AUTOMOUNT
+	const mask = statxMask | unix.STATX_MNT_ID
+	if err := retryEINTR(func() error { return unix.Statx(dir, name, flags, mask, &st) }); err != nil {
+		return hostInfo{}, fmt.Errorf("hostfs: stat %q: %w", name, err)
+	}
+	if st.Mask&unix.STATX_MNT_ID == 0 || st.Mnt_id != h.mountID || st.Attributes&unix.STATX_ATTR_AUTOMOUNT != 0 {
+		return hostInfo{}, ErrPathTraversal
+	}
+	return statxToHostInfo(&st), nil
+}
+
+func (h *hostRoot) readIsolatedLink(dir int, name, rel string) (string, error) {
+	fd, err := h.openat(dir, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", fmt.Errorf("hostfs: open link %q: %w", rel, err)
+	}
+	defer unix.Close(fd)
+	return readlinkAt(fd, "", rel)
+}
+
+func (h *hostRoot) isolatedTimesAt(dir int, name string, validate func(hoststorage.StorageIdentity) error, atime, mtime *time.Time) error {
+	fd, err := h.openat(dir, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("hostfs: open %q for timestamps: %w", name, err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	if validate != nil {
+		id, err := hoststorage.VerifyStorageFile(f)
+		if err != nil {
+			return err
+		}
+		if err := validate(id); err != nil {
+			return err
+		}
+	}
+	omit := unix.Timespec{Nsec: unix.UTIME_OMIT}
+	times := [2]unix.Timespec{omit, omit}
+	if atime != nil {
+		times[0] = unix.NsecToTimespec(atime.UnixNano())
+	}
+	if mtime != nil {
+		times[1] = unix.NsecToTimespec(mtime.UnixNano())
+	}
+	return retryEINTR(func() error { return unix.UtimesNanoAt(fd, "", times[:], unix.AT_EMPTY_PATH) })
 }

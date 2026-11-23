@@ -213,6 +213,115 @@ func TestRelayDatagramsExpiresWhenIdle(t *testing.T) {
 	})
 }
 
+func TestRelayDatagramsClearsInheritedHostReadDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		guestPeer, guestConn := net.Pipe()
+		hostPeer, hostConn := net.Pipe()
+		defer guestPeer.Close()
+		defer hostPeer.Close()
+		if err := hostConn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			relayDatagrams(ctx, guestConn, hostConn, time.Minute)
+		}()
+
+		if _, err := hostPeer.Write([]byte("x")); err != nil {
+			t.Fatalf("send after relay took over expired socket: %v", err)
+		}
+		var got [1]byte
+		if _, err := io.ReadFull(guestPeer, got[:]); err != nil || got[0] != 'x' {
+			t.Fatalf("guest received %q, %v; want x", got, err)
+		}
+		cancel()
+		<-done
+	})
+}
+
+func TestProtectedUDPRelayKeepsSessionUntilPacedWriteSettles(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = 100 * time.Millisecond
+		policy := schedulerPolicy(t, schedulerLimit(8), PolicyLimit{})
+		guestPeer, guestConn := net.Pipe()
+		hostPeer, hostConn := net.Pipe()
+		defer guestPeer.Close()
+		defer hostPeer.Close()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			relayDatagramPumps(t.Context(), guestConn, hostConn, idle, newActivityClock(), policy, schedulerIPv4, schedulerIPv4)
+		}()
+
+		if _, err := guestPeer.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(idle * 2)
+		synctest.Wait()
+		schedulerNoEvent(t, done, "UDP expiry while waiting for tokens")
+		var received [1]byte
+		if _, err := io.ReadFull(hostPeer, received[:]); err != nil || received[0] != 'x' {
+			t.Fatalf("paced UDP datagram at host = %q, %v; want x", received, err)
+		}
+		synctest.Wait()
+		time.Sleep(idle - time.Nanosecond)
+		synctest.Wait()
+		schedulerNoEvent(t, done, "UDP expiry before reply window ended")
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		schedulerEvent(t, done, "UDP expiry after paced write")
+	})
+}
+
+func TestProtectedUDPRelayEvictionCancelsBothDirections(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limit := schedulerLimit(8)
+		policy := schedulerPolicy(t, limit, limit)
+		guestPeer, guestConn := net.Pipe()
+		hostPeer, hostConn := net.Pipe()
+		defer guestPeer.Close()
+		defer hostPeer.Close()
+		sess := &udpSession{guest: guestConn, host: hostConn, clock: newActivityClock(), policy: policy}
+		table := newUDPSessionTable(1)
+		table.add(sess)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			relayDatagramPumps(t.Context(), guestConn, hostConn, time.Hour, sess.clock, policy, schedulerIPv4, schedulerIPv4)
+		}()
+
+		if _, err := guestPeer.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := hostPeer.Write([]byte("y")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		// Model an admitted datagram whose pump has not reached its sendWork
+		// cancellation path. Eviction itself must give back its queue space.
+		for _, chain := range []PolicyChain{PolicyInput, PolicyOutput} {
+			err := policy.submit(&policyWork{
+				chain: chain, n: 1, tuples: []PolicyTuple{schedulerIPv4}, activity: sess.clock,
+				ctx: t.Context(), done: make(chan error, 1), send: func() (int, error) { return 1, nil },
+			})
+			if err != nil {
+				t.Fatalf("stage queued datagram for %v: %v", chain, err)
+			}
+		}
+		table.add(newTestSession(t))
+		for _, chain := range []PolicyChain{PolicyInput, PolicyOutput} {
+			if !policy.Enqueue(chain, limit.QueueBytes, func() {}, nil, schedulerIPv4) {
+				t.Errorf("eviction did not immediately free queue space for %v", chain)
+			}
+		}
+		synctest.Wait()
+		schedulerEvent(t, done, "UDP eviction with queued work in both directions")
+	})
+}
+
 func TestRelayDatagramsStopsOnContextAndClosesConnections(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	guestPeer, hostPeer := newUDPEndpoint(t), newUDPEndpoint(t)
@@ -260,8 +369,7 @@ func (c *scriptConn) Read(p []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 }
-func (c *scriptConn) SetReadDeadline(time.Time) error { return nil }
-func (c *scriptConn) Close() error                    { c.once.Do(func() { close(c.closed) }); return nil }
+func (c *scriptConn) Close() error { c.once.Do(func() { close(c.closed) }); return nil }
 
 func connRefused() error {
 	return &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", syscall.ECONNREFUSED)}
@@ -273,7 +381,7 @@ func TestPumpDatagramsSurvivesReadErrorsOfConnectedSocket(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		pumpDatagrams(src, func(p []byte) error { got <- string(p); return nil }, newActivityClock(), time.Hour)
+		pumpDatagrams(src, func(p []byte) error { got <- string(p); return nil })
 	}()
 	// Two refusals, a datagram, then two more refusals and a second datagram.
 	// The counter of consecutive errors resets after each datagram.
@@ -310,7 +418,7 @@ func TestPumpDatagramsEndsOnPersistentReadErrors(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		pumpDatagrams(src, func([]byte) error { return nil }, newActivityClock(), time.Hour)
+		pumpDatagrams(src, func([]byte) error { return nil })
 	}()
 	select {
 	case <-done:
@@ -336,7 +444,7 @@ func TestPumpDatagramsDropsOnlyTheDatagramThatFailsToSend(t *testing.T) {
 			sent = append(sent, string(p))
 			close(delivered)
 			return nil
-		}, newActivityClock(), time.Hour)
+		})
 	}()
 	src.results <- scriptResult{data: "bad"}
 	src.results <- scriptResult{data: "good"}
@@ -360,7 +468,7 @@ func TestPumpDatagramsEndsWhenSendReportsClosed(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		pumpDatagrams(src, func([]byte) error { return net.ErrClosed }, newActivityClock(), time.Hour)
+		pumpDatagrams(src, func([]byte) error { return net.ErrClosed })
 	}()
 	select {
 	case <-done:
@@ -389,29 +497,6 @@ func TestIsTimeoutRecognizesGonetDeadlines(t *testing.T) {
 	}
 	if isTimeout(errors.New("other")) || isTimeout(net.ErrClosed) {
 		t.Fatal("isTimeout reports a non-timeout error as a timeout")
-	}
-}
-
-func TestActivityClock(t *testing.T) {
-	c := newActivityClock()
-	const idle = time.Hour
-	if c.expired(idle) {
-		t.Fatal("new clock is expired")
-	}
-	d1 := c.deadline(idle)
-	c.touch()
-	d2 := c.deadline(idle)
-	if d2.Before(d1) {
-		t.Fatalf("touch moved the deadline back from %v to %v", d1, d2)
-	}
-	if !c.expired(0) {
-		t.Fatal("clock with zero idle time is not expired")
-	}
-	// touch never moves the last activity time backward.
-	c.last.Store(int64(10 * time.Hour))
-	c.touch()
-	if got := time.Duration(c.last.Load()); got != 10*time.Hour {
-		t.Fatalf("touch moved last activity back to %v", got)
 	}
 }
 

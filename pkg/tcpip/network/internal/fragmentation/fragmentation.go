@@ -284,6 +284,18 @@ func (f *Fragmentation) release(r *reassembler, timedOut bool) {
 	}
 
 	if h := f.timeoutHandler; timedOut && h != nil {
+		// A timeout can quote only fragment zero, but its packet-only effect
+		// is charged for every distinct fragment kept by this reassembly.
+		if first := r.pkt; first != nil { // +checklocksignore
+			if policy := first.PacketPolicy(); policy.HasIngress() {
+				for _, hole := range r.holes { // +checklocksignore
+					if hole.first != 0 && hole.pkt != nil {
+						policy.AddIngressFragment(hole.pkt)
+					}
+				}
+				policy.Ingress.Reassembled = true
+			}
+		}
 		h.OnReassemblyTimeout(r.pkt) // +checklocksignore
 	}
 	if r.pkt != nil { // +checklocksignore
@@ -335,6 +347,7 @@ type PacketFragmenter struct {
 	currentFragment    int
 	fragmentOffset     int
 	mark               uint32
+	policyOutput       stack.PacketPolicyOutput
 }
 
 // MakePacketFragmenter prepares the struct needed for packet fragmentation.
@@ -359,6 +372,10 @@ func MakePacketFragmenter(pkt *stack.PacketBuffer, fragmentPayloadLen uint32, re
 	pktBuf := pkt.Data().ToBuffer()
 	fragmentableData.Merge(&pktBuf)
 	fragmentCount := (uint32(fragmentableData.Size()) + fragmentPayloadLen - 1) / fragmentPayloadLen
+	var policyOutput stack.PacketPolicyOutput
+	if policy := pkt.PacketPolicy(); policy != nil {
+		policyOutput = policy.Output
+	}
 
 	return PacketFragmenter{
 		data:               fragmentableData,
@@ -366,6 +383,7 @@ func MakePacketFragmenter(pkt *stack.PacketBuffer, fragmentPayloadLen uint32, re
 		fragmentPayloadLen: int(fragmentPayloadLen),
 		fragmentCount:      int(fragmentCount),
 		mark:               pkt.Mark,
+		policyOutput:       policyOutput,
 	}
 }
 
@@ -387,6 +405,7 @@ func (pf *PacketFragmenter) BuildNextFragment() (*stack.PacketBuffer, int, int, 
 		ReserveHeaderBytes: pf.reserve,
 		Mark:               pf.mark,
 	})
+	fragPkt.PacketPolicy().Output = pf.policyOutput
 
 	// Copy data for the fragment.
 	copied := fragPkt.Data().ReadFrom(&pf.data, pf.fragmentPayloadLen)

@@ -17,13 +17,20 @@
 # Pure-Go Sentry and Netstack core. SPEC 3.1 requires these files to build on all four
 # Priority-0 targets. Upstream gives them no //go:build line, so retag edits nothing today.
 # The audit still fails if any of them stops building on a target.
-pkg/sentry/kernel/kernel.go
+seam pkg/sentry/kernel/kernel.go
 pkg/sentry/arch/arch.go
 pkg/ring0/ring0.go
 pkg/sentry/vfs/vfs.go
 pkg/sentry/fsimpl/tmpfs/tmpfs.go
 seam pkg/tcpip/tcpip.go
 seam pkg/tcpip/tcpip_state_autogen.go
+# Restrict checkpoint page metadata to its declared hook-free types.
+seam pkg/sentry/kernel/kernel_restore.go
+seam pkg/state/decode.go
+seam pkg/state/graph_decode_callbacks_unsafe.go
+seam pkg/state/graph_decode_unsafe.go
+seam pkg/state/state.go
+seam pkg/state/types.go
 
 # Content seams: EROFS inline xattr, device node, and listxattr support (SPEC 3.6).
 # Upstream rejects any inode with xattrs, which breaks OCI layers that carry capabilities.
@@ -229,6 +236,25 @@ seam pkg/tcpip/stack/nic.go
 # receiving NIC (pkg/tcpip/network/ipv6/local_delivery_xplat.go). The seam is one call in
 # forwardUnicastPacket.
 seam pkg/tcpip/network/ipv6/ipv6.go
+# The private NAT peer retains fragment lengths and classifies local delivery
+# by the actual transport endpoint. UDP replies carry their tuple to the link.
+seam pkg/tcpip/adapters/gonet/gonet.go
+seam pkg/tcpip/network/internal/fragmentation/fragmentation.go
+seam pkg/tcpip/stack/transport_demuxer.go
+seam pkg/tcpip/transport/tcp/accept.go
+seam pkg/tcpip/transport/tcp/connect.go
+seam pkg/tcpip/transport/udp/endpoint.go
+seam pkg/tcpip/transport/udp/forwarder.go
+# Charge packets before a private peer emits an ICMP response.
+seam pkg/tcpip/network/ipv4/icmp.go
+seam pkg/tcpip/network/ipv6/icmp.go
+# Keep private NAT metadata out of serializable packet and socket layouts.
+seam pkg/tcpip/socketops.go
+seam pkg/tcpip/stack/packet_buffer_unsafe.go
+# Stage TCP endpoint restore order for each decoded stack.
+seam pkg/tcpip/transport/tcp/endpoint_state.go
+# A restored link can close before checkpoint admission starts its dispatcher.
+seam pkg/tcpip/link/veth/veth.go
 # NETLINK_NETFILTER opens without nftables and serves the subsystem CTNETLINK
 # (pkg/sentry/socket/netlink/netfilter/ctnetlink_xplat.go).
 seam pkg/sentry/socket/netlink/netfilter/protocol.go

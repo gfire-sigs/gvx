@@ -299,6 +299,12 @@ func (so *SocketOptions) InitHandler(handler SocketOptionsHandler, stack StackHa
 	so.getReceiveBufferLimits = getReceiveBufferLimits
 }
 
+// UsesRelayStackHandler reports whether the socket belongs to a private relay.
+func (so *SocketOptions) UsesRelayStackHandler() bool {
+	_, relay := so.stackHandler.(interface{ IsRelaySocketStackHandler() })
+	return relay
+}
+
 func storeAtomicBool(addr *atomicbitops.Uint32, v bool) {
 	var val uint32
 	if v {

@@ -16,8 +16,18 @@
 
 package hostfs
 
+import (
+	"time"
+
+	"z.gfire.dev/gvx/internal/hoststorage"
+)
+
 // lstatBound reads the metadata of the bound file of a single-file workspace.
 // A Unix host checks nothing beyond the lstat of the name.
 func (h *hostRoot) lstatBound(name string) (hostInfo, error) {
 	return h.lstat(name)
+}
+
+func (h *hostRoot) chtimesBound(name string, atime, mtime *time.Time, validate func(hoststorage.StorageIdentity) error) error {
+	return h.isolatedTimesAt(h.rootFD(), name, validate, atime, mtime)
 }

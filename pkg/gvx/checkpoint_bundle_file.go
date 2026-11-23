@@ -19,22 +19,59 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+
+	"z.gfire.dev/gvx/internal/hoststorage"
 )
 
-// openBundleFile opens the file name of the checkpoint bundle in dir. The
-// file must be a regular file, or absent when flag has os.O_CREATE.
-//
-// A bundle is untrusted input. A symbolic link in it could redirect a read or
-// a write of the host process to another host file, and a FIFO could block
-// the open call. The function reads the type of the entry before it opens the
-// entry. It opens the entry through an os.Root, so a name that another
-// process replaces between the two steps cannot leave dir.
-func openBundleFile(dir, name string, flag int, perm os.FileMode) (*os.File, error) {
-	root, err := os.OpenRoot(dir)
+type bundleRoot struct {
+	path       string
+	root       *os.Root
+	dir        *os.File
+	identities []hoststorage.StorageIdentity
+}
+
+func openBundleRoot(path string, isolated bool) (*bundleRoot, error) {
+	root, err := os.OpenRoot(path)
 	if err != nil {
 		return nil, err
 	}
-	defer root.Close()
+	if !isolated {
+		return &bundleRoot{path: path, root: root}, nil
+	}
+	dir, err := root.Open(".")
+	if err := errors.Join(err, root.Close()); err != nil {
+		if dir != nil {
+			err = errors.Join(err, dir.Close())
+		}
+		return nil, err
+	}
+	return &bundleRoot{path: path, dir: dir}, nil
+}
+
+func (b *bundleRoot) Close() error {
+	if b.dir != nil {
+		return b.dir.Close()
+	}
+	return b.root.Close()
+}
+
+func (b *bundleRoot) openFile(name string, flag int, perm os.FileMode) (*os.File, error) {
+	if b.dir != nil {
+		f, err := hoststorage.OpenStorageFile(b.dir, name, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		id, err := hoststorage.VerifyStorageFile(f)
+		if err != nil {
+			return nil, errors.Join(err, f.Close())
+		}
+		b.identities = append(b.identities, id)
+		return f, nil
+	}
+	root := b.root
+
+	// Reject special files before opening. The OS root confines the open to
+	// this bundle even if the entry changes after the type inspection.
 
 	info, err := root.Lstat(name)
 	switch {

@@ -330,7 +330,9 @@ A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.me
 
 The bundle preserves the guest's IPv4 and IPv6 `iptables-legacy` rules in each network namespace. It does not preserve connection tracking entries, host socket sessions, or the host NAT policy. A protected bundle requires explicit host policy files on restore (see Section 4.12).
 
-Use a `rungv` build that supports guest firewall restore to resume a new bundle. Older bundles do not contain guest firewall rules.
+Restore validates guest firewall rules in every network namespace before it enables networking. A version 1 bundle has no guest firewall rules. Use `-trust-legacy-checkpoint` only to import a version 1 bundle from a trusted source. This import starts the guest with Linux default rules.
+
+The checkpoint client verifies required tokens before it connects. The Android SDK opens tokens relative to the app's private cache directory. On Windows, the checkpoint client can also read older tokens with inherited permissions that grant access only to the current user and SYSTEM.
 
 | Command or flag | Meaning |
 | :--- | :--- |
@@ -364,6 +366,7 @@ Each rule file has a 64 KiB limit. Each built-in chain can visit at most 4,096 r
 | Relay rules | Both guest and host endpoint tuples must pass. A destination port on one side does not authorize a different port on the other side. |
 | Denials | Unsupported rules reject the full update. If an unknown field affects a verdict, the backend denies that operation. Policy `ACCEPT` never overrides `-isolate-lan`. |
 | Publications | Protected runs reject Unix-socket publications and wildcard UDP bind addresses. The default loopback bind is valid. |
+| Fragments | The peer tests guest fragments before reassembly. A port rule cannot match a fragment without a validated transport header. The peer retains the datagram tuple for UDP replies that it fragments locally. |
 | Bandwidth | Each direction takes `unlimited` or `rate-bps=N,burst-bytes=B,queue-bytes=Q`. One bucket per direction covers all protected paths. RX limits delivery, not packets the host kernel already received. |
 
 Pass both rule files on every protected start or restore. A protected checkpoint rejects restore without these files. It does not record which rules or limits were active. The operator selects the policy for the next run.
@@ -371,7 +374,7 @@ Pass both rule files on every protected start or restore. A protected checkpoint
 `net-policy replace` changes both rule sets and both limits together. The last successful replacement wins. Neither `get` nor `replace` edits the input files. If a reply is lost, use `get` before retrying.
 
 > [!IMPORTANT]
-> Keep policy files and control endpoints outside guest mounts.
+> Keep policy files, checkpoints, and control endpoints outside guest mounts. Protected host mounts must support checks that prevent access across host mount boundaries.
 
 ```sh
 rungv run -net=nat --nat-iptables-file rules.v4 --nat-ip6tables-file rules.v6 \
@@ -384,6 +387,8 @@ rungv checkpoint -control-socket tcp://127.0.0.1:7401
 rungv restore -checkpoint-dir ./ckpt \
   --nat-iptables-file next.v4 --nat-ip6tables-file next.v6
 ```
+
+On Linux, protected host mounts require `openat2` and mount IDs from `statx`. The runtime rejects layouts that cannot prove separation, including alternate views of one mount. Android does not support live host mounts in protected mode.
 
 The NAT backend refuses guest connections to its own TCP control endpoint. A checkpoint listener does not enable policy commands unless the operator sets `--net-policy-live`.
 

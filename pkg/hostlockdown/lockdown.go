@@ -55,6 +55,13 @@ type HostMount struct {
 	// is not a regular file. Apply accepts a symbolic link to a regular file.
 	// The lockdown does not allow access to the parent directory by path.
 	File bool
+
+	// Root is the borrowed, validated directory of a protected mount.
+	// For a file mount it is the containing directory, and BoundFile and
+	// Leaf identify the validated file. Apply does not close these files.
+	Root      *os.File
+	BoundFile *os.File
+	Leaf      string
 }
 
 // Options configures the host OS lockdown boundary.
@@ -223,6 +230,12 @@ func validateMounts(mounts []HostMount) error {
 		}
 		if filepath.Dir(abs) == abs {
 			return fmt.Errorf("hostlockdown: mount %q is the root of a file system and would allow every host file", m.Path)
+		}
+		if m.Root != nil {
+			if m.File != (m.BoundFile != nil && m.Leaf != "") {
+				return fmt.Errorf("hostlockdown: invalid pinned mount %q", m.Path)
+			}
+			continue
 		}
 		if !m.File {
 			continue

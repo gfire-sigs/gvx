@@ -52,8 +52,10 @@ type hostRoot struct {
 	// form of fileKey.dev. It is zero when the query failed. rootPath is the
 	// normalized path of the root without the volume, or "" when the query
 	// failed. Both stay unchanged after newHostRoot. existsByID uses them.
-	volume   uint64
-	rootPath string
+	volume     uint64
+	rootPath   string
+	isolated   bool
+	pinnedFile *os.File
 }
 
 // fileShareAll lets other openers read, write, and delete the file while

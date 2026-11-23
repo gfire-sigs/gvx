@@ -40,7 +40,20 @@ func (h natPolicyHooks) allows(chain PolicyChain, pkt *stack.PacketBuffer) bool 
 }
 
 func (h natPolicyHooks) CheckInput(pkt *stack.PacketBuffer, _ *stack.Route, _ stack.AddressFamily) bool {
-	return h.allows(PolicyInput, pkt)
+	metadata := pkt.PacketPolicy()
+	if !metadata.HasIngress() {
+		return false
+	}
+	tuple, ipBytes, ok := policyPacketDetails(pkt)
+	if !ok || !h.policy.active.allows(PolicyInput, []PolicyTuple{tuple}) {
+		return false
+	}
+	input := &metadata.Ingress
+	input.WireBytes = ipBytes
+	input.Protocol, input.ProtocolKnown = tcpip.TransportProtocolNumber(tuple.Protocol), tuple.ProtocolKnown
+	input.SourcePort, input.SourcePortKnown = tuple.SourcePort, tuple.SourcePortKnown
+	input.DestinationPort, input.DestinationPortKnown = tuple.DestinationPort, tuple.DestinationPortKnown
+	return true
 }
 
 func (h natPolicyHooks) CheckForward(pkt *stack.PacketBuffer, _ *stack.Route, _ tcpip.NICID, _ stack.AddressFamily) bool {
@@ -48,7 +61,85 @@ func (h natPolicyHooks) CheckForward(pkt *stack.PacketBuffer, _ *stack.Route, _ 
 }
 
 func (h natPolicyHooks) CheckOutput(pkt *stack.PacketBuffer, _ *stack.Route, _ tcpip.NICID, _ stack.AddressFamily) bool {
+	metadata := pkt.PacketPolicy()
+	if metadata != nil {
+		if output, ok := metadata.Output.Provenance.(*natRelayOutput); ok {
+			// The pipe is the final handoff. It checks the original legs under
+			// the snapshot pinned by the relay's synchronous write.
+			return output.policy == h.policy
+		}
+	}
 	return h.allows(PolicyOutput, pkt)
+}
+
+func (h natPolicyHooks) DeliverPacketOnly(pkt *stack.PacketBuffer, deliver func(*stack.PacketBuffer)) {
+	h.deliverPacketOnly(pkt, deliver, false)
+}
+
+func (h natPolicyHooks) DeliverReassemblyTimeout(pkt *stack.PacketBuffer, deliver func(*stack.PacketBuffer)) {
+	release := h.policy.tryRead()
+	if release == nil {
+		return
+	}
+	defer release()
+	// Netstack calls the timeout handler under its reassembly lock. Do not
+	// run a synchronous pipe write until that lock can be released.
+	h.deliverPacketOnly(pkt, deliver, true)
+}
+
+func (h natPolicyHooks) deliverPacketOnly(pkt *stack.PacketBuffer, deliver func(*stack.PacketBuffer), forceQueue bool) {
+	metadata := pkt.PacketPolicy()
+	if metadata == nil {
+		return
+	}
+	input := metadata.Ingress
+	wire, ok := input.Attachment.(*natPacketLinkState)
+	if !ok || input.WireBytes <= 0 || input.Generation != h.policy.generation {
+		return
+	}
+	chargedDelivery := func(pkt *stack.PacketBuffer) {
+		metadata.Ingress.Accounted = true
+		deliver(pkt)
+	}
+	if !forceQueue && h.policy.active.config.TX.RateBPS == 0 {
+		chargedDelivery(pkt)
+		return
+	}
+	tuple := policyInputTuple(pkt)
+	pkt.IncRef()
+	h.policy.enqueue(PolicyInput, input.WireBytes, input.Generation, input.Reassembled, func() {
+		wire.withActive(input.Epoch, func() { chargedDelivery(pkt) })
+	}, pkt.DecRef, tuple)
+}
+
+func (h natPolicyHooks) ForwardPacket(pkt *stack.PacketBuffer, forward func(*stack.PacketBuffer, stack.PacketPolicyOutput), dispose func()) {
+	metadata := pkt.PacketPolicy()
+	if metadata == nil {
+		dispose()
+		return
+	}
+	input := metadata.Ingress
+	wire, ok := input.Attachment.(*natPacketLinkState)
+	if !ok {
+		dispose()
+		return
+	}
+	tuple, ipBytes, ok := policyPacketDetails(pkt)
+	if !ok {
+		dispose()
+		return
+	}
+	// Never put forwarded fragments through reassembly. The unit is the
+	// individual ingress packet, even when the outgoing MTU fragments it.
+	pkt.IncRef()
+	h.policy.Enqueue(PolicyForward, ipBytes, func() {
+		wire.withActive(input.Epoch, func() {
+			forward(pkt, stack.PacketPolicyOutput{Provenance: wire})
+		})
+	}, func() {
+		pkt.DecRef()
+		dispose()
+	}, tuple)
 }
 
 func (natPolicyHooks) CheckPrerouting(*stack.PacketBuffer, *stack.Route, stack.AddressFamily) bool {
@@ -99,19 +190,55 @@ func (s *natPacketLinkState) withActive(epoch uint64, send func()) {
 	}
 }
 
+type natPolicyDispatcher struct {
+	stack.NetworkDispatcher
+	policy *NATPolicy
+	state  *natPacketLinkState
+}
+
+func (d natPolicyDispatcher) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	epoch := d.state.epoch.Load()
+	d.state.withActive(epoch, func() {
+		release := d.policy.tryRead()
+		if release == nil {
+			return
+		}
+		defer release()
+		if d.policy.active == nil {
+			return
+		}
+		// The pipe allocates a fresh buffer containing only wire bytes.
+		// This context is derived solely from the private receiving end.
+		pkt.PacketPolicy().Ingress = stack.PacketPolicyIngress{
+			Attachment: d.state,
+			Epoch:      epoch,
+			Generation: d.policy.generation,
+		}
+		d.NetworkDispatcher.DeliverNetworkPacket(protocol, pkt)
+	})
+}
+
 type natPolicyLink struct {
 	stack.LinkEndpoint
 	policy *NATPolicy
 	state  *natPacketLinkState
-	chain  PolicyChain
 }
 
-func wrapNATPolicyLink(ep stack.LinkEndpoint, policy *NATPolicy, chain PolicyChain, state *natPacketLinkState) stack.LinkEndpoint {
+func wrapNATPolicyLink(ep stack.LinkEndpoint, policy *NATPolicy, state *natPacketLinkState) stack.LinkEndpoint {
 	if policy == nil {
 		return ep
 	}
-	return &natPolicyLink{LinkEndpoint: ep, policy: policy, state: state, chain: chain}
+	return &natPolicyLink{LinkEndpoint: ep, policy: policy, state: state}
 }
+
+func (e *natPolicyLink) Attach(d stack.NetworkDispatcher) {
+	if d != nil {
+		d = natPolicyDispatcher{NetworkDispatcher: d, policy: e.policy, state: e.state}
+	}
+	e.LinkEndpoint.Attach(d)
+}
+
+func (*natPolicyLink) SynchronousPolicyLink() {}
 
 func (e *natPolicyLink) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	if pkts.Len() == 1 {
@@ -125,53 +252,94 @@ func (e *natPolicyLink) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Er
 }
 
 func (e *natPolicyLink) writePacket(pkt *stack.PacketBuffer, direct stack.PacketBufferList) {
+	metadata := pkt.PacketPolicy()
+	var policyOutput stack.PacketPolicyOutput
+	if metadata != nil {
+		policyOutput = metadata.Output
+	}
+	if wire, ok := policyOutput.Provenance.(*natPacketLinkState); ok {
+		// The FORWARD continuation already owns the epoch and accounts
+		// for the original packet. Do not filter/charge its egress again.
+		if wire == e.state {
+			e.deliverOne(pkt, direct)
+		}
+		return
+	}
 	epoch := e.state.epoch.Load()
 	if e.state.closed.Load() || e.state.paused.Load() {
 		return
 	}
-	tuple, ipBytes, socketBacked, ok := policyPacketDetails(pkt)
+	if output, ok := policyOutput.Provenance.(*natRelayOutput); ok {
+		if output.policy != e.policy || !output.snapshot.allows(PolicyOutput, output.tuples) {
+			return
+		}
+		if policyOutput.PayloadAccounted {
+			e.state.withActive(epoch, func() { e.deliverOne(pkt, direct) })
+			return
+		}
+		_, ipBytes, valid := policyPacketDetails(pkt)
+		if valid {
+			metadata.Output.Provenance = nil
+			e.queuePacket(pkt, epoch, ipBytes, output.tuples...)
+		}
+		return
+	}
+	tuple, ipBytes, ok := policyPacketDetails(pkt)
 	if !ok {
 		return
 	}
-	if socketBacked || !tuple.ProtocolKnown {
-		// Socket payload is charged at its relay. An unresolved fragment
-		// could belong to either accounting path; pass it only if that
-		// direction is unlimited. The peer hooks still filter its tuple.
+	if policyOutput.RelayTCP {
 		e.state.withActive(epoch, func() {
-			var release func()
-			var allowed bool
-			if e.chain == PolicyInput {
-				// Synchronous pipe delivery enters the peer INPUT matcher below.
-				release, allowed = e.policy.beginUnshaped(e.chain, !tuple.ProtocolKnown)
-			} else {
-				release, allowed = e.policy.beginUnshaped(e.chain, !tuple.ProtocolKnown, tuple)
-			}
-			if !allowed {
-				return
-			}
-			defer release()
-			if direct.Len() == 1 {
-				_, _ = e.LinkEndpoint.WritePackets(direct)
-			} else {
-				e.deliver(pkt)
+			release, allowed := e.policy.Begin(PolicyOutput, tuple)
+			if allowed {
+				defer release()
+				e.deliverOne(pkt, direct)
 			}
 		})
 		return
 	}
-	// The queue owns the reference on both acceptance and rejection. Its
-	// callback writes directly to the pipe, not back into this wrapper. Raw
-	// host writes (including dial-failure ICMP) also get checked here, even
-	// when Netstack skips the OUTPUT hook.
-	pkt.IncRef()
-	e.policy.Enqueue(e.chain, ipBytes, func() {
-		e.state.withActive(epoch, func() { e.deliver(pkt) })
-	}, pkt.DecRef, tuple)
+	// Raw writes, including dial-failure ICMP, must still pass OUTPUT
+	// even when Netstack skips its OUTPUT hook.
+	e.queuePacket(pkt, epoch, ipBytes, tuple)
 }
 
-func (e *natPolicyLink) deliver(pkt *stack.PacketBuffer) {
+func (e *natPolicyLink) queuePacket(pkt *stack.PacketBuffer, epoch uint64, size int, tuples ...PolicyTuple) {
+	pkt.IncRef()
+	e.policy.Enqueue(PolicyOutput, size, func() {
+		e.state.withActive(epoch, func() { e.deliverOne(pkt, stack.PacketBufferList{}) })
+	}, pkt.DecRef, tuples...)
+}
+
+func (e *natPolicyLink) deliverOne(pkt *stack.PacketBuffer, direct stack.PacketBufferList) {
+	if direct.Len() == 1 {
+		_, _ = e.LinkEndpoint.WritePackets(direct)
+		return
+	}
 	var one stack.PacketBufferList
 	one.PushBack(pkt)
 	_, _ = e.LinkEndpoint.WritePackets(one)
+}
+
+type natRelayOutput struct {
+	policy   *NATPolicy
+	snapshot *CompiledPolicy
+	tuples   []PolicyTuple // borrowed for the synchronous private write
+}
+
+// writeNATRelayDatagram runs only inside an eligible policy scheduler
+// callback. Its pinned snapshot remains active until the synchronous private
+// pipe write, including all locally generated fragments, returns.
+func writeNATRelayDatagram(policy *NATPolicy, dst *gonet.UDPConn, payload []byte, tuples ...PolicyTuple) (int, error) {
+	if len(tuples) == 0 || len(tuples) > 2 {
+		return 0, ErrPolicyDenied
+	}
+	output := &policy.relayOutput
+	*output = natRelayOutput{policy: policy, snapshot: policy.active, tuples: tuples}
+	defer func() { *output = natRelayOutput{} }()
+	return dst.WriteWithPacketPolicy(payload, stack.PacketPolicyOutput{
+		Provenance:       output,
+		PayloadAccounted: true,
+	})
 }
 
 func policySocketAddrPort(addr net.Addr) netip.AddrPort {
@@ -297,7 +465,7 @@ func (nf *NATForwarder) startProtectedUDP(r *udp.ForwarderRequest, target netip.
 			return
 		}
 		widenUDPSend(hostConn)
-		sess := &udpSession{guest: guestConn, host: hostConn, clock: newActivityClock()}
+		sess := &udpSession{guest: guestConn, host: hostConn, clock: newActivityClock(), policy: policy}
 		nf.udpSessions.add(sess)
 		releaseSlot(nf.udpDialSem)
 		defer nf.udpSessions.remove(sess)

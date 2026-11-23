@@ -45,6 +45,7 @@ import java.util.Set;
 public final class Gvx {
     /** The file name of rungv in the native library directory. */
     public static final String EXECUTABLE = "librungv.so";
+    private static final String LAUNCHER = "librungv-launcher.so";
 
     /** The commands of rungv that resolve registry names. */
     private static final Set<String> PULLING_COMMANDS =
@@ -63,7 +64,9 @@ public final class Gvx {
             throw new IllegalArgumentException("rungv needs a command");
         }
         List<String> cmd = new ArrayList<>();
-        cmd.add(new File(ctx.getApplicationInfo().nativeLibraryDir, EXECUTABLE).getPath());
+        File cacheDir = ctx.getCacheDir();
+        cmd.add(new File(ctx.getApplicationInfo().nativeLibraryDir, LAUNCHER).getPath());
+        cmd.add(cacheDir.getPath());
         cmd.add(args.get(0));
         if (PULLING_COMMANDS.contains(args.get(0))) {
             for (String server : activeDnsServers(ctx)) {
@@ -75,8 +78,8 @@ public final class Gvx {
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(ctx.getFilesDir());
         Map<String, String> env = pb.environment();
         env.put("HOME", ctx.getFilesDir().getPath());
-        env.put("XDG_CACHE_HOME", ctx.getCacheDir().getPath());
-        env.put("TMPDIR", ctx.getCacheDir().getPath());
+        env.put("XDG_CACHE_HOME", cacheDir.getPath());
+        env.put("TMPDIR", cacheDir.getPath());
         return pb.start();
     }
 

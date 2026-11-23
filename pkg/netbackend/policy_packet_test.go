@@ -52,9 +52,9 @@ func TestPolicyPacketFromStackUDP(t *testing.T) {
 			}
 			for i := range tc.fragments {
 				pkt := readPolicyTestUDP(t, ep, netProto(remote))
-				tuple, ipBytes, socketBacked, ok := policyPacketDetails(pkt)
-				if !ok || !socketBacked || ipBytes != pkt.Size() {
-					t.Fatalf("UDP fragment %d: valid = %t, socket-backed = %t, IP bytes = %d, packet = %d", i, ok, socketBacked, ipBytes, pkt.Size())
+				tuple, ipBytes, ok := policyPacketDetails(pkt)
+				if !ok || ipBytes != pkt.Size() {
+					t.Fatalf("UDP fragment %d: valid = %t, IP bytes = %d, packet = %d", i, ok, ipBytes, pkt.Size())
 				}
 				if tuple.IPv6 != remote.Is6() || tuple.Source != local.Addr() || tuple.Destination != remote ||
 					!tuple.ProtocolKnown || tuple.Protocol != uint8(header.UDPProtocolNumber) {
@@ -134,10 +134,10 @@ func TestPolicyPacketIPv6WalksSplitViews(t *testing.T) {
 	padded := append(bytes.Clone(wire), 0xff, 0xff)
 	pkt := policyTestPacketBuffer(t, header.IPv6ProtocolNumber, padded[:5], padded[5:41], padded[41:57], padded[57:59], padded[59:])
 	pkt.TransportProtocolNumber = header.UDPProtocolNumber
-	tuple, ipBytes, socketBacked, ok := policyPacketDetails(pkt)
-	if !ok || !socketBacked || ipBytes != len(wire) || !tuple.IPv6 || !tuple.ProtocolKnown || tuple.Protocol != tcp ||
+	tuple, ipBytes, ok := policyPacketDetails(pkt)
+	if !ok || ipBytes != len(wire) || !tuple.IPv6 || !tuple.ProtocolKnown || tuple.Protocol != tcp ||
 		!tuple.SourcePortKnown || !tuple.DestinationPortKnown || tuple.SourcePort != 12345 || tuple.DestinationPort != 443 {
-		t.Fatalf("split IPv6 packet: tuple = %+v, valid = %t, socket-backed = %t, IP bytes = %d, want %d", tuple, ok, socketBacked, ipBytes, len(wire))
+		t.Fatalf("split IPv6 packet: tuple = %+v, valid = %t, IP bytes = %d, want %d", tuple, ok, ipBytes, len(wire))
 	}
 	view := pkt.ToView()
 	defer view.Release()
@@ -183,16 +183,16 @@ func TestPolicyPacketIPv6FragmentsExposeOnlyValidatedFields(t *testing.T) {
 	}
 }
 
-func TestPolicyPacketAHIsPacketOnly(t *testing.T) {
+func TestPolicyPacketIPv6WalksAuthenticationHeader(t *testing.T) {
 	const ah = uint8(header.IPv6AuthenticationExtHdrIdentifier)
 	const udp = uint8(header.UDPProtocolNumber)
 	payload := make([]byte, 16+header.UDPMinimumSize)
 	payload[0], payload[1] = udp, 2
 	header.UDP(payload[16:]).Encode(&header.UDPFields{SrcPort: 12345, DstPort: 53, Length: header.UDPMinimumSize})
 	wire := policyTestIPv6Packet(ah, payload)
-	tuple, ipBytes, socketBacked, ok := policyPacketDetails(policyTestPacketBuffer(t, header.IPv6ProtocolNumber, wire))
-	if !ok || socketBacked || ipBytes != len(wire) || !tuple.ProtocolKnown || tuple.Protocol != udp || tuple.DestinationPort != 53 {
-		t.Fatalf("AH transport tuple = %+v, valid = %t, socket-backed = %t, IP bytes = %d, want %d", tuple, ok, socketBacked, ipBytes, len(wire))
+	tuple, ipBytes, ok := policyPacketDetails(policyTestPacketBuffer(t, header.IPv6ProtocolNumber, wire))
+	if !ok || ipBytes != len(wire) || !tuple.ProtocolKnown || tuple.Protocol != udp || tuple.DestinationPort != 53 {
+		t.Fatalf("AH transport tuple = %+v, valid = %t, IP bytes = %d, want %d", tuple, ok, ipBytes, len(wire))
 	}
 }
 

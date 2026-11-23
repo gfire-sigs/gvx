@@ -18,6 +18,7 @@ package hostlockdown
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -130,6 +131,26 @@ func resolveMounts(mounts []HostMount) (abs, real []string, err error) {
 		a, r, err := resolveMountPath(m.Path)
 		if err != nil {
 			return nil, nil, err
+		}
+		if m.Root != nil {
+			flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
+			if !m.File {
+				flags |= unix.O_DIRECTORY
+			}
+			fd, err := unix.Open(r, flags, 0)
+			if err != nil {
+				return nil, nil, err
+			}
+			f := os.NewFile(uintptr(fd), r)
+			err = verifyDarwinMount(m, f)
+			closeErr := f.Close()
+			if err != nil {
+				return nil, nil, err
+			}
+			if closeErr != nil {
+				return nil, nil, closeErr
+			}
+			a = r
 		}
 		abs = append(abs, a)
 		real = append(real, r)

@@ -60,6 +60,45 @@ func buildIPv4UDPPacket(src, dst tcpip.Address, srcPort, dstPort uint16, payload
 	return pkt
 }
 
+func TestPacketCheckpointDropsLivePolicyMetadata(t *testing.T) {
+	ctx := context.Background()
+	released := 0
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Mark:      42,
+		OnRelease: func() { released++ },
+	})
+	defer func() {
+		pkt.DecRef()
+		if released != 1 {
+			t.Errorf("original packet release count = %d, want 1", released)
+		}
+	}()
+	pkt.PacketPolicy().Ingress.Attachment = "private link"
+	pkt.PacketPolicy().Output.Provenance = "relay"
+
+	var checkpoint bytes.Buffer
+	if _, err := state.Save(ctx, &checkpoint, &pkt); err != nil {
+		t.Fatalf("save packet: %v", err)
+	}
+	var restored *stack.PacketBuffer
+	if _, err := state.Load(ctx, &checkpoint, &restored); err != nil {
+		t.Fatalf("load packet: %v", err)
+	}
+	defer restored.DecRef()
+	if restored.Mark != 42 {
+		t.Errorf("restored packet mark = %d, want 42", restored.Mark)
+	}
+	if restored.PacketPolicy() != nil {
+		t.Fatal("restored packet has live policy metadata")
+	}
+
+	clone := restored.Clone()
+	defer clone.DecRef()
+	if got := clone.PacketPolicy(); got == nil || got.HasIngress() || got.Output.Provenance != nil {
+		t.Errorf("clone policy metadata = %+v, want fresh empty metadata", got)
+	}
+}
+
 func TestConnTrackNATSaveLoadPreservesSessionAndCount(t *testing.T) {
 	clock := faketime.NewManualClock()
 	clock.Advance(10 * time.Second)

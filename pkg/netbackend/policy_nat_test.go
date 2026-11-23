@@ -16,10 +16,11 @@ package netbackend
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -29,8 +30,11 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
+	"z.gfire.dev/gvx/pkg/tcpip/link/pipe"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
+	"z.gfire.dev/gvx/pkg/tcpip/transport/udp"
 )
 
 func compileNATPolicyTest(t *testing.T, ipv4Rules string, tx, rx PolicyLimit) *CompiledPolicy {
@@ -215,22 +219,22 @@ func natPolicyProbeIPv4(proto uint8) []byte {
 	return packet
 }
 
-func TestNATPolicyShapesRawLinkIPBytesWithoutShapingSocketPackets(t *testing.T) {
+func TestNATPolicyShapesRawUDPAndICMPByIPLength(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		limit := PolicyLimit{RateBPS: 8, BurstBytes: minPolicyBurst, QueueBytes: minPolicyBurst}
 		policy := NewNATPolicy(compileNATPolicyTest(t, "", PolicyLimit{}, limit), netip.AddrPort{})
 		defer policy.Close()
 		sent := make(chan time.Time, 2)
 		state := &natPacketLinkState{paused: new(atomic.Bool)}
-		link := wrapNATPolicyLink(natPolicyProbeLink{sent: sent}, policy, PolicyOutput, state)
+		link := wrapNATPolicyLink(natPolicyProbeLink{sent: sent}, policy, state)
 		start := time.Now()
 		sendNATPolicyProbe(t, link, header.IPv4ProtocolNumber, natPolicyProbeIPv4(uint8(header.UDPProtocolNumber)))
-		if elapsed := (<-sent).Sub(start); elapsed != 0 {
-			t.Fatalf("socket packet took %v through the link; want no link debit", elapsed)
+		if elapsed := (<-sent).Sub(start); elapsed != 28*time.Second {
+			t.Fatalf("raw UDP took %v at one byte per second; want 28 IP bytes", elapsed)
 		}
 		sendNATPolicyProbe(t, link, header.IPv4ProtocolNumber, natPolicyProbeIPv4(uint8(header.ICMPv4ProtocolNumber)))
-		if elapsed := (<-sent).Sub(start); elapsed != 28*time.Second {
-			t.Fatalf("raw packet took %v at one byte per second; want 28 IP bytes, excluding padding", elapsed)
+		if elapsed := (<-sent).Sub(start); elapsed != 56*time.Second {
+			t.Fatalf("raw UDP and ICMP took %v at one byte per second; want 56 IP bytes, excluding padding", elapsed)
 		}
 	})
 }
@@ -242,7 +246,7 @@ func TestNATPolicyFiltersRawHostPacketsWithoutHeaders(t *testing.T) {
 		defer policy.Close()
 		sent := make(chan time.Time, 1)
 		state := &natPacketLinkState{paused: new(atomic.Bool)}
-		link := wrapNATPolicyLink(natPolicyProbeLink{sent: sent}, policy, PolicyOutput, state)
+		link := wrapNATPolicyLink(natPolicyProbeLink{sent: sent}, policy, state)
 		sendNATPolicyProbe(t, link, header.IPv4ProtocolNumber, natPolicyProbeIPv4(uint8(header.ICMPv4ProtocolNumber)))
 		synctest.Wait()
 		if len(sent) != 0 {
@@ -251,35 +255,187 @@ func TestNATPolicyFiltersRawHostPacketsWithoutHeaders(t *testing.T) {
 	})
 }
 
-func TestNATPolicyAmbiguousIPv6FragmentRequiresUnlimitedLink(t *testing.T) {
-	packet := make([]byte, 56)
-	packet[0], packet[6], packet[7] = 0x60, 44, 64 // IPv6 with a Fragment header.
-	binary.BigEndian.PutUint16(packet[4:6], 16)
-	packet[8], packet[23], packet[24], packet[39] = 0x20, 1, 0x20, 2
-	packet[40], packet[43] = 60, 8 // Non-initial fragment of Destination Options.
+func newPolicyUDPPeer(t *testing.T, addr tcpip.FullAddress, factory stack.NetworkProtocolFactory, proto tcpip.NetworkProtocolNumber, subnet tcpip.Subnet, link stack.LinkEndpoint, hooks stack.NFTablesInterface) *stack.Stack {
+	t.Helper()
+	// TCP's runtime sleeper prevents synctest from advancing time.
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{factory},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+		NFTables:           hooks,
+	})
+	t.Cleanup(s.Destroy)
+	if hooks != nil {
+		s.SetNFTablesConfigured(true)
+	}
+	if err := s.CreateNIC(addr.NIC, link); err != nil {
+		t.Fatalf("create NIC %d: %s", addr.NIC, err)
+	}
+	if err := s.AddProtocolAddress(addr.NIC, tcpip.ProtocolAddress{
+		Protocol:          proto,
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: addr.Addr, PrefixLen: addr.Addr.BitLen()},
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("add address %s: %s", addr.Addr, err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: subnet, NIC: addr.NIC}})
+	return s
+}
 
+func TestNATPolicyShapesFragmentedPacketOnlyUDPByOriginalIPLengths(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		limit PolicyLimit
-		want  int
+		name, source, destination string
+		factory                   stack.NetworkProtocolFactory
+		subnet                    tcpip.Subnet
+		headerBytes               int
 	}{
-		{name: "unlimited", want: 1},
-		{name: "limited", limit: PolicyLimit{RateBPS: 8, BurstBytes: minPolicyBurst, QueueBytes: minPolicyBurst}},
+		{"IPv4", "10.0.2.15", "10.0.2.2", ipv4.NewProtocol, header.IPv4EmptySubnet, header.IPv4MinimumSize},
+		{"IPv6", "2001:db8::1", "2001:db8::2", ipv6.NewProtocol, header.IPv6EmptySubnet, header.IPv6MinimumSize + header.IPv6FragmentHeaderSize},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				policy := NewNATPolicy(compileNATPolicyTest(t, "", tc.limit, PolicyLimit{}), netip.AddrPort{})
-				defer policy.Close()
-				sent := make(chan time.Time, 1)
+				limit := PolicyLimit{RateBPS: 8, BurstBytes: minPolicyBurst, QueueBytes: minPolicyBurst}
+				policy := NewNATPolicy(compileNATPolicyTest(t, "", limit, PolicyLimit{}), netip.AddrPort{})
+				t.Cleanup(policy.Close)
+				guestLink, peerLink := pipe.New("", "", 1500)
 				state := &natPacketLinkState{paused: new(atomic.Bool)}
-				link := wrapNATPolicyLink(natPolicyProbeLink{sent: sent}, policy, PolicyInput, state)
-				sendNATPolicyProbe(t, link, header.IPv6ProtocolNumber, packet)
-				time.Sleep(time.Minute) // Virtual time, sufficient to expose either path.
-				if got := len(sent); got != tc.want {
-					t.Fatalf("handed off %d ambiguous fragments; want %d", got, tc.want)
+				source, destination := netip.MustParseAddr(tc.source), netip.MustParseAddr(tc.destination)
+				guestAddr, peerAddr := fullAddr(source, 12345), fullAddr(destination, 12346)
+				guestAddr.NIC, peerAddr.NIC = hostNICID, hostNICID
+				proto := netProto(source)
+				guest := newPolicyUDPPeer(t, guestAddr, tc.factory, proto, tc.subnet, checksumOffloadEndpoint{guestLink}, nil)
+				peer := newPolicyUDPPeer(t, peerAddr, tc.factory, proto, tc.subnet,
+					wrapNATPolicyLink(checksumOffloadEndpoint{peerLink}, policy, state), natPolicyHooks{policy: policy})
+
+				guestConn, err := gonet.DialUDP(guest, &guestAddr, &peerAddr, proto)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = guestConn.Close() })
+				// This ordinary local socket is not a NAT or DNS endpoint.
+				localConn, err := gonet.DialUDP(peer, &peerAddr, &guestAddr, proto)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = localConn.Close() })
+
+				const payloadSize = 2000 // Two fragments at this MTU.
+				wireBytes := payloadSize + header.UDPMinimumSize + 2*tc.headerBytes
+				payload := strings.Repeat("p", payloadSize)
+				start := time.Now()
+				if _, err := guestConn.Write([]byte(payload)); err != nil {
+					t.Fatal(err)
+				}
+				if err := localConn.SetReadDeadline(start.Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+				buf := make([]byte, payloadSize)
+				n, err := localConn.Read(buf)
+				if err != nil || string(buf[:n]) != payload {
+					t.Fatalf("local UDP read: got %d bytes, err = %v, want the %d-byte datagram", n, err, payloadSize)
+				}
+				if elapsed := time.Since(start); elapsed != time.Duration(wireBytes)*time.Second {
+					t.Fatalf("fragmented UDP reached the local endpoint at %v; want %d original IP bytes", elapsed, wireBytes)
 				}
 			})
 		})
+	}
+}
+
+type dropLaterIPv4Fragments struct {
+	stack.LinkEndpoint
+}
+
+func (link dropLaterIPv4Fragments) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	for _, pkt := range pkts.AsSlice() {
+		if pkt.NetworkProtocolNumber == ipv4.ProtocolNumber && header.IPv4(pkt.NetworkHeader().Slice()).FragmentOffset() != 0 {
+			continue
+		}
+		var one stack.PacketBufferList
+		one.PushBack(pkt)
+		if _, err := link.LinkEndpoint.WritePackets(one); err != nil {
+			return 0, err
+		}
+	}
+	return pkts.Len(), nil
+}
+
+func TestNATPolicyChargesInputBeforeReassemblyTimeoutReply(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limit := PolicyLimit{RateBPS: 8, BurstBytes: minPolicyBurst, QueueBytes: minPolicyBurst}
+		policy := NewNATPolicy(compileNATPolicyTest(t, "", limit, PolicyLimit{}), netip.AddrPort{})
+		t.Cleanup(policy.Close)
+
+		const mtu = 1500
+		guestLink, peerLink := pipe.New("", "", mtu)
+		state := &natPacketLinkState{paused: new(atomic.Bool)}
+		guestAddr := fullAddr(netip.MustParseAddr("10.0.2.15"), 12345)
+		peerAddr := fullAddr(netip.MustParseAddr("10.0.2.2"), 12346)
+		guestAddr.NIC, peerAddr.NIC = hostNICID, hostNICID
+		replies := make(chan time.Time, 1)
+		guest := newPolicyUDPPeer(t, guestAddr, ipv4.NewProtocol, ipv4.ProtocolNumber, header.IPv4EmptySubnet,
+			dropLaterIPv4Fragments{checksumOffloadEndpoint{guestLink}}, nil)
+		newPolicyUDPPeer(t, peerAddr, ipv4.NewProtocol, ipv4.ProtocolNumber, header.IPv4EmptySubnet,
+			wrapNATPolicyLink(natPolicyProbeLink{LinkEndpoint: checksumOffloadEndpoint{peerLink}, sent: replies}, policy, state), natPolicyHooks{policy: policy})
+
+		conn, err := gonet.DialUDP(guest, &guestAddr, &peerAddr, ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		start := time.Now()
+		if _, err := conn.Write(make([]byte, 2000)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case reply := <-replies:
+			if elapsed := reply.Sub(start); elapsed != mtu*time.Second {
+				t.Fatalf("reassembly timeout reply at %v; want %d original input bytes charged first", elapsed, mtu)
+			}
+		case <-time.After(time.Hour):
+			t.Fatal("no reassembly timeout reply for incomplete datagram")
+		}
+	})
+}
+
+func TestNATPolicyRelaysFragmentedUDPWithFiniteTXAndRX(t *testing.T) {
+	host := newUDPEndpoint(t)
+	port := host.addr().Port
+	rules := fmt.Sprintf(
+		"-A OUTPUT -s 10.0.2.2 -p udp -m udp --sport %d -j ACCEPT\n"+
+			"-A OUTPUT -s 127.0.0.1 -p udp -m udp --sport %d -j ACCEPT\n"+
+			"-A OUTPUT -p udp -j DROP\n", port, port)
+	limit := PolicyLimit{RateBPS: 8_000_000, BurstBytes: minPolicyBurst, QueueBytes: minPolicyBurst}
+	policy := NewNATPolicy(compileNATPolicyTest(t, rules, limit, limit), netip.AddrPort{})
+	t.Cleanup(policy.Close)
+	guest, forwarder, err := NewNATStack(NATConfig{Policy: policy, DNSServers: []string{"192.0.2.53"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = forwarder.Close(); guest.Destroy() })
+	destination := tcpip.FullAddress{NIC: Eth0NICID, Addr: hostGatewayAddr, Port: uint16(port)}
+	conn, err := gonet.DialUDP(guest, nil, &destination, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	request, reply := strings.Repeat("q", 2000), strings.Repeat("r", 2000)
+	buf := make([]byte, len(reply))
+	for _, phase := range []string{"new relay", "established relay"} {
+		if _, err := conn.Write([]byte(request)); err != nil {
+			t.Fatalf("%s: write guest datagram: %v", phase, err)
+		}
+		got, peer := host.recv()
+		if got != request {
+			t.Fatalf("%s: host received %d bytes, want the %d-byte request", phase, len(got), len(request))
+		}
+		host.send(reply, peer)
+		if err := conn.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
+			t.Fatal(err)
+		}
+		n, err := conn.Read(buf)
+		if err != nil || string(buf[:n]) != reply {
+			t.Fatalf("%s: guest received %d bytes, err = %v, want the %d-byte reply", phase, n, err, len(reply))
+		}
 	}
 }
 
@@ -291,7 +447,7 @@ func TestNATPolicyQuiesceDiscardsPreviouslyQueuedPackets(t *testing.T) {
 		sent := make(chan time.Time, 2)
 		state := &natPacketLinkState{paused: new(atomic.Bool)}
 		forwarder := NATForwarder{paused: state.paused, packetLink: state, cfg: NATConfig{Policy: policy}}
-		link := wrapNATPolicyLink(natPolicyProbeLink{sent: sent}, policy, PolicyOutput, state)
+		link := wrapNATPolicyLink(natPolicyProbeLink{sent: sent}, policy, state)
 		packet := natPolicyProbeIPv4(uint8(header.ICMPv4ProtocolNumber))
 		sendNATPolicyProbe(t, link, header.IPv4ProtocolNumber, packet)
 		forwarder.QuiesceForSave()

@@ -41,11 +41,12 @@ func init() {
 
 // restoreConfig holds the parsed flags of `rungv restore`.
 type restoreConfig struct {
-	dir           string
-	cfg           gvx.Config
-	autoPlatform  bool
-	controlSocket string
-	netPolicyLive bool
+	dir                   string
+	cfg                   gvx.Config
+	autoPlatform          bool
+	controlSocket         string
+	netPolicyLive         bool
+	trustLegacyCheckpoint bool
 }
 
 // parseRestoreArgs converts `rungv restore` arguments into a restoreConfig.
@@ -58,6 +59,7 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	}
 
 	flags := registerSandboxFlags(fs, flagDefaults{})
+	trustLegacy := fs.Bool("trust-legacy-checkpoint", false, "allow trusted version 1 checkpoints without saved guest firewall rules")
 	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return restoreConfig{}, 0, true
@@ -81,11 +83,12 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return usageError("%v", err)
 	}
 	return restoreConfig{
-		dir:           dir,
-		cfg:           cfg,
-		autoPlatform:  autoPlatform,
-		controlSocket: strings.TrimSpace(flags.controlSocket),
-		netPolicyLive: flags.netPolicy.live,
+		dir:                   dir,
+		cfg:                   cfg,
+		autoPlatform:          autoPlatform,
+		controlSocket:         strings.TrimSpace(flags.controlSocket),
+		netPolicyLive:         flags.netPolicy.live,
+		trustLegacyCheckpoint: *trustLegacy,
 	}, 0, false
 }
 
@@ -102,6 +105,7 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 	var sb *gvx.Sandbox
 	if control != nil {
+		defer control.closeToken()
 		defer func() {
 			if sb == nil || !sb.LockdownStatus().Applied {
 				control.Cleanup()
@@ -110,7 +114,10 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 
 	var err error
-	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir})
+	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{
+		Dir:                   rc.dir,
+		TrustLegacyCheckpoint: rc.trustLegacyCheckpoint,
+	})
 	if err != nil {
 		if rc.cfg.CheckpointListener != nil {
 			_ = rc.cfg.CheckpointListener.Close()

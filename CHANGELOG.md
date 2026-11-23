@@ -12,7 +12,10 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
-- **Guest firewall restore**: Preserve IPv4 and IPv6 `iptables-legacy` rules per network namespace. Restore Linux-compatible defaults for bundles that contain no guest rules.
+- **Guest firewall restore**: Validate IPv4 and IPv6 `iptables-legacy` state in each network namespace before restore enables networking. Require explicit trust to import a version 1 bundle without guest rules.
+- **NAT firewall and QoS**: Check locally generated UDP fragments against the current policy with the datagram's ports. Keep admitted datagrams queued during idle timeout. Charge reassembled IPv6 traffic before delivery. Match a `/0` selector even when the address is not yet known.
+- **Checkpoint credentials**: Validate credentials before connecting. Accept safe inherited Windows permissions for older checkpoint tokens. Use the app cache directory for Android SDK checkpoint tokens.
+- **Protected storage**: Validate opened host mounts against checkpoint bundles and control tokens. Use one directory descriptor for each protected bundle.
 
 ## [v0.19.10002026111600] - 2026-11-21
 

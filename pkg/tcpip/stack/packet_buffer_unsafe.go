@@ -16,8 +16,40 @@ package stack
 
 import "unsafe"
 
-// PacketBufferStructSize is the minimal size of the packet buffer overhead.
+// PacketBufferStructSize is the per-packet overhead charged to checkpointed
+// queues. It excludes auxiliary storage that exists only on pooled packets.
 const PacketBufferStructSize = int(unsafe.Sizeof(PacketBuffer{}))
+
+// The pool allocates the saved packet layout and its unsaved metadata together.
+// packet must be first so a marked *PacketBuffer points to the same allocation.
+type pooledPacketBuffer struct {
+	packet  PacketBuffer
+	policy  PacketPolicyMetadata
+	release func()
+}
+
+func (pk *PacketBuffer) pooled() *pooledPacketBuffer {
+	if pk.onRelease == nil {
+		return nil
+	}
+	return (*pooledPacketBuffer)(unsafe.Pointer(pk))
+}
+
+// PacketPolicy returns the metadata belonging to a live packet, or nil for a
+// packet decoded from a checkpoint. The metadata is borrowed with the packet.
+func (pk *PacketBuffer) PacketPolicy() *PacketPolicyMetadata {
+	if storage := pk.pooled(); storage != nil {
+		return &storage.policy
+	}
+	return nil
+}
+
+func (pk *PacketBuffer) policyIngress() PacketPolicyIngress {
+	if policy := pk.PacketPolicy(); policy != nil {
+		return policy.Ingress
+	}
+	return PacketPolicyIngress{}
+}
 
 // ID returns a unique ID for the underlying storage of the packet.
 //

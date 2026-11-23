@@ -188,6 +188,22 @@ for g in "${app_elves[@]}"; do
 	fi
 done
 
+echo "== TCP checkpoint from installed APK"
+if [ "$(adb shell getenforce | tr -d '\r')" = Enforcing ]; then
+	adb shell "cat $dir/checkpointprobe | run-as dev.gfire.gvx.probe sh -c 'mkdir -p files && cat > files/checkpointprobe && chmod 700 files/checkpointprobe'"
+	checkpoint_out=$(scripts/android/run-probe.sh checkpoint-smoke @FILES@/checkpointprobe | tr -d '\r') || true
+	if grep -qF "app checkpoint ok" <<<"$checkpoint_out"; then
+		echo "PASS app-tcp-checkpoint"
+	else
+		echo "FAIL app-tcp-checkpoint"
+		echo "$checkpoint_out"
+		failed=1
+	fi
+else
+	echo "FAIL app-tcp-checkpoint (SELinux is not enforcing)"
+	failed=1
+fi
+
 echo "== sample foreground service APK (untrusted_app)"
 ANDROID_ABI=$abi scripts/android/build-sdk.sh "$work/sdk" >/dev/null
 adb install -r "$work/sdk/gvx-sample.apk" >/dev/null

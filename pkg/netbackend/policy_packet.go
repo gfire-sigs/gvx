@@ -70,36 +70,60 @@ func (c *policyPacketCursor) skip(n int) {
 type policyIPPacket struct {
 	tuple   PolicyTuple
 	ipBytes int
-	opaque  bool
 }
 
 func policyPacketTuple(pkt *stack.PacketBuffer) (PolicyTuple, bool) {
-	tuple, _, _, ok := policyPacketDetails(pkt)
+	tuple, _, ok := policyPacketDetails(pkt)
 	return tuple, ok
 }
 
 // policyPacketDetails does not trust transport metadata. INPUT can run before
 // reassembly, and raw writes can leave both header slots unset.
-func policyPacketDetails(pkt *stack.PacketBuffer) (tuple PolicyTuple, ipBytes int, socketBacked bool, ok bool) {
+func policyPacketDetails(pkt *stack.PacketBuffer) (PolicyTuple, int, bool) {
 	views, start := pkt.AsViewList()
 	c := policyPacketCursor{view: views.Front(), remaining: pkt.Size() + start}
 	c.skip(start + len(pkt.LinkHeader().Slice()))
 	var ip policyIPPacket
+	var ok bool
 	switch pkt.NetworkProtocolNumber {
 	case header.IPv4ProtocolNumber:
 		ok = parsePolicyIPv4(&c, &ip)
 	case header.IPv6ProtocolNumber:
 		ok = parsePolicyIPv6(&c, &ip)
-	default:
-		ok = false
 	}
 	if !ok {
-		return PolicyTuple{}, 0, false, false
+		return PolicyTuple{}, 0, false
 	}
-	tuple = ip.tuple
-	socketBacked = !ip.opaque && tuple.ProtocolKnown &&
-		(tuple.Protocol == uint8(header.TCPProtocolNumber) || tuple.Protocol == uint8(header.UDPProtocolNumber))
-	return tuple, ip.ipBytes, socketBacked, true
+	return ip.tuple, ip.ipBytes, true
+}
+
+// policyInputTuple uses the fields validated before delivery changed the
+// buffer. Reassembled UDP may have been trimmed to its transport length;
+// the wire-byte count still includes every byte contributed by its fragments.
+func policyInputTuple(pkt *stack.PacketBuffer) PolicyTuple {
+	input := &pkt.PacketPolicy().Ingress
+	network := pkt.Network()
+	localSource, localDestination := network.SourceAddress(), network.DestinationAddress()
+	source, _ := netip.AddrFromSlice(localSource.AsSlice())
+	destination, _ := netip.AddrFromSlice(localDestination.AsSlice())
+	tuple := PolicyTuple{
+		IPv6:                 pkt.NetworkProtocolNumber == header.IPv6ProtocolNumber,
+		Protocol:             uint8(input.Protocol),
+		ProtocolKnown:        input.ProtocolKnown,
+		Source:               source,
+		Destination:          destination,
+		SourcePort:           input.SourcePort,
+		DestinationPort:      input.DestinationPort,
+		SourcePortKnown:      input.SourcePortKnown,
+		DestinationPortKnown: input.DestinationPortKnown,
+	}
+	if hdr := pkt.TransportHeader().Slice(); input.Reassembled && len(hdr) >= 4 &&
+		(input.Protocol == header.UDPProtocolNumber || input.Protocol == header.TCPProtocolNumber) &&
+		pkt.TransportProtocolNumber == input.Protocol {
+		tuple.SourcePort, tuple.DestinationPort = binary.BigEndian.Uint16(hdr[:2]), binary.BigEndian.Uint16(hdr[2:4])
+		tuple.SourcePortKnown, tuple.DestinationPortKnown = true, true
+	}
+	return tuple
 }
 
 func parsePolicyIPv4(c *policyPacketCursor, ip *policyIPPacket) bool {
@@ -218,9 +242,6 @@ func parsePolicyIPv6(c *policyPacketCursor, ip *policyIPPacket) bool {
 		}
 		if next == header.IPv6RoutingExtHdrIdentifier && fragmented {
 			return false
-		}
-		if next == header.IPv6AuthenticationExtHdrIdentifier {
-			ip.opaque = true // Netstack delivers AH as raw IP, not to TCP or UDP.
 		}
 		length, following, ok := policyIPv6Extension(c, next, maxPolicyIPv6ExtensionBytes-walked, scratch[:])
 		if !ok {

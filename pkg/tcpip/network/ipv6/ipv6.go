@@ -1196,14 +1196,26 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		}
 	}
 
-	hopLimit := header.IPv6(pkt.NetworkHeader().Slice()).HopLimit()
-
-	// We need to do a deep copy of the IP packet because
-	// WriteHeaderIncludedPacket takes ownership of the packet buffer, but we do
-	// not own it.
 	newPkt := pkt.DeepCopyForForwarding(int(route.MaxHeaderLength()))
 	defer newPkt.DecRef()
+	if policy := stk.PacketDeliveryPolicy(); policy != nil {
+		if metadata := pkt.PacketPolicy(); metadata != nil {
+			newPkt.PacketPolicy().Ingress = metadata.Ingress
+		}
+		newPkt.NICID = pkt.NICID
+		route.Acquire()
+		policy.ForwardPacket(newPkt, func(owned *stack.PacketBuffer, output stack.PacketPolicyOutput) {
+			owned.PacketPolicy().Output = output
+			e.handleForwardingError(e.writeForwardedPacket(route, nil, owned))
+		}, route.Release)
+		return nil
+	}
+	return e.writeForwardedPacket(route, pkt, newPkt)
+}
+
+func (e *endpoint) writeForwardedPacket(route *stack.Route, original, newPkt *stack.PacketBuffer) ip.ForwardingError {
 	newHdr := header.IPv6(newPkt.NetworkHeader().Slice())
+	hopLimit := newHdr.HopLimit()
 
 	// As per RFC 8200 section 3,
 	//
@@ -1229,7 +1241,11 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		//   A Packet Too Big MUST be sent by a router in response to a packet that
 		//   it cannot forward because the packet is larger than the MTU of the
 		//   outgoing link.
-		_ = e.protocol.returnError(&icmpReasonPacketTooBig{}, pkt, false /* deliveredLocally */)
+		if original == nil {
+			newHdr.SetHopLimit(hopLimit)
+			original = newPkt
+		}
+		_ = e.protocol.returnError(&icmpReasonPacketTooBig{}, original, false /* deliveredLocally */)
 		return &ip.ErrMessageTooLong{}
 	case *tcpip.ErrNoBufferSpace:
 		return &ip.ErrOutgoingDeviceNoBufferSpace{}
@@ -1739,10 +1755,24 @@ func (e *endpoint) processIPv6RawPayloadHeader(extHdr *header.IPv6RawPayloadHead
 
 	stats.PacketsDelivered.Increment()
 	if proto == header.ICMPv6ProtocolNumber {
-		e.handleICMP(pkt, hasFragmentHeader, routerAlert)
+		if policy := e.protocol.stack.PacketDeliveryPolicy(); policy != nil {
+			policy.DeliverPacketOnly(pkt, func(pkt *stack.PacketBuffer) { e.handleICMP(pkt, hasFragmentHeader, routerAlert) })
+		} else {
+			e.handleICMP(pkt, hasFragmentHeader, routerAlert)
+		}
 		return nil
 	}
-	switch res := e.dispatcher.DeliverTransportPacket(proto, pkt); res {
+	if pkt.PacketPolicy().HasIngress() {
+		e.protocol.stack.DeliverLocalTransportPacket(e.dispatcher, proto, pkt, func(pkt *stack.PacketBuffer, res stack.TransportPacketDisposition) {
+			_ = e.handleLocalTransportDisposition(pkt, previousHeaderStart, res)
+		})
+		return nil
+	}
+	return e.handleLocalTransportDisposition(pkt, previousHeaderStart, e.dispatcher.DeliverTransportPacket(proto, pkt))
+}
+
+func (e *endpoint) handleLocalTransportDisposition(pkt *stack.PacketBuffer, previousHeaderStart uint32, res stack.TransportPacketDisposition) error {
+	switch res {
 	case stack.TransportPacketHandled:
 		return nil
 	case stack.TransportPacketDestinationPortUnreachable:
@@ -2084,6 +2114,10 @@ func (e *endpoint) processFragmentExtHdr(extHdr *header.IPv6FragmentExtHdr, it *
 	}
 
 	if ready {
+		if policy := resPkt.PacketPolicy(); policy != nil && policy.Ingress.WireBytes < 0 {
+			resPkt.DecRef()
+			return nil
+		}
 		// We create a new iterator with the reassembled packet because we could
 		// have more extension headers in the reassembled payload, as per RFC
 		// 8200 section 4.5. We also use the NextHeader value from the first

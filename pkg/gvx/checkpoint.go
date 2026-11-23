@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hoststorage"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
@@ -143,6 +144,7 @@ type checkpointBundleFiles struct {
 	state     *os.File
 	pagesMeta *os.File
 	pages     *os.File
+	root      *bundleRoot
 
 	// afterSave runs after Kernel.SaveTo succeeds and before the manifest is
 	// written. Tests set it to inject a post-save failure. Production code
@@ -150,14 +152,22 @@ type checkpointBundleFiles struct {
 	afterSave func() error
 }
 
-func openCheckpointBundleFiles(dir string) (*checkpointBundleFiles, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("gvx: create checkpoint directory %q: %w", dir, err)
+func openCheckpointBundleFiles(dir string, protected *bundleRoot) (*checkpointBundleFiles, error) {
+	root := protected
+	if root == nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("gvx: create checkpoint directory %q: %w", dir, err)
+		}
+		var err error
+		root, err = openBundleRoot(dir, false)
+		if err != nil {
+			return nil, fmt.Errorf("gvx: open checkpoint directory %q: %w", dir, err)
+		}
 	}
-	files := &checkpointBundleFiles{dir: dir}
+	files := &checkpointBundleFiles{dir: dir, root: root}
 	openWritable := func(name string) (*os.File, error) {
 		p := filepath.Join(dir, name)
-		f, err := openBundleFile(dir, name, os.O_RDWR|os.O_CREATE, 0o600)
+		f, err := root.openFile(name, os.O_RDWR|os.O_CREATE, 0o600)
 		if err != nil {
 			return nil, fmt.Errorf("gvx: pre-open checkpoint file %q: %w", p, err)
 		}
@@ -184,6 +194,13 @@ func openCheckpointBundleFiles(dir string) (*checkpointBundleFiles, error) {
 }
 
 func (f *checkpointBundleFiles) rewindAndTruncate() error {
+	if f.root.dir != nil {
+		for _, file := range []*os.File{f.manifest, f.state, f.pagesMeta, f.pages} {
+			if _, err := hoststorage.VerifyStorageFile(file); err != nil {
+				return fmt.Errorf("gvx: validate checkpoint file %q: %w", file.Name(), err)
+			}
+		}
+	}
 	for _, file := range []*os.File{f.manifest, f.state, f.pagesMeta, f.pages} {
 		if file == nil {
 			return errors.New("gvx: checkpoint bundle file is closed")
@@ -222,6 +239,10 @@ func (f *checkpointBundleFiles) Close() error {
 			}
 			*ptr = nil
 		}
+	}
+	if f.root != nil {
+		errs = append(errs, f.root.Close())
+		f.root = nil
 	}
 	return errors.Join(errs...)
 }

@@ -13,6 +13,7 @@ trap 'rm -rf "$work"' EXIT
 
 android_go_lib "$work" libandroidprobe.so ./tools/androidprobe
 android_go_lib "$work" librungv.so ./cmd/rungv
-android_javac "$work/classes" "$android_root/tools/androidprobe/apk/src"
+android_go_lib "$work" librungv-launcher.so ./android/launcher
+android_javac "$work/classes" "$android_root/android/library/src" "$android_root/tools/androidprobe/apk/src"
 android_apk "$out" "$android_root/tools/androidprobe/apk/AndroidManifest.xml" "$work/classes" "$work"
 echo "$out"

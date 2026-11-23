@@ -15,7 +15,6 @@
 package netbackend
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -331,16 +330,21 @@ type udpForwardSession struct {
 // PortForwarder binds host TCP listeners and UDP packet sockets prior to
 // hostlockdown.Apply() and forwards inbound traffic into Netstack via gonet.
 type PortForwarder struct {
-	mu      sync.Mutex
-	stack   *stack.Stack
-	tcpList []*boundTCPForward
-	udpList []*boundUDPForward
-	started bool
-	closed  bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	policy  *NATPolicy
+	mu            sync.Mutex
+	stack         *stack.Stack
+	tcpList       []*boundTCPForward
+	udpList       []*boundUDPForward
+	started       bool
+	closed        bool
+	socketsClosed chan struct{}
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	policy        *NATPolicy
+
+	// udpHandoff pins published UDP writes against quiesce and loss of
+	// session ownership. When both are needed, it precedes mu.
+	udpHandoff sync.RWMutex
 
 	// udpIdle is the time without a datagram after which a UDP session ends.
 	udpIdle time.Duration
@@ -578,9 +582,11 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 	if s == nil {
 		return errors.New("netbackend: restored stack is nil")
 	}
+	pf.udpHandoff.Lock()
 	pf.mu.Lock()
 	if pf.closed {
 		pf.mu.Unlock()
+		pf.udpHandoff.Unlock()
 		return errors.New("netbackend: PortForwarder is closed")
 	}
 	if !pf.started {
@@ -599,6 +605,7 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 			go pf.runDynamicLoop()
 		}
 		pf.mu.Unlock()
+		pf.udpHandoff.Unlock()
 		return nil
 	}
 	pf.stack = s
@@ -617,6 +624,7 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 		}
 	}
 	pf.mu.Unlock()
+	pf.udpHandoff.Unlock()
 	for _, g := range staleGuests {
 		_ = g.Close()
 	}
@@ -644,6 +652,8 @@ func (pf *PortForwarder) targetStack() *stack.Stack {
 // during the pause waits in the listener backlog, and a datagram waits in the
 // socket buffer.
 func (pf *PortForwarder) QuiesceForSave() {
+	pf.udpHandoff.Lock()
+	defer pf.udpHandoff.Unlock()
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
 	if pf.resumed == nil {
@@ -924,7 +934,9 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 			pf.enqueuePublishedDatagram(b, sess, PolicyOutput, buf[:n])
 			continue
 		}
-		sess.clock.touch()
+		if !sess.clock.touch() {
+			continue
+		}
 		if _, err := sess.guest.Write(buf[:n]); err != nil {
 			pf.log.Debug("netbackend: write forwarded datagram to guest", "client", client, "error", err)
 		}
@@ -1007,24 +1019,33 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 func (pf *PortForwarder) runUDPSession(b *boundUDPForward, sess *udpForwardSession) {
 	defer pf.wg.Done()
 	defer func() {
+		pf.udpHandoff.Lock()
 		pf.mu.Lock()
 		if b.sessions[sess.client] == sess {
 			delete(b.sessions, sess.client)
 		}
 		pf.mu.Unlock()
+		pf.udpHandoff.Unlock()
+		if sess.clock.stop() != 0 && pf.policy != nil {
+			pf.policy.cancelDatagrams(sess.clock)
+		}
 		_ = sess.guest.Close()
 	}()
+	sess.clock.startIdleTimer(pf.udpIdle, func() { _ = sess.guest.Close() }, nil)
 	pumpDatagrams(sess.guest, func(p []byte) error {
 		if pf.policy != nil {
 			pf.enqueuePublishedDatagram(b, sess, PolicyInput, p)
 			return nil
+		}
+		if !sess.clock.touch() {
+			return net.ErrClosed
 		}
 		_, err := b.packetConn.WriteToUDPAddrPort(p, sess.client)
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			pf.log.Debug("netbackend: write guest reply to host client", "client", sess.client, "error", err)
 		}
 		return err
-	}, sess.clock, pf.udpIdle)
+	})
 }
 
 func (pf *PortForwarder) enqueuePublishedDatagram(b *boundUDPForward, sess *udpForwardSession, chain PolicyChain, p []byte) {
@@ -1035,36 +1056,44 @@ func (pf *PortForwarder) enqueuePublishedDatagram(b *boundUDPForward, sess *udpF
 	if !pf.policy.Allow(chain, host, guest) {
 		return
 	}
-	// The shared reader reuses its buffer before the queued write runs.
-	payload := bytes.Clone(p)
-	if pf.policy.Enqueue(chain, len(payload), func() {
-		if err := pf.writePublishedDatagram(b, sess, chain, payload); err != nil && !errors.Is(err, net.ErrClosed) {
+	w := &policyWork{chain: chain, n: len(p), activity: sess.clock, payload: p}
+	w.inline = [2]PolicyTuple{host, guest}
+	w.tuples = w.inline[:]
+	w.send = func() (int, error) {
+		n, err := pf.writePublishedDatagram(b, sess, chain, w.payload)
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			pf.log.Debug("netbackend: write published datagram", "client", sess.client, "error", err)
 		}
-	}, nil, host, guest) && chain == PolicyOutput {
-		sess.clock.touch()
+		return n, err
 	}
+	_ = pf.policy.submit(w)
 }
 
-func (pf *PortForwarder) writePublishedDatagram(b *boundUDPForward, sess *udpForwardSession, chain PolicyChain, payload []byte) error {
+func (pf *PortForwarder) writePublishedDatagram(b *boundUDPForward, sess *udpForwardSession, chain PolicyChain, payload []byte) (int, error) {
+	pf.udpHandoff.RLock()
+	defer pf.udpHandoff.RUnlock()
 	pf.mu.Lock()
-	defer pf.mu.Unlock()
-	if pf.closed || b.closed || b.sessions[sess.client] != sess {
-		return net.ErrClosed
+	eligible := !pf.closed && !b.closed && b.sessions[sess.client] == sess &&
+		(chain == PolicyInput || pf.resumed == nil)
+	pf.mu.Unlock()
+	if !eligible {
+		return 0, net.ErrClosed
 	}
+	var n int
 	if chain == PolicyInput {
-		return policyWrite(b.packetConn, func() error {
-			_, err := b.packetConn.WriteToUDPAddrPort(payload, sess.client)
+		err := policyWrite(b.packetConn, func() error {
+			var err error
+			n, err = b.packetConn.WriteToUDPAddrPort(payload, sess.client)
 			return err
 		})
+		return n, err
 	}
-	if pf.resumed != nil {
-		return net.ErrClosed
-	}
-	return policyWrite(sess.guest, func() error {
-		_, err := sess.guest.Write(payload)
+	err := policyWrite(sess.guest, func() error {
+		var err error
+		n, err = sess.guest.Write(payload)
 		return err
 	})
+	return n, err
 }
 
 var guestLoopbackIPv4 = tcpip.AddrFrom4([4]byte{127, 0, 0, 1})
@@ -1115,50 +1144,65 @@ func parseGuestFullAddr(ipStr string, port uint16) tcpip.FullAddress {
 // waits for active relays. It closes the session endpoints before it waits,
 // so a guest that never answers cannot block Close.
 func (pf *PortForwarder) Close() error {
+	pf.udpHandoff.Lock()
 	pf.mu.Lock()
 	if pf.closed {
+		done := pf.socketsClosed
 		pf.mu.Unlock()
+		pf.udpHandoff.Unlock()
+		<-done
 		return nil
 	}
 	pf.closed = true
-	pf.cancel()
-	var errs []error
-	for _, b := range pf.tcpList {
-		if err := b.listener.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	for _, b := range pf.dynTCP {
-		if err := b.listener.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	clear(pf.dynTCP)
+	done := make(chan struct{})
+	pf.socketsClosed = done
+	tcpList, udpList := pf.tcpList, pf.udpList
+	dynTCP, dynUDP := pf.dynTCP, pf.dynUDP
+	pf.dynTCP, pf.dynUDP = nil, nil
 	var guests []*gonet.UDPConn
-	for _, b := range pf.udpList {
+	for _, b := range udpList {
 		b.closed = true
-		if err := b.packetConn.Close(); err != nil {
-			errs = append(errs, err)
-		}
 		for _, sess := range b.sessions {
 			guests = append(guests, sess.guest)
 		}
 	}
-	for _, b := range pf.dynUDP {
+	for _, b := range dynUDP {
 		b.closed = true
-		if err := b.packetConn.Close(); err != nil {
-			errs = append(errs, err)
-		}
 		for _, sess := range b.sessions {
 			guests = append(guests, sess.guest)
 		}
 	}
-	clear(pf.dynUDP)
 	clear(pf.dynFailed)
 	pf.mu.Unlock()
+	pf.udpHandoff.Unlock()
+	pf.cancel()
+	var errs []error
+	for _, b := range tcpList {
+		if err := b.listener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, b := range dynTCP {
+		if err := b.listener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, b := range udpList {
+		if err := b.packetConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, b := range dynUDP {
+		if err := b.packetConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, g := range guests {
 		_ = g.Close()
 	}
+	// Other Close callers can rebind once all sockets have closed, even if
+	// the first caller is still waiting for the relay goroutines to exit.
+	close(done)
 	pf.wg.Wait()
 	return errors.Join(errs...)
 }

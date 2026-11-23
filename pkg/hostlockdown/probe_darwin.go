@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"z.gfire.dev/gvx/internal/hoststorage"
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
@@ -147,13 +148,44 @@ func probeMountsReachable(mounts []HostMount, mountsReal []string) error {
 		if mounts[i].File {
 			flags = unix.O_RDONLY | unix.O_CLOEXEC
 		}
+		if mounts[i].Root != nil {
+			flags |= unix.O_NOFOLLOW | unix.O_NONBLOCK
+		}
 		fd, err := unix.Open(real, flags, 0)
 		if err != nil {
 			return fmt.Errorf("hostlockdown: open mount %q after lockdown: %w", real, err)
 		}
+		if mounts[i].Root != nil {
+			f := os.NewFile(uintptr(fd), real)
+			err := verifyDarwinMount(mounts[i], f)
+			if err := errors.Join(err, f.Close()); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := unix.Close(fd); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func verifyDarwinMount(m HostMount, current *os.File) error {
+	pin := m.Root
+	if m.File {
+		pin = m.BoundFile
+	}
+	expected, err := hoststorage.IdentifyStorage(pin)
+	if err != nil {
+		return err
+	}
+	actual, err := hoststorage.IdentifyStorage(current)
+	if err != nil {
+		return err
+	}
+	if !expected.SameFile(actual) || !expected.SameMount(actual) ||
+		(m.File && actual.Links != 1) {
+		return fmt.Errorf("hostlockdown: mount %q changed after opening", m.Path)
 	}
 	return nil
 }

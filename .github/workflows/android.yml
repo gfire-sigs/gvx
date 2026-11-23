@@ -17,6 +17,9 @@ on:
       - scripts/android/**
       - android/**
       - tools/androidprobe/**
+      - internal/androidcache/**
+      - cmd/rungv/*checkpoint*
+      - cmd/rungv/control_auth*
       - internal/acceptprog/**
       - e2e/**
       - pkg/gvx/**

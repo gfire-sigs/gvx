@@ -166,7 +166,11 @@ func (m *LimitMatcher) beforeSave() {
 	}
 }
 
-func (m *LimitMatcher) afterLoad(context.Context) {
+func (m *LimitMatcher) afterLoad(ctx context.Context) {
+	stack.DeferCheckpointActivation(ctx, m, m.restoreClock)
+}
+
+func (m *LimitMatcher) restoreClock() {
 	baseOffset := m.savedNow
 	if m.stk != nil {
 		clock := m.stk.Clock()

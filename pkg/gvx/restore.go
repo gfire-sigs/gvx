@@ -50,6 +50,10 @@ type RestoreOptions struct {
 	// Dir is the host directory containing manifest.json, state.img,
 	// pages.meta, and pages.img.
 	Dir string
+	// TrustLegacyCheckpoint allows importing a trusted version 1 checkpoint,
+	// which may lack saved guest firewall rules. It never relaxes validation
+	// of version 3 or 5 checkpoints or of rules that are present.
+	TrustLegacyCheckpoint bool
 }
 
 // ErrCheckpointManifest reports a checkpoint manifest validation failure.
@@ -136,8 +140,8 @@ const maxManifestBytes = 1 << 20
 
 // readManifestBytes reads manifest.json from path and fails when the file is
 // larger than maxManifestBytes, before the whole file reaches memory.
-func readManifestBytes(dir string) ([]byte, error) {
-	f, err := openBundleFile(dir, checkpointManifestFileName, os.O_RDONLY, 0)
+func (b *bundleRoot) readManifestBytes() ([]byte, error) {
+	f, err := b.openFile(checkpointManifestFileName, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -152,9 +156,9 @@ func readManifestBytes(dir string) ([]byte, error) {
 	return data, nil
 }
 
-func readAndParseManifest(dir string) (CheckpointManifest, error) {
-	manifestPath := filepath.Join(dir, checkpointManifestFileName)
-	data, err := readManifestBytes(dir)
+func (b *bundleRoot) readAndParseManifest() (CheckpointManifest, error) {
+	manifestPath := filepath.Join(b.path, checkpointManifestFileName)
+	data, err := b.readManifestBytes()
 	if err != nil {
 		return CheckpointManifest{}, fmt.Errorf("%w: read %q: %w", ErrCheckpointManifest, manifestPath, err)
 	}
@@ -289,7 +293,12 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
 	}
-	manifest, err := readAndParseManifest(opts.Dir)
+	bundle, err := openBundleRoot(opts.Dir, cfg.NetPolicy != nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: open bundle %q: %w", ErrCheckpointManifest, opts.Dir, err)
+	}
+	defer bundle.Close()
+	manifest, err := bundle.readAndParseManifest()
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +333,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 	openReadOnly := func(name string) (*os.File, error) {
 		p := filepath.Join(opts.Dir, name)
-		f, oErr := openBundleFile(opts.Dir, name, os.O_RDONLY, 0)
+		f, oErr := bundle.openFile(name, os.O_RDONLY, 0)
 		if oErr != nil {
 			return nil, fmt.Errorf("gvx: open checkpoint file %q: %w", p, oErr)
 		}
@@ -335,6 +344,13 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 	if _, err := manifest.statePayloadOffset(stateFile); err != nil {
 		return cleanup(err)
+	}
+	networkCheckpointMode := inet.RequireNetworkCheckpoint
+	if manifest.Version == legacyCheckpointManifestVersion {
+		if !opts.TrustLegacyCheckpoint {
+			return cleanup(fmt.Errorf("%w: version 1 restore requires TrustLegacyCheckpoint", ErrCheckpointManifest))
+		}
+		networkCheckpointMode = inet.ImportLegacyNetworkCheckpoint
 	}
 	if manifest.Version == protectedCheckpointManifestVersion {
 		if cfg.NetPolicy == nil {
@@ -377,7 +393,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		}
 		sb.hostCARoots = roots
 	}
-	if err := sb.initNetPolicy(opts.Dir); err != nil {
+	if err := sb.initNetPolicy(bundle); err != nil {
 		return cleanup(err)
 	}
 	if pagesMetaFile, err = openReadOnly(checkpointPagesMetaFileName); err != nil {
@@ -385,6 +401,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 	if pagesFile, err = openReadOnly(checkpointPagesFileName); err != nil {
 		return cleanup(err)
+	}
+	if sb.policyStorage != nil {
+		sb.policyStorage.files = append(sb.policyStorage.files, bundle.identities...)
 	}
 
 	opened, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown, allowUnconfined)
@@ -427,7 +446,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	sb.attachChunkMemory()
 
 	if cfg.CheckpointDir != "" {
-		cf, cErr := openCheckpointBundleFiles(cfg.CheckpointDir)
+		cf, cErr := sb.openCheckpointOutput()
 		if cErr != nil {
 			return cleanup(cErr)
 		}
@@ -489,6 +508,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 	for _, sm := range sb.mounts {
 		if sm.workspace != nil {
+			if err := sm.workspace.ValidateRestoreBinding(); err != nil {
+				return cleanup(fmt.Errorf("gvx: restore host mount %s: %w", sm.GuestPath, err))
+			}
 			id := checkpoint.ResourceID{
 				ContainerName: containerName,
 				Path:          sm.GuestPath,
@@ -526,7 +548,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		RawHost: &rawHost,
 	}).(gvcontext.Context)
 	loadCtx = WithRestoreNetnsHook(loadCtx, nil).(gvcontext.Context)
-	loadCtx = netstack.WithIPTablesCheckpointRestore(loadCtx)
+	loadCtx = inet.WithNetworkCheckpointRestore(loadCtx, networkCheckpointMode)
 
 	pagesMetaReader := stateio.NewBufioReadCloser(io.NopCloser(pagesMetaFile))
 	pagesAsyncReader := stateio.NewIOReader(nopCloseReaderAt{pagesFile}, 4<<20, 1024, 4)

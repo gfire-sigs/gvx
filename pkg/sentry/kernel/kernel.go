@@ -1141,6 +1141,11 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 	log.Infof("Kernel load took [%s].", time.Since(kernelStart))
 	timeline.Reached("Kernel loaded")
 
+	activateNetwork, err := inet.PrepareNetworkCheckpointRestore(ctx, k.rootNetworkNamespace)
+	if err != nil {
+		return fmt.Errorf("validating checkpoint network: %w", err)
+	}
+
 	if asyncMFLoader == nil {
 		mfStart := time.Now()
 		if err := k.loadMemoryFiles(ctx, r); err != nil {
@@ -1159,6 +1164,9 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 	}
 
 	k.Timekeeper().SetClocks(clocks, k.vdsoParams)
+	if activateNetwork != nil {
+		activateNetwork()
+	}
 
 	if timeReady != nil {
 		close(timeReady)

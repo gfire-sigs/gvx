@@ -242,12 +242,24 @@ func sameDirIdentity(keyA fileIDKey, okA bool, ntA string, keyB fileIDKey, okB b
 func (b *winMountBroker) isExactMountRoot(dirKey fileIDKey, dirKeyOK bool, dirNTPath string) bool {
 	for i := range b.mounts.dirs {
 		dm := &b.mounts.dirs[i]
+		if dm.strict {
+			if dirKeyOK && dirKey == dm.rootKey {
+				return true
+			}
+			continue
+		}
 		if sameDirIdentity(dirKey, dirKeyOK, dirNTPath, dm.rootKey, dm.rootKeyOK, dm.ntPath) {
 			return true
 		}
 	}
 	for i := range b.mounts.files {
 		fm := &b.mounts.files[i]
+		if fm.strict {
+			if dirKeyOK && dirKey == fm.parentKey {
+				return true
+			}
+			continue
+		}
 		if sameDirIdentity(dirKey, dirKeyOK, dirNTPath, fm.parentKey, fm.parentKeyOK, fm.parentNTPath) {
 			return true
 		}
@@ -292,6 +304,10 @@ func (b *winMountBroker) authorizeDir(dir windows.Handle) (dirAuth, error) {
 		dm := &b.mounts.dirs[i]
 		var match bool
 		switch {
+		case dm.strict:
+			if dirKeyOK {
+				_, match = dm.knownDirs[dirKey]
+			}
 		case ntErr == nil && dm.ntPath != "":
 			match = ntPathAtOrBelow(dirNTPath, dm.ntPath)
 		case dirKeyOK:
@@ -314,7 +330,11 @@ func (b *winMountBroker) authorizeSingleFile(auth dirAuth, name string, disposit
 	}
 	for i := range b.mounts.files {
 		fm := &b.mounts.files[i]
-		if !sameDirIdentity(auth.key, auth.keyOK, auth.ntPath, fm.parentKey, fm.parentKeyOK, fm.parentNTPath) {
+		if fm.strict {
+			if !auth.keyOK || auth.key != fm.parentKey {
+				continue
+			}
+		} else if !sameDirIdentity(auth.key, auth.keyOK, auth.ntPath, fm.parentKey, fm.parentKeyOK, fm.parentNTPath) {
 			continue
 		}
 		if name == fm.leafName {
@@ -411,6 +431,11 @@ func (b *winMountBroker) OpenAt(dir windows.Handle, name string, access, fileAtt
 				bhfi.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
 				if childKey, ok := queryFileIDKey(h, bhfi); ok {
 					for _, idx := range auth.coveringIdxs {
+						m := &b.mounts.dirs[idx]
+						if m.strict && childKey.dev != m.rootKey.dev {
+							_ = windows.CloseHandle(h)
+							return windows.ERROR_ACCESS_DENIED
+						}
 						b.mounts.dirs[idx].knownDirs[childKey] = struct{}{}
 					}
 				}
@@ -556,6 +581,16 @@ func (b *winMountBroker) ExistsByID(root windows.Handle, id [16]byte) (bool, err
 		auth, err := b.authorizeDir(root)
 		if err != nil || !auth.covered {
 			return windows.ERROR_ACCESS_DENIED
+		}
+		var byIDAllowed bool
+		for _, idx := range auth.coveringIdxs {
+			if !b.mounts.dirs[idx].strict {
+				byIDAllowed = true
+				break
+			}
+		}
+		if !byIDAllowed {
+			return windows.ERROR_NOT_SUPPORTED
 		}
 		desc := brokerFileIDDescriptor{
 			size: uint32(unsafe.Sizeof(brokerFileIDDescriptor{})),

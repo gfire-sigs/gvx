@@ -17,6 +17,7 @@ package netstack
 import (
 	"bytes"
 	stdcontext "context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -75,6 +76,103 @@ func newTestRootNetstack(t *testing.T) *Stack {
 		t.Fatalf("CreateStack: %v", err)
 	}
 	return st.(*Stack)
+}
+
+func TestModernCheckpointRejectsIncompleteNetworkAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		dropStack  bool
+		childRules bool
+		wantErr    string
+	}{
+		{"missing child rules", false, false, "missing iptables checkpoint rules"},
+		{"missing child stack", true, false, "missing its saved netstack"},
+		{"unowned network setup", false, true, "unowned network checkpoint activation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootStack := newTestRootNetstack(t)
+			t.Cleanup(rootStack.Stack.Destroy)
+			root := inet.NewRootNamespace(rootStack, NewStackCreator(rootStack), auth.NewRootUserNamespace())
+			child := root.NewNetworkNamespace(nil)
+			t.Cleanup(child.Stack().(*Stack).Stack.Destroy)
+			rootStack.Stack.EnableIPTablesCheckpoint()
+			if tc.childRules {
+				child.Stack().(*Stack).Stack.EnableIPTablesCheckpoint()
+			}
+			if tc.dropStack {
+				child.ResetStack()
+			}
+			var buf bytes.Buffer
+			bundle := savedNamespaceBundle{RootNS: root, ChildNS: child}
+			rootStack.Pause()
+			_, saveErr := state.Save(t.Context(), &buf, &bundle)
+			rootStack.Resume()
+			if err := saveErr; err != nil {
+				t.Fatalf("state.Save: %v", err)
+			}
+
+			ctx := inet.WithNetworkCheckpointRestore(context.Background(), inet.RequireNetworkCheckpoint)
+			var restored savedNamespaceBundle
+			if _, err := state.Load(ctx, &buf, &restored); err != nil {
+				t.Fatalf("state.Load: %v", err)
+			}
+			rootTCPIP := restored.RootNS.Stack().(*Stack).Stack
+			t.Cleanup(rootTCPIP.Destroy)
+			if st := restored.ChildNS.Stack(); st != nil {
+				t.Cleanup(st.(*Stack).Stack.Destroy)
+			}
+			if tc.dropStack && restored.ChildNS.Stack() != nil {
+				t.Fatal("a missing child stack was recreated during decode")
+			}
+			activated := false
+			stack.DeferCheckpointActivation(ctx, rootTCPIP, func() { activated = true })
+			activate, err := inet.PrepareNetworkCheckpointRestore(ctx, restored.RootNS)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("prepare network = %v, want %q", err, tc.wantErr)
+			}
+			if activate != nil || activated || rootTCPIP.IPTables() != nil {
+				t.Fatal("rejecting a checkpoint partially installed or activated the network")
+			}
+		})
+	}
+}
+
+func TestLegacyCheckpointRecreatesAndCapturesMissingChildStack(t *testing.T) {
+	rootStack := newTestRootNetstack(t)
+	t.Cleanup(rootStack.Stack.Destroy)
+	root := inet.NewRootNamespace(rootStack, NewStackCreator(rootStack), auth.NewRootUserNamespace())
+	child := root.NewNetworkNamespace(nil)
+	t.Cleanup(child.Stack().(*Stack).Stack.Destroy)
+	child.ResetStack()
+
+	var buf bytes.Buffer
+	bundle := savedNamespaceBundle{RootNS: root, ChildNS: child}
+	rootStack.Pause()
+	_, saveErr := state.Save(t.Context(), &buf, &bundle)
+	rootStack.Resume()
+	if saveErr != nil {
+		t.Fatalf("state.Save (v1): %v", saveErr)
+	}
+	ctx := inet.WithNetworkCheckpointRestore(context.Background(), inet.ImportLegacyNetworkCheckpoint)
+	var restored savedNamespaceBundle
+	if _, err := state.Load(ctx, &buf, &restored); err != nil {
+		t.Fatalf("state.Load (v1): %v", err)
+	}
+	t.Cleanup(restored.RootNS.Stack().(*Stack).Stack.Destroy)
+	if restored.ChildNS.Stack() != nil {
+		t.Fatal("legacy child unexpectedly created during decode")
+	}
+	activate, err := inet.PrepareNetworkCheckpointRestore(ctx, restored.RootNS)
+	if err != nil {
+		t.Fatalf("preparing legacy network: %v", err)
+	}
+	childStack := restored.ChildNS.Stack().(*Stack).Stack
+	t.Cleanup(childStack.Destroy)
+	activate()
+	restored.RootNS.Stack().Restore()
+	if !childStack.IPTablesCheckpointEnabled() {
+		t.Fatal("the reconstructed child will not save its firewall on the next checkpoint")
+	}
 }
 
 func TestRestoreRootStackPreservesChildNetworkNamespace(t *testing.T) {

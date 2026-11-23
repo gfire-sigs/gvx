@@ -45,6 +45,24 @@ func newHostFilterEndpoint(child stack.LinkEndpoint) *hostFilterEndpoint {
 	return e
 }
 
+// Restore restarts the veth pair beneath its Ethernet and packet socket layers.
+func (e *hostFilterEndpoint) Restore() {
+	type wrappedLink interface {
+		Child() stack.LinkEndpoint
+	}
+	packetSocket, ok := e.Child().(wrappedLink)
+	if !ok {
+		return
+	}
+	ethernet, ok := packetSocket.Child().(wrappedLink)
+	if !ok {
+		return
+	}
+	if link, ok := ethernet.Child().(*vethLink); ok && link.Endpoint != nil {
+		link.Endpoint.Restore()
+	}
+}
+
 // Attach implements stack.LinkEndpoint.Attach. It records whether the NIC
 // became a bridge port.
 func (e *hostFilterEndpoint) Attach(d stack.NetworkDispatcher) {

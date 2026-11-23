@@ -36,7 +36,7 @@ const tmpfileUnlinkAtOnce = true
 // The kernel frees the file at the last close, and a crash of the process
 // leaves nothing behind.
 func (h *hostRoot) openAnonAt(dir hostDirHandle) (*os.File, error) {
-	fd, err := openatRetry(int(dir), ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	fd, err := h.openat(int(dir), ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: create unnamed file: %w", err)
 	}

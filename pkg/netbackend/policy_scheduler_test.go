@@ -361,6 +361,114 @@ func TestNATPolicySendCancellationReleasesQueuedCapacity(t *testing.T) {
 	})
 }
 
+func TestPolicyDatagramRejectionDoesNotRefreshIdle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = 100 * time.Millisecond
+		limit := schedulerLimit(8)
+		p := NewNATPolicy(schedulerCompile(t, schedulerDropRules, schedulerAcceptRules, limit, PolicyLimit{}), netip.AddrPort{})
+		defer p.Close()
+		if !p.Enqueue(PolicyInput, limit.QueueBytes, func() {}, nil, schedulerIPv6) {
+			t.Fatal("fill TX queue")
+		}
+		clock := newActivityClock()
+		expired := make(chan struct{})
+		clock.startIdleTimer(idle, func() { close(expired) }, nil)
+		defer clock.stop()
+		time.Sleep(idle / 2)
+		send := func() (int, error) {
+			t.Error("a rejected datagram reached the writer")
+			return 1, nil
+		}
+		if err := p.sendDatagram(t.Context(), PolicyInput, 1, clock, send, schedulerIPv4); !errors.Is(err, ErrPolicyDenied) {
+			t.Errorf("denied datagram = %v, want %v", err, ErrPolicyDenied)
+		}
+		if err := p.sendDatagram(t.Context(), PolicyInput, 1, clock, send, schedulerIPv6); !errors.Is(err, ErrPolicyQueueFull) {
+			t.Errorf("datagram beyond capacity = %v, want %v", err, ErrPolicyQueueFull)
+		}
+		time.Sleep(idle / 2)
+		synctest.Wait()
+		schedulerEvent(t, expired, "session expiry despite rejected datagrams")
+	})
+}
+
+func TestPolicyDatagramHoldSurvivesCancellationDuringWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = 100 * time.Millisecond
+		p := schedulerPolicy(t, PolicyLimit{}, PolicyLimit{})
+		clock := newActivityClock()
+		expired := make(chan struct{})
+		clock.startIdleTimer(idle, func() { close(expired) }, nil)
+		defer clock.stop()
+		started, unblock := make(chan struct{}), make(chan struct{})
+		release := sync.OnceFunc(func() { close(unblock) })
+		defer release()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- p.sendDatagram(ctx, PolicyOutput, 1, clock, func() (int, error) {
+				close(started)
+				<-unblock
+				return 0, net.ErrClosed
+			}, schedulerIPv4)
+		}()
+		<-started
+		cancel()
+		time.Sleep(idle * 2)
+		synctest.Wait()
+		schedulerNoEvent(t, done, "canceled work with a write still in flight")
+		schedulerNoEvent(t, expired, "expiry with a write still in flight")
+		release()
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		if err := schedulerEvent(t, done, "write completion"); !errors.Is(err, net.ErrClosed) {
+			t.Errorf("write result = %v, want %v", err, net.ErrClosed)
+		}
+		schedulerEvent(t, expired, "expiry after unsuccessful write completion")
+	})
+}
+
+func TestPolicyDatagramQueueDropsReleaseIdleHold(t *testing.T) {
+	for _, action := range []string{"rule replacement", "policy close"} {
+		t.Run(action, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const idle = 100 * time.Millisecond
+				limit := schedulerLimit(8)
+				p := schedulerPolicy(t, limit, PolicyLimit{})
+				clock := newActivityClock()
+				expired := make(chan struct{})
+				clock.startIdleTimer(idle, func() { close(expired) }, nil)
+				defer clock.stop()
+				done := make(chan error, 1)
+				go func() {
+					done <- p.sendDatagram(t.Context(), PolicyInput, 1, clock, func() (int, error) {
+						t.Error("discarded datagram reached the writer")
+						return 1, nil
+					}, schedulerIPv4)
+				}()
+				synctest.Wait()
+				time.Sleep(idle * 2)
+				synctest.Wait()
+				schedulerNoEvent(t, expired, "expiry with work still queued")
+				if action == "rule replacement" {
+					candidate := schedulerCompile(t, schedulerDropRules, schedulerAcceptRules, limit, PolicyLimit{})
+					if err := p.Commit(candidate); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					p.Close()
+				}
+				time.Sleep(time.Nanosecond)
+				synctest.Wait()
+				if err := schedulerEvent(t, done, "datagram dropped from queue"); !errors.Is(err, ErrPolicyDenied) {
+					t.Errorf("dropped datagram = %v, want %v", err, ErrPolicyDenied)
+				}
+				schedulerEvent(t, expired, "expiry after queued datagram was dropped")
+			})
+		})
+	}
+}
+
 func TestNATPolicySendCancellationWaitsForDispatchedWrite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := schedulerPolicy(t, PolicyLimit{}, PolicyLimit{})

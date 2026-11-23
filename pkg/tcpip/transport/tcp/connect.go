@@ -836,6 +836,7 @@ type tcpFields struct {
 	opts      []byte
 	txHash    uint32
 	df        bool
+	relay     bool
 	expOptVal uint16
 }
 
@@ -866,6 +867,7 @@ func (e *Endpoint) sendSynTCP(r *stack.Route, tf tcpFields, opts header.TCPSynOp
 // This method takes ownership of pkt.
 func (e *Endpoint) sendTCP(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso stack.GSO) tcpip.Error {
 	tf.txHash = e.txHash
+	tf.relay = e.IsRelayTransportEndpoint()
 	if err := sendTCP(r, tf, pkt, gso, e.owner); err != nil {
 		e.stats.SendErrors.SegmentSendToNetworkFailed.Increment()
 		return err
@@ -878,6 +880,9 @@ func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso stac
 	optLen := len(tf.opts)
 	tcp := header.TCP(pkt.TransportHeader().Push(header.TCPMinimumSize + optLen))
 	pkt.TransportProtocolNumber = header.TCPProtocolNumber
+	if tf.relay {
+		pkt.PacketPolicy().Output.RelayTCP = true
+	}
 	tcp.Encode(&header.TCPFields{
 		SrcPort:    tf.id.LocalPort,
 		DstPort:    tf.id.RemotePort,

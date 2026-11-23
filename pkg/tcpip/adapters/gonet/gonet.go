@@ -677,6 +677,19 @@ func (c *UDPConn) Write(b []byte) (int, error) {
 //
 // +checklocksexclude:c.deadlineTimer.mu
 func (c *UDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	return c.writeTo(b, addr, nil)
+}
+
+// WriteWithPacketPolicy writes a connected UDP datagram with private local
+// output metadata. It is only supported for a Netstack UDP endpoint.
+//
+// +checklocksexclude:c.deadlineTimer.mu
+func (c *UDPConn) WriteWithPacketPolicy(b []byte, policy stack.PacketPolicyOutput) (int, error) {
+	return c.writeTo(b, nil, &policy)
+}
+
+// +checklocksexclude:c.deadlineTimer.mu
+func (c *UDPConn) writeTo(b []byte, addr net.Addr, policy *stack.PacketPolicyOutput) (int, error) {
 	deadline := c.writeCancel()
 
 	// Check if deadline has already expired.
@@ -698,7 +711,19 @@ func (c *UDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 
 	var r bytes.Reader
 	r.Reset(b)
-	n, err := c.ep.Write(&r, writeOptions)
+	write := c.ep.Write
+	if policy != nil {
+		ep, ok := c.ep.(interface {
+			WriteWithPacketPolicy(tcpip.Payloader, tcpip.WriteOptions, stack.PacketPolicyOutput) (int64, tcpip.Error)
+		})
+		if !ok {
+			return 0, c.newRemoteOpError("write", addr, errors.ErrUnsupported)
+		}
+		write = func(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcpip.Error) {
+			return ep.WriteWithPacketPolicy(p, opts, *policy)
+		}
+	}
+	n, err := write(&r, writeOptions)
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		// Create wait queue entry that notifies a channel.
 		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
@@ -711,7 +736,7 @@ func (c *UDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 			case <-notifyCh:
 			}
 
-			n, err = c.ep.Write(&r, writeOptions)
+			n, err = write(&r, writeOptions)
 			if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
 				break
 			}

@@ -515,62 +515,59 @@ const (
 	visited
 )
 
-func checkChainDFS(table stack.Table, ruleIdx int, state []visitState, ipv6 bool) *syserr.Error {
-	if state[ruleIdx] == visiting {
-		nflog("jump loop detected at rule %d", ruleIdx)
-		return syserr.ErrLinkLoop
-	}
-	if state[ruleIdx] == visited {
-		return nil
-	}
-	state[ruleIdx] = visiting
-
-	rule := table.Rules[ruleIdx]
-	if jump, ok := rule.Target.(*JumpTarget); ok {
-		jumpTo := jump.RuleNum
-		if jumpTo <= 0 || jumpTo >= len(table.Rules) {
-			nflog("jump to out-of-bounds rule %d", jumpTo)
-			return syserr.ErrInvalidArgument
+func checkChainDFS(table stack.Table, first int, state []visitState, pending []int, ipv6 bool) *syserr.Error {
+	pending = append(pending, first)
+	for len(pending) != 0 {
+		i := pending[len(pending)-1]
+		if state[i] == visited {
+			pending = pending[:len(pending)-1]
+			continue
 		}
-		// A jump to the next rule falls through, so it enters no chain.
-		if jumpTo != ruleIdx+1 {
-			if !isUserChainTarget(table.Rules[jumpTo-1].Target) {
-				nflog("jump target %d is not a user chain (rule %d-1 target is %T)", jumpTo, jumpTo, table.Rules[jumpTo-1].Target)
+		state[i] = visiting
+		rule := table.Rules[i]
+		next := i + 1
+		if jump, ok := rule.Target.(*JumpTarget); ok && jump.RuleNum != next {
+			dst := jump.RuleNum
+			if dst <= 0 || dst >= len(table.Rules) || !isUserChainTarget(table.Rules[dst-1].Target) {
+				nflog("invalid jump destination at rule %d", i)
 				return syserr.ErrInvalidArgument
 			}
-			if err := checkChainDFS(table, jumpTo, state, ipv6); err != nil {
-				return err
+			switch state[dst] {
+			case visiting:
+				nflog("jump loop detected at rule %d", dst)
+				return syserr.ErrLinkLoop
+			case unvisited:
+				pending = append(pending, dst)
+				continue
 			}
 		}
+		if !isUnconditionalFinalRule(rule, ipv6) {
+			if next >= len(table.Rules) || isUserChainTarget(table.Rules[next].Target) {
+				nflog("chain at rule %d lacks an unconditional final rule", i)
+				return syserr.ErrInvalidArgument
+			}
+			switch state[next] {
+			case visiting:
+				nflog("jump loop detected at rule %d", next)
+				return syserr.ErrLinkLoop
+			case unvisited:
+				pending = append(pending, next)
+				continue
+			}
+		}
+		state[i] = visited
+		pending = pending[:len(pending)-1]
 	}
-
-	if isUnconditionalFinalRule(rule, ipv6) {
-		state[ruleIdx] = visited
-		return nil
-	}
-
-	nextIdx := ruleIdx + 1
-	if nextIdx >= len(table.Rules) {
-		nflog("chain fell off the end of table without an unconditional final rule at rule %d", ruleIdx)
-		return syserr.ErrInvalidArgument
-	}
-	if isUserChainTarget(table.Rules[nextIdx].Target) {
-		nflog("chain fell through into a user chain without an unconditional final rule at rule %d (next target is %T)", ruleIdx, table.Rules[nextIdx].Target)
-		return syserr.ErrInvalidArgument
-	}
-	if err := checkChainDFS(table, nextIdx, state, ipv6); err != nil {
-		return err
-	}
-	state[ruleIdx] = visited
 	return nil
 }
 
 func checkLoopsAndChains(table stack.Table, ipv6 bool) *syserr.Error {
 	state := make([]visitState, len(table.Rules))
+	pending := make([]int, 0, len(table.Rules))
 
 	for hook, ruleIdx := range table.BuiltinChains {
 		if table.ValidHooks()&(1<<hook) != 0 {
-			if err := checkChainDFS(table, ruleIdx, state, ipv6); err != nil {
+			if err := checkChainDFS(table, ruleIdx, state, pending, ipv6); err != nil {
 				return err
 			}
 		}
@@ -578,7 +575,7 @@ func checkLoopsAndChains(table stack.Table, ipv6 bool) *syserr.Error {
 
 	for ruleIdx, rule := range table.Rules {
 		if isUserChainTarget(rule.Target) && ruleIdx+1 < len(table.Rules) {
-			if err := checkChainDFS(table, ruleIdx+1, state, ipv6); err != nil {
+			if err := checkChainDFS(table, ruleIdx+1, state, pending, ipv6); err != nil {
 				return syserr.ErrInvalidArgument
 			}
 		}

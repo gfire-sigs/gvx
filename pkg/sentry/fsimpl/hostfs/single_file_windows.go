@@ -16,7 +16,13 @@
 
 package hostfs
 
-import "golang.org/x/sys/windows"
+import (
+	"os"
+	"time"
+
+	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/internal/hoststorage"
+)
 
 // lstatBound reads the metadata of the bound file of a single-file workspace.
 // OpenWorkspace resolved the stored name before the lockdown, so the call
@@ -36,4 +42,36 @@ func (h *hostRoot) lstatBound(name string) (hostInfo, error) {
 		return hostInfo{}, hostError("lstat", name, err)
 	}
 	return info, nil
+}
+
+func (h *hostRoot) isolate() error {
+	if _, err := hoststorage.IdentifyStorage(h.dir); err != nil {
+		return err
+	}
+	// A volume-wide by-ID open cannot prove containment in the strict broker.
+	h.byIDErr = errHostUnsupported
+	h.isolated = true
+	return nil
+}
+
+func (h *hostRoot) chtimesBound(name string, atime, mtime *time.Time, validate func(hoststorage.StorageIdentity) error) error {
+	atimeFT, mtimeFT, err := setTimesArgs(name, atime, mtime)
+	if err != nil {
+		return err
+	}
+	handle, err := openAt(h.handle, name, windows.FILE_READ_ATTRIBUTES|windows.FILE_WRITE_ATTRIBUTES,
+		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, windows.FILE_NON_DIRECTORY_FILE)
+	if err != nil {
+		return hostError("set times", name, err)
+	}
+	f := os.NewFile(uintptr(handle), name)
+	defer f.Close()
+	id, err := hoststorage.VerifyStorageFile(f)
+	if err != nil {
+		return hostError("set times", name, err)
+	}
+	if err := validate(id); err != nil {
+		return err
+	}
+	return setHandleTimes(handle, name, atimeFT, mtimeFT)
 }

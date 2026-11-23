@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -68,80 +69,101 @@ func openControlInput(path string, token bool) (*os.File, error) {
 	return f, nil
 }
 
-func createControlTokenFile(path string) (*os.File, error) {
-	name, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, err
-	}
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
-	if err != nil {
-		return nil, err
-	}
-	owner := user.User.Sid.String()
+func newControlTokenDACL(user *windows.SID) (*windows.SECURITY_DESCRIPTOR, error) {
+	owner := user.String()
 	sddl := "O:" + owner + "D:P(A;;FA;;;" + owner + ")"
-	if owner != "S-1-5-18" {
+	if !user.IsWellKnown(windows.WinLocalSystemSid) {
 		sddl += "(A;;FA;;;SY)"
 	}
-	sd, err := windows.SecurityDescriptorFromString(sddl)
+	return windows.SecurityDescriptorFromString(sddl)
+}
+
+var reopenControlToken = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
+
+func pinControlTokenFile(_ controlTokenTarget, f *os.File) (*os.File, error) {
+	// Reopen by handle so the retained identity does not keep a writer open.
+	h, err := reopenTokenHandle(f, windows.FILE_READ_ATTRIBUTES)
 	if err != nil {
 		return nil, err
 	}
-	sa := windows.SecurityAttributes{SecurityDescriptor: sd}
-	sa.Length = uint32(unsafe.Sizeof(sa))
-	h, err := windows.CreateFile(name, windows.GENERIC_WRITE|windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ, &sa, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
-	if err != nil {
-		return nil, &os.PathError{Op: "create", Path: path, Err: err}
+	return os.NewFile(uintptr(h), f.Name()), nil
+}
+
+func reopenTokenHandle(f *os.File, access uint32) (windows.Handle, error) {
+	h, _, err := reopenControlToken.Call(f.Fd(), uintptr(access), windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, 0)
+	runtime.KeepAlive(f)
+	if windows.Handle(h) == windows.InvalidHandle {
+		return windows.InvalidHandle, err
 	}
-	f := os.NewFile(uintptr(h), path)
-	if err := validateControlInput(f, true); err != nil {
-		return nil, errors.Join(err, f.Close(), os.Remove(path))
-	}
-	return f, nil
+	return windows.Handle(h), nil
 }
 
 func validateControlInput(f *os.File, token bool) error {
-	h := windows.Handle(f.Fd())
-	kind, err := windows.GetFileType(h)
+	sd, err := controlFileSecurity(windows.Handle(f.Fd()))
+	runtime.KeepAlive(f)
+	if err == nil {
+		err = validateControlDACL(sd, token)
+	}
 	if err != nil {
-		return err
-	}
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
-		return err
-	}
-	if kind != windows.FILE_TYPE_DISK || info.NumberOfLinks != 1 || info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-		return fmt.Errorf("%q is not a trusted regular file", f.Name())
-	}
-	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, controlSecurityInfo)
-	if err != nil {
-		return err
-	}
-	if err := validateControlDACL(sd, token); err != nil {
 		return fmt.Errorf("%q: %w", f.Name(), err)
 	}
 	return nil
 }
 
+func controlFileSecurity(h windows.Handle) (*windows.SECURITY_DESCRIPTOR, error) {
+	kind, err := windows.GetFileType(h)
+	if err != nil {
+		return nil, err
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return nil, err
+	}
+	if kind != windows.FILE_TYPE_DISK || info.NumberOfLinks != 1 || info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+		return nil, errors.New("not a trusted regular file")
+	}
+	return windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, controlSecurityInfo)
+}
+
+type controlDACLKind uint8
+
+const (
+	controlPolicyInput controlDACLKind = iota
+	controlProtectedToken
+	controlCheckpointToken
+	controlCheckpointAncestor
+)
+
 func validateControlDACL(sd *windows.SECURITY_DESCRIPTOR, token bool) error {
-	if sd == nil {
-		return errUnsafeControlDACL
+	kind := controlPolicyInput
+	if token {
+		kind = controlProtectedToken
 	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return err
 	}
+	return validateControlDACLFor(sd, user.User.Sid, kind)
+}
+
+func validateControlDACLFor(sd *windows.SECURITY_DESCRIPTOR, user *windows.SID, kind controlDACLKind) error {
+	if sd == nil {
+		return errUnsafeControlDACL
+	}
+	token := kind == controlProtectedToken || kind == controlCheckpointToken
 	owner, _, err := sd.Owner()
 	if err != nil {
 		return err
 	}
-	if owner == nil || !(owner.Equals(user.User.Sid) || !token && trustedControlSID(owner)) {
+	if owner == nil || !(owner.Equals(user) || !token && trustedControlSID(owner) ||
+		kind == controlCheckpointAncestor && isWindowsServicingSID(owner)) {
 		return errUnsafeControlDACL
 	}
 	acl, _, err := sd.DACL()
 	if err != nil || acl == nil {
 		return errors.Join(errUnsafeControlDACL, err)
 	}
-	if token {
+	if kind == controlProtectedToken {
 		flags, _, err := sd.Control()
 		if err != nil {
 			return err
@@ -151,8 +173,12 @@ func validateControlDACL(sd *windows.SECURITY_DESCRIPTOR, token bool) error {
 		}
 	}
 	const fileDeleteChild = 0x00000040
-	const mutationRights = windows.GENERIC_ALL | windows.GENERIC_WRITE | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER |
-		windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES | fileDeleteChild
+	mutationRights := windows.ACCESS_MASK(windows.GENERIC_ALL | windows.GENERIC_WRITE | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER |
+		windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES | fileDeleteChild)
+	if kind == controlCheckpointAncestor {
+		// Add-file and add-directory rights cannot replace an existing child.
+		mutationRights &^= windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
+	}
 	for i := range uint32(acl.AceCount) {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(acl, i, &ace); err != nil {
@@ -162,11 +188,16 @@ func validateControlDACL(sd *windows.SECURITY_DESCRIPTOR, token bool) error {
 		case windows.ACCESS_DENIED_ACE_TYPE:
 			continue
 		case windows.ACCESS_ALLOWED_ACE_TYPE:
+			if kind == controlCheckpointAncestor && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+				continue
+			}
 			if !token && ace.Mask&mutationRights == 0 {
 				continue
 			}
 			sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-			if sid.Equals(user.User.Sid) || sid.IsWellKnown(windows.WinLocalSystemSid) || !token && sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
+			if sid.Equals(user) || sid.IsWellKnown(windows.WinLocalSystemSid) ||
+				!token && sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) ||
+				kind == controlCheckpointAncestor && isWindowsServicingSID(sid) {
 				continue
 			}
 		}
@@ -179,4 +210,10 @@ var errUnsafeControlDACL = errors.New("control path has an unsafe owner or DACL"
 
 func trustedControlSID(sid *windows.SID) bool {
 	return sid.IsWellKnown(windows.WinLocalSystemSid) || sid.IsWellKnown(windows.WinBuiltinAdministratorsSid)
+}
+
+func isWindowsServicingSID(sid *windows.SID) bool {
+	// The Windows Modules Installer service can own system directories.
+	const trustedInstaller = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+	return sid.String() == trustedInstaller
 }

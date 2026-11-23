@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 )
 
 // TCP and Windows AF_UNIX connections require a per-run token. POSIX Unix
@@ -47,6 +48,9 @@ func controlTokenRequired(network string) bool {
 // controlTokenDir returns the owner-only directory for the token files of TCP
 // listeners.
 func controlTokenDir() (string, error) {
+	if dir, err := appControlTokenDir(); dir != "" || err != nil {
+		return dir, err
+	}
 	if base, err := os.UserCacheDir(); err == nil && base != "" {
 		return filepath.Join(base, "gvx", "control"), nil
 	}
@@ -83,46 +87,102 @@ func newControlToken() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
-// Replace stale tokens only after binding the corresponding endpoint.
-func writeControlToken(path, token string, protected bool) (string, error) {
-	dir, err := privatePolicyControlDir(filepath.Dir(path), true)
-	if err != nil {
-		return "", err
-	}
-	path = filepath.Join(dir, filepath.Base(path))
-	if info, err := os.Lstat(path); err == nil {
-		if !info.Mode().IsRegular() {
-			return "", fmt.Errorf("control token path %q is not a regular file", path)
+type controlTokenTarget interface {
+	verifyRegular() error
+	open() (*os.File, error)
+	create() (*os.File, error)
+	remove() error
+	removeIfSame(*os.File) error
+}
+
+func openControlTokenTarget(network, path string, create bool) (controlTokenTarget, func() error, error) {
+	if network == "tcp" {
+		if target, closeTarget, err := openAppControlTokenTarget(path, create); target != nil || err != nil {
+			return target, closeTarget, err
 		}
+	}
+	return openPathControlTokenTarget(path, create)
+}
+
+type controlTokenArtifact struct {
+	file   *os.File
+	finish func(remove bool)
+}
+
+// Replace stale tokens only after binding the corresponding endpoint.
+func writeControlToken(network, path, token string, protected bool) (controlTokenArtifact, error) {
+	target, closeTarget, err := openControlTokenTarget(network, path, true)
+	if err != nil {
+		return controlTokenArtifact{}, err
+	}
+	f, err := publishControlToken(target, token, protected)
+	if err != nil {
+		if closeTarget != nil {
+			err = errors.Join(err, closeTarget())
+		}
+		return controlTokenArtifact{}, fmt.Errorf("publish control token %q: %w", path, err)
+	}
+	if runtime.GOOS == "windows" {
+		// Windows removes the token by file handle, not through the directories.
+		if err := closeTarget(); err != nil {
+			return controlTokenArtifact{}, errors.Join(err, target.removeIfSame(f), f.Close())
+		}
+		closeTarget = nil
+	}
+	var once sync.Once
+	finish := func(remove bool) {
+		once.Do(func() {
+			if remove {
+				_ = target.removeIfSame(f)
+			}
+			_ = f.Close()
+			if closeTarget != nil {
+				_ = closeTarget()
+			}
+		})
+	}
+	return controlTokenArtifact{file: f, finish: finish}, nil
+}
+
+func publishControlToken(target controlTokenTarget, token string, protected bool) (*os.File, error) {
+	if err := target.verifyRegular(); err == nil {
 		if protected {
-			if _, err := readControlTokenFile(path); err != nil {
-				return "", fmt.Errorf("verify stale control token: %w", err)
+			if _, err := readControlTokenFile(target.open()); err != nil {
+				return nil, fmt.Errorf("verify stale control token: %w", err)
 			}
 		}
+		if err := target.remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("remove stale control token: %w", err)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", err
+		return nil, err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("remove stale control token %q: %w", path, err)
-	}
-	f, err := createControlTokenFile(path)
+	f, err := target.create()
 	if err != nil {
-		return "", fmt.Errorf("create control token %q: %w", path, err)
+		return nil, fmt.Errorf("create control token: %w", err)
 	}
 	if _, err := f.WriteString(token + "\n"); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return "", fmt.Errorf("write control token %q: %w", path, err)
+		return nil, errors.Join(err, target.removeIfSame(f), f.Close())
+	}
+	pinned, err := pinControlTokenFile(target, f)
+	if err != nil {
+		return nil, errors.Join(err, target.removeIfSame(f), f.Close())
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("close control token %q: %w", path, err)
+		return nil, errors.Join(err, target.removeIfSame(pinned), pinned.Close())
 	}
-	return path, nil
+	return pinned, nil
+}
+
+func controlTokenFileName(f *os.File) string {
+	if f == nil {
+		return ""
+	}
+	return f.Name()
 }
 
 // A missing token is permitted only on transports that do not require one.
-func readControlToken(network, address string) (string, error) {
+func readControlToken(network, address string) (token string, err error) {
 	if !controlTokenRequired(network) {
 		return "", nil
 	}
@@ -130,21 +190,23 @@ func readControlToken(network, address string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dir, err := privatePolicyControlDir(filepath.Dir(path), false)
+	target, closeTarget, err := openControlTokenTarget(network, path, false)
 	if err != nil {
 		return "", err
 	}
-	return readControlTokenFile(filepath.Join(dir, filepath.Base(path)))
+	if closeTarget != nil {
+		defer func() { err = errors.Join(err, closeTarget()) }()
+	}
+	return readControlTokenFile(target.open())
 }
 
-func readControlTokenFile(path string) (string, error) {
-	f, err := openControlInput(path, true)
+func readControlTokenFile(f *os.File, err error) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read control token: %w", err)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxControlTokenFileBytes+1))
 	if err := errors.Join(err, f.Close()); err != nil {
-		return "", fmt.Errorf("read control token %q: %w", path, err)
+		return "", fmt.Errorf("read control token %q: %w", f.Name(), err)
 	}
 	if len(data) > maxControlTokenFileBytes {
 		return "", errors.New("invalid control token file")

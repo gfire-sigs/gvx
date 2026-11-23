@@ -807,15 +807,33 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		}
 	}
 
-	// We need to do a deep copy of the IP packet because
-	// WriteHeaderIncludedPacket may modify the packet buffer, but we do
-	// not own it.
-	//
-	// TODO(https://gvisor.dev/issue/7473): For multicast, only create one deep
-	// copy and then clone.
+	// Make the forwarding copy before local delivery can update IP options.
 	newPkt := pkt.DeepCopyForForwarding(int(route.MaxHeaderLength()))
-	newHdr := header.IPv4(newPkt.NetworkHeader().Slice())
 	defer newPkt.DecRef()
+	if policy := stk.PacketDeliveryPolicy(); policy != nil {
+		if metadata := pkt.PacketPolicy(); metadata != nil {
+			newPkt.PacketPolicy().Ingress = metadata.Ingress
+		}
+		newPkt.NICID = pkt.NICID
+		newPkt.NetworkPacketInfo.LocalAddressBroadcast = pkt.NetworkPacketInfo.LocalAddressBroadcast
+		route.Acquire()
+		policy.ForwardPacket(newPkt, func(owned *stack.PacketBuffer, output stack.PacketPolicyOutput) {
+			owned.PacketPolicy().Output = output
+			e.handleForwardingError(e.writeForwardedPacket(route, nil, owned, updateOptions))
+		}, route.Release)
+		return nil
+	}
+	return e.writeForwardedPacket(route, pkt, newPkt, updateOptions)
+}
+
+func (e *endpoint) writeForwardedPacket(route *stack.Route, original, newPkt *stack.PacketBuffer, updateOptions bool) ip.ForwardingError {
+	newHdr := header.IPv4(newPkt.NetworkHeader().Slice())
+	// The private queue owns only the forwarding copy. Preserve the
+	// original IP header for the rare fragmentation-needed reply.
+	var savedHeader [header.IPv4MaximumHeaderSize]byte
+	if original == nil {
+		copy(savedHeader[:], newHdr)
+	}
 
 	forwardToEp, ok := e.protocol.getEndpointForNIC(route.NICID())
 	if !ok {
@@ -828,7 +846,7 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		}
 	}
 
-	ttl := header.IPv4(pkt.NetworkHeader().Slice()).TTL()
+	ttl := newHdr.TTL()
 	// As per RFC 791 page 30, Time to Live,
 	//
 	//   This field must be decreased at each point that the internet header
@@ -859,9 +877,13 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		// WriteHeaderIncludedPacket checks for the presence of the Don't Fragment bit
 		// while sending the packet and returns this error iff fragmentation is
 		// necessary and the bit is also set.
+		if original == nil {
+			copy(newHdr, savedHeader[:len(newHdr)])
+			original = newPkt
+		}
 		_ = e.protocol.returnError(&icmpReasonFragmentationNeeded{
 			mtu: forwardToEp.nic.MTU(),
-		}, pkt, false /* deliveredLocally */)
+		}, original, false /* deliveredLocally */)
 		return &ip.ErrMessageTooLong{}
 	case *tcpip.ErrNoBufferSpace:
 		return &ip.ErrOutgoingDeviceNoBufferSpace{}
@@ -1434,6 +1456,9 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 			return
 		}
 		defer resPkt.DecRef()
+		if policy := resPkt.PacketPolicy(); policy != nil && policy.Ingress.WireBytes < 0 {
+			return
+		}
 		pkt = resPkt
 		h = header.IPv4(pkt.NetworkHeader().Slice())
 
@@ -1461,7 +1486,11 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 		// headers, the setting of the transport number here should be
 		// unnecessary and removed.
 		pkt.TransportProtocolNumber = p
-		e.handleICMP(pkt)
+		if policy := stk.PacketDeliveryPolicy(); policy != nil {
+			policy.DeliverPacketOnly(pkt, e.handleICMP)
+		} else {
+			e.handleICMP(pkt)
+		}
 		return
 	}
 	// ICMP handles options itself but do it here for all remaining destinations.
@@ -1488,13 +1517,29 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 		}
 	}
 	if p == header.IGMPProtocolNumber {
-		e.mu.Lock()
-		e.igmp.handleIGMP(pkt, hasRouterAlertOption)
-		e.mu.Unlock()
+		if policy := stk.PacketDeliveryPolicy(); policy != nil {
+			policy.DeliverPacketOnly(pkt, func(pkt *stack.PacketBuffer) { e.deliverIGMP(pkt, hasRouterAlertOption) })
+		} else {
+			e.deliverIGMP(pkt, hasRouterAlertOption)
+		}
 		return
 	}
 
-	switch res := e.dispatcher.DeliverTransportPacket(p, pkt); res {
+	if pkt.PacketPolicy().HasIngress() {
+		stk.DeliverLocalTransportPacket(e.dispatcher, p, pkt, e.handleLocalTransportDisposition)
+		return
+	}
+	e.handleLocalTransportDisposition(pkt, e.dispatcher.DeliverTransportPacket(p, pkt))
+}
+
+func (e *endpoint) deliverIGMP(pkt *stack.PacketBuffer, hasRouterAlertOption bool) {
+	e.mu.Lock()
+	e.igmp.handleIGMP(pkt, hasRouterAlertOption)
+	e.mu.Unlock()
+}
+
+func (e *endpoint) handleLocalTransportDisposition(pkt *stack.PacketBuffer, res stack.TransportPacketDisposition) {
+	switch res {
 	case stack.TransportPacketHandled:
 	case stack.TransportPacketDestinationPortUnreachable:
 		// As per RFC: 1122 Section 3.2.2.1 A host SHOULD generate Destination

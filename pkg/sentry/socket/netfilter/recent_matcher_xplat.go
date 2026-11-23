@@ -204,7 +204,11 @@ type RecentMatcher struct {
 	release *recentRelease
 }
 
-func (m *RecentMatcher) afterLoad(context.Context) {
+func (m *RecentMatcher) afterLoad(ctx context.Context) {
+	stack.DeferCheckpointActivation(ctx, m, m.restoreListBinding)
+}
+
+func (m *RecentMatcher) restoreListBinding() {
 	if m.table == nil || (m.release != nil && m.release.released.Load()) {
 		return
 	}
@@ -357,7 +361,11 @@ func (t *recentTable) beforeSave() {
 	}
 }
 
-func (t *recentTable) afterLoad(context.Context) {
+func (t *recentTable) afterLoad(ctx context.Context) {
+	stack.DeferCheckpointActivation(ctx, t, t.restoreEntries)
+}
+
+func (t *recentTable) restoreEntries() {
 	t.lru.Init()
 	for _, e := range t.savedOrder {
 		e.lru = t.lru.PushBack(e)
@@ -503,7 +511,11 @@ func (r *recentRegistry) beforeSave() {
 	}
 }
 
-func (r *recentRegistry) afterLoad(context.Context) {
+func (r *recentRegistry) afterLoad(ctx context.Context) {
+	stack.DeferCheckpointActivation(ctx, r, r.restoreClock)
+}
+
+func (r *recentRegistry) restoreClock() {
 	r.mu.Lock()
 	if r.tables == nil {
 		r.tables = make(map[string]*recentTable)

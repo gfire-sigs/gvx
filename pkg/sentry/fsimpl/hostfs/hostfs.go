@@ -40,6 +40,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hoststorage"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 )
@@ -165,6 +166,8 @@ type dirNames struct {
 
 // Workspace wraps a pre-opened Go 1.25+ *os.Root directory handle and enforces
 // symlink-safe traversal and POSIX metadata persistence.
+// Keep backing descriptor state on hostRoot: the checkpoint fingerprint
+// includes the size of Workspace even though it is not saved.
 type Workspace struct {
 	// mu protects closed and orders the guest calls. Lock order:
 	// Workspace.mu, then pinMu, then nameMu. filesystem.mu is always taken
@@ -316,7 +319,9 @@ type workspaceOptions struct {
 	countDirLinks bool
 	// restoreMode skips ephemeral file sweeping during OpenWorkspaceForRestore
 	// so CompleteRestore can reattach unlinked backing files first.
-	restoreMode bool
+	restoreMode  bool
+	isolate      func(dir, file *os.File) error
+	validateFile func(hoststorage.StorageIdentity) error
 }
 
 // ChunkMemory supplies the memory for the chunks of mapped files.
@@ -338,6 +343,17 @@ func (w *Workspace) chunkMemory() ChunkMemory {
 // and loads any persisted .gvx_meta table.
 func OpenWorkspace(hostPath string, readOnly bool) (*Workspace, error) {
 	return openWorkspace(hostPath, readOnly, workspaceOptions{coalesce: defaultCoalesceWindow})
+}
+
+// OpenIsolatedWorkspace validates the opened root and optional binding before
+// it probes the filesystem, opens metadata, or starts workers.
+func OpenIsolatedWorkspace(hostPath string, readOnly, restore bool, validate func(dir, file *os.File) error, validateFile func(hoststorage.StorageIdentity) error) (*Workspace, error) {
+	if validate == nil || validateFile == nil {
+		return nil, os.ErrInvalid
+	}
+	return openWorkspace(hostPath, readOnly, workspaceOptions{
+		coalesce: defaultCoalesceWindow, restoreMode: restore, isolate: validate, validateFile: validateFile,
+	})
 }
 
 func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Workspace, error) {
@@ -362,9 +378,30 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		_ = root.Close()
 		return nil, err
 	}
+	var pinnedFile *os.File
+	if opts.isolate != nil {
+		if err := backend.isolate(); err != nil {
+			return nil, errors.Join(err, backend.close(), root.Close())
+		}
+		if single != "" {
+			pinnedFile, err = backend.open(single, os.O_RDONLY, 0)
+			if err != nil {
+				return nil, errors.Join(err, backend.close(), root.Close())
+			}
+			if _, err = hoststorage.VerifyStorageFile(pinnedFile); err != nil {
+				return nil, errors.Join(err, pinnedFile.Close(), backend.close(), root.Close())
+			}
+		}
+		if err := opts.isolate(backend.dir, pinnedFile); err != nil {
+			if pinnedFile != nil {
+				err = errors.Join(err, pinnedFile.Close())
+			}
+			return nil, errors.Join(err, backend.close(), root.Close())
+		}
+	}
 	var host hostBackend = backend
 	if single != "" {
-		host = &singleHost{hostBackend: host, bound: backend, name: single}
+		host = &singleHost{hostBackend: host, bound: backend, name: single, validate: opts.validateFile}
 	}
 	if opts.wrapHost != nil {
 		host = opts.wrapHost(host)
@@ -376,6 +413,9 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	}
 	rootInfo, err := host.lstat(".")
 	if err != nil {
+		if pinnedFile != nil {
+			_ = pinnedFile.Close()
+		}
 		_ = host.close()
 		_ = root.Close()
 		return nil, fmt.Errorf("hostfs: stat workspace root %q: %w", pinDir, err)
@@ -397,6 +437,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	if hostOS == "" {
 		hostOS = runtime.GOOS
 	}
+	backend.pinnedFile = pinnedFile
 	w := &Workspace{
 		rootPath:         absPath,
 		root:             root,
@@ -437,10 +478,10 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	if caps.LocksOpenDirMove {
 		w.handles = newWinHandleRegistry(workspaceHandleOps{w})
 	}
-	if single != "" {
-		// Every host change reaches the guest through the poll backend, which
-		// reads the one file by name.
+	if single != "" || (backend.isolated && runtime.GOOS == "darwin") {
 		w.watch.factory = func(hw *hostWatcher) (watchBackend, error) { return newPollBackend(hw), nil }
+	}
+	if single != "" {
 		return w, nil
 	}
 	if err := w.openMetaLock(); err != nil {
@@ -473,6 +514,28 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 // Root returns the underlying pinned *os.Root handle.
 func (w *Workspace) Root() *os.Root {
 	return w.root
+}
+
+// IsolatedStorage returns the borrowed directory and optional bound file of
+// a protected workspace. The workspace owns the descriptors until Close.
+func (w *Workspace) IsolatedStorage() (dir, file *os.File, leaf string) {
+	backend := w.rawHost.(*hostRoot)
+	if !backend.isolated {
+		return nil, nil, ""
+	}
+	return backend.dir, backend.pinnedFile, w.single
+}
+
+// ValidateRestoreBinding verifies the protected file's current open target.
+func (w *Workspace) ValidateRestoreBinding() error {
+	if _, file, _ := w.IsolatedStorage(); file == nil {
+		return nil
+	}
+	f, err := w.host.open(".", os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // HostPath returns the absolute host directory path of the workspace.
@@ -515,7 +578,11 @@ func (w *Workspace) Close() error {
 	pinErr := w.closePins()
 	hostErr := w.host.close()
 	rootErr := w.root.Close()
-	return errors.Join(flushErr, journalErr, lockErr, pinErr, hostErr, rootErr)
+	var fileErr error
+	if _, file, _ := w.IsolatedStorage(); file != nil {
+		fileErr = file.Close()
+	}
+	return errors.Join(flushErr, journalErr, lockErr, pinErr, hostErr, rootErr, fileErr)
 }
 
 // Sync writes every pending metadata mutation to stable storage. After Sync

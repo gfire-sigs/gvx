@@ -17,6 +17,7 @@ package wireguard
 import (
 	stdcontext "context"
 	"errors"
+	"fmt"
 	"sync"
 	"weak"
 
@@ -307,6 +308,23 @@ func (e *linkEndpoint) afterLoad(ctx stdcontext.Context) {
 	if e.closed {
 		return
 	}
+	staged := stack.IsolatedEndpointRestore(ctx)
+	stack.DeferCheckpointActivation(ctx, e, func() { e.restoreBinding(ctx, staged) })
+}
+
+// ValidateCheckpointLink ensures that a live WireGuard bind can be restored
+// only into a network namespace admitted as part of this checkpoint.
+func (e *linkEndpoint) ValidateCheckpointLink(owners map[*stack.Stack]struct{}) error {
+	if e.Endpoint == nil || e.bind == nil || e.bind.stack == nil {
+		return fmt.Errorf("WireGuard device has no saved link or bind")
+	}
+	if _, ok := owners[e.bind.stack]; !ok && !e.bind.gone {
+		return fmt.Errorf("WireGuard bind belongs to an unrestored namespace")
+	}
+	return nil
+}
+
+func (e *linkEndpoint) restoreBinding(ctx stdcontext.Context, staged bool) {
 	if gctx, ok := ctx.(context.Context); ok {
 		e.acct = accountingOf(gctx)
 	} else {
@@ -316,6 +334,11 @@ func (e *linkEndpoint) afterLoad(ctx stdcontext.Context) {
 		if err := chargeMemory(e.acct, e.charged); err != nil {
 			e.charged = 0
 		}
+	}
+	// A moved device whose original namespace exited keeps its config but
+	// can never open sockets again. Do not retain its dead stack globally.
+	if staged && e.bind.gone {
+		return
 	}
 	e.register()
 	e.registerHooks()

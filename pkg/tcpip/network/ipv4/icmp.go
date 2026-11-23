@@ -634,6 +634,12 @@ func (*icmpReasonHostUnreachable) isICMPReason() {}
 // possible as well as any error metadata as is available. returnError
 // expects pkt to hold a valid IPv4 packet as per the wire format.
 func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer, deliveredLocally bool) tcpip.Error {
+	if metadata := pkt.PacketPolicy(); deliveredLocally && metadata.HasIngress() && !metadata.Ingress.Accounted {
+		if policy := p.stack.PacketDeliveryPolicy(); policy != nil {
+			policy.DeliverPacketOnly(pkt, func(pkt *stack.PacketBuffer) { _ = p.returnError(reason, pkt, true) })
+			return nil
+		}
+	}
 	origIPHdr := header.IPv4(pkt.NetworkHeader().Slice())
 	origIPHdrSrc := origIPHdr.SourceAddress()
 	origIPHdrDst := origIPHdr.DestinationAddress()
@@ -850,6 +856,12 @@ func (p *protocol) OnReassemblyTimeout(pkt *stack.PacketBuffer) {
 	//   If fragment zero is not available then no time exceeded need be sent at
 	//   all.
 	if pkt != nil {
+		if policy := p.stack.PacketDeliveryPolicy(); policy != nil && pkt.PacketPolicy().HasIngress() {
+			policy.DeliverReassemblyTimeout(pkt, func(pkt *stack.PacketBuffer) {
+				_ = p.returnError(&icmpReasonReassemblyTimeout{}, pkt, true)
+			})
+			return
+		}
 		p.returnError(&icmpReasonReassemblyTimeout{}, pkt, true /* deliveredLocally */)
 	}
 }

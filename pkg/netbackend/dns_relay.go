@@ -368,12 +368,22 @@ func (p *dnsRequestPolicy) sendReply(ctx context.Context, conn net.Conn, wire []
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	guest := p.guest.Reverse()
-	send := func() error { return policyWrite(conn, write) }
-	if !reply.upstream.ProtocolKnown {
-		return p.policy.Send(ctx, PolicyOutput, len(wire), send, guest)
+	tuples := [2]PolicyTuple{p.guest.Reverse()}
+	count, size := 1, len(wire)
+	if reply.upstream.ProtocolKnown {
+		tuples[1] = reply.upstream.Reverse()
+		count, size = 2, reply.upstreamBytes
 	}
-	return p.policy.Send(ctx, PolicyOutput, reply.upstreamBytes, send, guest, reply.upstream.Reverse())
+	if udp, ok := conn.(*gonet.UDPConn); ok {
+		write = func() error {
+			n, err := writeNATRelayDatagram(p.policy, udp, wire, tuples[:count]...)
+			if err == nil && n != len(wire) {
+				return io.ErrShortWrite
+			}
+			return err
+		}
+	}
+	return p.policy.Send(ctx, PolicyOutput, size, func() error { return policyWrite(conn, write) }, tuples[:count]...)
 }
 
 func writeDNSWire(conn net.Conn, wire []byte) error {

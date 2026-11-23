@@ -36,7 +36,7 @@ const (
 
 var pkPool = sync.Pool{
 	New: func() any {
-		return &PacketBuffer{}
+		return new(pooledPacketBuffer)
 	},
 }
 
@@ -183,15 +183,15 @@ type PacketBuffer struct {
 
 	tuple *tuple
 
-	// onRelease is a function to be run when the packet buffer is no longer
-	// referenced (released back to the pool).
+	// onRelease is non-nil only for packets embedded in pooledPacketBuffer.
+	// Keep this transient slot in the checkpoint layout.
 	onRelease func() `state:"nosave"`
 }
 
 // NewPacketBuffer creates a new PacketBuffer with opts.
 func NewPacketBuffer(opts PacketBufferOptions) *PacketBuffer {
-	pk := pkPool.Get().(*PacketBuffer)
-	pk.reset()
+	storage := getPacketBuffer()
+	pk := &storage.packet
 	if opts.ReserveHeaderBytes != 0 {
 		v := buffer.NewViewSize(opts.ReserveHeaderBytes)
 		pk.buf.Append(v)
@@ -201,7 +201,7 @@ func NewPacketBuffer(opts PacketBufferOptions) *PacketBuffer {
 		pk.buf.Merge(&opts.Payload)
 	}
 	pk.NetworkPacketInfo.IsForwardedPacket = opts.IsForwardedPacket
-	pk.onRelease = opts.OnRelease
+	storage.release = opts.OnRelease
 	pk.Mark = opts.Mark
 	pk.InitRefs()
 	return pk
@@ -213,23 +213,30 @@ func (pk *PacketBuffer) IncRef() *PacketBuffer {
 	return pk
 }
 
-// DecRef decrements the PacketBuffer's refcount. If the refcount is
-// decremented to zero, the PacketBuffer is returned to the PacketBuffer
-// pool.
+// DecRef decrements the PacketBuffer's refcount and releases it at zero.
 func (pk *PacketBuffer) DecRef() {
 	pk.packetBufferRefs.DecRef(func() {
-		if pk.onRelease != nil {
-			pk.onRelease()
+		if storage := pk.pooled(); storage != nil {
+			if storage.release != nil {
+				storage.release()
+			}
+			pk.buf.Release()
+			storage.release = nil
+			storage.policy = PacketPolicyMetadata{}
+			pkPool.Put(storage)
+		} else {
+			pk.buf.Release()
 		}
-
-		pk.buf.Release()
-		pkPool.Put(pk)
 	})
 }
 
-func (pk *PacketBuffer) reset() {
-	*pk = PacketBuffer{}
+func getPacketBuffer() *pooledPacketBuffer {
+	storage := pkPool.Get().(*pooledPacketBuffer)
+	storage.packet = PacketBuffer{onRelease: pooledPacketMarker}
+	return storage
 }
+
+func pooledPacketMarker() {}
 
 // ReservedHeaderBytes returns the number of bytes initially reserved for
 // headers.
@@ -285,8 +292,8 @@ func (pk *PacketBuffer) Size() int {
 	return int(pk.buf.Size()) - pk.headerOffset()
 }
 
-// MemSize returns the estimation size of the pk in memory, including backing
-// buffer data.
+// MemSize returns the packet's queue charge, including its backing buffer.
+// The charge is the same before and after restoring the packet.
 func (pk *PacketBuffer) MemSize() int {
 	return int(pk.buf.Size()) + PacketBufferStructSize
 }
@@ -392,8 +399,8 @@ func (pk *PacketBuffer) headerView(typ headerType) buffer.View {
 // Clone makes a semi-deep copy of pk. The underlying packet payload is
 // shared. Hence, no modifications is done to underlying packet payload.
 func (pk *PacketBuffer) Clone() *PacketBuffer {
-	newPk := pkPool.Get().(*PacketBuffer)
-	newPk.reset()
+	storage := getPacketBuffer()
+	newPk := &storage.packet
 	newPk.buf = pk.buf.Clone()
 	newPk.reserved = pk.reserved
 	newPk.pushed = pk.pushed
@@ -416,6 +423,9 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 	newPk.InputNICID = pk.InputNICID
 	newPk.RXChecksumValidated = pk.RXChecksumValidated
 	newPk.NetworkPacketInfo = pk.NetworkPacketInfo
+	if policy := pk.PacketPolicy(); policy != nil {
+		storage.policy.Ingress = policy.Ingress
+	}
 	newPk.tuple = pk.tuple
 	newPk.InitRefs()
 	return newPk
@@ -451,8 +461,8 @@ func (pk *PacketBuffer) Network() header.Network {
 // See PacketBuffer.Data for details about how a packet buffer holds an inbound
 // packet.
 func (pk *PacketBuffer) CloneToInbound() *PacketBuffer {
-	newPk := pkPool.Get().(*PacketBuffer)
-	newPk.reset()
+	storage := getPacketBuffer()
+	newPk := &storage.packet
 	newPk.buf = pk.buf.Clone()
 	newPk.InitRefs()
 	// Treat unfilled header portion as reserved.
@@ -713,6 +723,9 @@ func (d PacketData) MergeBuffer(b *buffer.Buffer) {
 func MergeFragment(dst, frag *PacketBuffer) {
 	frag.buf.TrimFront(int64(frag.dataOffset()))
 	dst.buf.Merge(&frag.buf)
+	if policy := dst.PacketPolicy(); policy != nil {
+		policy.AddIngressFragment(frag)
+	}
 }
 
 // ReadFrom moves at most count bytes from the beginning of src to the end

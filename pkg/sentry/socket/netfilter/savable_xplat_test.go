@@ -19,6 +19,7 @@ import (
 	"context"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -150,9 +151,11 @@ func TestIPTablesWithStandardMatchersAndTargetsSurvivesSaveLoad(t *testing.T) {
 		t.Fatalf("state.Load: %v", err)
 	}
 	t.Cleanup(restored.Destroy)
-	if !restored.RestoreIPTablesCheckpoint() {
-		t.Fatal("restored stack did not contain guest rules")
+	install, err := restored.PrepareIPTablesCheckpoint(nil)
+	if err != nil || install == nil {
+		t.Fatalf("prepare saved guest rules: %v", err)
 	}
+	install()
 	restoredTables := restored.IPTables()
 
 	gotRules := restoredTables.GetTable(stack.NATID, false).Rules
@@ -175,5 +178,140 @@ func TestIPTablesWithStandardMatchersAndTargetsSurvivesSaveLoad(t *testing.T) {
 		if !bytes.Equal(marshalTarget(got.Target), marshalTarget(want.Target)) {
 			t.Errorf("rule %d target (%T): restored ABI bytes differ", i, want.Target)
 		}
+	}
+}
+
+func TestIPTablesCheckpointAcceptsRulesWrittenThroughSetEntries(t *testing.T) {
+	original := stack.New(stack.Options{Clock: faketime.NewManualClock(), DefaultIPTables: DefaultLinuxTables})
+	t.Cleanup(original.Destroy)
+	original.EnableIPTablesCheckpoint()
+	var name linux.TableName
+	copy(name[:], filterTable)
+	// The writer accepts alignment padding after a fixed-size comment.
+	// The guest ABI dump does not preserve that padding when it emits rules.
+	const padding = 8
+	paddedComment := marshalEntryMatch(matcherNameComment, make([]byte, linux.SizeOfXTCommentInfo+padding))
+	commentSize := len(paddedComment) - padding
+	for _, ipv6 := range [...]bool{false, true} {
+		table := original.IPTables().GetTable(stack.FilterID, ipv6)
+		filter, entrySize := stack.EmptyFilter4(), linux.SizeOfIPTEntry
+		if ipv6 {
+			filter, entrySize = stack.EmptyFilter6(), linux.SizeOfIP6TEntry
+		}
+		proto := filter.NetworkProtocol()
+		jump := &JumpTarget{NetworkProtocol: proto}
+		table = insertChainRules(table, stack.Input, []stack.Rule{{
+			Filter: filter, Matchers: []stack.Matcher{&commentMatcher{}}, Target: jump,
+		}})
+		last := len(table.Rules) - 1
+		jump.Offset = uint32(last*(entrySize+linux.SizeOfXTStandardTarget) + entrySize + linux.SizeOfXTErrorTarget + len(paddedComment))
+		table.Rules = append(table.Rules[:last:last],
+			stack.Rule{Filter: filter, Target: &userChainTarget{stack.UserChainTarget{Name: "GUEST", NetworkProtocol: proto}}},
+			stack.Rule{Filter: filter, Matchers: []stack.Matcher{&commentMatcher{comment: "guest policy"}}, Target: &dropTarget{stack.DropTarget{NetworkProtocol: proto}}},
+			stack.Rule{Filter: filter, Target: &returnTarget{stack.ReturnTarget{NetworkProtocol: proto}}},
+			table.Rules[last],
+		)
+		var entries []byte
+		var info linux.IPTGetinfo
+		if ipv6 {
+			wire, metadata := getEntries6(table, name)
+			info = metadata
+			for i, entry := range wire.Entrytable {
+				if i == 0 {
+					entry.Elems = append(slices.Clone(paddedComment), entry.Elems[commentSize:]...)
+					entry.Entry.TargetOffset += padding
+					entry.Entry.NextOffset += padding
+				}
+				entries = append(entries, marshal.Marshal(&entry)...)
+			}
+		} else {
+			wire, metadata := getEntries4(table, name)
+			info = metadata
+			for i, entry := range wire.Entrytable {
+				if i == 0 {
+					entry.Elems = append(slices.Clone(paddedComment), entry.Elems[commentSize:]...)
+					entry.Entry.TargetOffset += padding
+					entry.Entry.NextOffset += padding
+				}
+				entries = append(entries, marshal.Marshal(&entry)...)
+			}
+		}
+		replace := linux.IPTReplace{
+			Name: name, ValidHooks: info.ValidHooks, NumEntries: info.NumEntries,
+			Size: info.Size, HookEntry: info.HookEntry, Underflow: info.Underflow,
+		}
+		replace.Size += padding
+		for hook := range replace.HookEntry {
+			if replace.HookEntry[hook] != 0 {
+				replace.HookEntry[hook] += padding
+			}
+			if replace.Underflow[hook] != 0 {
+				replace.Underflow[hook] += padding
+			}
+		}
+		if err := SetEntries(nil, original, append(marshal.Marshal(&replace), entries...), ipv6); err != nil {
+			t.Fatalf("SetEntries (ipv6=%t): %v", ipv6, err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if _, err := state.Save(t.Context(), &buf, &original); err != nil {
+		t.Fatalf("state.Save: %v", err)
+	}
+	var restored *stack.Stack
+	if _, err := state.Load(t.Context(), &buf, &restored); err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	t.Cleanup(restored.Destroy)
+	install, err := restored.PrepareIPTablesCheckpoint(func(it *stack.IPTables, modified bool) error {
+		return ValidateIPTablesCheckpoint(t.Context(), restored, it, modified)
+	})
+	if err != nil || install == nil {
+		t.Fatalf("prepare rules written by SetEntries: %v", err)
+	}
+	if restored.IPTables() != nil {
+		t.Fatal("validation installed iptables")
+	}
+	install()
+	for _, ipv6 := range [...]bool{false, true} {
+		table := restored.IPTables().GetTable(stack.FilterID, ipv6)
+		jump := table.Rules[table.BuiltinChains[stack.Input]].Target.(*JumpTarget)
+		wantOffset := uint32(0)
+		if ipv6 {
+			wire, _ := getEntries6(table, name)
+			for _, entry := range wire.Entrytable[:jump.RuleNum] {
+				wantOffset += uint32(entry.Entry.NextOffset)
+			}
+		} else {
+			wire, _ := getEntries4(table, name)
+			for _, entry := range wire.Entrytable[:jump.RuleNum] {
+				wantOffset += uint32(entry.Entry.NextOffset)
+			}
+		}
+		if jump.Offset != wantOffset {
+			t.Errorf("restored jump offset (ipv6=%t) = %d, want %d from the guest ABI", ipv6, jump.Offset, wantOffset)
+		}
+		rule := table.Rules[jump.RuleNum]
+		if got, ok := rule.Matchers[0].(*commentMatcher); !ok || got.comment != "guest policy" {
+			t.Errorf("restored jump destination (ipv6=%t) lost its comment: %v", ipv6, rule.Matchers)
+		}
+		if verdict, _ := rule.Target.Action(nil, stack.Input, nil, nil); verdict != stack.RuleDrop {
+			t.Errorf("restored guest target (ipv6=%t) = %v, want DROP", ipv6, verdict)
+		}
+	}
+}
+
+func TestIPTablesCheckpointRejectsNonDefaultInactiveRules(t *testing.T) {
+	st := stack.New(stack.Options{Clock: faketime.NewManualClock(), DefaultIPTables: DefaultLinuxTables})
+	t.Cleanup(st.Destroy)
+	if err := ValidateIPTablesCheckpoint(t.Context(), st, st.IPTables(), false); err != nil {
+		t.Fatalf("validate inactive defaults: %v", err)
+	}
+	table := st.IPTables().GetTable(stack.FilterID, true)
+	table.Rules = slices.Clone(table.Rules)
+	table.Rules[table.Underflows[stack.Input]].Target = &dropTarget{stack.DropTarget{NetworkProtocol: header.IPv6ProtocolNumber}}
+	st.IPTables().ReplaceTable(stack.FilterID, table, true)
+	if err := ValidateIPTablesCheckpoint(t.Context(), st, st.IPTables(), false); err == nil || !strings.Contains(err.Error(), "unmodified rules differ") {
+		t.Fatalf("validate inactive IPv6 DROP policy = %v, want non-default rule error", err)
 	}
 }

@@ -856,6 +856,11 @@ func checkNoLegacyHostfsVolume(m Mount, image string) error {
 }
 
 func (s *Sandbox) openMountsWithMode(forRestore bool) error {
+	if s.policyStorage != nil {
+		if err := s.policyStorage.pinCheckpointOutput(); err != nil {
+			return unsafePolicyStorage(err)
+		}
+	}
 	shared := make(map[workspaceKey]*hostfs.Workspace)
 	rwVolumes := make(map[string]bool)
 	roVolumes := make(map[string]*ext4lite.Volume)
@@ -974,6 +979,14 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 				sm.volume = vol
 			}
 		default:
+			if s.policyStorage != nil {
+				var err error
+				sm.hostPath, sm.hostFile, sm.workspace, err = s.openIsolatedHostMount(m, forRestore, shared)
+				if err != nil {
+					return unsafePolicyStorage(fmt.Errorf("open mount %s: %w", m.GuestPath, err))
+				}
+				break
+			}
 			hostPath, isFile, err := s.prepareHostPath(m)
 			if err != nil {
 				return err
@@ -1090,7 +1103,7 @@ func (s *Sandbox) openVolumeImage(m Mount, image string) (*ext4lite.Volume, erro
 }
 
 func (s *Sandbox) openVolumeImageWithMode(m Mount, image string, forRestore bool) (*ext4lite.Volume, error) {
-	if info, err := os.Stat(image); err == nil && !info.Mode().IsRegular() {
+	if info, err := os.Stat(image); s.policyStorage == nil && err == nil && !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("gvx: volume %s: %q is not a regular file (mode %s): %w", m.volumeLabel(), image, info.Mode().Type(), ErrInvalidConfig)
 	}
 	flags := os.O_RDWR | os.O_CREATE
@@ -1098,12 +1111,18 @@ func (s *Sandbox) openVolumeImageWithMode(m Mount, image string, forRestore bool
 		flags = os.O_RDONLY
 	} else if forRestore {
 		flags = os.O_RDWR
-	} else if m.ImagePath == "" {
+	} else if m.ImagePath == "" && s.policyStorage == nil {
 		if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
 			return nil, fmt.Errorf("gvx: create the volume directory: %w", err)
 		}
 	}
-	f, err := os.OpenFile(image, flags, 0o600)
+	var f *os.File
+	var err error
+	if s.policyStorage != nil {
+		f, err = s.openIsolatedVolumeImage(m, image, flags)
+	} else {
+		f, err = os.OpenFile(image, flags, 0o600)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("gvx: open volume %s: %w", m.volumeLabel(), err)
 	}
@@ -1179,7 +1198,11 @@ func (s *Sandbox) hostMounts() []hostlockdown.HostMount {
 	var list []hostlockdown.HostMount
 	for _, m := range s.mounts {
 		if m.Kind != MountTmpfs && m.Kind != MountOverlay && m.volume == nil {
-			list = append(list, hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly, File: m.hostFile})
+			mount := hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly, File: m.hostFile}
+			if s.policyStorage != nil {
+				mount.Root, mount.BoundFile, mount.Leaf = m.workspace.IsolatedStorage()
+			}
+			list = append(list, mount)
 		}
 	}
 	return list

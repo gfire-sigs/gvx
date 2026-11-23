@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
@@ -272,6 +273,47 @@ func TestPortForwarderCloseDoesNotWaitForUnansweredDatagrams(t *testing.T) {
 	if err := waitNoGoroutines(testContext(t), "(*PortForwarder)"); err != nil {
 		t.Fatalf("forwarder goroutines remain after Close: %v", err)
 	}
+}
+
+type gatedCloseListener struct {
+	net.Listener
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (l gatedCloseListener) Close() error {
+	close(l.entered)
+	<-l.release
+	return nil
+}
+
+func TestPortForwarderConcurrentCloseWaitsForUDPPortRelease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pf, hostAddr := preBoundUDPForward(t, 5300)
+		gate := gatedCloseListener{entered: make(chan struct{}), release: make(chan struct{})}
+		release := sync.OnceFunc(func() { close(gate.release) })
+		defer release()
+		pf.tcpList = append(pf.tcpList, &boundTCPForward{listener: gate})
+		first, second := make(chan error, 1), make(chan error, 1)
+		go func() { first <- pf.Close() }()
+		<-gate.entered // The first Close has marked the forwarder closed.
+		go func() { second <- pf.Close() }()
+		synctest.Wait()
+		schedulerNoEvent(t, second, "concurrent Close while the UDP port is still bound")
+
+		release()
+		if err := <-second; err != nil {
+			t.Fatal(err)
+		}
+		rebound, err := net.ListenUDP("udp4", hostAddr)
+		if err != nil {
+			t.Fatalf("rebind after concurrent Close: %v", err)
+		}
+		defer rebound.Close()
+		if err := <-first; err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestPortForwarderUDPSessionLimit(t *testing.T) {

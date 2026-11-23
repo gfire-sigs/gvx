@@ -17,6 +17,7 @@ package hostfs
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hoststorage"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
@@ -343,6 +345,47 @@ func TestSingleFileFollowsAnAtomicHostReplace(t *testing.T) {
 		t.Fatalf("host content = %q", got)
 	}
 	s.wantHostNames("after the replace")
+}
+
+func TestIsolatedSingleFileFollowsAtomicHostReplace(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skip("Android does not permit openat2 for live hostfs mounts")
+	}
+	dir := t.TempDir()
+	bound := filepath.Join(dir, "bound.txt")
+	if err := os.WriteFile(bound, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := OpenIsolatedWorkspace(bound, false, false, func(_, file *os.File) error {
+		if file == nil {
+			return os.ErrInvalid
+		}
+		return nil
+	}, func(hoststorage.StorageIdentity) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	old, err := w.OpenFile(".", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+
+	const replacement = "editor.tmp"
+	if err := os.WriteFile(filepath.Join(dir, replacement), []byte("edited"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The native rename helper requests POSIX replacement on Windows.
+	if err := w.rawHost.rename(replacement, filepath.Base(bound)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := w.ReadFile("."); err != nil || string(got) != "edited" {
+		t.Fatalf("new description reads %q, %v; want edited", got, err)
+	}
+	if got, err := io.ReadAll(old); err != nil || string(got) != "original" {
+		t.Fatalf("old description reads %q, %v; want original", got, err)
+	}
 }
 
 func TestSingleFileWatcherEvents(t *testing.T) {

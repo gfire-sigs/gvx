@@ -163,7 +163,7 @@ func applyLandlock(mounts []HostMount) ([]string, error) {
 	defer unix.Close(rulesetFD)
 
 	for i, m := range mounts {
-		if err := addLandlockMountRule(rulesetFD, mountsReal[i], handled, m.ReadOnly, m.File); err != nil {
+		if err := addLandlockMountRule(rulesetFD, mountsReal[i], handled, m); err != nil {
 			return nil, err
 		}
 	}
@@ -174,19 +174,29 @@ func applyLandlock(mounts []HostMount) ([]string, error) {
 	return mountsReal, nil
 }
 
-func addLandlockMountRule(rulesetFD int, realPath string, handled uint64, readOnly, isFile bool) error {
-	openFlags := unix.O_PATH | unix.O_CLOEXEC
-	if !isFile {
-		openFlags |= unix.O_DIRECTORY
+func addLandlockMountRule(rulesetFD int, realPath string, handled uint64, m HostMount) error {
+	pinned := m.Root
+	if m.File {
+		pinned = m.BoundFile
 	}
-	pathFD, err := unix.Open(realPath, openFlags, 0)
-	if err != nil {
-		return fmt.Errorf("hostlockdown: open mount %q for Landlock: %w", realPath, err)
+	var pathFD int
+	if pinned != nil {
+		pathFD = int(pinned.Fd())
+	} else {
+		openFlags := unix.O_PATH | unix.O_CLOEXEC
+		if !m.File {
+			openFlags |= unix.O_DIRECTORY
+		}
+		var err error
+		pathFD, err = unix.Open(realPath, openFlags, 0)
+		if err != nil {
+			return fmt.Errorf("hostlockdown: open mount %q for Landlock: %w", realPath, err)
+		}
+		defer unix.Close(pathFD)
 	}
-	defer unix.Close(pathFD)
 
 	rule := unix.LandlockPathBeneathAttr{
-		Allowed_access: landlockMountAccessFS(handled, readOnly, isFile),
+		Allowed_access: landlockMountAccessFS(handled, m.ReadOnly, m.File),
 		Parent_fd:      int32(pathFD),
 	}
 	_, _, errno := unix.Syscall6(
@@ -199,6 +209,7 @@ func addLandlockMountRule(rulesetFD int, realPath string, handled uint64, readOn
 		0,
 	)
 	runtime.KeepAlive(&rule)
+	runtime.KeepAlive(pinned)
 	if errno != 0 {
 		return fmt.Errorf("hostlockdown: add Landlock rule for %q: %w", realPath, errno)
 	}

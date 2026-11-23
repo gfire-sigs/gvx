@@ -91,6 +91,9 @@ func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, 
 	}()
 
 	ep := newEndpoint(r.stack, r.pkt.NetworkProtocolNumber, queue)
+	if r.stack.IsTransportRelayProtocol(ProtocolNumber) {
+		ep.ops.InitHandler(ep, r.stack.RelaySocketStackHandler(), tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
+	}
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 

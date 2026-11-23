@@ -485,6 +485,10 @@ func (n *nic) WritePacket(r *Route, pkt *PacketBuffer) tcpip.Error {
 		pkt.EgressRoute = routeInfo
 		return n.writePacket(pkt)
 	case *tcpip.ErrWouldBlock:
+		if policy := pkt.PacketPolicy(); policy != nil && policy.Output.Provenance != nil {
+			// The local write lends this context only for synchronous delivery.
+			return &tcpip.ErrNoBufferSpace{}
+		}
 		// As per relevant RFCs, we should queue packets while we wait for link
 		// resolution to complete.
 		//
@@ -533,6 +537,13 @@ func (n *nic) writeRawPacketWithLinkHeaderInPayload(pkt *PacketBuffer) tcpip.Err
 }
 
 func (n *nic) writeRawPacket(pkt *PacketBuffer) tcpip.Error {
+	if policy := pkt.PacketPolicy(); policy != nil && policy.Output.Provenance != nil {
+		_, synchronousLink := n.NetworkLinkEndpoint.(SynchronousPolicyLink)
+		_, synchronousQueue := n.qDisc.(*delegatingQueueingDiscipline)
+		if !synchronousLink || !synchronousQueue {
+			return &tcpip.ErrNoBufferSpace{}
+		}
+	}
 	// Always an outgoing packet.
 	pkt.PktType = tcpip.PacketOutgoing
 
@@ -981,20 +992,26 @@ func (n *nic) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Packe
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
 func (n *nic) DeliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
-	res, _ := n.deliverTransportPacket(protocol, pkt)
+	res, _ := n.deliverTransportPacket(protocol, pkt, nil, nil)
 	return res
 }
 
 // DeliverTransportPacketWithDefaultHandlerResult implements
 // TransportDispatcherWithDefaultHandlerResult.DeliverTransportPacketWithDefaultHandlerResult.
 func (n *nic) DeliverTransportPacketWithDefaultHandlerResult(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) (TransportPacketDisposition, bool) {
-	return n.deliverTransportPacket(protocol, pkt)
+	return n.deliverTransportPacket(protocol, pkt, nil, nil)
 }
 
-func (n *nic) deliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) (TransportPacketDisposition, bool) {
+func (n *nic) deliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer, policy PacketDeliveryPolicy, onUnhandled func(*PacketBuffer, TransportPacketDisposition)) (TransportPacketDisposition, bool) {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stats.unknownL4ProtocolRcvdPacketCounts.Increment(uint64(protocol))
+		if policy != nil {
+			policy.DeliverPacketOnly(pkt, func(pkt *PacketBuffer) {
+				onUnhandled(pkt, TransportPacketProtocolUnreachable)
+			})
+			return TransportPacketHandled, false
+		}
 		return TransportPacketProtocolUnreachable, false
 	}
 
@@ -1023,16 +1040,31 @@ func (n *nic) deliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt
 		RemotePort:    srcPort,
 		RemoteAddress: src,
 	}
-	if n.stack.demux.deliverPacket(protocol, pkt, id) {
+	if n.stack.demux.deliverPacket(protocol, pkt, id, policy) {
 		return TransportPacketHandled, false
 	}
 
 	// Try to deliver to per-stack default handler.
-	if state.defaultHandler != nil {
-		if state.defaultHandler(id, pkt) {
+	handler := state.defaultHandler
+	relay := handler != nil && policy != nil && n.stack.IsTransportRelayProtocol(protocol)
+	if handler != nil && (policy == nil || relay) {
+		if handler(id, pkt) {
 			return TransportPacketHandled, true
 		}
 	}
+	if policy != nil {
+		policy.DeliverPacketOnly(pkt, func(pkt *PacketBuffer) {
+			if handler != nil && !relay && handler(id, pkt) {
+				return
+			}
+			onUnhandled(pkt, n.handleUnknownTransportDestination(transProto, id, pkt))
+		})
+		return TransportPacketHandled, false
+	}
+	return n.handleUnknownTransportDestination(transProto, id, pkt), false
+}
+
+func (n *nic) handleUnknownTransportDestination(transProto TransportProtocol, id TransportEndpointID, pkt *PacketBuffer) TransportPacketDisposition {
 
 	// We could not find an appropriate destination for this packet so
 	// give the protocol specific error handler a chance to handle it.
@@ -1040,11 +1072,11 @@ func (n *nic) deliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt
 	switch res := transProto.HandleUnknownDestinationPacket(id, pkt); res {
 	case UnknownDestinationPacketMalformed:
 		n.stats.malformedL4RcvdPackets.Increment()
-		return TransportPacketHandled, false
+		return TransportPacketHandled
 	case UnknownDestinationPacketUnhandled:
-		return TransportPacketDestinationPortUnreachable, false
+		return TransportPacketDestinationPortUnreachable
 	case UnknownDestinationPacketHandled:
-		return TransportPacketHandled, false
+		return TransportPacketHandled
 	default:
 		panic(fmt.Sprintf("unrecognized result from HandleUnknownDestinationPacket = %d", res))
 	}

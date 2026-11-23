@@ -20,11 +20,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hoststorage"
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
@@ -55,8 +57,11 @@ const (
 )
 
 type hostRoot struct {
-	dir      *os.File
-	caseFold bool
+	dir        *os.File
+	caseFold   bool
+	isolated   bool
+	mountID    uint64 // Linux mount ID of the pinned directory.
+	pinnedFile *os.File
 	// vol decides per device whether an entry keeps its identity. It does
 	// nothing on Linux.
 	vol *volumeTrust
@@ -79,6 +84,36 @@ func newHostRoot(root *os.Root) (*hostRoot, error) {
 		return nil, fmt.Errorf("hostfs: stat workspace root: %w", probeErr)
 	}
 	return h, nil
+}
+
+func (h *hostRoot) isolate() error {
+	fd, err := hoststorage.OpenIsolatedAt(h.dir.Fd(), ".", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return err
+	}
+	if err := unix.Close(int(fd)); err != nil {
+		return err
+	}
+	if runtime.GOOS == "linux" {
+		id, err := hoststorage.IdentifyStorage(h.dir)
+		if err != nil {
+			return fmt.Errorf("hostfs: identify workspace mount: %w", err)
+		}
+		h.mountID = id.Mount
+	}
+	h.isolated = true
+	return nil
+}
+
+func (h *hostRoot) openat(dir int, name string, flags int, perm uint32) (int, error) {
+	if h.isolated {
+		fd, err := hoststorage.OpenIsolatedAt(uintptr(dir), name, flags, perm)
+		if errors.Is(err, unix.EXDEV) {
+			err = ErrPathTraversal
+		}
+		return int(fd), err
+	}
+	return openatRetry(dir, name, flags, perm)
 }
 
 func (h *hostRoot) close() error {
@@ -152,7 +187,7 @@ func (h *hostRoot) walkParent(rel string) (dirfd int, name string, release func(
 		}
 	}
 	for _, comp := range parts[:len(parts)-1] {
-		fd, oerr := openatRetry(cur, comp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		fd, oerr := h.openat(cur, comp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if oerr != nil {
 			if isLinkRefusal(cur, comp, oerr) {
 				release()
@@ -176,7 +211,7 @@ func (h *hostRoot) open(rel string, flags int, perm os.FileMode) (*os.File, erro
 		return nil, err
 	}
 	defer release()
-	return openIn(parent, name, rel, flags, perm)
+	return h.openIn(parent, name, rel, flags, perm)
 }
 
 // hostDirHandle is an open directory descriptor. openDirAt returns one, and
@@ -204,7 +239,7 @@ func (h *hostRoot) openDirAt(dir hostDirHandle, name string) (hostDirHandle, hos
 	if err := checkChildName(name); err != nil {
 		return -1, hostInfo{}, err
 	}
-	fd, err := openatRetry(int(dir), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := h.openat(int(dir), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if isLinkRefusal(int(dir), name, err) {
 			return -1, hostInfo{}, ErrPathTraversal
@@ -241,6 +276,9 @@ func (h *hostRoot) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
 	if err := checkChildName(name); err != nil {
 		return hostInfo{}, err
 	}
+	if h.isolated {
+		return h.isolatedLstatAt(int(dir), name)
+	}
 	info, err := lstatatInfo(int(dir), name)
 	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w", name, err)
@@ -252,16 +290,19 @@ func (h *hostRoot) openChildAt(dir hostDirHandle, name string, flags int, perm o
 	if err := checkChildName(name); err != nil {
 		return nil, err
 	}
-	return openIn(int(dir), name, name, flags, perm)
+	return h.openIn(int(dir), name, name, flags, perm)
 }
 
 // openIn opens the entry name inside the directory descriptor parent. The
 // path rel only labels errors.
-func openIn(parent int, name, rel string, flags int, perm os.FileMode) (*os.File, error) {
+func (h *hostRoot) openIn(parent int, name, rel string, flags int, perm os.FileMode) (*os.File, error) {
 	// O_NONBLOCK keeps open from blocking on a host FIFO. The descriptor
 	// returns to blocking mode below once fstat proves a regular file.
 	openFlags := flags&(unix.O_ACCMODE|unix.O_CREAT|unix.O_EXCL|unix.O_TRUNC) | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
-	fd, err := openatRetry(parent, name, openFlags, uint32(perm.Perm()))
+	if h.isolated {
+		openFlags &^= unix.O_TRUNC
+	}
+	fd, err := h.openat(parent, name, openFlags, uint32(perm.Perm()))
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) && flags&unix.O_CREAT == 0 {
 			return nil, ErrPathTraversal
@@ -282,6 +323,12 @@ func openIn(parent int, name, rel string, flags int, perm os.FileMode) (*os.File
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("hostfs: open %q: %w", rel, unix.ENXIO)
 	}
+	if h.isolated && flags&unix.O_TRUNC != 0 {
+		if err := retryEINTR(func() error { return unix.Ftruncate(fd, 0) }); err != nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("hostfs: truncate %q: %w", rel, err)
+		}
+	}
 	if err := unix.SetNonblock(fd, false); err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("hostfs: clear O_NONBLOCK on %q: %w", rel, err)
@@ -295,7 +342,7 @@ func (h *hostRoot) openDir(rel string) (*os.File, error) {
 		return nil, err
 	}
 	defer release()
-	fd, err := openatRetry(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := h.openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if isLinkRefusal(parent, name, err) {
 			return nil, ErrPathTraversal
@@ -331,6 +378,9 @@ func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 		return hostInfo{}, err
 	}
 	defer release()
+	if h.isolated {
+		return h.isolatedLstatAt(parent, name)
+	}
 	info, err := lstatatInfo(parent, name)
 	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w", rel, err)
@@ -502,6 +552,13 @@ func (h *hostRoot) readlink(rel string) (string, error) {
 		return "", err
 	}
 	defer release()
+	if h.isolated {
+		return h.readIsolatedLink(parent, name, rel)
+	}
+	return readlinkAt(parent, name, rel)
+}
+
+func readlinkAt(parent int, name, rel string) (string, error) {
 	for size := 256; ; size *= 2 {
 		buf := make([]byte, size)
 		var n int
@@ -540,12 +597,18 @@ func (h *hostRoot) chtimes(rel string, atime, mtime *time.Time) error {
 		return err
 	}
 	defer release()
+	if h.isolated {
+		return h.isolatedTimesAt(parent, name, nil, atime, mtime)
+	}
 	return chtimesIn(parent, name, rel, atime, mtime)
 }
 
 func (h *hostRoot) chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error {
 	if err := checkChildName(name); err != nil {
 		return err
+	}
+	if h.isolated {
+		return h.isolatedTimesAt(int(dir), name, nil, atime, mtime)
 	}
 	return chtimesIn(int(dir), name, name, atime, mtime)
 }

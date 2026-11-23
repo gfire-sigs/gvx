@@ -19,19 +19,22 @@ import (
 	"io"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
-// newTestSession returns a session over two pipes. Its clock shows activity at
-// the offset from the start of the clock.
-func newTestSession(t *testing.T, active time.Duration) *udpSession {
+func newTestSession(t *testing.T) *udpSession {
+	t.Helper()
 	g1, g2 := net.Pipe()
 	h1, h2 := net.Pipe()
-	t.Cleanup(func() { g2.Close(); h2.Close() })
 	s := &udpSession{guest: g1, host: h1, clock: newActivityClock()}
-	s.clock.last.Store(int64(active))
+	t.Cleanup(func() {
+		s.close()
+		g2.Close()
+		h2.Close()
+	})
 	return s
 }
 
@@ -42,30 +45,35 @@ func closed(c net.Conn) bool {
 }
 
 func TestUDPSessionTableEvictsTheOldestSession(t *testing.T) {
-	table := newUDPSessionTable(2)
-	oldest := newTestSession(t, 1*time.Second)
-	newer := newTestSession(t, 5*time.Second)
-	table.add(newer)
-	table.add(oldest)
-	third := newTestSession(t, 9*time.Second)
-	table.add(third)
-	if table.len() != 2 {
-		t.Fatalf("len = %d, want 2", table.len())
-	}
-	if !closed(oldest.guest) || !closed(oldest.host) {
-		t.Error("the session with the oldest datagram stays open")
-	}
-	if closed(newer.guest) || closed(third.guest) {
-		t.Error("a newer session was closed")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		table := newUDPSessionTable(2)
+		oldest := newTestSession(t)
+		table.add(oldest)
+		time.Sleep(time.Second)
+		oldest.clock.touch()
+		time.Sleep(time.Second)
+		newer := newTestSession(t)
+		table.add(newer)
+		third := newTestSession(t)
+		table.add(third)
+		if table.len() != 2 {
+			t.Fatalf("len = %d, want 2", table.len())
+		}
+		if !closed(oldest.guest) || !closed(oldest.host) {
+			t.Error("the session with the oldest datagram stays open")
+		}
+		if closed(newer.guest) || closed(third.guest) {
+			t.Error("a newer session was closed")
+		}
+	})
 }
 
 func TestUDPSessionTableFreesTheSlotOfARemovedSession(t *testing.T) {
 	table := newUDPSessionTable(1)
-	a := newTestSession(t, time.Second)
+	a := newTestSession(t)
 	table.add(a)
 	table.remove(a)
-	b := newTestSession(t, 2*time.Second)
+	b := newTestSession(t)
 	table.add(b)
 	if closed(b.guest) || table.len() != 1 {
 		t.Errorf("len = %d, closed = %v; want 1 session and no eviction after a removal", table.len(), closed(b.guest))
