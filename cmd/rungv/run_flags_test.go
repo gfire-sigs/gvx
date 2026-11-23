@@ -148,7 +148,7 @@ func TestRunFlagsRejectUnsupportedAndInvalidInput(t *testing.T) {
 		{"host network", []string{"--network", "host", "-image=x"}, "network"},
 		{"small memory", []string{"-m", "1m", "-image=x"}, "-m"},
 		{"bad cpus", []string{"--cpus", "abc", "-image=x"}, "--cpus"},
-		{"negative bandwidth", []string{"--net-tx-bps=-1", "-image=x"}, "--net-tx-bps"},
+		{"negative bandwidth", []string{"--net-tx-bps=-1", "-image=x"}, "net-tx-bps:"},
 		{"non-NAT bandwidth", []string{"--net=none", "--net-rx-bps=0", "-image=x"}, "require -net=nat"},
 		{"bad env name", []string{"-e", "A B=1", "-image=x"}, "-e"},
 		{"unknown pull policy", []string{"--pull", "sometimes", "-image=x"}, "--pull"},
