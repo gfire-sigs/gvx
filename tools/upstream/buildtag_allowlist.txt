@@ -130,8 +130,10 @@ seam pkg/sentry/kernel/memevent/memory_events.go
 # in pkg/sentry/kernel/cpu_bandwidth_xplat.go. The CPU clock ticker charges it, and the run loop
 # of a task blocks a task whose cgroup spent its quota
 # (pkg/sentry/kernel/task_cpu_bandwidth_xplat.go, pkg/sentry/fsimpl/cgroup2fs/cpu_xplat.go).
+# Cgroup2IO adds the block I/O controller (pkg/sentry/fsimpl/cgroup2fs/io_xplat.go).
 seam pkg/sentry/fsimpl/cgroup2fs/cpu.go
 seam pkg/sentry/fsimpl/cgroup2fs/cgroup.go
+seam pkg/sentry/kernel/cgroup2.go
 # The enforcer of memory.max belongs to the filesystem, so it ends with the kernel
 # (pkg/sentry/fsimpl/cgroup2fs/memory_xplat.go). The seam is one field of the filesystem
 # and one releaseXplat call in Release.

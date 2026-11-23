@@ -31,6 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/gvx/control"
+	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
@@ -314,8 +315,114 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 		})
 
 	case "bind":
+		if len(fds) > 0 {
+			if !slices.Contains(caps, control.CapMountBindAttach) {
+				if runtime.GOOS == "windows" {
+					return control.NewError(control.CodeUnsupported, "live hostfs bind attachment via SCM_RIGHTS is POSIX-only; use rungv mount serve or -lockdown=false")
+				}
+				if locked && !s.cfg.AllowBindAttach {
+					return control.NewError(control.CodeLockdownDenied, "live hostfs bind attachment under host lockdown requires --allow-bind-attach; or use rungv mount serve")
+				}
+				return control.NewError(control.CodeForbiddenByPolicy, "bind attachment is disabled by policy")
+			}
+			if len(fds) != 1 {
+				return control.NewError(control.CodeInvalidArgument, "bind attach requires exactly one SCM_RIGHTS directory file descriptor")
+			}
+
+			var (
+				extHandle int64 = -1
+				hasExt    bool
+			)
+			if runtime.GOOS == "darwin" && locked {
+				if req.SandboxToken == "" {
+					return control.NewError(control.CodeInvalidArgument, "bind attach under macOS Seatbelt lockdown requires sandbox_token")
+				}
+				h, extErr := hostlockdown.ConsumeFileExtension(req.SandboxToken)
+				if extErr != nil {
+					return control.NewErrorf(control.CodeLockdownDenied, "consume sandbox file extension: %v", extErr)
+				}
+				extHandle, hasExt = h, true
+			}
+			releaseExt := func() {
+				if hasExt {
+					_ = hostlockdown.ReleaseFileExtension(extHandle)
+					hasExt = false
+				}
+			}
+
+			dirFD := fds[0]
+			fds = nil // ownership transferred to OpenWorkspaceFromDirFD below
+			label := cmp.Or(strings.TrimSpace(req.Source), target)
+			ws, wsErr := hostfs.OpenWorkspaceFromDirFD(dirFD, label, req.SingleFileName, req.ReadOnly)
+			if wsErr != nil {
+				releaseExt()
+				return control.NewErrorf(control.CodeInvalidArgument, "open attached hostfs bind %q: %v", label, wsErr)
+			}
+			if sharedChunkMemory && mf != nil {
+				ws.SetChunkMemory(&memoryFileChunks{MemoryFile: mf})
+			}
+			isFile := ws.SingleFile()
+			if isFile {
+				if err := vfsEnsureEmptyFile(sctxWithRoot, vfsObj, creds, root, target, 0o644); err != nil {
+					_ = ws.Close()
+					releaseExt()
+					return control.NewErrorf(control.CodeInternal, "create guest file %q: %v", target, err)
+				}
+			} else if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
+				_ = ws.Close()
+				releaseExt()
+				return control.NewErrorf(control.CodeInternal, "create guest dir %q: %v", target, err)
+			}
+			pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
+			if _, err := vfsObj.MountAt(sctxWithRoot, creds, "", &pop, hostfs.Name, &vfs.MountOptions{
+				ReadOnly: ws.ReadOnly(),
+				GetFilesystemOptions: vfs.GetFilesystemOptions{
+					InternalMount: true,
+					InternalData: hostfs.InternalFilesystemOptions{
+						Workspace: ws,
+						UniqueID: checkpoint.ResourceID{
+							ContainerName: cmp.Or(s.cfg.Name, "gvx-default"),
+							Path:          target,
+						},
+					},
+				},
+			}); err != nil {
+				_ = ws.Close()
+				releaseExt()
+				return control.NewErrorf(control.CodeInternal, "mount hostfs at %q: %v", target, err)
+			}
+			m := Mount{Kind: MountBind, HostPath: label, GuestPath: target, ReadOnly: req.ReadOnly}
+			s.mu.Lock()
+			s.workspaces = append(s.workspaces, ws)
+			if hasExt {
+				s.sandboxExtHandles = append(s.sandboxExtHandles, extHandle)
+			}
+			s.mounts = append(s.mounts, sandboxMount{
+				Mount:            m,
+				hostPath:         label,
+				hostFile:         isFile,
+				backingReadOnly:  ws.ReadOnly(),
+				dynamic:          true,
+				workspace:        ws,
+				hasSandboxExt:    hasExt,
+				sandboxExtHandle: extHandle,
+			})
+			sortMountsByDepth(s.mounts)
+			s.mu.Unlock()
+			s.emitEvent("mount", "add", map[string]string{"type": "hostfs", "target": target})
+			return stream.Reply(control.MountInfo{
+				Target: target, Type: "hostfs", Source: label, ReadOnly: req.ReadOnly, Mutable: !req.ReadOnly,
+			})
+		}
+
 		if locked {
-			return control.NewError(control.CodeLockdownDenied, "dynamic host bind mounts are denied under host lockdown; use rungv mount serve or start with -lockdown=false")
+			if !s.cfg.AllowBindAttach {
+				return control.NewError(control.CodeLockdownDenied, "dynamic host bind mounts are denied under host lockdown; start with --allow-bind-attach, use rungv mount serve, or start with -lockdown=false")
+			}
+			if runtime.GOOS == "windows" {
+				return control.NewError(control.CodeUnsupported, "live hostfs bind attach under lockdown is POSIX-only; use rungv mount serve or start with -lockdown=false")
+			}
+			return control.NewError(control.CodeInvalidArgument, "bind attach under host lockdown requires one SCM_RIGHTS directory file descriptor over a Unix control socket")
 		}
 		if !slices.Contains(caps, control.CapMountBind) {
 			return control.NewError(control.CodeForbiddenByPolicy, "bind mounts are disabled by policy")
@@ -521,6 +628,8 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 
 	var closeVol *ext4lite.Volume
 	var closeWS *hostfs.Workspace
+	var releaseExtHandle int64
+	var hasReleaseExt bool
 	s.mu.Lock()
 	kept := s.mounts[:0]
 	for _, m := range s.mounts {
@@ -534,6 +643,13 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 					closeWS = m.workspace
 					s.workspaces = slices.DeleteFunc(s.workspaces, func(w *hostfs.Workspace) bool { return w == closeWS })
 				}
+				if m.hasSandboxExt {
+					releaseExtHandle = m.sandboxExtHandle
+					hasReleaseExt = true
+					if idx := slices.Index(s.sandboxExtHandles, releaseExtHandle); idx >= 0 {
+						s.sandboxExtHandles = slices.Delete(s.sandboxExtHandles, idx, idx+1)
+					}
+				}
 			}
 			continue
 		}
@@ -546,6 +662,9 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 	}
 	if closeWS != nil {
 		_ = closeWS.Close()
+	}
+	if hasReleaseExt {
+		_ = hostlockdown.ReleaseFileExtension(releaseExtHandle)
 	}
 
 	s.rpcMountsMu.Lock()

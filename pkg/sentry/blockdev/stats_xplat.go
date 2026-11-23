@@ -26,6 +26,8 @@ import (
 	"context"
 	"sync/atomic"
 	"time"
+
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 )
 
 // SectorSize is the size of the sector in all counters. Linux counts sectors
@@ -100,6 +102,19 @@ type Stats struct {
 	// goroutine that moves it forward adds the interval, so no interval counts
 	// twice.
 	last atomic.Int64 `state:"nosave"`
+	// dev points back to the owning Device once registered via Registry.Add.
+	dev atomic.Pointer[Device] `state:"nosave"`
+}
+
+// AccountIO forwards a per-task I/O event on the disk owning s to its Registry
+// IOAccountant, if any.
+func (s *Stats) AccountIO(ctx gvcontext.Context, op Op, bytes, ios uint64) {
+	if s == nil || ctx == nil || (bytes == 0 && ios == 0) {
+		return
+	}
+	if d := s.dev.Load(); d != nil {
+		d.AccountIO(ctx, op, bytes, ios)
+	}
 }
 
 func (s *Stats) saveInFlight() int64                      { return s.inFlight.Load() }

@@ -98,6 +98,13 @@ type Options struct {
 	// PreboundListeners plus DynamicListeners.
 	DynamicListeners int
 
+	// AllowBindAttach authorizes runtime hostfs bind-mount attachment via
+	// control-socket FD transfer after Apply. On macOS Seatbelt, this permits
+	// consuming explicit per-path sandbox file extension tokens issued by the
+	// unlocked client while keeping all other host paths denied. On Linux,
+	// Landlock is skipped while seccomp remains enforced on descriptor opens.
+	AllowBindAttach bool
+
 	// OutboundUDPPorts lists remote UDP ports that pre-bound UDP sockets may
 	// send to and receive from. The -net=wg backend sets the WireGuard peer
 	// port here. Seatbelt can match remote ports but not remote addresses.

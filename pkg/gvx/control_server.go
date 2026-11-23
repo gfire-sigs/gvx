@@ -169,10 +169,20 @@ func (s *Sandbox) ControlCapabilities() []string {
 	if !locked {
 		avail = append(avail, control.CapMountBind)
 	}
+	if supportsBindAttach(runtime.GOOS, locked, cfg.AllowBindAttach) {
+		avail = append(avail, control.CapMountBindAttach)
+	}
 	if supportsVolumeAttach(runtime.GOOS, locked, cfg.AllowVolumeAttach) {
 		avail = append(avail, control.CapMountVolumeAttach)
 	}
 	return control.FilterCapabilities(avail, cfg.ControlPolicy, cfg.ControlDisable)
+}
+
+func supportsBindAttach(goos string, locked, allowBindAttach bool) bool {
+	if goos != "darwin" && goos != "linux" && goos != "android" {
+		return false
+	}
+	return !locked || allowBindAttach
 }
 
 func supportsVolumeAttach(goos string, locked, allowVolumeAttach bool) bool {
@@ -204,7 +214,7 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 		SandboxID:        cmp.Or(cfg.Name, "gvx-default"),
 		Token:            cfg.ControlToken,
 		Capabilities:     caps,
-		AllowFDs:         slices.Contains(caps, control.CapMountVolumeAttach),
+		AllowFDs:         slices.Contains(caps, control.CapMountVolumeAttach) || slices.Contains(caps, control.CapMountBindAttach),
 		MaxConnections:   cfg.Tuning.Int(tuning.ControlMaxConnections),
 		MaxFrameBytes:    int(cfg.Tuning.Size(tuning.ControlMaxFrameBytes)),
 		HandshakeTimeout: cfg.Tuning.Duration(tuning.ControlHandshakeTimeout),

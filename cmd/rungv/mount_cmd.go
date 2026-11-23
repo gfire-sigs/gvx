@@ -178,9 +178,16 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 		req.TmpfsSizeBytes = tmpMnt.TmpfsSizeBytes
 	}
 
+	client, err := target.dial(ctx, "")
+	if err != nil {
+		return controlFail(stderr, cmdName, err)
+	}
+	defer client.Close()
+
 	var sendFDs []int
-	var volFile *os.File
-	if kind == "volume" {
+	var attachFile *os.File
+	switch kind {
+	case "volume":
 		if src == "" {
 			return controlUsageError(stderr, cmdName, "--type=volume requires --src=<volume-name-or-.ext4-path>")
 		}
@@ -203,16 +210,32 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 		if err != nil {
 			return controlFail(stderr, cmdName, fmt.Errorf("open volume %q: %w", volPath, err))
 		}
-		volFile = f
-		defer volFile.Close()
+		attachFile = f
+		defer attachFile.Close()
 		sendFDs = []int{int(f.Fd())}
+
+	case "bind":
+		if src == "" {
+			return controlUsageError(stderr, cmdName, "--type=bind requires --src=<host-path>")
+		}
+		if runtime.GOOS != "windows" && client.Network() == "unix" && client.HasCapability(control.CapMountBindAttach) {
+			dirFile, leafName, realPath, err := openBindAttachFD(src)
+			if err != nil {
+				return controlFail(stderr, cmdName, err)
+			}
+			attachFile = dirFile
+			defer attachFile.Close()
+			req.Source = realPath
+			req.SingleFileName = leafName
+			tok, err := gvx.IssueBindAttachToken(realPath, readOnly)
+			if err != nil {
+				return controlFail(stderr, cmdName, fmt.Errorf("issue bind attach token: %w", err))
+			}
+			req.SandboxToken = tok
+			sendFDs = []int{int(dirFile.Fd())}
+		}
 	}
 
-	client, err := target.dial(ctx, "")
-	if err != nil {
-		return controlFail(stderr, cmdName, err)
-	}
-	defer client.Close()
 	callCtx, cancel := target.callContext(ctx)
 	defer cancel()
 
@@ -226,6 +249,62 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 	}
 	_, _ = fmt.Fprintf(stdout, "mounted %s (%s, %s)\n", info.Target, info.Type, mode)
 	return 0
+}
+
+// openBindAttachFD opens a POSIX directory descriptor for hostPath (or its
+// parent directory plus stored leaf name when hostPath is a regular file) for
+// SCM_RIGHTS bind attachment.
+func openBindAttachFD(hostPath string) (dirFile *os.File, leafName, realPath string, err error) {
+	abs, err := filepath.Abs(hostPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("resolve bind source %q: %w", hostPath, err)
+	}
+	realPath, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("resolve bind source %q: %w", abs, err)
+	}
+	if filepath.Dir(realPath) == realPath {
+		return nil, "", "", fmt.Errorf("refusing to bind-mount filesystem root %q", realPath)
+	}
+	st, err := os.Stat(realPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("stat bind source %q: %w", realPath, err)
+	}
+	pinDir := realPath
+	switch {
+	case st.IsDir():
+	case st.Mode().IsRegular():
+		pinDir = filepath.Dir(realPath)
+		leafName = filepath.Base(realPath)
+		if entries, rerr := os.ReadDir(pinDir); rerr == nil {
+			fold := ""
+			for _, e := range entries {
+				if e.Name() == leafName {
+					fold = e.Name()
+					break
+				}
+				if fold == "" && strings.EqualFold(e.Name(), leafName) {
+					fold = e.Name()
+				}
+			}
+			if fold != "" {
+				leafName = fold
+			}
+		}
+		realPath = filepath.Join(pinDir, leafName)
+	default:
+		return nil, "", "", fmt.Errorf("bind source %q must be a directory or regular file", realPath)
+	}
+	root, err := os.OpenRoot(pinDir)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("open bind root %q: %w", pinDir, err)
+	}
+	dirFile, err = root.Open(".")
+	_ = root.Close()
+	if err != nil {
+		return nil, "", "", fmt.Errorf("pin bind directory %q: %w", pinDir, err)
+	}
+	return dirFile, leafName, realPath, nil
 }
 
 func mountRemountSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {

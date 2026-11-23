@@ -424,6 +424,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 
 	if !cfg.DisableHostLockdown {
+		if cfg.AllowBindAttach {
+			hostfs.WarmWatchLimit()
+		}
 		st, lErr := hostlockdown.Apply(sb.lockdownOptions())
 		if lErr != nil {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", lErr))

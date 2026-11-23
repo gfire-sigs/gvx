@@ -559,3 +559,46 @@ func TestLinuxApplyRejectsAFilterThatLeavesExecOpen(t *testing.T) {
 		t.Error("IsLockedDown() = true after a failed Apply")
 	}
 }
+
+func TestLinuxApplyWithAllowBindAttach(t *testing.T) {
+	if os.Getenv(childEnv) == "" {
+		out, err := runChild(t, "TestLinuxApplyWithAllowBindAttach", "GVX_ATTACH="+t.TempDir())
+		if err != nil {
+			t.Fatalf("child failed: %v\n%s", err, out)
+		}
+		return
+	}
+	attachDir := os.Getenv("GVX_ATTACH")
+	if err := os.WriteFile(filepath.Join(attachDir, "ok.txt"), []byte("attached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirFD, err := unix.Open(attachDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(dirFD)
+
+	st, err := Apply(Options{
+		AllowBindAttach:      true,
+		InstallSyscallFilter: installTestFilter(true),
+	})
+	if err != nil {
+		t.Fatalf("Apply(AllowBindAttach): %v", err)
+	}
+	if !st.Applied || !st.SubprocessBlocked || st.UnboundFileOpenBlocked {
+		t.Fatalf("Status = %+v, want Applied=true SubprocessBlocked=true UnboundFileOpenBlocked=false", st)
+	}
+	// Seccomp still blocks AT_FDCWD opens and subprocess execution.
+	if _, err := os.ReadFile("/etc/hostname"); !errors.Is(err, unix.EPERM) {
+		t.Errorf("ReadFile(/etc/hostname) = %v, want EPERM", err)
+	}
+	if err := exec.Command("/bin/true").Run(); err == nil {
+		t.Error("exec.Command(/bin/true) succeeded after AllowBindAttach lockdown")
+	}
+	// Descriptor-relative open on a delegated directory FD succeeds without Landlock.
+	fd, err := unix.Openat(dirFD, "ok.txt", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("Openat(dirFD, ok.txt) = %v, want nil", err)
+	}
+	_ = unix.Close(fd)
+}

@@ -128,6 +128,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `--dynamic-ports` | Allow runtime loopback (`127.0.0.1` and `[::1]`) port publishing through `rungv port add` under host lockdown. |
 | `--dynamic-ports-addr IP` | Allow runtime `rungv port add` binds on the listed host IP literal under host lockdown (repeatable). Unlisted addresses and Unix sockets stay denied. |
 | `--allow-volume-attach` | Enable Linux seccomp rules for attaching `ext4lite` volumes over POSIX `SCM_RIGHTS` via `rungv mount add --type volume`. |
+| `--allow-bind-attach` | Enable runtime bind attachment for `hostfs` via POSIX `SCM_RIGHTS` under host lockdown. On Linux this skips Landlock while keeping seccomp enforced; Windows uses `rungv mount serve`. |
 | `-lockdown=false` | Skip host lockdown. Use for debugging only. |
 | `--tune KEY=VALUE` | Set a host-side tunable (repeatable; see Section 3.3). Accepted by `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info`. |
 | `--tune-file FILE` | Load host-side tunables from a JSON object. `--tune` flags override the file. Accepted by the same commands. |

@@ -91,7 +91,7 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | `mount remount` | The server always allows remounting `rw` to `ro`; remounting `ro` to `rw` succeeds only when the host backing opened writable before lockdown. | Original writable mount. |
 | `mount add --type volume` | Allowed over POSIX `AF_UNIX` via `SCM_RIGHTS` FD transfer; server verifies `S_IFREG` before opening `ext4lite`. | `--allow-volume-attach` (Linux seccomp rule). |
 | `mount serve` (`rpcfs`) | Allowed on all host OSes; the unlocked client serves an `os.Root`-pinned directory or single file over stream events. Supports paginated `readdir` and host-to-guest `inotify` events. | None. |
-| `mount add --type bind` | Always rejected with `LOCKDOWN_DENIED` under lockdown. | `-lockdown=false` (debugging only). |
+| `mount add --type bind` | Allowed over POSIX `AF_UNIX` via transfer of a directory FD over `SCM_RIGHTS` (with file-extension tokens for macOS Seatbelt). Linux skips Landlock while keeping seccomp; rejected without opt-in and unsupported under Windows lockdown. | `--allow-bind-attach` (POSIX) or `-lockdown=false`. |
 
 ---
 

@@ -15,6 +15,7 @@
 package erofs
 
 import (
+	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 )
 
@@ -51,18 +52,20 @@ func (fs *filesystem) beginRead(off, n uint64) (uint64, blockdev.Request) {
 }
 
 // endRead completes the request r that beginRead returned with the fresh bytes.
-func (fs *filesystem) endRead(r blockdev.Request, fresh uint64) {
+func (fs *filesystem) endRead(ctx context.Context, r blockdev.Request, fresh uint64) {
 	fs.iopts.BlockStats.End(blockdev.Read, r, int64(fresh))
+	fs.iopts.BlockStats.AccountIO(ctx, blockdev.Read, fresh, 1)
 }
 
 // countMappedRead counts the pages that a guest mapping of the n bytes at the
 // image offset off takes from the image for the first time. The mapping reads
 // nothing at this point, so the request has no duration and no lock is held.
-func (fs *filesystem) countMappedRead(off, n uint64) {
+func (fs *filesystem) countMappedRead(ctx context.Context, off, n uint64) {
 	if fs.touched == nil {
 		return
 	}
 	if fresh := fs.touched.Claim(off, n); fresh > 0 {
 		fs.iopts.BlockStats.Add(blockdev.Read, int64(fresh))
+		fs.iopts.BlockStats.AccountIO(ctx, blockdev.Read, fresh, 1)
 	}
 }

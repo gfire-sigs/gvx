@@ -176,7 +176,7 @@ func (c *cgroup) initRoot(ctx context.Context) {
 	arr := new(ctrlSet)
 	for i := firstController; i < numControllers; i++ {
 		// Root cgroup must have all controllers active.
-		ctrl := c.newController(i)
+		ctrl := c.newControllerWithXplat(i)
 		c.ctrls[i] = ctrl
 		c.populateInterfaceFiles(ctx, ctrl)
 		arr[i] = c.ctrls[i]
@@ -199,7 +199,7 @@ func (c *cgroup) init(ctx context.Context) {
 	arr := new(ctrlSet)
 	for i := firstController; i < numControllers; i++ {
 		if c.parent.subtreeCtrls[i] { // +checklocksforce: c.fs.treeMu is locked
-			ctrl := c.newController(i)
+			ctrl := c.newControllerWithXplat(i)
 			c.ctrls[i] = ctrl
 			c.populateInterfaceFiles(ctx, ctrl)
 		}
@@ -557,7 +557,7 @@ func (c *cgroup) rebuildCtrlsLocked(ctx context.Context, cTypes []kernel.Cgroup2
 
 	for _, cType := range cTypes {
 		if c.parent.subtreeCtrls[cType] && c.ctrls[cType] == nil { // +checklocksforce: c.fs.treeMu is locked
-			ctrl := c.newController(cType)
+			ctrl := c.newControllerWithXplat(cType)
 			c.ctrls[cType] = ctrl
 			c.populateInterfaceFiles(ctx, ctrl)
 			if newPids, ok := ctrl.(*pids); ok {
@@ -1395,7 +1395,7 @@ func (c *cgroup) returnController(ctx context.Context, cType kernel.Cgroup2Ctrl)
 		panic("Unified cgroups inconsistency: returnController called on non-root")
 	}
 
-	ctrl := c.newController(cType)
+	ctrl := c.newControllerWithXplat(cType)
 	c.ctrls[cType] = ctrl
 	c.populateInterfaceFiles(ctx, ctrl)
 	if newPids, ok := ctrl.(*pids); ok {

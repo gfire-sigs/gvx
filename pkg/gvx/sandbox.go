@@ -70,6 +70,7 @@ type Sandbox struct {
 	rootVolume        *ext4lite.Volume
 	rootUpperExisting bool
 	mounts            []sandboxMount
+	sandboxExtHandles []int64
 	netStack          *stack.Stack
 	natForwarder      *netbackend.NATForwarder
 	portForwarder     *netbackend.PortForwarder
@@ -249,6 +250,9 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	}
 
 	if !cfg.DisableHostLockdown {
+		if cfg.AllowBindAttach {
+			hostfs.WarmWatchLimit()
+		}
 		st, err := hostlockdown.Apply(sb.lockdownOptions())
 		if err != nil {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", err))
@@ -376,6 +380,7 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 		CPUQuotaMillis:       s.cfg.Resources.CPUMillis,
 		Mounts:               s.hostMounts(),
 		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
+		AllowBindAttach:      s.cfg.AllowBindAttach,
 		TTYPath:              ttyPath,
 		InstallSyscallFilter: s.syscallFilter(),
 	}
