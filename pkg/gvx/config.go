@@ -261,6 +261,12 @@ type Config struct {
 	// /workspace when WorkspacePath is set.
 	Mounts []Mount
 
+	// ServeMounts lists rpcfs mounts to reattach during Restore. Each entry
+	// must match a MountRPCFS entry in the checkpoint manifest. Entries in the
+	// manifest omitted from ServeMounts restore in detached mode and return EIO
+	// until a client reconnects via mount.serve.
+	ServeMounts []ServeMount
+
 	// ReadOnlyRoot mounts the root file system of the guest in read-only mode
 	// after the guest setup. /proc, /sys, /dev, /dev/shm, /dev/pts, and every
 	// mount of WorkspacePath and Mounts keep their own access flags.

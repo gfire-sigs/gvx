@@ -560,6 +560,10 @@ func mountServeSubcommand(ctx context.Context, args []string, stdout, stderr io.
 			}
 			break
 		}
+		if ev.Type == "rpcfs.detached" {
+			_, _ = fmt.Fprintf(stdout, "Detached %s (sandbox checkpointed)\n", resp.Target)
+			break
+		}
 		if ev.Type != "rpcfs.req" {
 			continue
 		}

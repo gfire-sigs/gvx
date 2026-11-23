@@ -433,6 +433,17 @@ func (w *Workspace) syncDir(rel string) error {
 
 // chtimes sets host timestamps of a host file, or the recorded timestamps of
 // a virtual symlink. A nil time stays unchanged.
+// Chtimes updates the access and modification times of relPath inside the
+// workspace without following symbolic links. A nil time leaves that timestamp
+// unchanged.
+func (w *Workspace) Chtimes(relPath string, atime, mtime *time.Time) error {
+	cleanRel, err := CleanRelativePath(relPath)
+	if err != nil {
+		return err
+	}
+	return w.chtimes(cleanRel, atime, mtime)
+}
+
 func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

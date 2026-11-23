@@ -125,7 +125,7 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `mount.add` | Unary (optional FD) | Mount a `tmpfs`, `SCM_RIGHTS` `ext4lite` volume, or `-lockdown=false` bind mount. |
 | `mount.remount` | Unary | Toggle a mount between read-only and read-write. |
 | `mount.remove` | Unary | Unmount one guest mount point (optional `MNT_DETACH`). |
-| `mount.serve` | Bidirectional event stream | Attach an `rpcfs` directory or single-file proxy mount backed by client `rpcfs.req`, `rpcfs.resp`, and `rpcfs.notify` events. |
+| `mount.serve` | Bidirectional event stream | Attach or reconnect an `rpcfs` directory or single-file proxy mount backed by client `rpcfs.req`, `rpcfs.resp`, `rpcfs.notify`, and `rpcfs.detached` events. |
 | `proc.list` | Unary | Return a snapshot of guest thread groups from `TaskSet`. |
 | `proc.signal` | Unary | Send a POSIX signal to PID 1, a specific guest PID, or all guest processes. |
 | `kernel.log` | Unary or event stream | Read or follow records from the guest kernel log ring. |
@@ -161,7 +161,7 @@ Failed RPCs return a `ProtoError` object with a stable `code`, a diagnostic `mes
 | `NOT_PAUSED` | `1` | `lifecycle.unpause` called on a running sandbox. |
 | `NOT_FOUND` | `1` | Target PID, path, port rule, or mount does not exist. |
 | `ALREADY_EXISTS` | `1` | Conflicting port rule or mount target already exists. |
-| `BUSY` | `1` | Target mount is in use, or an active `rpcfs` mount or shaped NAT tunnel blocks checkpointing. |
+| `BUSY` | `1` | Target mount or volume image is in use, or a shaped NAT tunnel blocks checkpointing. |
 | `LIMIT_EXCEEDED` | `1` | Resource limit or concurrency ceiling exceeded (for example, memory cap below usage without `--force-memory`). |
 | `EXEC_ACTIVE` | `1` | Active `exec` sessions block checkpointing without `--force`. |
 | `SANDBOX_EXITING` | `1` | Sandbox is shutting down and accepts no new streams. |

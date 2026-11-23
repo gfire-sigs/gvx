@@ -632,9 +632,36 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 			t.Fatalf("host file written by guest via rpcfs = (%q, %v)", hostWritten, err)
 		}
 
-		// Checkpoint while rpcfs is active must return BUSY.
-		if err := rs.client.Call(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: true}, nil); !control.IsCode(err, control.CodeBusy) {
-			t.Fatalf("checkpoint with active rpcfs err = %v, want BUSY", err)
+		// Checkpoint with leave_running while rpcfs is active must succeed,
+		// record the rpcfs mount in manifest.json, and keep rpcfs working.
+		ckptSt, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: true})
+		if err != nil {
+			t.Fatalf("checkpoint with active rpcfs open stream: %v", err)
+		}
+		if err := ckptSt.WaitResponse(ctx, nil); err != nil {
+			ckptSt.Close()
+			t.Fatalf("checkpoint with active rpcfs wait response: %v", err)
+		}
+		ckptTar, err := io.ReadAll(ckptSt.ChannelReader(ctx, control.ChannelGeneric))
+		ckptSt.Close()
+		if err != nil || len(ckptTar) == 0 {
+			t.Fatalf("checkpoint with active rpcfs stream = (%d bytes, %v)", len(ckptTar), err)
+		}
+
+		// Verify rpcfs still reads cleanly after checkpoint -leave-running.
+		catAfter, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv: []string{"/bin/cat", "/mnt/proxy/host.txt"},
+		})
+		if err != nil {
+			t.Fatalf("exec cat after checkpoint: %v", err)
+		}
+		if err := catAfter.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("exec cat after checkpoint wait: %v", err)
+		}
+		gotAfter, readErr := io.ReadAll(catAfter.ChannelReader(ctx, control.ChannelStdout))
+		catAfter.Close()
+		if readErr != nil || string(gotAfter) != "hello-from-rpcfs-host\n" {
+			t.Fatalf("guest read from rpcfs after checkpoint = (%q, %v), want hello-from-rpcfs-host", gotAfter, readErr)
 		}
 
 		serveCancel()
