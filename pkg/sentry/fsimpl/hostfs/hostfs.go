@@ -334,6 +334,14 @@ func (w *Workspace) chunkMemory() ChunkMemory {
 	return w.chunkMem.Get()
 }
 
+// WarmWatchLimit caches the host watch descriptor budget before host lockdown
+// runs so runtime OpenWorkspaceFromDirFD calls on Linux never invoke getrlimit.
+func WarmWatchLimit() {
+	if processWatches.limit.Load() <= 0 {
+		processWatches.limit.Store(int64(hostWatchLimit()))
+	}
+}
+
 // OpenWorkspace opens hostPath via os.OpenRoot prior to hostlockdown.Apply()
 // and loads any persisted .gvx_meta table.
 func OpenWorkspace(hostPath string, readOnly bool) (*Workspace, error) {
@@ -362,6 +370,15 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		_ = root.Close()
 		return nil, err
 	}
+	return initWorkspace(absPath, root, backend, single, readOnly, opts)
+}
+
+func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single string, readOnly bool, opts workspaceOptions) (*Workspace, error) {
+	closeRoot := func() {
+		if root != nil {
+			_ = root.Close()
+		}
+	}
 	var host hostBackend = backend
 	if single != "" {
 		host = &singleHost{hostBackend: host, bound: backend, name: single}
@@ -377,8 +394,8 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	rootInfo, err := host.lstat(".")
 	if err != nil {
 		_ = host.close()
-		_ = root.Close()
-		return nil, fmt.Errorf("hostfs: stat workspace root %q: %w", pinDir, err)
+		closeRoot()
+		return nil, fmt.Errorf("hostfs: stat workspace root %q: %w", absPath, err)
 	}
 	var caps WorkspaceCaps
 	if opts.caps != nil {
@@ -424,10 +441,14 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		single:           single,
 		orphans:          orphanCollector{dirsPerStep: opts.orphanDirsPerStep},
 	}
-	// The query runs here because the Linux filter after the lockdown does not
-	// allow getrlimit.
-	w.watch.limit = hostWatchLimit()
-	processWatches.limit.Store(int64(w.watch.limit))
+	// Reuse the pre-lockdown cached watch limit when set because the Linux
+	// seccomp filter forbids getrlimit after lockdown.
+	if cached := processWatches.limit.Load(); cached > 0 {
+		w.watch.limit = int(cached)
+	} else {
+		w.watch.limit = hostWatchLimit()
+		processWatches.limit.Store(int64(w.watch.limit))
+	}
 	if w.pathKeys {
 		w.rootKey = recKey{kind: kindPath, path: "."}
 	} else {
@@ -445,13 +466,13 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	}
 	if err := w.openMetaLock(); err != nil {
 		_ = host.close()
-		_ = root.Close()
+		closeRoot()
 		return nil, err
 	}
 	if err := w.loadMeta(); err != nil {
 		_ = w.closeMetaLock()
 		_ = host.close()
-		_ = root.Close()
+		closeRoot()
 		return nil, err
 	}
 	if !readOnly && !opts.restoreMode {
@@ -514,7 +535,10 @@ func (w *Workspace) Close() error {
 	w.mu.Unlock()
 	pinErr := w.closePins()
 	hostErr := w.host.close()
-	rootErr := w.root.Close()
+	var rootErr error
+	if w.root != nil {
+		rootErr = w.root.Close()
+	}
 	return errors.Join(flushErr, journalErr, lockErr, pinErr, hostErr, rootErr)
 }
 

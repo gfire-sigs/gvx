@@ -67,6 +67,10 @@ func newHostRoot(root *os.Root) (*hostRoot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: pin workspace directory: %w", err)
 	}
+	return newHostRootFromFile(dir)
+}
+
+func newHostRootFromFile(dir *os.File) (*hostRoot, error) {
 	h := &hostRoot{dir: dir}
 	var probeErr error
 	h.caseFold, probeErr = probeCaseInsensitive(dir)

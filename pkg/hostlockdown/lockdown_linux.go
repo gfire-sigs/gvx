@@ -49,9 +49,25 @@ func applyOSLockdown(opts Options) (Status, error) {
 	}
 	defer unix.Close(root)
 
-	mountsReal, err := applyLandlock(opts.Mounts)
-	if err != nil {
-		return Status{}, err
+	var mountsReal []string
+	if opts.AllowBindAttach {
+		// Landlock rulesets cannot be extended after landlock_restrict_self, so
+		// live bind-mount FD attach skips Landlock while seccomp still enforces
+		// descriptor-relative opens and blocks AT_FDCWD, open, execve, and fork.
+		mountsReal = make([]string, 0, len(opts.Mounts))
+		for _, m := range opts.Mounts {
+			_, realPath, err := resolveMountPath(m.Path)
+			if err != nil {
+				return Status{}, err
+			}
+			mountsReal = append(mountsReal, realPath)
+		}
+	} else {
+		var err error
+		mountsReal, err = applyLandlock(opts.Mounts)
+		if err != nil {
+			return Status{}, err
+		}
 	}
 
 	if err := opts.InstallSyscallFilter(); err != nil {
@@ -74,14 +90,16 @@ func applyOSLockdown(opts Options) (Status, error) {
 	if !cwdBlocked {
 		return st, errors.New("hostlockdown: the filter allows an open relative to the working directory")
 	}
-	dirfdBlocked, err := probeRootOpenBlocked(root, mountsReal)
-	if err != nil {
-		return st, err
+	if !opts.AllowBindAttach {
+		dirfdBlocked, err := probeRootOpenBlocked(root, mountsReal)
+		if err != nil {
+			return st, err
+		}
+		if !dirfdBlocked && (runtime.GOOS != "android" || len(opts.Mounts) == 0) {
+			return st, errors.New("hostlockdown: descriptor-relative open outside Options.Mounts succeeded after lockdown")
+		}
+		st.UnboundFileOpenBlocked = dirfdBlocked
 	}
-	if !dirfdBlocked && (runtime.GOOS != "android" || len(opts.Mounts) == 0) {
-		return st, errors.New("hostlockdown: descriptor-relative open outside Options.Mounts succeeded after lockdown")
-	}
-	st.UnboundFileOpenBlocked = dirfdBlocked
 
 	if !opts.AllowOutboundNet {
 		if err := probeSocketBlocked(); err != nil {

@@ -788,13 +788,23 @@ func (c Config) volumeRoot() (string, error) {
 // otherwise. An ext4lite volume holds its open volume.
 type sandboxMount struct {
 	Mount
-	hostPath        string
-	hostFile        bool
-	backingReadOnly bool
-	dynamic         bool
-	workspace       *hostfs.Workspace
-	volume          *ext4lite.Volume
-	upperVolume     *ext4lite.Volume
+	hostPath         string
+	hostFile         bool
+	backingReadOnly  bool
+	dynamic          bool
+	workspace        *hostfs.Workspace
+	volume           *ext4lite.Volume
+	upperVolume      *ext4lite.Volume
+	hasSandboxExt    bool
+	sandboxExtHandle int64
+}
+
+// IssueBindAttachToken issues a host sandbox file extension token (macOS
+// Seatbelt) for hostPath so a locked sandbox with AllowBindAttach enabled can
+// consume it when receiving the directory descriptor over SCM_RIGHTS. Outside
+// macOS it returns an empty string and nil error.
+func IssueBindAttachToken(hostPath string, readOnly bool) (string, error) {
+	return hostlockdown.IssueFileExtension(hostPath, readOnly)
 }
 
 // mountList returns every guest mount: the WorkspacePath mount first, then
@@ -1211,6 +1221,12 @@ func (s *Sandbox) closeMounts() error {
 			errs = append(errs, err)
 		}
 	}
+	for _, h := range s.sandboxExtHandles {
+		if err := hostlockdown.ReleaseFileExtension(h); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	s.sandboxExtHandles = nil
 	for _, vol := range s.volumes {
 		if err := vol.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("gvx: close volume: %w", err))

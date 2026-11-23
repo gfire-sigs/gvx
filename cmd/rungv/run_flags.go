@@ -174,6 +174,7 @@ type sandboxFlagValues struct {
 	dynamicPorts           bool
 	dynamicPortAddrs       multiStringFlag
 	allowVolumeAttach      bool
+	allowBindAttach        bool
 }
 
 // registerAlias binds a registration callback to each flag name in names.
@@ -279,6 +280,7 @@ func (f *sandboxFlagValues) registerResourceAndCheckpointFlags(fs *flag.FlagSet)
 	fs.Var(&f.controlDisable, "control-disable", "Comma-separated control capabilities or groups to disable (e.g. exec,net.dial)")
 	fs.StringVar(&f.controlTokenFile, "control-token-file", "", "Path for the control authentication token file (forces token auth on POSIX Unix sockets)")
 	fs.BoolVar(&f.allowVolumeAttach, "allow-volume-attach", false, "Allow POSIX SCM_RIGHTS ext4lite volume attachment via `rungv mount add --type volume` under lockdown")
+	fs.BoolVar(&f.allowBindAttach, "allow-bind-attach", false, "Allow POSIX SCM_RIGHTS hostfs bind attachment via `rungv mount add --type bind` under lockdown")
 }
 
 // buildPortForwards parses repeatable -p / --publish flags with tuning applied.
@@ -518,6 +520,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		DynamicPorts:           f.dynamicPorts,
 		DynamicPortAddrs:       append([]string(nil), f.dynamicPortAddrs...),
 		AllowVolumeAttach:      f.allowVolumeAttach,
+		AllowBindAttach:        f.allowBindAttach,
 	}
 	if err := control.ValidateDisableList(cfg.ControlDisable); err != nil {
 		return gvx.Config{}, false, fmt.Errorf("--control-disable: %w", err)

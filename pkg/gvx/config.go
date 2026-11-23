@@ -358,6 +358,12 @@ type Config struct {
 	// over the control socket under Linux seccomp lockdown.
 	AllowVolumeAttach bool
 
+	// AllowBindAttach enables POSIX Unix SCM_RIGHTS hostfs bind-mount attachment
+	// (`mount add --type bind`) over the control socket under host lockdown. On
+	// macOS Seatbelt this permits consuming per-path sandbox file extensions
+	// issued by the unlocked client while keeping all other paths denied.
+	AllowBindAttach bool
+
 	// WorkDir is the initial guest working directory (defaults to "/workspace"
 	// when WorkspacePath is set, or "/").
 	WorkDir string
