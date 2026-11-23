@@ -43,8 +43,10 @@ import (
 // unless CheckpointOptions.Force is set.
 var ErrCheckpointExecActive = errors.New("gvx: active exec sessions prevent checkpoint; pass Force to detach them")
 
-// ErrCheckpointRPCFSActive reports that an active client-served rpcfs mount
-// prevents checkpointing.
+// ErrCheckpointRPCFSActive is retained for API compatibility. Active rpcfs
+// mounts no longer block checkpointing.
+//
+// Deprecated: Checkpoint now quiesces and records active rpcfs mounts.
 var ErrCheckpointRPCFSActive = errors.New("gvx: unmount active rpcfs proxy mounts before checkpointing")
 
 // ErrCheckpointNATTunnelActive reports that a NAT tunnel still needs to drain.

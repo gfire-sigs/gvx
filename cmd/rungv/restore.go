@@ -85,16 +85,11 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return usageError("%v", err)
 	}
 	for _, spec := range attachBindFlags {
-		sm, err := gvx.ParseServeMount(spec)
+		m, err := parseAttachBindSpec(spec)
 		if err != nil {
 			return usageError("--attach-bind: %v", err)
 		}
-		cfg.Mounts = append(cfg.Mounts, gvx.Mount{
-			Kind:      gvx.MountBind,
-			HostPath:  sm.HostPath,
-			GuestPath: sm.GuestPath,
-			ReadOnly:  sm.ReadOnly,
-		})
+		cfg.Mounts = append(cfg.Mounts, m)
 	}
 	for _, spec := range serveFlags {
 		sm, err := gvx.ParseServeMount(spec)
@@ -155,4 +150,17 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 		errOut = rc.cfg.Stderr
 	}
 	return executeSandboxWithControl(ctx, sb, &rc.cfg, rc.autoPlatform, "rungv restore", errOut)
+}
+
+func parseAttachBindSpec(spec string) (gvx.Mount, error) {
+	sm, err := gvx.ParseServeMount(spec)
+	if err != nil {
+		return gvx.Mount{}, fmt.Errorf("invalid bind mount %q (want HOST_PATH:GUEST_PATH[:ro|rw])", spec)
+	}
+	return gvx.Mount{
+		Kind:      gvx.MountBind,
+		HostPath:  sm.HostPath,
+		GuestPath: sm.GuestPath,
+		ReadOnly:  sm.ReadOnly,
+	}, nil
 }

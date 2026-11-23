@@ -46,6 +46,7 @@ type rpcMountEntry struct {
 	label             string
 	readOnly          bool
 	backingReadOnly   bool
+	clientReadOnly    bool
 	singleFile        bool
 	detached          bool
 	checkpointClosing atomic.Bool
@@ -181,7 +182,7 @@ func (s *Sandbox) listMountInfos() []control.MountInfo {
 			Type:     rpcfs.Name,
 			Source:   cmp.Or(rm.label, "client-proxy"),
 			ReadOnly: rm.readOnly,
-			Mutable:  !rm.backingReadOnly,
+			Mutable:  !rm.backingReadOnly && !rm.clientReadOnly,
 		})
 	}
 	s.rpcMountsMu.Unlock()
@@ -724,6 +725,7 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 	s.rpcMountsMu.Unlock()
 	if rm != nil {
 		if rm.handle != nil {
+			rm.handle.MarkUnmounted()
 			rm.handle.DetachClient()
 		}
 		if rm.cancel != nil {
@@ -1161,9 +1163,11 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		}
 		prevLabel := existing.label
 		prevReadOnly := existing.readOnly
+		prevClientReadOnly := existing.clientReadOnly
 		s.rpcMountsMu.Lock()
 		existing.detached = false
-		existing.readOnly = existing.backingReadOnly || req.ReadOnly
+		existing.clientReadOnly = req.ReadOnly
+		existing.readOnly = existing.readOnly || existing.backingReadOnly || req.ReadOnly
 		if req.Label != "" {
 			existing.label = req.Label
 		}
@@ -1181,6 +1185,7 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 				existing.detached = true
 				existing.label = prevLabel
 				existing.readOnly = prevReadOnly
+				existing.clientReadOnly = prevClientReadOnly
 				existing.stream = nil
 				existing.cancel = nil
 				existing.client = nil
@@ -1240,6 +1245,9 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 				delete(s.rpcMounts, target)
 			}
 			s.rpcMountsMu.Unlock()
+			if handle != nil {
+				handle.MarkUnmounted()
+			}
 			umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
 			_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
 			return err
@@ -1296,6 +1304,9 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
 	}
 	if entry.handle != nil {
+		if stillMounted {
+			entry.handle.MarkUnmounted()
+		}
 		entry.handle.DetachClient()
 	}
 	s.rpcMountsMu.Lock()

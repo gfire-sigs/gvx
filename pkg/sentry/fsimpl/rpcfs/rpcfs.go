@@ -127,9 +127,9 @@ func doRPC[T any](ctx context.Context, fs *filesystem, fn func(goContext.Context
 		callErr error
 	)
 	go func() {
+		defer close(done)
+		defer release()
 		val, callErr = fn(rpcCtx, c)
-		release()
-		close(done)
 	}()
 	if err := ctx.Block(done); err != nil {
 		cancel()
@@ -414,10 +414,10 @@ func (fs *filesystem) reconcileWatches(wctx goContext.Context) {
 			callCtx, cancel := goContext.WithTimeout(wctx, 5*time.Second)
 			_ = wc.Unwatch(callCtx, rel)
 			cancel()
-			release()
 			fs.watchMu.Lock()
 			delete(fs.watchSynced, rel)
 			fs.watchMu.Unlock()
+			release()
 		}
 		for _, rel := range toWatch {
 			if wctx.Err() != nil {
@@ -430,7 +430,6 @@ func (fs *filesystem) reconcileWatches(wctx goContext.Context) {
 			callCtx, cancel := goContext.WithTimeout(wctx, 5*time.Second)
 			err := wc.Watch(callCtx, rel)
 			cancel()
-			release()
 			fs.watchMu.Lock()
 			if err == nil {
 				fs.watchSynced[rel] = struct{}{}
@@ -443,6 +442,7 @@ func (fs *filesystem) reconcileWatches(wctx goContext.Context) {
 				}
 			}
 			fs.watchMu.Unlock()
+			release()
 		}
 	}
 }

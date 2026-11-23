@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
+	"z.gfire.dev/gvx/pkg/sync"
 )
 
 type restoreContextID int
@@ -46,9 +47,25 @@ type RestoreConfig struct {
 	// clients to attach immediately during CompleteRestore. Targets absent from
 	// Clients restore in detached mode (returning EIO until AttachClient runs).
 	Clients map[string]RestoreClient
-	// OnRestored is invoked once for every restored rpcfs filesystem with its
-	// live Handle.
+	// OnRestored is invoked once for every mounted restored rpcfs filesystem
+	// with its live Handle.
 	OnRestored func(*Handle)
+
+	claimMu sync.Mutex
+	claimed map[string]bool
+}
+
+func (cfg *RestoreConfig) claimTarget(target string) error {
+	cfg.claimMu.Lock()
+	defer cfg.claimMu.Unlock()
+	if cfg.claimed == nil {
+		cfg.claimed = make(map[string]bool)
+	}
+	if cfg.claimed[target] {
+		return fmt.Errorf("rpcfs: duplicate restored filesystem claiming target %q", target)
+	}
+	cfg.claimed[target] = true
+	return nil
 }
 
 // WithRestoreConfig returns a copy of ctx carrying cfg for CompleteRestore.
@@ -83,7 +100,19 @@ func HandleOf(fs *vfs.Filesystem) (*Handle, bool) {
 
 // Target returns the guest mount target path recorded for this filesystem.
 func (h *Handle) Target() string {
-	return h.fs.target
+	h.fs.clientMu.Lock()
+	target := h.fs.target
+	h.fs.clientMu.Unlock()
+	return target
+}
+
+// MarkUnmounted clears the recorded target path so a lazy-unmounted
+// (MNT_DETACH) filesystem that stays alive behind open FDs is never reclaimed
+// as a live mount after checkpoint/restore.
+func (h *Handle) MarkUnmounted() {
+	h.fs.clientMu.Lock()
+	h.fs.target = ""
+	h.fs.clientMu.Unlock()
 }
 
 // Label returns the current client-side label (typically the host path).
@@ -187,6 +216,13 @@ func (fs *filesystem) detachClientLocked() {
 	fs.watchCancel = nil
 	fs.watchNotify = nil
 	fs.watchDone = nil
+	if fs.quiesced {
+		fs.quiesced = false
+		if fs.quiesceCh != nil {
+			close(fs.quiesceCh)
+			fs.quiesceCh = nil
+		}
+	}
 	fs.clientMu.Unlock()
 
 	if oldWatcher != nil {
@@ -195,11 +231,13 @@ func (fs *filesystem) detachClientLocked() {
 	if oldCancel != nil {
 		oldCancel()
 	}
-	if oldDone != nil {
-		<-oldDone
-	}
+	// Close the client before waiting for watchLoop so any watch RPC blocked on
+	// the transport unblocks immediately.
 	if oldClient != nil {
 		_ = oldClient.Close()
+	}
+	if oldDone != nil {
+		<-oldDone
 	}
 
 	fs.watchMu.Lock()
@@ -309,21 +347,39 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 	fs.watchSynced = make(map[string]struct{})
 	fs.watchMu.Unlock()
 
+	fs.clientMu.Lock()
+	target := fs.target
+	fs.clientMu.Unlock()
+	if target == "" {
+		// Lazy-unmounted (MNT_DETACH) filesystems stay detached and are never
+		// reclaimed as live mounts.
+		return nil
+	}
+
 	cfg := RestoreConfigFromContext(ctx)
-	if cfg != nil && fs.target != "" {
-		if rc, ok := cfg.Clients[fs.target]; ok && rc.Client != nil {
-			if rc.SingleFile != fs.singleFile {
-				return fmt.Errorf("rpcfs: restore target %q singleFile=%v does not match saved singleFile=%v", fs.target, rc.SingleFile, fs.singleFile)
-			}
-			if !rc.ReadOnly && fs.readOnly {
-				return fmt.Errorf("rpcfs: restore target %q is read-only in checkpoint and cannot attach read-write", fs.target)
-			}
-			if err := fs.attachClient(rc.Client, rc.ReadOnly, rc.Label); err != nil {
-				return fmt.Errorf("rpcfs: attach restore client for %q: %w", fs.target, err)
-			}
+	if cfg == nil {
+		return nil
+	}
+	if err := cfg.claimTarget(target); err != nil {
+		return err
+	}
+	if rc, ok := cfg.Clients[target]; ok && rc.Client != nil {
+		if rc.SingleFile != fs.singleFile {
+			return fmt.Errorf("rpcfs: restore target %q singleFile=%v does not match saved singleFile=%v", target, rc.SingleFile, fs.singleFile)
+		}
+		if !rc.ReadOnly && fs.readOnly {
+			return fmt.Errorf("rpcfs: restore target %q is read-only in checkpoint and cannot attach read-write", target)
+		}
+		if rc.ReadOnly {
+			// Persist the narrowed read-only policy in saved filesystem state so
+			// chained checkpoints cannot widen it back to read-write.
+			fs.readOnly = true
+		}
+		if err := fs.attachClient(rc.Client, rc.ReadOnly, rc.Label); err != nil {
+			return fmt.Errorf("rpcfs: attach restore client for %q: %w", target, err)
 		}
 	}
-	if cfg != nil && cfg.OnRestored != nil {
+	if cfg.OnRestored != nil {
 		cfg.OnRestored(&Handle{fs: fs})
 	}
 	return nil

@@ -532,6 +532,14 @@ func TestParseServeMount(t *testing.T) {
 	if err != nil || !sm.ReadOnly {
 		t.Fatalf("ParseServeMount ro = (%+v, %v)", sm, err)
 	}
+	sm, err = ParseServeMount("a:/mnt/proj")
+	if err != nil || sm.HostPath != "a" || sm.GuestPath != "/mnt/proj" || sm.ReadOnly {
+		t.Fatalf("ParseServeMount single-letter rw = (%+v, %v)", sm, err)
+	}
+	sm, err = ParseServeMount("a:/mnt/proj:ro")
+	if err != nil || sm.HostPath != "a" || sm.GuestPath != "/mnt/proj" || !sm.ReadOnly {
+		t.Fatalf("ParseServeMount single-letter ro = (%+v, %v)", sm, err)
+	}
 	sm, err = ParseServeMount(`C:\work\proj:/mnt/proj:ro`)
 	if err != nil || sm.HostPath != `C:\work\proj` || sm.GuestPath != "/mnt/proj" || !sm.ReadOnly {
 		t.Fatalf("ParseServeMount windows = (%+v, %v)", sm, err)
@@ -542,4 +550,324 @@ func TestParseServeMount(t *testing.T) {
 		}
 	}
 	_ = fmt.Sprint(sm)
+}
+
+func TestValidateManifestMountsRejectsDuplicateAndInvalidPaths(t *testing.T) {
+	cases := []struct {
+		name   string
+		mounts []ManifestMount
+	}{
+		{
+			name:   "empty-path",
+			mounts: []ManifestMount{{Type: MountTmpfs, GuestPath: "", Dynamic: true}},
+		},
+		{
+			name:   "root-path",
+			mounts: []ManifestMount{{Type: MountTmpfs, GuestPath: "/", Dynamic: true}},
+		},
+		{
+			name:   "reserved-proc",
+			mounts: []ManifestMount{{Type: MountTmpfs, GuestPath: "/proc", Dynamic: true}},
+		},
+		{
+			name:   "unclean-dotdot",
+			mounts: []ManifestMount{{Type: MountTmpfs, GuestPath: "/mnt/../etc", Dynamic: true}},
+		},
+		{
+			name: "dup-rpcfs",
+			mounts: []ManifestMount{
+				{Type: MountRPCFS, GuestPath: "/mnt/proj", ReadOnly: true},
+				{Type: MountRPCFS, GuestPath: "/mnt/proj", ReadOnly: false},
+			},
+		},
+		{
+			name: "dup-cross-type",
+			mounts: []ManifestMount{
+				{Type: MountRPCFS, GuestPath: "/mnt/x"},
+				{Type: MountTmpfs, GuestPath: "/mnt/x", Dynamic: true},
+			},
+		},
+		{
+			name: "dup-dynamic-tmpfs",
+			mounts: []ManifestMount{
+				{Type: MountTmpfs, GuestPath: "/mnt/t", Dynamic: true},
+				{Type: MountTmpfs, GuestPath: "/mnt/t", Dynamic: true},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &Sandbox{}
+			if err := sb.validateManifestMounts(tc.mounts); !errors.Is(err, ErrCheckpointManifest) {
+				t.Fatalf("validateManifestMounts(%s) err = %v, want ErrCheckpointManifest", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestLocalRPCFSClientSafetyAndSingleFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read-only client rejects mutations.
+	roCli, _, isFile, err := openLocalRPCFSClient(dir, true)
+	if err != nil || isFile {
+		t.Fatalf("openLocalRPCFSClient(dir, ro) = (%v, %v)", isFile, err)
+	}
+	defer roCli.Close()
+	if _, err := roCli.Write(ctx, "hello.txt", 0, []byte("x")); err == nil {
+		t.Fatal("expected EROFS on read-only Write")
+	}
+
+	// Read-write client rejects escaping symlinks.
+	rwCli, _, _, err := openLocalRPCFSClient(dir, false)
+	if err != nil {
+		t.Fatalf("openLocalRPCFSClient(dir, rw): %v", err)
+	}
+	defer rwCli.Close()
+	if err := rwCli.Symlink(ctx, "../../etc/passwd", "escape"); err == nil {
+		t.Fatal("expected error creating escaping symlink")
+	}
+
+	// Single-file client isolates the file and rejects subpaths / unlink.
+	filePath := filepath.Join(t.TempDir(), "one.txt")
+	if err := os.WriteFile(filePath, []byte("single-ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sfCli, _, sf, err := openLocalRPCFSClient(filePath, false)
+	if err != nil || !sf {
+		t.Fatalf("openLocalRPCFSClient(file) = (sf=%v, err=%v)", sf, err)
+	}
+	defer sfCli.Close()
+	got, err := sfCli.Read(ctx, ".", 0, 64)
+	if err != nil || string(got) != "single-ok" {
+		t.Fatalf("single-file Read = (%q, %v)", got, err)
+	}
+	if _, err := sfCli.Stat(ctx, "sibling"); err == nil {
+		t.Fatal("expected ENOTDIR for subpath on single-file client")
+	}
+	if err := sfCli.Unlink(ctx, "."); err == nil {
+		t.Fatal("expected EBUSY for unlink on single-file client")
+	}
+}
+
+func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
+	requireCheckpointGuestBackend(t)
+
+	fdHoldELF := buildFDHoldGuestELF(t)
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/fdhold", Data: fdHoldELF, Mode: 0o755},
+		testimage.File{Name: "mnt/", Type: tar.TypeDir, Mode: 0o755},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+
+	cacheDir := t.TempDir()
+	ckpt1 := t.TempDir()
+	ckpt2 := t.TempDir()
+	ckptLazy := t.TempDir()
+	serveDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(serveDir, "data.txt"), []byte("0123456789abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := startControlTestSandbox(t, Config{
+		OCILayerTars:  [][]byte{layer},
+		OCICacheDir:   cacheDir,
+		CheckpointDir: ckpt1,
+		Argv:          []string{"/bin/fdhold"},
+	})
+	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Serve /mnt/proj rw, open a file, then checkpoint #1 (rw).
+	detCh, cancelServe, doneServe := startTestRPCFSServer(t, ctx, rs.client, serveDir, "/mnt/proj", false, false)
+	if _, err := io.WriteString(rs.stdinW, "open /mnt/proj/data.txt\n"); err != nil {
+		t.Fatal(err)
+	}
+	rs.stdout.waitForSubstring(t, "OPENED:012345\n", 10*time.Second)
+
+	if err := rs.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
+		t.Fatalf("Checkpoint #1: %v", err)
+	}
+
+	// 1. Restore #1 with --serve ...:ro -> chained checkpoint #2 -> detached restore must refuse rw reconnect.
+	rsRO := startRestoredControlSandbox(t, Config{
+		OCICacheDir:   cacheDir,
+		CheckpointDir: ckpt2,
+		ServeMounts: []ServeMount{
+			{HostPath: serveDir, GuestPath: "/mnt/proj", ReadOnly: true},
+		},
+	}, ckpt1)
+	if err := rsRO.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+		Target: "/mnt/proj", ReadOnly: false,
+	}, nil); !control.IsCode(err, control.CodeLockdownDenied) {
+		t.Fatalf("remount rw on --serve :ro err = %v, want LOCKDOWN_DENIED", err)
+	}
+	if err := rsRO.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
+		t.Fatalf("Chained Checkpoint #2: %v", err)
+	}
+	rsRO2 := startRestoredControlSandbox(t, Config{OCICacheDir: cacheDir}, ckpt2)
+	stRW, err := rsRO2.client.OpenStream(ctx, control.MethodMountServe, control.MountServeRequest{
+		Target: "/mnt/proj", ReadOnly: false, Label: serveDir,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream rw reconnect: %v", err)
+	}
+	if err := stRW.WaitResponse(ctx, nil); !control.IsCode(err, control.CodeLockdownDenied) {
+		stRW.Close()
+		t.Fatalf("rw reconnect after chained :ro checkpoint err = %v, want LOCKDOWN_DENIED", err)
+	}
+	stRW.Close()
+
+	// 2. Remount a second rw mount (/mnt/remount, no open writable FD) ro before checkpoint,
+	// restore detached -> mount.list keeps ReadOnly=true; reconnect with ro client ->
+	// mount.remount rw is refused.
+	remountDir := t.TempDir()
+	_, cancelRemSrc, doneRemSrc := startTestRPCFSServer(t, ctx, rs.client, remountDir, "/mnt/remount", false, false)
+	defer func() {
+		cancelRemSrc()
+		<-doneRemSrc
+	}()
+	if err := rs.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+		Target: "/mnt/remount", ReadOnly: true,
+	}, nil); err != nil {
+		t.Fatalf("mount.remount ro: %v", err)
+	}
+	ckptRemount := t.TempDir()
+	// Save via CheckpointStream(LeaveRunning=true) to also exercise CheckpointStream.
+	cs, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: true})
+	if err != nil {
+		t.Fatalf("CheckpointStream open: %v", err)
+	}
+	if err := cs.WaitResponse(ctx, nil); err != nil {
+		cs.Close()
+		t.Fatalf("CheckpointStream wait: %v", err)
+	}
+	if err := extractCheckpointTarToDir(cs.ChannelReader(ctx, control.ChannelGeneric), ckptRemount); err != nil {
+		cs.Close()
+		t.Fatalf("extractCheckpointTarToDir: %v", err)
+	}
+	cs.Close()
+
+	rsRem := startRestoredControlSandbox(t, Config{OCICacheDir: cacheDir}, ckptRemount)
+	var ml control.MountListResponse
+	if err := rsRem.client.Call(ctx, control.MethodMountList, nil, &ml); err != nil {
+		t.Fatalf("mount.list after remount restore: %v", err)
+	}
+	foundRO := false
+	for _, m := range ml.Mounts {
+		if m.Target == "/mnt/remount" {
+			foundRO = m.ReadOnly
+		}
+	}
+	if !foundRO {
+		t.Fatalf("restored /mnt/remount expected ReadOnly=true in mount.list, got %+v", ml.Mounts)
+	}
+	_, cancelROCli, doneROCli := startTestRPCFSServer(t, ctx, rsRem.client, remountDir, "/mnt/remount", true, false)
+	defer func() {
+		cancelROCli()
+		<-doneROCli
+	}()
+	if err := rsRem.client.Call(ctx, control.MethodMountRemount, control.MountRemountRequest{
+		Target: "/mnt/remount", ReadOnly: false,
+	}, nil); !control.IsCode(err, control.CodeLockdownDenied) {
+		t.Fatalf("mount.remount rw while ro client attached err = %v, want LOCKDOWN_DENIED", err)
+	}
+
+	// 3. Lazy-unmount /mnt/proj (MNT_DETACH) while guest holds open FD, then mount a replacement
+	// at /mnt/proj and checkpoint via CheckpointStream(LeaveRunning=false).
+	if err := rs.client.Call(ctx, control.MethodMountRemove, control.MountRemoveRequest{
+		Target: "/mnt/proj", Detach: true,
+	}, nil); err != nil {
+		t.Fatalf("mount.remove --detach: %v", err)
+	}
+	cancelServe()
+	<-doneServe
+	_ = detCh
+
+	replaceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(replaceDir, "fresh.txt"), []byte("fresh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	detRepCh, cancelRep, doneRep := startTestRPCFSServer(t, ctx, rs.client, replaceDir, "/mnt/proj", false, false)
+	defer func() {
+		cancelRep()
+		<-doneRep
+	}()
+
+	csStop, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: false})
+	if err != nil {
+		t.Fatalf("CheckpointStream stop open: %v", err)
+	}
+	if err := csStop.WaitResponse(ctx, nil); err != nil {
+		csStop.Close()
+		t.Fatalf("CheckpointStream stop wait: %v", err)
+	}
+	if err := extractCheckpointTarToDir(csStop.ChannelReader(ctx, control.ChannelGeneric), ckptLazy); err != nil {
+		csStop.Close()
+		t.Fatalf("extractCheckpointTarToDir lazy: %v", err)
+	}
+	csStop.Close()
+
+	select {
+	case detached := <-detRepCh:
+		if !detached {
+			t.Fatal("replacement serve client exited without rpcfs.detached on CheckpointStream(LeaveRunning=false)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement serve client did not receive rpcfs.detached")
+	}
+
+	// Restore checkpoint that has both lazy-unmounted fs1 (open FD) and live replacement fs2 at /mnt/proj.
+	rsLazy := startRestoredControlSandbox(t, Config{
+		OCICacheDir: cacheDir,
+		ServeMounts: []ServeMount{
+			{HostPath: replaceDir, GuestPath: "/mnt/proj"},
+		},
+	}, ckptLazy)
+	// Old open FD from lazy-unmounted fs1 returns EIO, while live replacement mount at /mnt/proj stays healthy.
+	if _, err := io.WriteString(rsLazy.stdinW, "read\n"); err != nil {
+		t.Fatal(err)
+	}
+	rsLazy.stdout.waitForSubstring(t, "ERR:", 10*time.Second)
+	var mlLazy control.MountListResponse
+	if err := rsLazy.client.Call(ctx, control.MethodMountList, nil, &mlLazy); err != nil {
+		t.Fatalf("mount.list after lazy restore: %v", err)
+	}
+	count := 0
+	for _, m := range mlLazy.Mounts {
+		if m.Target == "/mnt/proj" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 /mnt/proj entry in mount.list, got %d (%+v)", count, mlLazy.Mounts)
+	}
+}
+
+func extractCheckpointTarToDir(r io.Reader, dir string) error {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, filepath.Base(hdr.Name)), data, 0o600); err != nil {
+			return err
+		}
+	}
 }

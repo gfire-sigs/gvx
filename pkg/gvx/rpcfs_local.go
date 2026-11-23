@@ -20,25 +20,26 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/gvx/control"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/rpcfs"
 )
 
 // ServeMount configures an rpcfs mount reattached during Restore.
 // When Client is non-nil, Restore attaches Client directly without opening any
-// host path. When Client is nil, HostPath must refer to a host directory or
-// regular file that Restore opens via os.OpenRoot before host lockdown.
+// host path. Restore takes ownership of Client once CompleteRestore attaches
+// it and closes it when the sandbox closes or unmounts; if Restore fails before
+// CompleteRestore attaches Client, the caller retains ownership. When Client is
+// nil, HostPath must refer to a host directory or regular file that Restore
+// opens via hostfs.Workspace before host lockdown.
 type ServeMount struct {
 	HostPath   string
 	GuestPath  string
@@ -49,28 +50,32 @@ type ServeMount struct {
 
 // ParseServeMount parses a HOST_PATH:GUEST_PATH[:ro|rw] serve mount spec.
 func ParseServeMount(spec string) (ServeMount, error) {
+	return parseHostGuestMountSpec(spec, "serve mount")
+}
+
+func parseHostGuestMountSpec(spec, label string) (ServeMount, error) {
 	s := strings.TrimSpace(spec)
 	if s == "" {
-		return ServeMount{}, fmt.Errorf("%w: empty serve mount specification (want HOST_PATH:GUEST_PATH[:ro|rw])", ErrInvalidConfig)
+		return ServeMount{}, fmt.Errorf("%w: empty %s specification (want HOST_PATH:GUEST_PATH[:ro|rw])", ErrInvalidConfig, label)
 	}
-	parts := splitMountSpec(s)
-	if len(parts) < 2 || len(parts) > 3 {
-		return ServeMount{}, fmt.Errorf("%w: invalid serve mount %q (want HOST_PATH:GUEST_PATH[:ro|rw])", ErrInvalidConfig, spec)
+	hostPath, guestPath, mode, err := splitVolumeSpec(s)
+	if err != nil {
+		return ServeMount{}, fmt.Errorf("%w: invalid %s %q (want HOST_PATH:GUEST_PATH[:ro|rw])", ErrInvalidConfig, label, spec)
 	}
-	hostPath := strings.TrimSpace(parts[0])
-	guestPath := strings.TrimSpace(parts[1])
+	hostPath = strings.TrimSpace(hostPath)
+	guestPath = strings.TrimSpace(guestPath)
 	if hostPath == "" || guestPath == "" {
-		return ServeMount{}, fmt.Errorf("%w: invalid serve mount %q (want HOST_PATH:GUEST_PATH[:ro|rw])", ErrInvalidConfig, spec)
+		return ServeMount{}, fmt.Errorf("%w: invalid %s %q (want HOST_PATH:GUEST_PATH[:ro|rw])", ErrInvalidConfig, label, spec)
 	}
 	var ro bool
-	if len(parts) == 3 {
-		switch strings.ToLower(strings.TrimSpace(parts[2])) {
+	if mode != "" {
+		switch strings.ToLower(strings.TrimSpace(mode)) {
 		case "ro", "readonly":
 			ro = true
 		case "rw":
 			ro = false
 		default:
-			return ServeMount{}, fmt.Errorf("%w: unsupported serve mount option %q (want ro or rw)", ErrInvalidConfig, parts[2])
+			return ServeMount{}, fmt.Errorf("%w: unsupported %s option %q (want ro or rw)", ErrInvalidConfig, label, mode)
 		}
 	}
 	return ServeMount{
@@ -80,69 +85,51 @@ func ParseServeMount(spec string) (ServeMount, error) {
 	}, nil
 }
 
-// splitMountSpec splits HOST:GUEST[:OPT] while preserving a leading Windows
-// drive prefix such as "C:\dir".
-func splitMountSpec(s string) []string {
-	start := 0
-	if len(s) >= 2 && s[1] == ':' && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) {
-		start = 2
-	}
-	rest := strings.Split(s[start:], ":")
-	rest[0] = s[:start] + rest[0]
-	return rest
-}
-
 type sandboxServeMount struct {
 	ServeMount
 	hostPath    string
 	localClient rpcfs.Client
 }
 
-// openLocalRPCFSClient opens hostPath via os.OpenRoot before host lockdown and
-// returns an in-process rpcfs.Client backed by that pinned root.
+// openLocalRPCFSClient opens hostPath via hostfs.Workspace before host lockdown
+// so all operations route through the OS lockdown containment layer (Windows
+// ActiveWindowsFileBroker, Linux openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS,
+// and macOS Seatbelt with single-file pinning).
 func openLocalRPCFSClient(hostPath string, readOnly bool) (client rpcfs.Client, absHost string, singleFile bool, err error) {
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("gvx: resolve serve mount %q: %w", hostPath, err)
 	}
-	fi, err := os.Stat(abs)
+	kind, err := classifyHostPath(abs)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("gvx: stat serve mount %q: %w", abs, err)
+		return nil, "", false, fmt.Errorf("%w: serve mount %q: %w", ErrInvalidConfig, abs, err)
 	}
-	if fi.IsDir() {
-		root, err := os.OpenRoot(abs)
+	if kind == hostPathMissing {
+		return nil, "", false, fmt.Errorf("gvx: serve mount %q does not exist", abs)
+	}
+	if kind == hostPathFile {
+		resolved, err := filepath.EvalSymlinks(abs)
 		if err != nil {
-			return nil, "", false, fmt.Errorf("gvx: open serve directory %q: %w", abs, err)
+			return nil, "", false, fmt.Errorf("gvx: resolve serve file %q: %w", abs, err)
 		}
-		return &localRPCFSClient{
-			root:     root,
-			readOnly: readOnly,
-		}, abs, false, nil
+		abs = resolved
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, "", false, fmt.Errorf("%w: serve mount %q must be a directory or regular file", ErrInvalidConfig, abs)
-	}
-	resolved, err := filepath.EvalSymlinks(abs)
+	ws, err := hostfs.OpenWorkspace(abs, readOnly)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("gvx: resolve serve file %q: %w", abs, err)
-	}
-	root, err := os.OpenRoot(filepath.Dir(resolved))
-	if err != nil {
-		return nil, "", false, fmt.Errorf("gvx: open serve file parent %q: %w", filepath.Dir(resolved), err)
+		return nil, "", false, fmt.Errorf("gvx: open serve mount %q: %w", abs, err)
 	}
 	return &localRPCFSClient{
-		root:       root,
-		singleFile: true,
-		leafName:   filepath.Base(resolved),
-		readOnly:   readOnly,
-	}, resolved, true, nil
+		ws:         ws,
+		singleFile: ws.SingleFile(),
+		readOnly:   ws.ReadOnly(),
+	}, ws.HostPath(), ws.SingleFile(), nil
 }
 
-// localRPCFSClient implements rpcfs.Client directly on a pre-opened *os.Root.
+// localRPCFSClient implements rpcfs.Client backed by a pre-opened
+// hostfs.Workspace.
 type localRPCFSClient struct {
-	root       *os.Root
+	ws         *hostfs.Workspace
 	singleFile bool
-	leafName   string
 	readOnly   bool
 
 	mu     sync.Mutex
@@ -159,17 +146,17 @@ func (c *localRPCFSClient) Close() error {
 	}
 	c.closed = true
 	c.mu.Unlock()
-	return c.root.Close()
+	return c.ws.Close()
 }
 
-func (c *localRPCFSClient) resolveRel(raw string, op string) (rel, hostRel string, err error) {
+func (c *localRPCFSClient) resolveRel(raw string, op string) (string, error) {
 	if strings.ContainsRune(raw, 0) {
-		return "", "", linuxerr.EINVAL
+		return "", linuxerr.EINVAL
 	}
 	norm := strings.ReplaceAll(raw, `\`, "/")
 	for _, seg := range strings.Split(norm, "/") {
 		if seg == ".." {
-			return "", "", linuxerr.EINVAL
+			return "", linuxerr.EINVAL
 		}
 	}
 	cleaned := strings.TrimPrefix(path.Clean("/"+norm), "/")
@@ -177,27 +164,20 @@ func (c *localRPCFSClient) resolveRel(raw string, op string) (rel, hostRel strin
 		cleaned = "."
 	}
 	if !c.singleFile {
-		return cleaned, cleaned, nil
+		return cleaned, nil
 	}
 	if cleaned != "." {
-		return "", "", linuxerr.ENOTDIR
+		return "", linuxerr.ENOTDIR
 	}
 	switch op {
 	case "readdir", "create", "mkdir", "symlink":
-		return "", "", linuxerr.ENOTDIR
+		return "", linuxerr.ENOTDIR
 	case "unlink", "rmdir", "rename":
-		return "", "", linuxerr.EBUSY
+		return "", linuxerr.EBUSY
 	case "readlink":
-		return "", "", linuxerr.EINVAL
+		return "", linuxerr.EINVAL
 	}
-	return ".", c.leafName, nil
-}
-
-func (c *localRPCFSClient) hostErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	return errnoToLinuxErr(control.HostErrorToLinuxErrno(err))
+	return ".", nil
 }
 
 func localStableIno(rel string) uint64 {
@@ -213,141 +193,83 @@ func localStableIno(rel string) uint64 {
 	return v
 }
 
-func localModeToLinux(m fs.FileMode) uint32 {
-	perm := uint32(m.Perm())
-	if m&os.ModeSetuid != 0 {
-		perm |= 0o4000
-	}
-	if m&os.ModeSetgid != 0 {
-		perm |= 0o2000
-	}
-	if m&os.ModeSticky != 0 {
-		perm |= 0o1000
-	}
-	switch {
-	case m.IsDir():
-		return linux.S_IFDIR | perm
-	case m&os.ModeSymlink != 0:
-		return linux.S_IFLNK | perm
-	default:
-		return linux.S_IFREG | perm
-	}
-}
-
-func (c *localRPCFSClient) entryFromInfo(rel, hostRel, name string, fi os.FileInfo) rpcfs.Entry {
+func (c *localRPCFSClient) entryFromAttr(rel, name string, attr hostfs.POSIXAttr, size int64) rpcfs.Entry {
 	nlink := uint32(1)
-	if fi.IsDir() {
+	if attr.Mode&linux.S_IFMT == linux.S_IFDIR {
 		nlink = 2
-	}
-	var linkTarget string
-	if !c.singleFile && fi.Mode()&os.ModeSymlink != 0 {
-		if target, err := c.root.Readlink(hostRel); err == nil {
-			linkTarget = target
-		}
 	}
 	ino := localStableIno(rel)
 	if c.singleFile {
 		ino = 1
 		name = ""
 	}
-	mtime := fi.ModTime().UnixNano()
 	return rpcfs.Entry{
 		Name:       name,
 		Ino:        ino,
-		Mode:       localModeToLinux(fi.Mode()),
-		Size:       fi.Size(),
+		Mode:       attr.Mode,
+		Size:       size,
 		Nlink:      nlink,
-		AtimeNS:    mtime,
-		MtimeNS:    mtime,
-		CtimeNS:    mtime,
-		LinkTarget: linkTarget,
-	}
-}
-
-func (c *localRPCFSClient) checkRegular(hostRel string) error {
-	fi, err := c.root.Lstat(hostRel)
-	if err != nil {
-		return c.hostErr(err)
-	}
-	switch {
-	case fi.Mode()&os.ModeSymlink != 0:
-		return linuxerr.ELOOP
-	case fi.IsDir():
-		return linuxerr.EISDIR
-	case !fi.Mode().IsRegular():
-		return linuxerr.EOPNOTSUPP
-	default:
-		return nil
+		UID:        attr.UID,
+		GID:        attr.GID,
+		AtimeNS:    attr.Atime,
+		MtimeNS:    attr.Mtime,
+		CtimeNS:    attr.Ctime,
+		LinkTarget: attr.Symlink,
 	}
 }
 
 func (c *localRPCFSClient) Stat(_ context.Context, relPath string) (rpcfs.Entry, error) {
-	rel, hostRel, err := c.resolveRel(relPath, "stat")
+	rel, err := c.resolveRel(relPath, "stat")
 	if err != nil {
 		return rpcfs.Entry{}, err
 	}
-	fi, err := c.root.Lstat(hostRel)
+	attr, size, err := c.ws.Stat(rel)
 	if err != nil {
-		return rpcfs.Entry{}, c.hostErr(err)
+		return rpcfs.Entry{}, hostfs.TranslateError(err)
 	}
-	return c.entryFromInfo(rel, hostRel, path.Base(rel), fi), nil
+	return c.entryFromAttr(rel, path.Base(rel), attr, size), nil
 }
 
 func (c *localRPCFSClient) Readdir(_ context.Context, relPath string) ([]rpcfs.Entry, error) {
-	rel, hostRel, err := c.resolveRel(relPath, "readdir")
+	rel, err := c.resolveRel(relPath, "readdir")
 	if err != nil {
 		return nil, err
 	}
-	f, err := c.root.Open(hostRel)
+	children, err := c.ws.ReadDirChildren(rel)
 	if err != nil {
-		return nil, c.hostErr(err)
+		return nil, hostfs.TranslateError(err)
 	}
-	des, err := f.ReadDir(-1)
-	_ = f.Close()
-	if err != nil {
-		return nil, c.hostErr(err)
-	}
-	slices.SortFunc(des, func(a, b os.DirEntry) int {
-		return strings.Compare(a.Name(), b.Name())
-	})
-	out := make([]rpcfs.Entry, 0, len(des))
-	for _, de := range des {
-		childRel := de.Name()
+	out := make([]rpcfs.Entry, 0, len(children))
+	for _, ch := range children {
+		childRel := ch.Name
 		if rel != "." {
-			childRel = rel + "/" + de.Name()
+			childRel = rel + "/" + ch.Name
 		}
-		fi, err := c.root.Lstat(childRel)
-		if err != nil {
-			continue
-		}
-		out = append(out, c.entryFromInfo(childRel, childRel, de.Name(), fi))
+		out = append(out, c.entryFromAttr(childRel, ch.Name, ch.Attr, ch.Size))
 	}
 	return out, nil
 }
 
 func (c *localRPCFSClient) Read(_ context.Context, relPath string, offset, length int64) ([]byte, error) {
-	_, hostRel, err := c.resolveRel(relPath, "read")
+	rel, err := c.resolveRel(relPath, "read")
 	if err != nil {
 		return nil, err
 	}
 	if offset < 0 || length < 0 {
 		return nil, linuxerr.EINVAL
 	}
-	if err := c.checkRegular(hostRel); err != nil {
-		return nil, err
-	}
 	if length == 0 {
 		return nil, nil
 	}
-	f, err := c.root.Open(hostRel)
+	f, err := c.ws.OpenFile(rel, os.O_RDONLY, 0)
 	if err != nil {
-		return nil, c.hostErr(err)
+		return nil, hostfs.TranslateError(err)
 	}
 	defer f.Close()
 	buf := make([]byte, min(length, c.MaxChunkBytes()))
 	n, err := f.ReadAt(buf, offset)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, c.hostErr(err)
+		return nil, hostfs.TranslateError(err)
 	}
 	if n == 0 && errors.Is(err, io.EOF) {
 		return nil, io.EOF
@@ -359,27 +281,24 @@ func (c *localRPCFSClient) Write(_ context.Context, relPath string, offset int64
 	if c.readOnly {
 		return 0, linuxerr.EROFS
 	}
-	_, hostRel, err := c.resolveRel(relPath, "write")
+	rel, err := c.resolveRel(relPath, "write")
 	if err != nil {
 		return 0, err
 	}
 	if offset < 0 {
 		return 0, linuxerr.EINVAL
 	}
-	if err := c.checkRegular(hostRel); err != nil {
-		return 0, err
-	}
-	f, err := c.root.OpenFile(hostRel, os.O_WRONLY, 0)
+	f, err := c.ws.OpenFile(rel, os.O_WRONLY, 0)
 	if err != nil {
-		return 0, c.hostErr(err)
+		return 0, hostfs.TranslateError(err)
 	}
 	n, err := f.WriteAt(data, offset)
 	closeErr := f.Close()
 	if err != nil {
-		return int64(n), c.hostErr(err)
+		return int64(n), hostfs.TranslateError(err)
 	}
 	if closeErr != nil {
-		return int64(n), c.hostErr(closeErr)
+		return int64(n), hostfs.TranslateError(closeErr)
 	}
 	return int64(n), nil
 }
@@ -388,7 +307,7 @@ func (c *localRPCFSClient) Create(_ context.Context, relPath string, mode, flags
 	if c.readOnly {
 		return rpcfs.Entry{}, linuxerr.EROFS
 	}
-	rel, hostRel, err := c.resolveRel(relPath, "create")
+	rel, err := c.resolveRel(relPath, "create")
 	if err != nil {
 		return rpcfs.Entry{}, err
 	}
@@ -399,140 +318,127 @@ func (c *localRPCFSClient) Create(_ context.Context, relPath string, mode, flags
 	if flags&linux.O_TRUNC != 0 {
 		osFlags |= os.O_TRUNC
 	}
-	perm := os.FileMode(mode) & 0o777
+	perm := mode & 0o777
 	if perm == 0 {
 		perm = 0o644
 	}
-	f, err := c.root.OpenFile(hostRel, osFlags, perm)
+	f, err := c.ws.OpenFile(rel, osFlags, perm)
 	if err != nil {
-		return rpcfs.Entry{}, c.hostErr(err)
+		return rpcfs.Entry{}, hostfs.TranslateError(err)
 	}
 	_ = f.Close()
-	fi, err := c.root.Lstat(hostRel)
+	attr, size, err := c.ws.Stat(rel)
 	if err != nil {
-		return rpcfs.Entry{}, c.hostErr(err)
+		return rpcfs.Entry{}, hostfs.TranslateError(err)
 	}
-	return c.entryFromInfo(rel, hostRel, path.Base(rel), fi), nil
+	return c.entryFromAttr(rel, path.Base(rel), attr, size), nil
 }
 
 func (c *localRPCFSClient) Mkdir(_ context.Context, relPath string, mode uint32) error {
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	_, hostRel, err := c.resolveRel(relPath, "mkdir")
+	rel, err := c.resolveRel(relPath, "mkdir")
 	if err != nil {
 		return err
 	}
-	perm := os.FileMode(mode) & 0o777
+	perm := mode & 0o777
 	if perm == 0 {
 		perm = 0o755
 	}
-	return c.hostErr(c.root.Mkdir(hostRel, perm))
+	return hostfs.TranslateError(c.ws.Mkdir(rel, perm))
 }
 
 func (c *localRPCFSClient) Unlink(_ context.Context, relPath string) error {
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	_, hostRel, err := c.resolveRel(relPath, "unlink")
+	rel, err := c.resolveRel(relPath, "unlink")
 	if err != nil {
 		return err
 	}
-	return c.hostErr(c.root.Remove(hostRel))
+	return hostfs.TranslateError(c.ws.Unlink(rel))
 }
 
 func (c *localRPCFSClient) Rmdir(_ context.Context, relPath string) error {
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	_, hostRel, err := c.resolveRel(relPath, "rmdir")
+	rel, err := c.resolveRel(relPath, "rmdir")
 	if err != nil {
 		return err
 	}
-	return c.hostErr(c.root.Remove(hostRel))
+	return hostfs.TranslateError(c.ws.Rmdir(rel))
 }
 
 func (c *localRPCFSClient) Rename(_ context.Context, oldRel, newRel string) error {
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	_, oldHost, err := c.resolveRel(oldRel, "rename")
+	oldClean, err := c.resolveRel(oldRel, "rename")
 	if err != nil {
 		return err
 	}
-	_, newHost, err := c.resolveRel(newRel, "rename")
+	newClean, err := c.resolveRel(newRel, "rename")
 	if err != nil {
 		return err
 	}
-	if err := verifyLocalSubtreeSymlinks(c.root, oldHost, newHost); err != nil {
-		return err
-	}
-	return c.hostErr(c.root.Rename(oldHost, newHost))
+	return hostfs.TranslateError(c.ws.Rename(oldClean, newClean))
 }
 
 func (c *localRPCFSClient) Truncate(_ context.Context, relPath string, size int64) error {
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	_, hostRel, err := c.resolveRel(relPath, "truncate")
+	rel, err := c.resolveRel(relPath, "truncate")
 	if err != nil {
 		return err
 	}
 	if size < 0 {
 		return linuxerr.EINVAL
 	}
-	if err := c.checkRegular(hostRel); err != nil {
-		return err
-	}
-	f, err := c.root.OpenFile(hostRel, os.O_WRONLY, 0)
-	if err != nil {
-		return c.hostErr(err)
-	}
-	tErr := f.Truncate(size)
-	closeErr := f.Close()
-	if tErr != nil {
-		return c.hostErr(tErr)
-	}
-	return c.hostErr(closeErr)
+	return hostfs.TranslateError(c.ws.Truncate(rel, size))
 }
 
 func (c *localRPCFSClient) Chmod(_ context.Context, relPath string, mode uint32) error {
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	_, hostRel, err := c.resolveRel(relPath, "chmod")
+	rel, err := c.resolveRel(relPath, "chmod")
 	if err != nil {
 		return err
 	}
-	return c.hostErr(c.root.Chmod(hostRel, os.FileMode(mode)&0o777))
+	return hostfs.TranslateError(c.ws.Chmod(rel, mode&0o7777))
 }
 
 func (c *localRPCFSClient) Utimens(_ context.Context, relPath string, atimeNS, mtimeNS int64, setAtime, setMtime bool) error {
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	_, hostRel, err := c.resolveRel(relPath, "utimens")
+	rel, err := c.resolveRel(relPath, "utimens")
 	if err != nil {
 		return err
 	}
-	var atime, mtime time.Time
+	var atime, mtime *time.Time
 	if setAtime {
-		atime = time.Unix(0, atimeNS)
+		t := time.Unix(0, atimeNS)
+		atime = &t
 	}
 	if setMtime {
-		mtime = time.Unix(0, mtimeNS)
+		t := time.Unix(0, mtimeNS)
+		mtime = &t
 	}
-	return c.hostErr(c.root.Chtimes(hostRel, atime, mtime))
+	return hostfs.TranslateError(c.ws.Chtimes(rel, atime, mtime))
 }
 
 func (c *localRPCFSClient) Readlink(_ context.Context, relPath string) (string, error) {
-	_, hostRel, err := c.resolveRel(relPath, "readlink")
+	rel, err := c.resolveRel(relPath, "readlink")
 	if err != nil {
 		return "", err
 	}
-	target, err := c.root.Readlink(hostRel)
+	target, err := c.ws.Readlink(rel)
 	if err != nil {
-		return "", c.hostErr(err)
+		return "", hostfs.TranslateError(err)
 	}
 	return target, nil
 }
@@ -541,14 +447,14 @@ func (c *localRPCFSClient) Symlink(_ context.Context, target, linkRel string) er
 	if c.readOnly {
 		return linuxerr.EROFS
 	}
-	rel, hostRel, err := c.resolveRel(linkRel, "symlink")
+	rel, err := c.resolveRel(linkRel, "symlink")
 	if err != nil {
 		return err
 	}
 	if err := validateLocalSymlinkTarget(rel, target); err != nil {
 		return err
 	}
-	return c.hostErr(c.root.Symlink(target, hostRel))
+	return hostfs.TranslateError(c.ws.Symlink(target, rel))
 }
 
 func validateLocalSymlinkTarget(linkRel, target string) error {
@@ -573,38 +479,6 @@ func validateLocalSymlinkTarget(linkRel, target string) error {
 			}
 		default:
 			depth++
-		}
-	}
-	return nil
-}
-
-func verifyLocalSubtreeSymlinks(root *os.Root, srcRel, dstRel string) error {
-	fi, err := root.Lstat(srcRel)
-	if err != nil {
-		return nil
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		target, err := root.Readlink(srcRel)
-		if err != nil {
-			return linuxerr.EACCES
-		}
-		return validateLocalSymlinkTarget(dstRel, target)
-	}
-	if !fi.IsDir() {
-		return nil
-	}
-	f, err := root.Open(srcRel)
-	if err != nil {
-		return nil
-	}
-	des, err := f.ReadDir(-1)
-	_ = f.Close()
-	if err != nil {
-		return nil
-	}
-	for _, de := range des {
-		if err := verifyLocalSubtreeSymlinks(root, path.Join(srcRel, de.Name()), path.Join(dstRel, de.Name())); err != nil {
-			return err
 		}
 	}
 	return nil

@@ -216,9 +216,17 @@ type manifestMountKey struct {
 }
 
 func (s *Sandbox) validateManifestMounts(bundleMounts []ManifestMount) error {
+	seenPaths := make(map[string]struct{}, len(bundleMounts))
 	bundleOther := make(map[string]ManifestMount)
 	bundleRPC := make(map[string]ManifestMount)
 	for _, mm := range bundleMounts {
+		if err := validateGuestPath(mm.GuestPath); err != nil {
+			return fmt.Errorf("%w: invalid manifest mount path %q: %v", ErrCheckpointManifest, mm.GuestPath, err)
+		}
+		if _, dup := seenPaths[mm.GuestPath]; dup {
+			return fmt.Errorf("%w: duplicate manifest mount path %q", ErrCheckpointManifest, mm.GuestPath)
+		}
+		seenPaths[mm.GuestPath] = struct{}{}
 		if mm.Type == MountRPCFS {
 			bundleRPC[mm.GuestPath] = mm
 		} else {
@@ -228,7 +236,7 @@ func (s *Sandbox) validateManifestMounts(bundleMounts []ManifestMount) error {
 
 	wantOther := sandboxManifestMounts(s.mounts)
 	wantByPath := make(map[string]ManifestMount, len(wantOther))
-	for _, wm := range wantOther {
+	for i, wm := range wantOther {
 		wantByPath[wm.GuestPath] = wm
 		bm, ok := bundleOther[wm.GuestPath]
 		if !ok {
@@ -236,6 +244,9 @@ func (s *Sandbox) validateManifestMounts(bundleMounts []ManifestMount) error {
 		}
 		if (manifestMountKey{bm.Type, bm.GuestPath, bm.ReadOnly, bm.Kind}) != (manifestMountKey{wm.Type, wm.GuestPath, wm.ReadOnly, wm.Kind}) {
 			return fmt.Errorf("%w: mounts mismatch at %q: bundle has %+v, config has %+v", ErrCheckpointManifest, wm.GuestPath, bm, wm)
+		}
+		if bm.Dynamic {
+			s.mounts[i].dynamic = true
 		}
 	}
 
@@ -570,6 +581,12 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		loadCtx = ext4lite.WithRestoreVolumeMap(loadCtx, volMap)
 	}
 
+	manifestRPCByTarget := make(map[string]ManifestMount)
+	for _, mm := range manifest.Mounts {
+		if mm.Type == MountRPCFS {
+			manifestRPCByTarget[mm.GuestPath] = mm
+		}
+	}
 	rpcRestoreClients := make(map[string]rpcfs.RestoreClient, len(sb.serveMounts))
 	serveByTarget := make(map[string]sandboxServeMount, len(sb.serveMounts))
 	for _, sm := range sb.serveMounts {
@@ -589,10 +606,11 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 			if target == "" {
 				return
 			}
+			mm := manifestRPCByTarget[target]
 			entry := &rpcMountEntry{
 				target:          target,
 				label:           h.Label(),
-				readOnly:        h.ReadOnly(),
+				readOnly:        h.ReadOnly() || mm.ReadOnly,
 				backingReadOnly: h.BackingReadOnly(),
 				singleFile:      h.SingleFile(),
 				detached:        h.Detached(),
@@ -600,7 +618,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 			}
 			if sm, ok := serveByTarget[target]; ok {
 				entry.client = sm.Client
+				entry.clientReadOnly = sm.ReadOnly
 				entry.backingReadOnly = h.BackingReadOnly() || sm.ReadOnly
+				entry.readOnly = entry.readOnly || sm.ReadOnly
 			}
 			sb.rpcMountsMu.Lock()
 			sb.rpcMounts[target] = entry

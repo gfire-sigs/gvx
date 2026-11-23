@@ -22,6 +22,11 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
 
+// TranslateError converts a Workspace error into the corresponding Linux errno.
+func TranslateError(err error) error {
+	return translateHostError(err)
+}
+
 // translateHostError converts an error from the workspace or host layer into
 // the Linux errno that guest code observes. An unrecognized error becomes EIO
 // so that no host detail leaks to the guest.
