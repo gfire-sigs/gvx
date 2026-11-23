@@ -30,30 +30,56 @@ import (
 )
 
 const testNATPolicy = `{"egress":{"default":"deny","rules":[{"action":"allow","cidr":"203.0.113.0/24","protocol":"tcp","ports":"443"}]},"ingress":{"default":"allow"}}`
+const testNATPolicyYAML = `egress:
+  default: deny
+  rules:
+    - action: allow
+      cidr: 203.0.113.0/24
+      protocol: tcp
+      ports: "443"
+ingress:
+  default: allow
+`
 
-func writeNATPolicyFile(t *testing.T, contents string) string {
+func writeNATPolicyFile(t *testing.T, suffix, contents string) string {
 	t.Helper()
-	file := filepath.Join(t.TempDir(), "policy file.json")
+	file := filepath.Join(t.TempDir(), "policy file"+suffix)
 	if err := os.WriteFile(file, []byte(contents), 0o600); err != nil {
-		t.Fatalf("write NAT policy: %v", err)
+		t.Fatalf("write NAT policy %q: %v", file, err)
 	}
 	return file
 }
 
 func TestRunAndRestoreLoadNATPolicyFile(t *testing.T) {
-	file := writeNATPolicyFile(t, testNATPolicy)
-	run, code, done, stderr := parse(t, "-nat-policy-file", file, "--network=bridge", "-image=x")
-	if done || code != 0 {
-		t.Fatalf("parse run policy: code=%d, done=%t, stderr=%q", code, done, stderr)
+	for _, tc := range []struct {
+		name     string
+		suffix   string
+		contents string
+	}{
+		{"JSON", ".json", testNATPolicy},
+		{"YAML", ".yaml", testNATPolicyYAML},
+		{"YML", ".yml", testNATPolicyYAML},
+		{"YAML at size limit", ".yaml", testNATPolicyYAML + strings.Repeat(" ", (64<<10)-len(testNATPolicyYAML))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := writeNATPolicyFile(t, tc.suffix, tc.contents)
+			t.Run("run", func(t *testing.T) {
+				run, code, done, stderr := parse(t, "-nat-policy-file", file, "--network=bridge", "-image=x")
+				if done || code != 0 {
+					t.Fatalf("parse run policy: code=%d, done=%t, stderr=%q", code, done, stderr)
+				}
+				assertConfiguredNATPolicy(t, run.cfg)
+			})
+			t.Run("restore", func(t *testing.T) {
+				var restoreErr bytes.Buffer
+				restore, code, done := parseRestoreArgs([]string{"-checkpoint-dir", t.TempDir(), "--nat-policy-file", file}, nil, io.Discard, &restoreErr)
+				if done || code != 0 {
+					t.Fatalf("parse restore policy without network mode: code=%d, done=%t, stderr=%q", code, done, restoreErr.String())
+				}
+				assertConfiguredNATPolicy(t, restore.cfg)
+			})
+		})
 	}
-	assertConfiguredNATPolicy(t, run.cfg)
-
-	var restoreErr bytes.Buffer
-	restore, code, done := parseRestoreArgs([]string{"-checkpoint-dir", t.TempDir(), "--nat-policy-file", file}, nil, io.Discard, &restoreErr)
-	if done || code != 0 {
-		t.Fatalf("parse restore policy without network mode: code=%d, done=%t, stderr=%q", code, done, restoreErr.String())
-	}
-	assertConfiguredNATPolicy(t, restore.cfg)
 }
 
 func assertConfiguredNATPolicy(t *testing.T, cfg gvx.Config) {
@@ -61,14 +87,21 @@ func assertConfiguredNATPolicy(t *testing.T, cfg gvx.Config) {
 	if cfg.NetworkMode != gvx.NetModeNAT || cfg.NetworkPolicy == nil {
 		t.Fatalf("network mode = %q, policy = %+v; want NAT with a policy", cfg.NetworkMode, cfg.NetworkPolicy)
 	}
-	p := cfg.NetworkPolicy
-	if p.Egress.Default != "deny" || p.Ingress.Default != "allow" || len(p.Egress.Rules) != 1 || p.Egress.Rules[0].Ports != "443" {
-		t.Fatalf("policy = %+v, want egress deny with a port 443 exception and ingress allow", p)
+	assertTestNATPolicy(t, cfg.NetworkPolicy)
+}
+
+func assertTestNATPolicy(t *testing.T, p *gvx.NATPolicyConfig) {
+	t.Helper()
+	if p.Egress.Default != "deny" || p.Ingress.Default != "allow" || len(p.Egress.Rules) != 1 || len(p.Ingress.Rules) != 0 {
+		t.Fatalf("policy = %+v, want egress deny with one exception and ingress allow without exceptions", p)
+	}
+	if rule := p.Egress.Rules[0]; rule.Action != "allow" || rule.CIDR != "203.0.113.0/24" || rule.Protocol != "tcp" || rule.Ports != "443" {
+		t.Errorf("egress exception = %+v, want allow TCP port 443 to 203.0.113.0/24", rule)
 	}
 }
 
 func TestNATPolicyFileRejectsNonNATNetworkMode(t *testing.T) {
-	file := writeNATPolicyFile(t, testNATPolicy)
+	file := writeNATPolicyFile(t, ".json", testNATPolicy)
 	for _, args := range [][]string{
 		{"run", "--nat-policy-file", file, "-net=none", "-image=x"},
 		{"restore", "--nat-policy-file", file, "--network=wg", "-checkpoint-dir", t.TempDir()},
@@ -92,10 +125,60 @@ func TestNATPolicyFileRejectsInvalidDocuments(t *testing.T) {
 		{"oversize whitespace", testNATPolicy + strings.Repeat(" ", 64<<10)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			file := writeNATPolicyFile(t, tc.json)
+			file := writeNATPolicyFile(t, ".json", tc.json)
 			_, code, done, stderr := parse(t, "--nat-policy-file", file, "-image=x")
 			if !done || code != 2 || !strings.Contains(stderr, "--nat-policy-file:") {
 				t.Errorf("parse %s policy: code=%d, done=%t, stderr=%q; want policy file usage error", tc.name, code, done, stderr)
+			}
+		})
+	}
+}
+
+func TestNATPolicyFileRequiresSupportedSuffix(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		suffix   string
+		contents string
+		want     string
+	}{
+		{"missing suffix", "", testNATPolicy, "expected .json, .yaml, or .yml"},
+		{"unsupported suffix", ".txt", testNATPolicyYAML, "expected .json, .yaml, or .yml"},
+		{"YAML with JSON suffix", ".json", testNATPolicyYAML, "--nat-policy-file:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := writeNATPolicyFile(t, tc.suffix, tc.contents)
+			_, code, done, stderr := parse(t, "--nat-policy-file", file, "-image=x")
+			if !done || code != 2 || !strings.Contains(stderr, tc.want) {
+				t.Errorf("parse policy: code=%d, done=%t, stderr=%q; want usage error containing %q", code, done, stderr, tc.want)
+			}
+		})
+	}
+}
+
+func TestNATPolicyFileRejectsInvalidYAML(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+	}{
+		{"unknown policy field", testNATPolicyYAML + "extra: deny\n"},
+		{"unknown direction field", strings.Replace(testNATPolicyYAML, "ingress:\n", "ingress:\n  extra: deny\n", 1)},
+		{"unknown rule field", strings.Replace(testNATPolicyYAML, `ports: "443"`, "extra: deny\n      ports: \"443\"", 1)},
+		{"duplicate policy field", testNATPolicyYAML + "ingress:\n  default: allow\n"},
+		{"duplicate direction field", strings.Replace(testNATPolicyYAML, "default: deny", "default: deny\n  default: deny", 1)},
+		{"duplicate rule field", strings.Replace(testNATPolicyYAML, "protocol: tcp", "protocol: tcp\n      protocol: tcp", 1)},
+		{"multiple documents", testNATPolicyYAML + "---\n" + testNATPolicyYAML},
+		{"sequence root", "- " + testNATPolicy},
+		{"null selector", strings.Replace(testNATPolicyYAML, `ports: "443"`, "ports: null", 1)},
+		{"numeric selector", strings.Replace(testNATPolicyYAML, `ports: "443"`, "ports: 443", 1)},
+		{"alias", "egress: &direction {default: deny}\ningress: *direction\n"},
+		{"merge key", "egress: {<<: {default: deny}}\ningress: {default: allow}\n"},
+		{"one byte over size limit", testNATPolicyYAML + strings.Repeat(" ", (64<<10)+1-len(testNATPolicyYAML))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := writeNATPolicyFile(t, ".yaml", tc.yaml)
+			_, code, done, stderr := parse(t, "--nat-policy-file", file, "-image=x")
+			if !done || code != 2 || !strings.Contains(stderr, "--nat-policy-file:") {
+				t.Errorf("parse YAML policy: code=%d, done=%t, stderr=%q; want policy file usage error", code, done, stderr)
 			}
 		})
 	}
@@ -127,21 +210,36 @@ func TestNetPolicyReadOnlyAllowsGetButDeniesReplace(t *testing.T) {
 }
 
 func TestNetPolicyReplaceSendsPolicyDocument(t *testing.T) {
-	file := writeNATPolicyFile(t, testNATPolicy)
-	ep := startMockCLIServer(t, []string{control.CapNATPolicyWrite}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
-		if req.Method != control.MethodNATPolicySet {
-			t.Errorf("replace sent method %q, want net.policy_set", req.Method)
-		}
-		var state control.NATPolicyState
-		if err := json.Unmarshal(req.Params, &state); err != nil {
-			return err
-		}
-		return stream.Reply(state)
-	})
-	res := runCLIArgs(t, nil, "net-policy", "replace", "-S", ep.Address, "--token", ep.Token, "--file", file).mustSucceed(t, "net-policy replace")
-	p, err := gvx.ParseNATPolicy(strings.NewReader(res.stdout))
-	if err != nil || p.Egress.Default != "deny" || p.Ingress.Default != "allow" || len(p.Egress.Rules) != 1 || p.Egress.Rules[0].CIDR != "203.0.113.0/24" {
-		t.Fatalf("replacement policy JSON = %q, err=%v; want both directions and the selected CIDR", res.stdout, err)
+	for _, tc := range []struct {
+		suffix   string
+		contents string
+	}{
+		{".json", testNATPolicy},
+		{".yaml", testNATPolicyYAML},
+	} {
+		t.Run(tc.suffix, func(t *testing.T) {
+			file := writeNATPolicyFile(t, tc.suffix, tc.contents)
+			ep := startMockCLIServer(t, []string{control.CapNATPolicyWrite}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+				if req.Method != control.MethodNATPolicySet {
+					t.Errorf("replace sent method %q, want net.policy_set", req.Method)
+				}
+				var state control.NATPolicyState
+				if err := json.Unmarshal(req.Params, &state); err != nil {
+					return err
+				}
+				if _, err := gvx.ParseNATPolicy(bytes.NewReader(state.Policy)); err != nil {
+					t.Errorf("RPC policy = %q; want a policy JSON object: %v", state.Policy, err)
+					return err
+				}
+				return stream.Reply(state)
+			})
+			res := runCLIArgs(t, nil, "net-policy", "replace", "-S", ep.Address, "--token", ep.Token, "--file", file).mustSucceed(t, "net-policy replace")
+			p, err := gvx.ParseNATPolicy(strings.NewReader(res.stdout))
+			if err != nil {
+				t.Fatalf("replacement output = %q; want a policy JSON object: %v", res.stdout, err)
+			}
+			assertTestNATPolicy(t, &p)
+		})
 	}
 }
 

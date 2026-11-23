@@ -206,7 +206,7 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	})
 	fs.BoolVar(&f.isolateLAN, "isolate-lan", false, "Block RFC1918 and loopback LAN destinations in NAT mode")
 	registerNetworkBandwidthFlags(fs, &f.netTXBPS, &f.netRXBPS)
-	fs.StringVar(&f.natPolicyFile, "nat-policy-file", "", "Read host NAT firewall policy from a JSON file")
+	fs.StringVar(&f.natPolicyFile, "nat-policy-file", "", "Read host NAT firewall policy (.json, .yaml, or .yml)")
 	fs.BoolVar(&f.privileged, "privileged", true, "Turn on --net-raw, --allow-packet-socket-write, and --allow-suid; --privileged=false turns them off")
 	fs.BoolVar(&f.netRaw, "net-raw", true, "Allow raw sockets and iptables in the guest (default from --privileged)")
 	fs.BoolVar(&f.packetWrite, "allow-packet-socket-write", true, "Allow writes on AF_PACKET sockets; needs --net-raw (default from --privileged)")

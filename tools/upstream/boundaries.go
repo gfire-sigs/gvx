@@ -181,7 +181,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:               "cmd/rungv",
 		tier:              Tier1Additive,
-		allowed:           []string{"pkg/gvx", "pkg/gvx/control", "pkg/oci"},
+		allowed:           []string{"pkg/gvx", "pkg/gvx/control", "pkg/oci", "gopkg.in/yaml.v3"},
 		forbidden:         []string{pkgSentryAll, "pkg/hostlockdown/*", "pkg/netbackend/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
 		forbiddenLiterals: []string{winHvDLL},
 	},

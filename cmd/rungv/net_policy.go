@@ -15,12 +15,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"z.gfire.dev/gvx/pkg/gvx"
 	"z.gfire.dev/gvx/pkg/gvx/control"
@@ -59,7 +65,7 @@ func netPolicySubcommand(ctx context.Context, args []string, streams cliIO) int 
 		method, capability = control.MethodNATPolicyGet, control.CapNATPolicyRead
 	case "replace":
 		method, capability = control.MethodNATPolicySet, control.CapNATPolicyWrite
-		fs.StringVar(&file, "file", "", "Path to the replacement NAT firewall policy JSON file")
+		fs.StringVar(&file, "file", "", "Replacement NAT firewall policy file (.json, .yaml, or .yml)")
 	default:
 		return controlUsageError(streams.stderr, "net-policy", "unknown subcommand %q (want get or replace)", args[0])
 	}
@@ -111,13 +117,100 @@ func netPolicySubcommand(ctx context.Context, args []string, streams cliIO) int 
 }
 
 func readNATPolicyFile(path string) (gvx.NATPolicyConfig, error) {
+	parse := gvx.ParseNATPolicy
+	ext := filepath.Ext(path)
+	switch strings.ToLower(ext) {
+	case ".json":
+	case ".yaml", ".yml":
+		parse = parseYAMLNATPolicy
+	case "":
+		return gvx.NATPolicyConfig{}, fmt.Errorf("policy file %q has no extension; expected .json, .yaml, or .yml", path)
+	default:
+		return gvx.NATPolicyConfig{}, fmt.Errorf("unsupported policy file extension %q; expected .json, .yaml, or .yml", ext)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return gvx.NATPolicyConfig{}, err
 	}
-	policy, parseErr := gvx.ParseNATPolicy(f)
+	policy, parseErr := parse(f)
 	if err := errors.Join(parseErr, f.Close()); err != nil {
 		return gvx.NATPolicyConfig{}, fmt.Errorf("read %q: %w", path, err)
 	}
 	return policy, nil
+}
+
+func parseYAMLNATPolicy(r io.Reader) (gvx.NATPolicyConfig, error) {
+	const maxYAMLBytes = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(r, maxYAMLBytes+1))
+	if err != nil {
+		return gvx.NATPolicyConfig{}, err
+	}
+	if len(data) > maxYAMLBytes {
+		return gvx.NATPolicyConfig{}, errors.New("NAT policy exceeds 64 KiB")
+	}
+	d := yaml.NewDecoder(bytes.NewReader(data))
+	var doc yaml.Node
+	if err := d.Decode(&doc); err != nil {
+		return gvx.NATPolicyConfig{}, fmt.Errorf("parse YAML policy: %w", err)
+	}
+	if err := d.Decode(new(yaml.Node)); err != io.EOF {
+		if err != nil {
+			return gvx.NATPolicyConfig{}, fmt.Errorf("parse YAML policy: %w", err)
+		}
+		return gvx.NATPolicyConfig{}, errors.New("NAT policy must contain one YAML document")
+	}
+	value, err := policyYAMLValue(doc.Content[0], 0)
+	if err != nil {
+		return gvx.NATPolicyConfig{}, err
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return gvx.NATPolicyConfig{}, err
+	}
+	return gvx.ParseNATPolicy(bytes.NewReader(raw))
+}
+
+func policyYAMLValue(n *yaml.Node, depth int) (any, error) {
+	// The deepest values are fields in rules: document, direction, rules, rule, field.
+	if depth > 4 {
+		return nil, fmt.Errorf("YAML line %d: policy nesting exceeds four levels", n.Line)
+	}
+	switch n.Kind {
+	case yaml.MappingNode:
+		if n.ShortTag() == "!!map" {
+			fields := make(map[string]any, len(n.Content)/2)
+			for i := 0; i < len(n.Content); i += 2 {
+				key := n.Content[i]
+				if key.Kind != yaml.ScalarNode || key.ShortTag() != "!!str" {
+					return nil, fmt.Errorf("YAML line %d: expected a string field name", key.Line)
+				}
+				if _, exists := fields[key.Value]; exists {
+					return nil, fmt.Errorf("YAML line %d: duplicate field %q", key.Line, key.Value)
+				}
+				value, err := policyYAMLValue(n.Content[i+1], depth+1)
+				if err != nil {
+					return nil, err
+				}
+				fields[key.Value] = value
+			}
+			return fields, nil
+		}
+	case yaml.SequenceNode:
+		if n.ShortTag() == "!!seq" {
+			items := make([]any, len(n.Content))
+			for i, item := range n.Content {
+				value, err := policyYAMLValue(item, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				items[i] = value
+			}
+			return items, nil
+		}
+	case yaml.ScalarNode:
+		if n.ShortTag() == "!!str" {
+			return n.Value, nil
+		}
+	}
+	return nil, fmt.Errorf("YAML line %d: expected a mapping, sequence, or string", n.Line)
 }

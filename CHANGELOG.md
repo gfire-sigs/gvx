@@ -8,7 +8,7 @@ This release adds an optional host firewall and per-sandbox bandwidth limits to 
 
 - Set limits with `--net-tx-bps` and `--net-rx-bps` on `rungv run` or `rungv restore`.
 - Change either rate on a running sandbox with `rungv update` over `gvx-ctrl/2`.
-- Install a NAT policy from a JSON file. Replace it at runtime with `rungv net-policy replace`.
+- Install a NAT policy from a JSON or YAML file. Replace it at runtime with `rungv net-policy replace`.
 
 ## [v0.20.10012026111600] - 2026-11-23
 

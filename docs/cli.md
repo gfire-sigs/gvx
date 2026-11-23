@@ -110,7 +110,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode (`nat`, `wg`, `none`) and its options. |
 | `--net-tx-bps N`, `--net-rx-bps N` | Set guest transmit and receive limits in bits per second for NAT. `0` leaves that direction unlimited. |
-| `--nat-policy-file FILE` | Load a host-owned JSON policy for NAT on `run` or `restore`. |
+| `--nat-policy-file FILE` | Load a host-owned NAT policy on `run` or `restore`. Use `.json`, `.yaml`, or `.yml`. |
 | `--privileged` | On by default. Enables `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` disables all three. Explicit per-flag values override `--privileged` (see Section 4.8). |
 | `--net-raw` | Allow guest raw sockets and `iptables` (required by `dockerd`). Defaults to `--privileged`. |
 | `--allow-packet-socket-write` | Allow guest writes on `AF_PACKET` sockets (requires `--net-raw`). Defaults to `--privileged` when `--net-raw` is on. |
@@ -429,7 +429,11 @@ This policy runs at the NAT boundary, outside the guest. Guest `iptables` does n
 | `protocol` | `tcp`, `udp`, `icmp`, `icmpv6`, or a protocol number from 1 through 255. Omit it to match all protocols. |
 | `ports` | Optional service port or inclusive range such as `8000-8010`. It applies to TCP and UDP. |
 
-The file limit is 64 KiB. The runtime rejects unknown fields. If the runtime cannot read a field that could change the verdict, it denies the operation.
+The CLI selects JSON or YAML from the file extension. It rejects missing or unknown extensions. Both formats use the same schema and a 64 KiB file limit.
+
+Use one YAML document without aliases or merge keys. Quote numeric strings such as `ports: "443"`. The runtime rejects unknown or duplicate fields.
+
+If the runtime cannot read a field that could change the verdict, it denies the operation.
 
 Egress requires permission for the guest destination and the actual host destination when they differ. DNS requires permission for each upstream attempt. Ingress uses the actual publication client and the selected guest service, including loopback fallback. An admitted TCP or UDP relay also permits its replies.
 
@@ -457,7 +461,9 @@ rungv net-policy get -n app
 rungv net-policy replace -n app --file new-policy.json
 ```
 
-Replacement cancels active relays that the new policy denies. The command does not write the file, change the configured bandwidth, or recall bytes the relay already sent.
+Replacement cancels active relays that the new policy denies. The command does not write the file, change bandwidth, or recall bytes the relay already sent.
+
+Both control commands write JSON, regardless of the input format.
 
 ## 5. Images and registries
 
