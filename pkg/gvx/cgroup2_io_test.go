@@ -186,7 +186,7 @@ func main() {
 		t.Fatalf("write main.go: %v", err)
 	}
 	outPath := filepath.Join(srcDir, "ioprobe")
-	cmd := exec.Command("go", "build", "-o", outPath, ".")
+	cmd := exec.Command("go", "build", "-ldflags=-linkmode=internal", "-o", outPath, ".")
 	cmd.Dir = srcDir
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -252,6 +252,7 @@ func TestCgroup2IOAccountingGuestEndToEndAndMultiSandboxIsolation(t *testing.T) 
 				ImagePath: volPath,
 				GuestPath: "/mnt/vol",
 			}},
+			Envv:   []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 			Stdout: &outB,
 			Stderr: &errB,
 		})
