@@ -150,6 +150,7 @@ type sandboxFlagValues struct {
 	detach                 bool
 	publishAll             bool
 	autoPublish            bool
+	autoPublishAddr        string
 	envFlags               listFlag
 	envFileFlags           listFlag
 	entrypoint             string
@@ -174,6 +175,7 @@ type sandboxFlagValues struct {
 	controlDisable         multiStringFlag
 	controlTokenFile       string
 	dynamicPorts           bool
+	dynamicPortAddrs       multiStringFlag
 	allowVolumeAttach      bool
 }
 
@@ -213,8 +215,10 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	fs.StringVar(&f.wgConfigAlias, "wg-config", "", "Alias for -wg-conf")
 	f.hostDNS = addHostDNSFlag(fs)
 	fs.BoolVar(&f.publishAll, "P", false, "Publish every port that the image exposes to a free port of 127.0.0.1")
-	fs.BoolVar(&f.autoPublish, "auto-publish", false, "Automatically publish guest TCP listeners and iptables NAT DNAT ports on host 127.0.0.1")
+	fs.BoolVar(&f.autoPublish, "auto-publish", false, "Automatically publish guest TCP listeners and iptables NAT DNAT ports on host 127.0.0.1 (or --auto-publish-addr)")
+	fs.StringVar(&f.autoPublishAddr, "auto-publish-addr", "", "Host IP literal for --auto-publish (defaults to 127.0.0.1; e.g. 0.0.0.0 or a LAN IP)")
 	fs.BoolVar(&f.dynamicPorts, "dynamic-ports", false, "Allow runtime loopback port publishing via `rungv port add` under host lockdown")
+	fs.Var(&f.dynamicPortAddrs, "dynamic-ports-addr", "Repeatable host IP literal allowed for runtime `rungv port add` under host lockdown (e.g. 0.0.0.0 or a LAN IP)")
 	registerAlias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&f.portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
 	})
@@ -516,6 +520,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		PortForwards:           portForwards,
 		PublishAll:             f.publishAll,
 		AutoPublishPorts:       f.autoPublish,
+		AutoPublishAddr:        strings.TrimSpace(f.autoPublishAddr),
 		WireGuardConfigPath:    f.wireGuardPath(),
 		OCIImage:               strings.TrimSpace(f.image),
 		OCICacheDir:            strings.TrimSpace(f.cacheDir),
@@ -545,6 +550,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		ControlPolicy:          ctrlPolicy,
 		ControlDisable:         append([]string(nil), f.controlDisable...),
 		DynamicPorts:           f.dynamicPorts,
+		DynamicPortAddrs:       append([]string(nil), f.dynamicPortAddrs...),
 		AllowVolumeAttach:      f.allowVolumeAttach,
 	}
 	cfg.NetworkBandwidth.TXBPS, cfg.NetworkBandwidth.RXBPS = f.netTXBPS, f.netRXBPS

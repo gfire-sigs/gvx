@@ -25,6 +25,8 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
+	"strings"
 
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
@@ -342,13 +344,25 @@ type Config struct {
 	PublishAll bool
 
 	// AutoPublishPorts publishes guest TCP listeners and iptables NAT DNAT
-	// ports on host 127.0.0.1 automatically while the sandbox runs. Static
-	// rules in PortForwards keep precedence. It needs the nat network mode.
+	// ports on host 127.0.0.1 (or AutoPublishAddr) automatically while the
+	// sandbox runs. Static rules in PortForwards keep precedence. It needs the
+	// nat network mode.
 	AutoPublishPorts bool
+
+	// AutoPublishAddr overrides the host bind IP address used by
+	// AutoPublishPorts (defaults to "127.0.0.1"). Setting a non-loopback IP
+	// authorizes that address under host lockdown for automatic publishing.
+	// Requires AutoPublishPorts and the nat network mode.
+	AutoPublishAddr string
 
 	// DynamicPorts enables runtime loopback port publishing (`port add`) under
 	// host lockdown without automatic guest port polling. It needs nat mode.
 	DynamicPorts bool
+
+	// DynamicPortAddrs lists explicit host IP literals (such as "0.0.0.0" or a
+	// LAN IP) that runtime `port add` may bind under host lockdown. Unlisted
+	// addresses and Unix domain sockets remain denied. It needs nat mode.
+	DynamicPortAddrs []string
 
 	// AllowVolumeAttach enables POSIX Unix SCM_RIGHTS ext4lite volume attachment
 	// over the control socket under Linux seccomp lockdown.
@@ -561,8 +575,35 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if c.AutoPublishPorts && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: auto-publishing guest ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
 	}
+	if c.AutoPublishAddr != "" {
+		if !c.AutoPublishPorts {
+			return fmt.Errorf("%w: AutoPublishAddr requires AutoPublishPorts", ErrInvalidConfig)
+		}
+		addr, err := parseBareIPAddr(c.AutoPublishAddr)
+		if err != nil {
+			return fmt.Errorf("%w: invalid AutoPublishAddr %q: %w", ErrInvalidConfig, c.AutoPublishAddr, err)
+		}
+		c.AutoPublishAddr = addr.String()
+	}
 	if c.DynamicPorts && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: dynamic port publishing needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+	}
+	if len(c.DynamicPortAddrs) > 0 {
+		if c.NetworkMode != NetModeNAT {
+			return fmt.Errorf("%w: dynamic port bind addresses need network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+		}
+		normalized := make([]string, 0, len(c.DynamicPortAddrs))
+		for _, raw := range c.DynamicPortAddrs {
+			addr, err := parseBareIPAddr(raw)
+			if err != nil {
+				return fmt.Errorf("%w: invalid DynamicPortAddrs entry %q: %w", ErrInvalidConfig, raw, err)
+			}
+			s := addr.String()
+			if !slices.Contains(normalized, s) {
+				normalized = append(normalized, s)
+			}
+		}
+		c.DynamicPortAddrs = normalized
 	}
 	if err := c.validateMounts(); err != nil {
 		return err
@@ -585,4 +626,13 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 		}
 	}
 	return nil
+}
+
+func parseBareIPAddr(raw string) (netip.Addr, error) {
+	s := strings.TrimSpace(raw)
+	addr, err := netip.ParseAddr(s)
+	if err != nil || addr.Zone() != "" {
+		return netip.Addr{}, errors.New("want a bare IP literal without port or zone")
+	}
+	return addr.Unmap(), nil
 }

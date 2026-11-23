@@ -155,7 +155,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --dynamic-ports -e --env-file -u --user -m --memory --cpus --pids-limit --net --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr -e --env-file -u --user -m --memory --cpus --pids-limit --net --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -295,8 +295,10 @@ _rungv() {
                 '--rootfs-volume[Persistent ext4lite volume name or image path for container rootfs]:volume:' \
                 '*-p[Publish guest port to host]:port:' \
                 '-P[Publish all exposed image ports]' \
-                '--auto-publish[Automatically publish guest listeners on host 127.0.0.1]' \
+                '--auto-publish[Automatically publish guest listeners on host 127.0.0.1 or --auto-publish-addr]' \
+                '--auto-publish-addr[Host IP literal for --auto-publish]:ip:' \
                 '--dynamic-ports[Allow runtime loopback port publishing via rungv port add]' \
+                '*--dynamic-ports-addr[Host IP literal allowed for runtime rungv port add under lockdown]:ip:' \
                 '*-e[Set guest environment variable]:env:' \
                 '*--env-file[Read environment variables from file]:file:_files' \
                 '-u[Guest user or UID:GID]:user:' \

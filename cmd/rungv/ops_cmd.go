@@ -170,6 +170,12 @@ func statusSubcommand(ctx context.Context, cmdName string, args []string, stdout
 		_, _ = fmt.Fprintf(tw, "PIDs:\t%d (limit=%d)\n", info.PIDCount, info.Resources.PidsLimit)
 		_, _ = fmt.Fprintf(tw, "Exec Sessions:\t%d\n", info.ActiveExecSessions)
 		_, _ = fmt.Fprintf(tw, "Ports:\t%d\n", len(info.Ports))
+		if len(info.DynamicBindAddrs) > 0 {
+			_, _ = fmt.Fprintf(tw, "Dynamic Bind:\t%s\n", strings.Join(info.DynamicBindAddrs, ", "))
+		}
+		if info.AutoPublishAddr != "" {
+			_, _ = fmt.Fprintf(tw, "Auto Publish:\t%s\n", info.AutoPublishAddr)
+		}
 		_, _ = fmt.Fprintf(tw, "Mounts:\t%d\n", len(info.Mounts))
 		_, _ = fmt.Fprintf(tw, "Capabilities:\t%s\n", strings.Join(info.Capabilities, ", "))
 		return tw.Flush()

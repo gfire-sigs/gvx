@@ -42,3 +42,11 @@ func listenHostLoopback(network, address string) (net.Listener, error) {
 func listenHostPacketLoopback(network, address string) (net.PacketConn, error) {
 	return net.ListenPacket(network, address)
 }
+
+func listenHostAllowed(network, address string) (net.Listener, error) {
+	return listenHostLoopback(network, address)
+}
+
+func listenHostPacketAllowed(network, address string) (net.PacketConn, error) {
+	return listenHostPacketLoopback(network, address)
+}

@@ -80,7 +80,8 @@ The table below lists the `rungv run` flags that match the Docker CLI.
 | `-t` | Allocate a pseudo-terminal. |
 | `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. Omitting the host port or using `0` picks a free port on `127.0.0.1`. Ranges like `8000-8009:8000-8009` publish each port. `unix:PATH:GUEST` exposes a guest TCP port on a host Unix socket (see Section 4.7). |
 | `-P` | Publish every port declared by image `EXPOSE` to a free `127.0.0.1` port. |
-| `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` while the sandbox runs. Static `-p` rules keep precedence (see Section 4.7). |
+| `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` (or `--auto-publish-addr`) while the sandbox runs. Static `-p` rules keep precedence (see Section 4.7). |
+| `--auto-publish-addr IP` | Override the host IP literal for `--auto-publish` (for example, `0.0.0.0` or a LAN IP). Requires `--auto-publish` and NAT mode. |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, a single host file, or a named volume. |
 | `--mount type=bind\|volume\|tmpfs\|overlay,src=...,dst=...,readonly[,driver=ext4lite\|hostfs][,upper=...][,tmpfs-size=...]` | Mount using Docker key-value syntax. `driver` applies to `type=volume` only; a volume `src` with a path separator names a host `.ext4` file. `type=overlay` mounts a copy-on-write branch over a read-only base volume. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
@@ -125,6 +126,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `--control-disable CAPS` | Disable comma-separated control capabilities or groups (for example, `exec,net.dial`). |
 | `--control-token-file PATH` | Write the 256-bit control token to `PATH` and require token authentication even on POSIX Unix sockets. |
 | `--dynamic-ports` | Allow runtime loopback (`127.0.0.1` and `[::1]`) port publishing through `rungv port add` under host lockdown. |
+| `--dynamic-ports-addr IP` | Allow runtime `rungv port add` binds on the listed host IP literal under host lockdown (repeatable). Unlisted addresses and Unix sockets stay denied. |
 | `--allow-volume-attach` | Enable Linux seccomp rules for attaching `ext4lite` volumes over POSIX `SCM_RIGHTS` via `rungv mount add --type volume`. |
 | `-lockdown=false` | Skip host lockdown. Use for debugging only. |
 | `--tune KEY=VALUE` | Set a host-side tunable (repeatable; see Section 3.3). Accepted by `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info`. |

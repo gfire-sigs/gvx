@@ -77,6 +77,7 @@ const (
 	CapPortList            = "port.list"
 	CapPortRemove          = "port.remove"
 	CapPortDynamicLoopback = "port.dynamic_loopback"
+	CapPortDynamicAny      = "port.dynamic_any"
 	CapPortAnyBind         = "port.any_bind"
 	CapNetDial             = "net.dial"
 	CapNATPolicyRead       = "net.policy.read"
@@ -116,6 +117,7 @@ var allKnownCapabilities = []string{
 	CapPortList,
 	CapPortRemove,
 	CapPortDynamicLoopback,
+	CapPortDynamicAny,
 	CapPortAnyBind,
 	CapNetDial,
 	CapNATPolicyRead,
@@ -285,7 +287,7 @@ func MethodAllowed(method string, caps []string) bool {
 		return false
 	}
 	if method == MethodPortAdd {
-		return slices.Contains(caps, CapPortDynamicLoopback) || slices.Contains(caps, CapPortAnyBind)
+		return slices.Contains(caps, CapPortDynamicLoopback) || slices.Contains(caps, CapPortDynamicAny) || slices.Contains(caps, CapPortAnyBind)
 	}
 	if method == MethodMountAdd {
 		return slices.Contains(caps, CapMountTmpfs) || slices.Contains(caps, CapMountVolumeAttach) || slices.Contains(caps, CapMountBind)
@@ -845,6 +847,8 @@ type InspectResponse struct {
 	Resources          ResourceSnapshot `json:"resources"`
 	MemoryUsedBytes    uint64           `json:"memory_used_bytes"`
 	Ports              []PortRuleInfo   `json:"ports,omitempty"`
+	DynamicBindAddrs   []string         `json:"dynamic_bind_addrs,omitempty"`
+	AutoPublishAddr    string           `json:"auto_publish_addr,omitempty"`
 	Mounts             []MountInfo      `json:"mounts,omitempty"`
 	ActiveExecSessions int              `json:"active_exec_sessions"`
 	PIDCount           int              `json:"pid_count"`

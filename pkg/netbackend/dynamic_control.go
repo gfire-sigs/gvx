@@ -371,10 +371,14 @@ func (pf *PortForwarder) addDynamicRuleLocked(
 		return norm, dynamicRuleUndo{kind: undoAddedTCP, tcpEntry: entry}, nil
 	}
 
+	tcpNet, udpNet := "tcp4", "udp4"
+	if addr, err := netip.ParseAddr(norm.HostIP); err == nil && addr.Unmap().Is6() {
+		tcpNet, udpNet = "tcp6", "udp6"
+	}
 	bindAddr := net.JoinHostPort(norm.HostIP, strconv.Itoa(int(norm.HostPort)))
 	switch proto {
 	case "tcp":
-		ln, err := listenTCP("tcp", bindAddr)
+		ln, err := listenTCP(tcpNet, bindAddr)
 		if err != nil {
 			return PortForwardRule{}, dynamicRuleUndo{}, fmt.Errorf("netbackend: bind tcp %s: %w", bindAddr, err)
 		}
@@ -400,7 +404,7 @@ func (pf *PortForwarder) addDynamicRuleLocked(
 		return norm, dynamicRuleUndo{kind: undoAddedTCP, tcpEntry: entry}, nil
 
 	case "udp":
-		pc, err := listenUDP("udp", bindAddr)
+		pc, err := listenUDP(udpNet, bindAddr)
 		if err != nil {
 			return PortForwardRule{}, dynamicRuleUndo{}, fmt.Errorf("netbackend: bind udp %s: %w", bindAddr, err)
 		}

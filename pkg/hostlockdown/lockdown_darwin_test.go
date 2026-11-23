@@ -452,6 +452,8 @@ func runLockedChild(mode string) error {
 		return childNetNATUnix()
 	case "net-loopback-bind":
 		return childNetLoopbackBind()
+	case "net-allowed-bind":
+		return childNetAllowedBind()
 	case "net-udp":
 		return childNetUDP()
 	case "net-fresh":
@@ -950,6 +952,99 @@ func childNetLoopbackBind() error {
 	ln, err := ListenLoopback("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("ListenLoopback(tcp4): %w", err)
+	}
+	defer func() { _ = ln.Close() }()
+	if err := c.err(); err != nil {
+		return err
+	}
+	fmt.Println(ln.Addr().String())
+	conn, err := AcceptListener(ln)
+	if err != nil {
+		return fmt.Errorf("AcceptListener: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || line != "ping\n" {
+		return fmt.Errorf("dynamic inbound read = %q, %v", line, err)
+	}
+	_, err = conn.Write([]byte("pong\n"))
+	return err
+}
+
+func TestLockdownDarwinAllowedBindAddrs(t *testing.T) {
+	// Use a short directory under /tmp so the Unix socket path stays below
+	// macOS's 104-byte sun_path limit and triggers Seatbelt EPERM, not EINVAL.
+	dir, err := os.MkdirTemp("/tmp", "gvx-ab-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	ws, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	child := startChild(t, "net-allowed-bind", childWSEnv+"="+ws)
+	addr := child.readLine(t)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", addr, err)
+	}
+	conn, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", port), 10*time.Second)
+	if err != nil {
+		t.Fatalf("dial child wildcard listener %s: %v\nchild stderr:\n%s", addr, err, child.stderr.String())
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("write to child listener: %v", err)
+	}
+	reply, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || reply != "pong\n" {
+		t.Fatalf("child listener reply = %q, %v; want pong\\n\nchild stderr:\n%s", reply, err, child.stderr.String())
+	}
+	child.wait(t)
+}
+
+func childNetAllowedBind() error {
+	ws := os.Getenv(childWSEnv)
+	st, err := Apply(Options{
+		Mounts:           []HostMount{{Path: ws}},
+		AllowOutboundNet: true,
+		AllowedBindAddrs: []string{"0.0.0.0"},
+		DynamicListeners: 4,
+	})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	c.expect(!st.NetworkOutboundBlocked, "NetworkOutboundBlocked = true with AllowOutboundNet")
+
+	// Unlisted IP addresses (including 127.0.0.1 when AllowLoopbackBind is false)
+	// and Unix domain sockets must remain denied.
+	if ln, err := ListenAllowed("tcp4", "127.0.0.1:0"); err == nil {
+		_ = ln.Close()
+		c.expect(false, "ListenAllowed accepted unlisted 127.0.0.1:0")
+	}
+	if ln, err := ListenAllowed("tcp4", "192.0.2.1:0"); err == nil {
+		_ = ln.Close()
+		c.expect(false, "ListenAllowed accepted unlisted 192.0.2.1:0")
+	}
+	if ln, err := net.Listen("unix", filepath.Join(ws, "denied.sock")); err == nil {
+		_ = ln.Close()
+		c.expect(false, "unix socket bind inside writable mount succeeded, want permission error")
+	} else {
+		c.expect(errors.Is(err, fs.ErrPermission), "unix socket bind = %v, want permission error", err)
+	}
+
+	// Listed wildcard IP UDP and TCP binds succeed under Seatbelt.
+	if pc, err := ListenPacketAllowed("udp4", "0.0.0.0:0"); err != nil {
+		c.expect(false, "ListenPacketAllowed(udp4, 0.0.0.0:0): %v", err)
+	} else {
+		_ = pc.Close()
+	}
+
+	ln, err := ListenAllowed("tcp4", "0.0.0.0:0")
+	if err != nil {
+		return fmt.Errorf("ListenAllowed(tcp4, 0.0.0.0:0): %w", err)
 	}
 	defer func() { _ = ln.Close() }()
 	if err := c.err(); err != nil {
