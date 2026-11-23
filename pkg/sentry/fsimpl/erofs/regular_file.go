@@ -61,10 +61,11 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, nil
 	}
 
-	return dst.CopyOutFrom(ctx, &regularFileReader{inode: fd.inode(), off: uint64(offset)})
+	return dst.CopyOutFrom(ctx, &regularFileReader{ctx: ctx, inode: fd.inode(), off: uint64(offset)})
 }
 
 type regularFileReader struct {
+	ctx   context.Context
 	inode *inode
 	off   uint64
 }
@@ -100,7 +101,7 @@ func (r *regularFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 			}
 		}
 		if fresh > 0 {
-			r.inode.fs.endRead(req, fresh)
+			r.inode.fs.endRead(r.ctx, req, fresh)
 		}
 		r.off += n
 		done += n
@@ -235,7 +236,7 @@ func (i *inode) Translate(ctx context.Context, required, optional memmap.Mappabl
 		}
 		t.Offset = e.ImageOff + t.Source.Start - e.Off
 		start, end := max(t.Source.Start, required.Start), min(t.Source.End, required.End)
-		i.fs.countMappedRead(t.Offset+start-t.Source.Start, end-start)
+		i.fs.countMappedRead(ctx, t.Offset+start-t.Source.Start, end-start)
 		ts = append(ts, t)
 		off = t.Source.End
 	}
