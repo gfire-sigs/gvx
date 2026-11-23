@@ -174,16 +174,26 @@ func (r *policyRule) match(t *PolicyTuple) policyMatch {
 			return policyMatchNo
 		}
 	}
+	// Each rule belongs to one IP family, so a /0 does not need the address.
+	// Known addresses still use Contains, which also compares families.
 	if r.source.IsValid() {
 		if !t.Source.IsValid() {
-			unknown = true
+			if r.source.Bits() != 0 {
+				unknown = true
+			} else if r.negateSource {
+				return policyMatchNo
+			}
 		} else if r.source.Contains(t.Source) == r.negateSource {
 			return policyMatchNo
 		}
 	}
 	if r.destination.IsValid() {
 		if !t.Destination.IsValid() {
-			unknown = true
+			if r.destination.Bits() != 0 {
+				unknown = true
+			} else if r.negateDestination {
+				return policyMatchNo
+			}
 		} else if r.destination.Contains(t.Destination) == r.negateDestination {
 			return policyMatchNo
 		}

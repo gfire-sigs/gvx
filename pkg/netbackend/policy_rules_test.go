@@ -105,6 +105,57 @@ func TestPolicyUnknownSelectorDoesNotHideMismatch(t *testing.T) {
 	}
 }
 
+func TestPolicyWildcardAddressWithPartialTuple(t *testing.T) {
+	for _, family := range []struct {
+		name, wildcard, narrow string
+		ipv6                   bool
+	}{
+		{name: "IPv4", wildcard: "0.0.0.0/0", narrow: "192.0.2.0/24"},
+		{name: "IPv6", wildcard: "::/0", narrow: "2001:db8::/32", ipv6: true},
+	} {
+		udp := PolicyTuple{Protocol: 17, ProtocolKnown: true}
+		for _, tc := range []struct {
+			name, rule, next string
+			tuple            PolicyTuple
+			allowed          bool
+		}{
+			{name: "unknown source matches wildcard", rule: "-s " + family.wildcard + " -j ACCEPT", next: "DROP", allowed: true},
+			{name: "unknown destination matches wildcard", rule: "-d " + family.wildcard + " -j ACCEPT", next: "DROP", allowed: true},
+			{name: "negated source wildcard cannot match", rule: "! -s " + family.wildcard + " -j DROP", next: "ACCEPT", allowed: true},
+			{name: "negated destination wildcard cannot match", rule: "! -d " + family.wildcard + " -j DROP", next: "ACCEPT", allowed: true},
+			{name: "narrow destination remains unknown", rule: "-s " + family.wildcard + " -d " + family.narrow + " -j ACCEPT", next: "ACCEPT"},
+			{name: "negated narrow source remains unknown", rule: "! -s " + family.narrow + " -d " + family.wildcard + " -j ACCEPT", next: "ACCEPT"},
+			{name: "source mismatch wins over unknown destination", rule: "! -s " + family.wildcard + " -d " + family.narrow + " -j DROP", next: "ACCEPT", allowed: true},
+			{name: "destination mismatch wins over unknown source", rule: "-s " + family.narrow + " ! -d " + family.wildcard + " -j DROP", next: "ACCEPT", allowed: true},
+			{name: "protocol remains unknown", rule: "-s " + family.wildcard + " -p udp -j ACCEPT", next: "ACCEPT"},
+			{name: "port remains unknown", rule: "-d " + family.wildcard + " -p udp -m udp --dport 53 -j ACCEPT", next: "ACCEPT", tuple: udp},
+			{
+				name: "port mismatch wins over unknown destination",
+				rule: "-s " + family.wildcard + " -d " + family.narrow + " -p udp -m udp --dport 53 -j DROP",
+				next: "ACCEPT",
+				tuple: PolicyTuple{
+					Protocol: 17, ProtocolKnown: true, DestinationPort: 443, DestinationPortKnown: true,
+				},
+				allowed: true,
+			},
+		} {
+			t.Run(family.name+"/"+tc.name, func(t *testing.T) {
+				rules := policyTestChains + "-A INPUT " + tc.rule + "\n-A INPUT -j " + tc.next + "\nCOMMIT\n"
+				v4, v6 := rules, policyTestEmpty
+				if family.ipv6 {
+					v4, v6 = v6, v4
+				}
+				p := testPolicyPrograms(t, v4, v6)
+				tuple := tc.tuple
+				tuple.IPv6 = family.ipv6
+				if got := p.allows(PolicyInput, tuple); got != tc.allowed {
+					t.Fatalf("rule %q, tuple %+v: allowed = %t, want %t", tc.rule, tuple, got, tc.allowed)
+				}
+			})
+		}
+	}
+}
+
 func TestPolicyMultiportEitherUsesKnownEndpoint(t *testing.T) {
 	for _, tc := range []struct {
 		name, negate, target, next string
