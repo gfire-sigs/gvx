@@ -58,12 +58,14 @@ func saveBlobPath(d digest.Digest) string {
 // image layout and also holds a Docker manifest.json with RepoTags, so
 // `docker load` and LoadArchive read it. Blobs that images share appear once.
 //
-// The cache holds compiled EROFS layers, not the original blobs. SaveImages
-// therefore fetches each original layer blob from the registry that the image
-// came from. It verifies size and digest while it copies the blob into the
-// archive. An image without a registry source, such as an image that
-// LoadArchive loaded, makes SaveImages fail with ErrNoRegistrySource before it
-// writes anything. A failure after the first byte leaves a partial stream in
+// SaveImages reads each original layer blob from the local kept-blob cache
+// (<cacheDir>/blobs/sha256/<hex>) when present, verifying size and digest. For
+// any layer blob not kept locally, SaveImages fetches it from the registry that
+// the image came from. When all layer blobs of an image are kept locally,
+// SaveImages writes the archive offline without contacting a registry, including
+// for images that LoadArchive loaded. An image that is missing local blobs and
+// has no registry source makes SaveImages fail with ErrNoRegistrySource before
+// it writes anything. A failure after the first byte leaves a partial stream in
 // w, so the caller must discard its output on error. A nil client selects a
 // default HTTP client. An image that is a manifest list saves its manifest for
 // the architecture of the image, not the whole list.
@@ -122,14 +124,20 @@ func (c *LayerCache) SaveImages(ctx context.Context, w io.Writer, client *http.C
 		entry := dockerSaveEntry{Config: saveBlobPath(p.dec.manifest.Config.Digest)}
 		for _, l := range p.dec.manifest.Layers {
 			if !written[l.Digest] {
-				rc, err := clientFor(p)
+				copied, err := c.copyLocalBlob(tw, l)
 				if err != nil {
 					return err
 				}
-				written[l.Digest] = true
-				if err := copyRegistryBlob(ctx, tw, rc, l); err != nil {
-					return err
+				if !copied {
+					rc, err := clientFor(p)
+					if err != nil {
+						return err
+					}
+					if err := copyRegistryBlob(ctx, tw, rc, l); err != nil {
+						return err
+					}
 				}
+				written[l.Digest] = true
 			}
 			entry.Layers = append(entry.Layers, saveBlobPath(l.Digest))
 		}
@@ -192,16 +200,23 @@ func (c *LayerCache) prepareSave(targets []SaveTarget) ([]preparedSave, error) {
 		if t.Image.Named() {
 			label = t.Image.Name()
 		}
-		baseURL, repo, err := t.Image.blobSource()
-		if err != nil {
-			return nil, fmt.Errorf("oci: cannot save %s: %w", label, err)
-		}
 		dec, err := c.verifyRecord(t.Image.record)
 		if err != nil {
 			return nil, fmt.Errorf("oci: cannot save %s: %w", label, err)
 		}
 		for _, l := range dec.manifest.Layers {
 			if err := checkLayerDescriptor(l, c.limits); err != nil {
+				return nil, fmt.Errorf("oci: cannot save %s: %w", label, err)
+			}
+		}
+		allLocal, err := c.checkLocalBlobs(dec.manifest.Layers)
+		if err != nil {
+			return nil, fmt.Errorf("oci: cannot save %s: %w", label, err)
+		}
+		var baseURL, repo string
+		if !allLocal {
+			baseURL, repo, err = t.Image.blobSource()
+			if err != nil {
 				return nil, fmt.Errorf("oci: cannot save %s: %w", label, err)
 			}
 		}

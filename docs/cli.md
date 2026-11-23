@@ -36,14 +36,15 @@ Run `rungv help` to print this command list.
 | `events` | Stream filtered lifecycle events from a running sandbox. |
 | `ping` | Verify control socket liveness and advertised capabilities. |
 | `debug` | Adjust the active Sentry log level (`warning`, `info`, or `debug`). |
-| `pull` | Download an image into the layer cache (`--platform linux/ARCH` selects the architecture). |
+| `pull` | Download an image into the layer cache (`--platform linux/ARCH` selects the architecture; `-keep-blobs` retains original blobs). |
+| `push` | Upload a cached image to a registry with OCI Distribution Spec v1.1 (`rungv push [flags] IMAGE [TARGET]`). |
 | `images` | List cached images. |
 | `inspect` | Print image metadata as JSON or through a Go template. |
 | `tag` | Add a second name or tag to a cached image. |
 | `rmi` | Remove an image tag or delete an unreferenced image. |
 | `save` | Export images to a tar archive. |
-| `load` | Import images from a tar archive. |
-| `image` | Group command for `ls`, `pull`, `rm`, `inspect`, `tag`, `save`, `load`, and `prune`. |
+| `load` | Import images from a tar archive (`-keep-blobs` retains original blobs). |
+| `image` | Group command for `ls`, `pull`, `push`, `rm`, `inspect`, `tag`, `save`, `load`, and `prune`. |
 | `volume` | Group command for `create`, `ls`, `inspect`, `compact`, `rm`, and `prune` on local volumes. |
 | `system` | Group command for `info`, `df`, and `prune` on host backends and local storage. |
 | `info` | Print the host OS, available execution backends, lockdown profile, and storage paths. |
@@ -57,7 +58,7 @@ Run `rungv help` to print this command list.
 | `license` | Print license texts for `gvx`, upstream gVisor, and linked libraries (see Section 9). |
 | `version` | Print the version, source commit, and Go toolchain of the binary (see Section 10). |
 
-Print the flags of any subcommand with `rungv COMMAND --help`. On `run`, `-h` sets the hostname, as in Docker. Every flag accepts single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image argument, and short clusters expand boolean flags (`-itP`) and value flags (`-itp 8080:80`, `-p8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`). Arguments after `--` or after the image name pass unchanged to the guest command. Non-execution commands (`pull`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`, `image`, `volume`, `system`, `info`, `checkpoint`, `restore`) accept flags before or after positional arguments.
+Print the flags of any subcommand with `rungv COMMAND --help`. On `run`, `-h` sets the hostname, as in Docker. Every flag accepts single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image argument, and short clusters expand boolean flags (`-itP`) and value flags (`-itp 8080:80`, `-p8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`). Arguments after `--` or after the image name pass unchanged to the guest command. Non-execution commands (`pull`, `push`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`, `image`, `volume`, `system`, `info`, `checkpoint`, `restore`) accept flags before or after positional arguments.
 
 ## 3. `rungv run`
 
@@ -120,6 +121,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-registry-url URL` | Override the registry host of the image reference. |
 | `--host-dns IP[:PORT]` | Specify a host DNS server (repeatable). Replaces host resolver discovery for the guest DNS relay and registry pulls. Also accepted by `pull` and `save` (see Section 5.2). |
 | `-cache-dir DIR` | Override the layer cache directory. |
+| `-keep-blobs` | Retain original image layer blobs in the cache during pull or load (default from `GVX_KEEP_BLOBS`). Enables offline `save` and `push` without a source registry. |
 | `-checkpoint-dir DIR` | Pre-open a host directory before lockdown for local checkpoint bundle files. |
 | `-S`, `-control-socket`, `--control-socket SPEC` | Bind an owner-only Unix socket or loopback TCP listener before lockdown for `gvx-ctrl/2` control commands. |
 | `--control` | Automatically bind an owner-only Unix control socket for `--name NAME`. |
@@ -510,22 +512,23 @@ rungv pull --host-dns 10.0.2.3 alpine:3.20
 
 ## 6. Storage, system, and completion commands
 
-`rungv` provides Docker-style noun-verb groups for local images, named volumes, host diagnostics, and shell completion. Top-level commands (`images`, `pull`, `rmi`, `inspect`, `tag`, `save`, `load`, `info`) remain aliases of the corresponding group subcommands.
+`rungv` provides Docker-style noun-verb groups for local images, named volumes, host diagnostics, and shell completion. Top-level commands (`images`, `pull`, `push`, `rmi`, `inspect`, `tag`, `save`, `load`, `info`) remain aliases of the corresponding group subcommands.
 
 ### 6.1 Image store and `rungv image`
 
-The layer cache holds compiled EROFS layers, one record per image, and one record per tag or digest. The default directory is `%LOCALAPPDATA%\gvx\cache\layers` on Windows, `~/Library/Caches/gvx/layers` on macOS, and `~/.cache/gvx/layers` on Linux.
+The layer cache holds compiled EROFS layers, one record per image, and one record per tag or digest. When `-keep-blobs` (or `GVX_KEEP_BLOBS=1`) is active, `pull`, `load`, and `run` also keep original layer blobs under `blobs/sha256/<hex>`. The default directory is `%LOCALAPPDATA%\gvx\cache\layers` on Windows, `~/Library/Caches/gvx/layers` on macOS, and `~/.cache/gvx/layers` on Linux.
 
 | Command | Behavior |
 | :--- | :--- |
 | `rungv image ls` (`rungv images`) | Lists cached images. `IMAGE ID` shows the first 12 hex digits of the config digest, and `SIZE` sums the EROFS layer files. Accepts `-a`, `-q`, `--no-trunc`, `--digests`, and `--format`. |
-| `rungv image pull` (`rungv pull`) | Downloads an image or archive into the layer cache. Accepts `--platform linux/ARCH`, `-arch`, `-registry-url`, and `--host-dns`. |
+| `rungv image pull` (`rungv pull`) | Downloads an image or archive into the layer cache. Accepts `--platform linux/ARCH`, `-arch`, `-registry-url`, `-keep-blobs`, and `--host-dns`. |
+| `rungv image push` (`rungv push`) | Uploads a cached image (`IMAGE [TARGET]`) to a registry. Checks existing blobs with `HEAD`, attempts cross-repository mounts on the same registry, and uploads the exact manifest bytes. Accepts `--platform`, `-registry-url`, `--host-dns`, `-q`, `-u`/`--username` with `--password-stdin`, `--auth-stdin`, and `--auth-fd N`. |
 | `rungv image inspect` (`rungv inspect`) | Prints a JSON array of image metadata, or evaluates `-f` / `--format` per image. |
-| `rungv image rm` (`rungv rmi`) | Removes a tag or an image record and deletes unreferenced EROFS layers. An image ID with multiple tags requires `-f`. |
+| `rungv image rm` (`rungv rmi`) | Removes a tag or an image record and deletes unreferenced EROFS layers and kept blobs. An image ID with multiple tags requires `-f`. |
 | `rungv image tag` (`rungv tag`) | Creates a second repository or tag reference for a cached image. |
-| `rungv image save` (`rungv save`) | Writes an OCI layout and `docker save` tar archive by fetching verified layer blobs from the origin registry. |
-| `rungv image load` (`rungv load`) | Loads images for the selected architecture from an OCI layout or `docker save` tar archive. |
-| `rungv image prune [-a] [-f]` | Deletes dangling images (or all images for the architecture with `-a`), sweeps orphaned layer files, and prints reclaimed bytes. |
+| `rungv image save` (`rungv save`) | Writes an OCI layout and `docker save` tar archive. Reads kept blobs locally first and fetches only missing blobs from the origin registry. Works offline when all blobs are kept. |
+| `rungv image load` (`rungv load`) | Loads images for the selected architecture from an OCI layout or `docker save` tar archive. Accepts `-keep-blobs` to retain original layer blobs for offline `save` and `push`. |
+| `rungv image prune [-a] [-f]` | Deletes dangling images (or all images for the architecture with `-a`), sweeps orphaned layer files and kept blobs, and prints reclaimed bytes. |
 
 ### 6.2 Named volumes and `rungv volume`
 
@@ -577,7 +580,7 @@ The table below lists Docker CLI features that differ or do not exist in `rungv`
 | `--privileged` | On by default. Its privileges stay inside the sandbox. |
 | `--name` | Sets the kernel container ID, and derives the default control socket path with `--control`. |
 | Image with Docker manifest schema 1 | Refused with an error. Docker 28 and later also refuse it; rebuild or re-push the image. |
-| `docker save` of any image | Requires the origin registry to fetch verified compressed layer blobs. |
+| `docker save` of any image | Uses kept blobs offline when pulled or loaded with `-keep-blobs`; otherwise fetches verified layer blobs from the origin registry. |
 | Cgroup limits | `--memory` uses a polling guard. `--cpus` enforces a cross-platform Sentry root CPU bandwidth quota (plus a Windows Job Object cap under lockdown). `--pids-limit` caps total guest tasks through the root `cgroup2` `pids` controller. Inside the guest, nested cgroups enforce `memory.max` (polling) and `cpu.max` (on every engine); `memory.high` and `cpu.weight` are not enforced. |
 | Linux host with an active seccomp user-notify listener | Linux allows one listener per filter chain, so `systrap` prints a warning and falls back to the slower futex loop for stub threads. |
 | Cgroup v1 | Not available. `/sys/fs/cgroup` mounts `cgroup2`. |

@@ -65,12 +65,14 @@ type LayerCache struct {
 	dir       string
 	limits    Limits
 	blockSize int
+	keepBlobs bool
 	// dnsServers are the resolvers of the registry requests that a pull or a
 	// save sends with its default HTTP client. Empty selects the host resolver.
 	dnsServers []netip.AddrPort
 
-	mu       sync.Mutex
-	verified map[string]verifiedLayer
+	mu            sync.Mutex
+	verified      map[string]verifiedLayer
+	verifiedBlobs map[string]verifiedLayer
 }
 
 // verifiedLayer records a layer that passed its integrity verification in this
@@ -111,6 +113,10 @@ type CacheOptions struct {
 	// size, so a caller passes at least hostarch.PageSize. Caches with other
 	// block sizes keep separate files in the same directory.
 	BlockSize int
+	// KeepBlobs retains original compressed/uncompressed layer blobs under
+	// <cacheDir>/blobs/sha256/<hex> during pulls and archive loads so offline
+	// SaveImages and PushImage work with original digests.
+	KeepBlobs bool
 }
 
 // NewLayerCache creates or opens a LayerCache at dir (or DefaultCacheDir when
@@ -135,7 +141,30 @@ func NewLayerCacheWithOptions(dir string, opts CacheOptions) (*LayerCache, error
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("oci: create layer cache dir %q: %w", dir, err)
 	}
-	return &LayerCache{dir: dir, limits: DefaultLimits(), blockSize: bs, verified: make(map[string]verifiedLayer)}, nil
+	return &LayerCache{
+		dir:           dir,
+		limits:        DefaultLimits(),
+		blockSize:     bs,
+		keepBlobs:     opts.KeepBlobs,
+		verified:      make(map[string]verifiedLayer),
+		verifiedBlobs: make(map[string]verifiedLayer),
+	}, nil
+}
+
+// KeepBlobs reports whether this cache retains original layer blobs during
+// pulls and archive loads.
+func (c *LayerCache) KeepBlobs() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.keepBlobs
+}
+
+// SetKeepBlobs enables or disables keeping original layer blobs under
+// <cacheDir>/blobs/sha256/<hex> during pulls and archive loads.
+func (c *LayerCache) SetKeepBlobs(keep bool) {
+	c.mu.Lock()
+	c.keepBlobs = keep
+	c.mu.Unlock()
 }
 
 // BlockSize returns the EROFS block size of the layers in this cache.
@@ -294,10 +323,11 @@ func (c *LayerCache) CompileAndStore(dgst string, tarStream io.Reader) (string, 
 	return c.compileAndStore(layerSpec{key: hexKey, blobHex: hexKey, blobSize: -1}, tarStream)
 }
 
-// hashingReader hashes and counts the bytes that pass through it.
+// hashingReader hashes, counts, and optionally tees the bytes that pass through it.
 type hashingReader struct {
 	r io.Reader
 	h hash.Hash
+	w io.Writer
 	n int64
 }
 
@@ -306,6 +336,11 @@ func (h *hashingReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		h.h.Write(p[:n])
 		h.n += int64(n)
+		if h.w != nil {
+			if _, wErr := h.w.Write(p[:n]); wErr != nil {
+				return n, wErr
+			}
+		}
 	}
 	return n, err
 }
@@ -320,6 +355,8 @@ type layerSpec struct {
 	blobSize int64
 	// diffID is the expected sha256 of the decompressed tar, or empty.
 	diffID string
+	// keepBlob tees the raw stream into blobs/sha256/<sha256> after verification.
+	keepBlob bool
 	// image accumulates the decompressed bytes of all layers of an image.
 	image *byteBudget
 }
@@ -340,10 +377,37 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 		}
 	}()
 
+	var (
+		blobTmp       *os.File
+		blobTmpPath   string
+		blobCommitted bool
+	)
+	if spec.keepBlob {
+		blobDir := c.blobsDir()
+		if err := os.MkdirAll(blobDir, 0o755); err != nil {
+			return "", CompileStats{}, fmt.Errorf("oci: create blob cache dir %q: %w", blobDir, err)
+		}
+		blobTmp, err = os.CreateTemp(blobDir, tempPattern)
+		if err != nil {
+			return "", CompileStats{}, fmt.Errorf("oci: create temp blob file: %w", err)
+		}
+		blobTmpPath = blobTmp.Name()
+		defer func() {
+			if !blobCommitted {
+				_ = blobTmp.Close()
+				_ = os.Remove(blobTmpPath)
+			}
+		}()
+	}
+
 	// The hash covers every byte that the compiler and the final drain read,
 	// so it equals the hash of the whole stream.
 	digester := digest.SHA256.Digester()
-	in := &hashingReader{r: newBoundedReader(src, "compressed layer size", c.limits.MaxBlobBytes, nil), h: digester.Hash()}
+	var tee io.Writer
+	if blobTmp != nil {
+		tee = blobTmp
+	}
+	in := &hashingReader{r: newBoundedReader(src, "compressed layer size", c.limits.MaxBlobBytes, nil), h: digester.Hash(), w: tee}
 	var diff *diffVerifier
 	if spec.diffID != "" {
 		diff = newDiffVerifier(spec.diffID)
@@ -358,11 +422,28 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 	if spec.blobSize >= 0 && in.n != spec.blobSize {
 		return "", CompileStats{}, fmt.Errorf("%w: layer has %d bytes, descriptor says %d", ErrDigestMismatch, in.n, spec.blobSize)
 	}
-	if got := digester.Digest().Encoded(); spec.blobHex != "" && got != spec.blobHex {
-		return "", CompileStats{}, fmt.Errorf("%w: layer sha256 is %s, want %s", ErrDigestMismatch, got, spec.blobHex)
+	gotBlobHex := digester.Digest().Encoded()
+	if spec.blobHex != "" && gotBlobHex != spec.blobHex {
+		return "", CompileStats{}, fmt.Errorf("%w: layer sha256 is %s, want %s", ErrDigestMismatch, gotBlobHex, spec.blobHex)
 	}
 	if hexKey == "" {
 		hexKey = stats.SHA256Hex
+	}
+
+	if blobTmp != nil {
+		if err := blobTmp.Sync(); err != nil {
+			return "", CompileStats{}, fmt.Errorf("oci: sync blob file: %w", err)
+		}
+		blobInfo, err := blobTmp.Stat()
+		if err != nil {
+			return "", CompileStats{}, fmt.Errorf("oci: stat blob file: %w", err)
+		}
+		if err := blobTmp.Close(); err != nil {
+			return "", CompileStats{}, fmt.Errorf("oci: close blob file: %w", err)
+		}
+		if _, err := c.publishBlobFile(blobTmpPath, gotBlobHex, blobInfo, &blobCommitted); err != nil {
+			return "", CompileStats{}, err
+		}
 	}
 
 	if err := tmp.Sync(); err != nil {
@@ -777,11 +858,20 @@ func (c *LayerCache) ImportCachedImage(src *LayerCache, baseURL, repository, ref
 	defer img.Close()
 
 	for _, d := range img.LayerDigests {
-		if _, ok := c.HasLayer(d); ok {
-			continue
+		if _, ok := c.HasLayer(d); !ok {
+			if err := c.importLayer(src, d); err != nil {
+				return nil, err
+			}
 		}
-		if err := c.importLayer(src, d); err != nil {
-			return nil, err
+		if c.KeepBlobs() {
+			dgst := digest.NewDigestFromEncoded(digest.SHA256, d)
+			if f, sz, bErr := src.openVerifiedBlob(dgst, -1); bErr == nil {
+				_, _, sErr := c.storeBlobFromReader(dgst, sz, io.NewSectionReader(f, 0, sz))
+				_ = f.Close()
+				if sErr != nil {
+					return nil, sErr
+				}
+			}
 		}
 	}
 

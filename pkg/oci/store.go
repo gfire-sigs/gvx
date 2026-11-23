@@ -513,7 +513,10 @@ func (c *LayerCache) dropRecord(img Image, report *RemoveReport) error {
 		}
 		report.Deleted = append(report.Deleted, img.ID)
 	}
-	return c.removeUnusedLayers(img.LayerDigests)
+	return errors.Join(
+		c.removeUnusedLayers(img.LayerDigests),
+		c.removeUnusedBlobs(img.LayerDigests),
+	)
 }
 
 // usedLayers returns the cache keys of the layers that any image record uses.

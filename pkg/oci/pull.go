@@ -401,16 +401,19 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 	}
 	baseURL, repository, reference, targetArch = normalizePullArgs(baseURL, repository, reference, targetArch)
 
-	// A digest names immutable content, so a cached image needs no network.
+	// A digest names immutable content, so a cached image needs no network
+	// unless keep-blobs is active and one or more original blobs are missing.
 	if isDigestRef(reference) {
 		img, err := cache.loadImageByDigest(baseURL, repository, reference, targetArch)
 		switch {
-		case err == nil:
+		case err == nil && (!cache.KeepBlobs() || cache.hasAllLayerBlobsForRecord(baseURL, repository, reference, targetArch)):
 			if err := cache.storeTag(baseURL, repository, reference, targetArch, reference); err != nil {
 				_ = img.Close()
 				return nil, err
 			}
 			return img, nil
+		case err == nil:
+			_ = img.Close()
 		case !errors.Is(err, ErrNotCached):
 			return nil, err
 		}
@@ -430,12 +433,14 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		}
 		img, err := cache.loadImageByDigest(baseURL, repository, dgstStr, targetArch)
 		switch {
-		case err == nil:
+		case err == nil && (!cache.KeepBlobs() || cache.hasAllLayerBlobsForRecord(baseURL, repository, dgstStr, targetArch)):
 			if err := cache.storeTag(baseURL, repository, reference, targetArch, dgstStr); err != nil {
 				_ = img.Close()
 				return nil, err
 			}
 			return img, nil
+		case err == nil:
+			_ = img.Close()
 		case !errors.Is(err, ErrNotCached):
 			return nil, err
 		}
@@ -477,15 +482,30 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		if err := checkLayerDescriptor(l, cache.limits); err != nil {
 			return nil, err
 		}
-		if _, ok := cache.HasLayer(hexStr); !ok {
+		_, hasLayer := cache.HasLayer(hexStr)
+		needBlob := cache.KeepBlobs() && !cache.hasBlobWithSize(l.Digest, l.Size)
+		if !hasLayer {
 			body, err := rc.openBlob(ctx, l.Digest.String())
 			if err != nil {
 				return nil, err
 			}
-			_, _, err = cache.compileAndStore(layerSpec{key: hexStr, blobHex: hexStr, blobSize: l.Size, image: image}, body)
+			_, _, err = cache.compileAndStore(layerSpec{key: hexStr, blobHex: hexStr, blobSize: l.Size, keepBlob: needBlob, image: image}, body)
 			closeErr := body.Close()
 			if err != nil {
 				return nil, fmt.Errorf("oci: compile layer %s: %w", l.Digest, err)
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("oci: close layer %s: %w", l.Digest, closeErr)
+			}
+		} else if needBlob {
+			body, err := rc.openBlob(ctx, l.Digest.String())
+			if err != nil {
+				return nil, err
+			}
+			_, _, err = cache.storeBlobFromReader(l.Digest, l.Size, body)
+			closeErr := body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("oci: keep layer blob %s: %w", l.Digest, err)
 			}
 			if closeErr != nil {
 				return nil, fmt.Errorf("oci: close layer %s: %w", l.Digest, closeErr)
