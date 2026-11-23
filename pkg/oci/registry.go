@@ -25,7 +25,9 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -40,8 +42,14 @@ const (
 	// defaultIdleTimeout is how long a registry request may go without
 	// receiving a byte before it fails.
 	defaultIdleTimeout = 60 * time.Second
-	userAgent          = "gvx-oci"
+	// ociClientProtocolVersion tracks the wire protocol behavior of pkg/oci
+	// independently of product release versions to avoid fingerprinting.
+	ociClientProtocolVersion = "v1.0"
+	// oauthClientID identifies this client in OAuth2 token exchange requests.
+	oauthClientID = "gvx-oci"
 )
+
+var userAgent = fmt.Sprintf("gvx-oci/%s (%s/%s; +https://z.gfire.dev/gvx)", ociClientProtocolVersion, runtime.GOOS, runtime.GOARCH)
 
 var manifestAccept = strings.Join([]string{
 	ocispec.MediaTypeImageIndex,
@@ -167,16 +175,17 @@ func canonicalHost(u *url.URL) string {
 
 // idleBody cancels its request when no byte arrives within the idle timeout.
 type idleBody struct {
-	rc     io.ReadCloser
-	timer  *time.Timer
-	idle   time.Duration
-	cancel context.CancelFunc
-	parent context.Context
+	rc      io.ReadCloser
+	timer   *time.Timer
+	stopped *atomic.Bool
+	idle    time.Duration
+	cancel  context.CancelFunc
+	parent  context.Context
 }
 
 func (b *idleBody) Read(p []byte) (int, error) {
 	n, err := b.rc.Read(p)
-	if n > 0 {
+	if n > 0 && !b.stopped.Load() {
 		b.timer.Reset(b.idle)
 	}
 	if err != nil && !errors.Is(err, io.EOF) && b.parent.Err() == nil {
@@ -186,60 +195,176 @@ func (b *idleBody) Read(p []byte) (int, error) {
 }
 
 func (b *idleBody) Close() error {
+	b.stopped.Store(true)
 	b.timer.Stop()
 	err := b.rc.Close()
 	b.cancel()
 	return err
 }
 
-// once sends one request with the current credentials.
-func (rc *registryClient) once(ctx context.Context, method, rawURL, accept string) (*http.Response, error) {
-	reqCtx, cancel := context.WithCancel(ctx)
-	timer := time.AfterFunc(rc.idle, cancel)
-	req, err := http.NewRequestWithContext(reqCtx, method, rawURL, nil)
+// idleReader resets timer on every Read that makes progress, so long uploads
+// only fail when the transfer stalls.
+type idleReader struct {
+	rc      io.ReadCloser
+	timer   *time.Timer
+	stopped *atomic.Bool
+	idle    time.Duration
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	if n > 0 && !r.stopped.Load() {
+		r.timer.Reset(r.idle)
+	}
+	return n, err
+}
+
+func (r *idleReader) Close() error {
+	return r.rc.Close()
+}
+
+// requestBody describes a replayable HTTP request payload.
+type requestBody struct {
+	contentLength int64
+	contentType   string
+	open          func() (io.ReadCloser, error)
+}
+
+// onceRequest sends one HTTP request with the current credentials. Authorization
+// is attached only when rawURL targets the registry host, and HTTPS never
+// downgrades to HTTP.
+func (rc *registryClient) onceRequest(ctx context.Context, method, rawURL string, headers http.Header, body *requestBody) (*http.Response, error) {
+	reqURL, err := url.Parse(rawURL)
 	if err != nil {
+		return nil, fmt.Errorf("oci: parse request URL %q: %w", rawURL, err)
+	}
+	if rc.baseURL.Scheme == "https" && reqURL.Scheme != "https" {
+		return nil, fmt.Errorf("oci: request URL %s downgrades https", reqURL.Redacted())
+	}
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	var stopped atomic.Bool
+	timer := time.AfterFunc(rc.idle, cancel)
+	stopTimer := func() {
+		stopped.Store(true)
 		timer.Stop()
+	}
+
+	var bodyReader io.Reader
+	var openedBody io.ReadCloser
+	hasNonEmptyBody := body != nil && body.open != nil && body.contentLength != 0
+	if body != nil && body.contentLength == 0 {
+		bodyReader = http.NoBody
+	} else if hasNonEmptyBody {
+		var openErr error
+		openedBody, openErr = body.open()
+		if openErr != nil {
+			stopTimer()
+			cancel()
+			return nil, openErr
+		}
+		bodyReader = &idleReader{rc: openedBody, timer: timer, stopped: &stopped, idle: rc.idle}
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, method, rawURL, bodyReader)
+	if err != nil {
+		if openedBody != nil {
+			_ = openedBody.Close()
+		}
+		stopTimer()
 		cancel()
-		return nil, fmt.Errorf("oci: build request %s: %w", rawURL, err)
+		return nil, fmt.Errorf("oci: build request %s: %w", reqURL.Redacted(), err)
+	}
+	if body != nil {
+		if body.contentLength >= 0 {
+			req.ContentLength = body.contentLength
+		}
+		if hasNonEmptyBody {
+			openFn := body.open
+			req.GetBody = func() (io.ReadCloser, error) {
+				inner, err := openFn()
+				if err != nil {
+					return nil, err
+				}
+				return &idleReader{rc: inner, timer: timer, stopped: &stopped, idle: rc.idle}, nil
+			}
+		}
+	}
+	for k, vals := range headers {
+		for _, v := range vals {
+			req.Header.Add(k, v)
+		}
 	}
 	req.Header.Set("User-Agent", userAgent)
-	if accept != "" {
-		req.Header.Set("Accept", accept)
+	if body != nil && body.contentType != "" {
+		req.Header.Set("Content-Type", body.contentType)
 	}
-	if rc.authz != "" {
+	if rc.authz != "" && canonicalHost(reqURL) == canonicalHost(rc.baseURL) {
 		req.Header.Set("Authorization", rc.authz)
 	}
+
 	resp, err := rc.http.Do(req)
 	if err != nil {
-		timer.Stop()
+		stopTimer()
 		// Only the idle timer cancels reqCtx before this call does.
 		stalled := ctx.Err() == nil && reqCtx.Err() != nil
 		cancel()
 		if stalled {
-			return nil, fmt.Errorf("oci: request %s received no data for %s", rawURL, rc.idle)
+			return nil, fmt.Errorf("oci: request %s received no data for %s", reqURL.Redacted(), rc.idle)
 		}
-		return nil, fmt.Errorf("oci: request %s: %w", rawURL, err)
+		return nil, fmt.Errorf("oci: request %s: %w", reqURL.Redacted(), err)
 	}
-	timer.Reset(rc.idle)
-	resp.Body = &idleBody{rc: resp.Body, timer: timer, idle: rc.idle, cancel: cancel, parent: ctx}
+	if !stopped.Load() {
+		timer.Reset(rc.idle)
+	}
+	resp.Body = &idleBody{rc: resp.Body, timer: timer, stopped: &stopped, idle: rc.idle, cancel: cancel, parent: ctx}
 	return resp, nil
+}
+
+// doRequest sends a request and answers one authentication challenge from the
+// registry host, replaying body when provided.
+func (rc *registryClient) doRequest(ctx context.Context, method, rawURL string, headers http.Header, body *requestBody) (*http.Response, error) {
+	resp, err := rc.onceRequest(ctx, method, rawURL, headers, body)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+	reqURL, parseErr := url.Parse(rawURL)
+	if parseErr != nil || canonicalHost(reqURL) != canonicalHost(rc.baseURL) {
+		return resp, nil
+	}
+	if resp.Request != nil && resp.Request.URL != nil && canonicalHost(resp.Request.URL) != canonicalHost(rc.baseURL) {
+		return resp, nil
+	}
+	authHeaders := resp.Header.Values("WWW-Authenticate")
+	if len(authHeaders) == 0 {
+		return resp, nil
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	if err := resp.Body.Close(); err != nil {
+		return nil, fmt.Errorf("oci: close response of %s: %w", reqURL.Redacted(), err)
+	}
+	if err := rc.authorize(ctx, authHeaders); err != nil {
+		return nil, err
+	}
+	return rc.onceRequest(ctx, method, rawURL, headers, body)
+}
+
+// once sends one request with the current credentials.
+func (rc *registryClient) once(ctx context.Context, method, rawURL, accept string) (*http.Response, error) {
+	var headers http.Header
+	if accept != "" {
+		headers = http.Header{"Accept": {accept}}
+	}
+	return rc.onceRequest(ctx, method, rawURL, headers, nil)
 }
 
 // do sends a request and answers one authentication challenge.
 func (rc *registryClient) do(ctx context.Context, method, rawURL, accept string) (*http.Response, error) {
-	resp, err := rc.once(ctx, method, rawURL, accept)
-	if err != nil || resp.StatusCode != http.StatusUnauthorized {
-		return resp, err
+	var headers http.Header
+	if accept != "" {
+		headers = http.Header{"Accept": {accept}}
 	}
-	headers := resp.Header.Values("WWW-Authenticate")
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-	if err := resp.Body.Close(); err != nil {
-		return nil, fmt.Errorf("oci: close response of %s: %w", rawURL, err)
-	}
-	if err := rc.authorize(ctx, headers); err != nil {
-		return nil, err
-	}
-	return rc.once(ctx, method, rawURL, accept)
+	return rc.doRequest(ctx, method, rawURL, headers, nil)
 }
 
 // get sends a GET request and returns the body of a 200 response.
@@ -578,13 +703,15 @@ func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cr
 		form := url.Values{
 			"grant_type":    {"refresh_token"},
 			"refresh_token": {cred.IdentityToken},
-			"client_id":     {userAgent},
+			"client_id":     {oauthClientID},
 		}
 		if s := ch.params["service"]; s != "" {
 			form.Set("service", s)
 		}
 		if s := ch.params["scope"]; s != "" {
-			form.Set("scope", s)
+			for _, sc := range strings.Fields(s) {
+				form.Add("scope", sc)
+			}
 		}
 		req, err = http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(form.Encode()))
 		if err != nil {
@@ -597,7 +724,9 @@ func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cr
 			q.Set("service", s)
 		}
 		if s := ch.params["scope"]; s != "" {
-			q.Set("scope", s)
+			for _, sc := range strings.Fields(s) {
+				q.Add("scope", sc)
+			}
 		}
 		u.RawQuery = q.Encode()
 		req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)

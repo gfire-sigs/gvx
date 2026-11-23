@@ -97,8 +97,10 @@ gvx/ (Fork of google/gvisor@go)
  │   │   ├── control/                       # [NEW] gvx-ctrl/2 framed mux protocol, auth, and capability policy
  │   │   ├── hostcerts/                     # [NEW] Host root CA bundle collector and guest injector
  │   │   └── tuning/                        # [NEW] Typed runtime tuning registry
- │   ├── oci/                               # [NEW] Multi-arch OCI puller, cache, and Tar-to-EROFS compiler
+ │   ├── oci/                               # [NEW] Multi-arch OCI pull/push client, blob/EROFS cache, and Tar-to-EROFS compiler
  │   │   ├── pull.go
+ │   │   ├── push.go
+ │   │   ├── blobs.go
  │   │   ├── tar2erofs.go
  │   │   ├── erofs_layout.go
  │   │   └── cache.go

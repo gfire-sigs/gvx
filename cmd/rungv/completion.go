@@ -63,8 +63,8 @@ _rungv_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local top_cmds="run exec pause unpause cp export update port port-forward pf unix-forward uf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help"
-    local image_cmds="ls list pull rm remove rmi inspect tag save load prune"
+    local top_cmds="run exec pause unpause cp export update port port-forward pf unix-forward uf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull push images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help"
+    local image_cmds="ls list pull push rm remove rmi inspect tag save load prune"
     local volume_cmds="create ls list inspect compact rm remove prune"
     local system_cmds="info df prune"
     local port_cmds="ls list add rm remove"
@@ -155,7 +155,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr --unix-forward -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --nat-policy-file --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --allow-bind-attach --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr --unix-forward -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --nat-policy-file --backend --platform --pull --keep-blobs --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --allow-bind-attach --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -211,6 +211,7 @@ _rungv() {
         'ping:Verify control socket liveness'
         'debug:Adjust runtime diagnostics'
         'pull:Download an OCI image into the EROFS layer cache'
+        'push:Upload a cached OCI image to a registry'
         'images:List cached images'
         'rmi:Remove cached images'
         'inspect:Print detailed image metadata'
@@ -231,7 +232,7 @@ _rungv() {
         'completion:Print shell completion scripts'
         'help:Print command usage'
     )
-    image_cmds=(ls list pull rm remove rmi inspect tag save load prune)
+    image_cmds=(ls list pull push rm remove rmi inspect tag save load prune)
     volume_cmds=(create ls list inspect compact rm remove prune)
     system_cmds=(info df prune)
     port_cmds=(ls list add rm remove)
@@ -321,7 +322,8 @@ _rungv() {
                 '--nat-policy-file[Read host NAT firewall policy]:file:_files' \
                 '--backend[Execution backend]:backend:(auto whpx hvf systrap)' \
                 '--platform[Target image platform]:platform:(linux/amd64 linux/arm64)' \
-                '--pull[Image pull policy]:policy:(missing always never)'
+                '--pull[Image pull policy]:policy:(missing always never)' \
+                '--keep-blobs[Keep original image blobs in the cache]'
             ;;
         restore|resume)
             _arguments \
@@ -343,7 +345,7 @@ compdef _rungv rungv
 const fishCompletionScript = `# fish completion for rungv
 complete -c rungv -f
 
-set -l __rungv_top_cmds run exec pause unpause cp export update port port-forward pf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help
+set -l __rungv_top_cmds run exec pause unpause cp export update port port-forward pf unix-forward uf net-policy mount status sandbox stats top kill stop dmesg events ping debug pull push images rmi inspect tag save load login logout image volume system info tune checkpoint snapshot restore resume version license completion help
 
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a run -d "Run a command in a new sandbox"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a exec -d "Execute a command inside a running sandbox"
@@ -367,6 +369,7 @@ complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a even
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a ping -d "Verify control socket liveness"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a debug -d "Adjust runtime diagnostics"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a pull -d "Download an OCI image"
+complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a push -d "Upload a cached OCI image to a registry"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a images -d "List cached images"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a rmi -d "Remove cached images"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a inspect -d "Inspect cached images"
@@ -386,7 +389,7 @@ complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a vers
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a license -d "Print license notices"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a completion -d "Generate shell completion script"
 
-complete -c rungv -n "__fish_seen_subcommand_from image; and not __fish_seen_subcommand_from ls list pull rm remove rmi inspect tag save load prune" -a "ls pull rm inspect tag save load prune"
+complete -c rungv -n "__fish_seen_subcommand_from image; and not __fish_seen_subcommand_from ls list pull push rm remove rmi inspect tag save load prune" -a "ls pull push rm inspect tag save load prune"
 complete -c rungv -n "__fish_seen_subcommand_from volume; and not __fish_seen_subcommand_from create ls list inspect compact rm remove prune" -a "create ls inspect compact rm prune"
 complete -c rungv -n "__fish_seen_subcommand_from system; and not __fish_seen_subcommand_from info df prune" -a "info df prune"
 complete -c rungv -n "__fish_seen_subcommand_from port; and not __fish_seen_subcommand_from ls list add rm remove" -a "ls add rm"
@@ -407,7 +410,7 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
     $tokens = $commandAst.CommandElements | ForEach-Object { $_.Extent.Text }
-    $topCmds = @('run','exec','pause','unpause','cp','export','update','port','port-forward','pf','net-policy','mount','status','sandbox','stats','top','kill','stop','dmesg','events','ping','debug','pull','images','rmi','inspect','tag','save','load','login','logout','image','volume','system','info','tune','checkpoint','snapshot','restore','resume','version','license','completion','help')
+    $topCmds = @('run','exec','pause','unpause','cp','export','update','port','port-forward','pf','unix-forward','uf','net-policy','mount','status','sandbox','stats','top','kill','stop','dmesg','events','ping','debug','pull','push','images','rmi','inspect','tag','save','load','login','logout','image','volume','system','info','tune','checkpoint','snapshot','restore','resume','version','license','completion','help')
 
     if ($tokens.Count -le 1 -or ($tokens.Count -eq 2 -and $wordToComplete -ne '')) {
         $topCmds | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -434,7 +437,7 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
         return
     }
     $candidates = switch ($sub) {
-        'image'      { @('ls','list','pull','rm','remove','rmi','inspect','tag','save','load','prune') }
+        'image'      { @('ls','list','pull','push','rm','remove','rmi','inspect','tag','save','load','prune') }
         'volume'     { @('create','ls','list','inspect','compact','rm','remove','prune') }
         'system'     { @('info','df','prune') }
         'port'       { @('ls','list','add','rm','remove') }

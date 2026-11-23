@@ -335,6 +335,11 @@ type Config struct {
 	// OCICacheDir overrides the default host EROFS layer cache directory.
 	OCICacheDir string
 
+	// OCIKeepBlobs retains original image blobs in the layer cache when pulling
+	// or loading OCIImage, so SaveImages works offline and PushImage needs no
+	// source registry.
+	OCIKeepBlobs bool
+
 	// RegistryBaseURL specifies an optional HTTP/HTTPS OCI registry base URL.
 	RegistryBaseURL string
 

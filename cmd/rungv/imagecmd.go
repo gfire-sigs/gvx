@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"strings"
 
@@ -50,6 +51,23 @@ func addHostDNSFlag(fs *flag.FlagSet) *multiStringFlag {
 	var servers multiStringFlag
 	fs.Var(&servers, "host-dns", hostDNSUsage)
 	return &servers
+}
+
+// defaultKeepBlobs reports whether GVX_KEEP_BLOBS enables keeping original
+// image blobs by default.
+func defaultKeepBlobs() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GVX_KEEP_BLOBS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+const keepBlobsUsage = "Keep original image layer blobs in the cache so save works offline and push needs no source registry (env: GVX_KEEP_BLOBS)"
+
+func addKeepBlobsFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("keep-blobs", defaultKeepBlobs(), keepBlobsUsage)
 }
 
 // openPullCache opens the layer cache that the flags name for a command that

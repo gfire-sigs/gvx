@@ -288,7 +288,7 @@ func (a *archive) loadOCILayout(indexJSON []byte, targetArch string) (*ResolvedI
 
 // compileOCILayers compiles the layer blobs of an OCI manifest from the archive
 // into the cache and returns their cache keys. It skips a layer that the cache
-// already holds.
+// already holds, unless KeepBlobs is enabled and the original blob is missing.
 func (a *archive) compileOCILayers(layers []ocispec.Descriptor) ([]string, error) {
 	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
 	digests := make([]string, 0, len(layers))
@@ -301,14 +301,24 @@ func (a *archive) compileOCILayers(layers []ocispec.Descriptor) ([]string, error
 			return nil, err
 		}
 		hexStr := l.Digest.Encoded()
-		if _, ok := a.cache.HasLayer(hexStr); !ok {
+		_, hasLayer := a.cache.HasLayer(hexStr)
+		needBlob := a.cache.KeepBlobs() && !a.cache.hasBlobWithSize(l.Digest, l.Size)
+		if !hasLayer {
 			sr, ok := a.reader(name)
 			if !ok {
 				return nil, fmt.Errorf("oci: layer blob %s is missing from the archive", l.Digest)
 			}
-			spec := layerSpec{key: hexStr, blobHex: hexStr, blobSize: l.Size, image: image}
+			spec := layerSpec{key: hexStr, blobHex: hexStr, blobSize: l.Size, image: image, keepBlob: needBlob}
 			if _, _, err := a.cache.compileAndStore(spec, sr); err != nil {
 				return nil, fmt.Errorf("oci: compile layer %s: %w", l.Digest, err)
+			}
+		} else if needBlob {
+			sr, ok := a.reader(name)
+			if !ok {
+				return nil, fmt.Errorf("oci: layer blob %s is missing from the archive", l.Digest)
+			}
+			if _, _, err := a.cache.storeBlobFromReader(l.Digest, l.Size, sr); err != nil {
+				return nil, fmt.Errorf("oci: store layer blob %s: %w", l.Digest, err)
 			}
 		}
 		digests = append(digests, hexStr)
@@ -370,10 +380,67 @@ type dockerSaveImage struct {
 	cfg      RuntimeConfig
 	// diffIDs are the diff IDs of the config, one per layer.
 	diffIDs []digest.Digest
-	// digests are the cache keys of the layers, which are the diff ID hex.
+	// digests are the cache keys of the layers.
 	digests []string
+	// layerDigests are the blob digests for the generated OCI manifest. For
+	// uncompressed tar layers these equal diffIDs.
+	layerDigests []digest.Digest
+	// layerMediaTypes are the OCI media types for the generated manifest.
+	layerMediaTypes []string
 	// layerSizes are the sizes of the layer members in the archive.
 	layerSizes []int64
+}
+
+func (a *archive) dockerSaveLayerDescriptor(name string, diffID digest.Digest) (digest.Digest, string, int64, error) {
+	member, ok := a.members[name]
+	if !ok {
+		return "", "", 0, fmt.Errorf("oci: layer %q is missing from the archive", name)
+	}
+	sr := io.NewSectionReader(a.ra, member.off, member.size)
+	var head [magicPeekLen]byte
+	n, err := sr.ReadAt(head[:], 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", "", 0, fmt.Errorf("oci: read header of layer %q: %w", name, err)
+	}
+	comp := detectCompression(head[:n])
+	var mediaType string
+	switch comp {
+	case compressionNone:
+		return diffID, ocispec.MediaTypeImageLayer, member.size, nil
+	case compressionGzip:
+		mediaType = ocispec.MediaTypeImageLayerGzip
+	case compressionZstd:
+		mediaType = ocispec.MediaTypeImageLayerZstd
+	default:
+		return "", "", 0, fmt.Errorf("oci: layer %q uses an unsupported compression format", name)
+	}
+	digester := digest.SHA256.Digester()
+	bounded := newBoundedReader(io.NewSectionReader(a.ra, member.off, member.size), fmt.Sprintf("layer %q size", name), a.cache.limits.MaxBlobBytes, nil)
+	if _, err := io.Copy(digester.Hash(), bounded); err != nil {
+		return "", "", 0, fmt.Errorf("oci: hash compressed layer %q: %w", name, err)
+	}
+	return digester.Digest(), mediaType, member.size, nil
+}
+
+func (a *archive) verifyCompressedDiffID(name string, diffID digest.Digest, image *byteBudget) error {
+	sr, ok := a.reader(name)
+	if !ok {
+		return fmt.Errorf("oci: layer %q is missing from the archive", name)
+	}
+	dec, err := openDecompressed(sr, a.cache.limits)
+	if err != nil {
+		return err
+	}
+	defer dec.Close()
+	digester := digest.SHA256.Digester()
+	bounded := newBoundedReader(dec, fmt.Sprintf("decompressed layer %q size", name), a.cache.limits.MaxLayerBytes, image)
+	if _, err := io.Copy(digester.Hash(), bounded); err != nil {
+		return fmt.Errorf("oci: verify decompressed layer %q: %w", name, err)
+	}
+	if got := digester.Digest(); got != diffID {
+		return fmt.Errorf("%w: layer %q diff ID is %s, want %s", ErrDigestMismatch, name, got, diffID)
+	}
+	return nil
 }
 
 // compileDockerSaveEntry compiles the layers of one manifest.json entry. skip
@@ -407,18 +474,40 @@ func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (
 		if err != nil {
 			return nil, false, err
 		}
-		if _, ok := a.cache.HasLayer(diffHex); !ok {
+		blobDigest, mediaType, memberSize, err := a.dockerSaveLayerDescriptor(name, diffID)
+		if err != nil {
+			return nil, false, err
+		}
+		blobHex := blobDigest.Encoded()
+		_, hasLayer := a.cache.HasLayer(blobHex)
+		needBlob := a.cache.KeepBlobs() && !a.cache.hasBlobWithSize(blobDigest, memberSize)
+		if !hasLayer {
 			sr, ok := a.reader(name)
 			if !ok {
 				return nil, false, fmt.Errorf("oci: layer %q is missing from the archive", layer)
 			}
-			spec := layerSpec{key: diffHex, blobSize: -1, diffID: diffHex, image: image}
+			spec := layerSpec{key: blobHex, blobHex: blobHex, blobSize: memberSize, diffID: diffHex, image: image, keepBlob: needBlob}
 			if _, _, err := a.cache.compileAndStore(spec, sr); err != nil {
 				return nil, false, fmt.Errorf("oci: compile layer %q: %w", layer, err)
 			}
+		} else if needBlob {
+			if blobDigest != diffID {
+				if err := a.verifyCompressedDiffID(name, diffID, image); err != nil {
+					return nil, false, err
+				}
+			}
+			sr, ok := a.reader(name)
+			if !ok {
+				return nil, false, fmt.Errorf("oci: layer %q is missing from the archive", layer)
+			}
+			if _, _, err := a.cache.storeBlobFromReader(blobDigest, memberSize, sr); err != nil {
+				return nil, false, fmt.Errorf("oci: store layer blob %q: %w", layer, err)
+			}
 		}
-		out.digests = append(out.digests, diffHex)
-		out.layerSizes = append(out.layerSizes, a.members[name].size)
+		out.digests = append(out.digests, blobHex)
+		out.layerDigests = append(out.layerDigests, blobDigest)
+		out.layerMediaTypes = append(out.layerMediaTypes, mediaType)
+		out.layerSizes = append(out.layerSizes, memberSize)
 	}
 	return out, false, nil
 }

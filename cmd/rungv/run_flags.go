@@ -141,6 +141,7 @@ type sandboxFlagValues struct {
 	readOnly               bool
 	workDir                string
 	cacheDir               string
+	keepBlobs              bool
 	registryURL            string
 	hostDNS                *multiStringFlag
 	pull                   string
@@ -241,6 +242,7 @@ func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
 	})
 	fs.BoolVar(&f.readOnly, "ro", false, "Mount /workspace read-only")
 	fs.StringVar(&f.cacheDir, "cache-dir", "", "EROFS layer cache directory")
+	fs.BoolVar(&f.keepBlobs, "keep-blobs", defaultKeepBlobs(), keepBlobsUsage)
 	fs.StringVar(&f.registryURL, "registry-url", "", "OCI registry base URL")
 	fs.StringVar(&f.pull, "pull", string(gvx.PullMissing), "Pull the image: missing (use the cache first, the default), always (ask the registry first), or never (cache only)")
 	fs.BoolVar(&f.hostCACerts, "host-ca-certs", false, "Make the guest trust the root certificates that the host trusts")
@@ -537,6 +539,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		WireGuardConfigPath:    f.wireGuardPath(),
 		OCIImage:               strings.TrimSpace(f.image),
 		OCICacheDir:            strings.TrimSpace(f.cacheDir),
+		OCIKeepBlobs:           f.keepBlobs,
 		RegistryBaseURL:        strings.TrimSpace(f.registryURL),
 		PullPolicy:             pullPolicy,
 		Warnings:               warningsOut,

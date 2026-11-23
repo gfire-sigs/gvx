@@ -144,6 +144,9 @@ func (c *LayerCache) sweepOrphanedCacheFiles() error {
 			}
 		}
 	}
+	if blobErr := c.sweepOrphanedBlobs(); blobErr != nil {
+		errs = append(errs, blobErr)
+	}
 	return errors.Join(errs...)
 }
 
@@ -174,6 +177,11 @@ func (c *LayerCache) cacheFileBytes() (int64, error) {
 			total += info.Size()
 		}
 	}
+	blobBytes, err := c.blobCacheBytes()
+	if err != nil {
+		return 0, err
+	}
+	total += blobBytes
 	return total, nil
 }
 
@@ -256,6 +264,17 @@ func (c *LayerCache) DiskUsage() (CacheDiskUsage, error) {
 			}
 		}
 	}
+
+	activeBlobs, err := c.activeBlobDigests(activeLayers)
+	if err != nil {
+		return CacheDiskUsage{}, err
+	}
+	blobTotal, blobReclaimable, err := c.blobDiskUsage(activeBlobs)
+	if err != nil {
+		return CacheDiskUsage{}, err
+	}
+	totalBytes += blobTotal
+	reclaimableBytes += blobReclaimable
 
 	return CacheDiskUsage{
 		TotalImages:      len(seenIDs),
