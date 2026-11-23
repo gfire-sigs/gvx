@@ -49,7 +49,7 @@ const (
 	oauthClientID = "gvx-oci"
 )
 
-var userAgent = fmt.Sprintf("gvx-oci/%s (%s/%s; +https://z.gfire.dev/gvx)", ociClientProtocolVersion, runtime.GOOS, runtime.GOARCH)
+var userAgent = fmt.Sprintf("gvx-oci/%s (gvisor-everywhere; not-a-whale; %s/%s; +https://z.gfire.dev/gvx; plz-no-429)", ociClientProtocolVersion, runtime.GOOS, runtime.GOARCH)
 
 var manifestAccept = strings.Join([]string{
 	ocispec.MediaTypeImageIndex,
