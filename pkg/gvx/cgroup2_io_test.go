@@ -43,10 +43,9 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -86,27 +85,7 @@ func doDirectWriteAndRead(path string, chunks, chunkSize int) {
 	}
 }
 
-func runWorker(cgDir, filePath string, chunks, chunkSize int) {
-	cmd := exec.Command("/bin/ioprobe", "worker", cgDir, filePath, strconv.Itoa(chunks), strconv.Itoa(chunkSize))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "worker %s: %v\n", cgDir, err)
-		os.Exit(15)
-	}
-}
-
 func main() {
-	if len(os.Args) >= 6 && os.Args[1] == "worker" {
-		cgDir := os.Args[2]
-		filePath := os.Args[3]
-		chunks, _ := strconv.Atoi(os.Args[4])
-		chunkSize, _ := strconv.Atoi(os.Args[5])
-		mustWriteFile(filepath.Join(cgDir, "cgroup.procs"), strconv.Itoa(os.Getpid())+"\n")
-		doDirectWriteAndRead(filePath, chunks, chunkSize)
-		return
-	}
-
 	ctrls, err := os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "read controllers: %v\n", err)
@@ -129,31 +108,30 @@ func main() {
 	fmt.Printf("WEIGHT=%s\n", strings.TrimSpace(string(wBytes)))
 	fmt.Printf("MAX=%s\n", strings.TrimSpace(string(mBytes)))
 
-	// cg-a runs two workers concurrently (ext4lite + rootfs overlay) to also
+	// Join cg-a and run three concurrent workers (ext4lite + rootfs overlay) to
 	// exercise concurrent overlay/blockdev I/O inside one sandbox under -race.
-	w1 := exec.Command("/bin/ioprobe", "worker", "/sys/fs/cgroup/cg-a", "/mnt/vol/a.bin", "4", strconv.Itoa(1<<20))
-	w2 := exec.Command("/bin/ioprobe", "worker", "/sys/fs/cgroup/cg-a", "/root_a.bin", "2", strconv.Itoa(1<<20))
-	w3 := exec.Command("/bin/ioprobe", "worker", "/sys/fs/cgroup/cg-a", "/root_a2.bin", "1", strconv.Itoa(1<<20))
-	for _, w := range []*exec.Cmd{w1, w2, w3} {
-		w.Stdout = os.Stdout
-		w.Stderr = os.Stderr
-		if err := w.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "start worker: %v\n", err)
-			os.Exit(15)
-		}
+	mustWriteFile("/sys/fs/cgroup/cg-a/cgroup.procs", strconv.Itoa(os.Getpid())+"\n")
+	var wg sync.WaitGroup
+	for _, job := range []struct {
+		path   string
+		chunks int
+	}{
+		{"/mnt/vol/a.bin", 4},
+		{"/root_a.bin", 2},
+		{"/root_a2.bin", 1},
+	} {
+		wg.Add(1)
+		go func(p string, c int) {
+			defer wg.Done()
+			doDirectWriteAndRead(p, c, 1<<20)
+		}(job.path, job.chunks)
 	}
-	for _, w := range []*exec.Cmd{w1, w2, w3} {
-		if err := w.Wait(); err != nil {
-			fmt.Fprintf(os.Stderr, "wait worker: %v\n", err)
-			os.Exit(15)
-		}
-	}
-	// cg-b writes/reads 1 MiB on ext4lite (/mnt/vol/b.bin) and reads a fresh EROFS lower file (/etc/erofs_blob.bin).
-	runWorker("/sys/fs/cgroup/cg-b", "/mnt/vol/b.bin", 1, 1<<20)
-	if err := os.WriteFile("/sys/fs/cgroup/cg-b/cgroup.procs", []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "join cg-b: %v\n", err)
-		os.Exit(16)
-	}
+	wg.Wait()
+
+	// Move to cg-b, write/read 1 MiB on ext4lite (/mnt/vol/b.bin), and read a
+	// fresh EROFS lower file (/etc/erofs_blob.bin).
+	mustWriteFile("/sys/fs/cgroup/cg-b/cgroup.procs", strconv.Itoa(os.Getpid())+"\n")
+	doDirectWriteAndRead("/mnt/vol/b.bin", 1, 1<<20)
 	if blob, err := os.ReadFile("/etc/erofs_blob.bin"); err != nil || len(blob) != 128<<10 {
 		fmt.Fprintf(os.Stderr, "read erofs_blob: len=%d err=%v\n", len(blob), err)
 		os.Exit(17)
