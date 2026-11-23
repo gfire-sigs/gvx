@@ -225,6 +225,20 @@ func TestParseRestoreArgs(t *testing.T) {
 		t.Fatalf("restore --platform/--backend failed: code=%d done=%v arch=%q plat=%q auto=%v stderr=%q",
 			code2, done2, rc2.cfg.Architecture, rc2.cfg.Platform, rc2.autoPlatform, stderr.String())
 	}
+	if rc2.cfg.NetworkMode != "" {
+		t.Errorf("restore without network flags chooses %q, want to inherit bundle mode", rc2.cfg.NetworkMode)
+	}
+
+	rc3, code3, done3 := parseRestoreArgs([]string{
+		"-checkpoint-dir=/tmp/bundle",
+		"--net-tx-bps=0",
+		"--net-rx-bps=500000",
+	}, nil, &bytes.Buffer{}, &stderr)
+	if done3 || code3 != 0 || rc3.cfg.NetworkMode != gvx.NetModeNAT ||
+		rc3.cfg.NetworkBandwidth.TXBPS != 0 || rc3.cfg.NetworkBandwidth.RXBPS != 500_000 {
+		t.Fatalf("restore bandwidth flags: code=%d, done=%t, mode=%q, bandwidth=%+v, stderr=%q",
+			code3, done3, rc3.cfg.NetworkMode, rc3.cfg.NetworkBandwidth, stderr.String())
+	}
 
 	for _, tc := range []struct {
 		name       string
@@ -237,6 +251,7 @@ func TestParseRestoreArgs(t *testing.T) {
 		{"missing dir on resume alias", "resume", []string{"-net=none"}, 2, "specify -checkpoint-dir"},
 		{"detach unsupported", "restore", []string{"-checkpoint-dir=/tmp/b", "-d"}, 2, "-d is not supported"},
 		{"unexpected positional arg", "restore", []string{"-checkpoint-dir=/tmp/b", "extra"}, 2, "unexpected positional"},
+		{"non-NAT bandwidth", "restore", []string{"-checkpoint-dir=/tmp/b", "--net=wg", "--net-rx-bps=0"}, 2, "require -net=nat"},
 		{"help", "restore", []string{"--help"}, 0, "Usage"},
 		{"resume help", "resume", []string{"--help"}, 0, "Usage"},
 	} {

@@ -155,11 +155,7 @@ type removedDynTCP struct {
 
 type removedDynUDP struct {
 	fwd      *boundUDPForward
-	sessions []gonetUDPCloser
-}
-
-type gonetUDPCloser interface {
-	Close() error
+	sessions []*udpForwardSession
 }
 
 func (pf *PortForwarder) reconcileDynamicPorts() {
@@ -211,12 +207,7 @@ func (pf *PortForwarder) reconcileDynamicPorts() {
 		if guestIP, ok := discovered[k]; !ok || guestIP != b.rule.GuestIP {
 			b.closed = true
 			delete(pf.dynUDP, k)
-			var closers []gonetUDPCloser
-			for client, sess := range b.sessions {
-				closers = append(closers, sess.guest)
-				delete(b.sessions, client)
-			}
-			remUDP = append(remUDP, removedDynUDP{fwd: b, sessions: closers})
+			remUDP = append(remUDP, removedDynUDP{fwd: b, sessions: b.detachSessions(nil)})
 		}
 	}
 	for k := range pf.dynFailed {
@@ -262,8 +253,8 @@ func (pf *PortForwarder) reconcileDynamicPorts() {
 	}
 	for _, r := range remUDP {
 		_ = r.fwd.packetConn.Close()
-		for _, g := range r.sessions {
-			_ = g.Close()
+		for _, sess := range r.sessions {
+			sess.close()
 		}
 		if opts.OnPublish != nil {
 			opts.OnPublish(r.fwd.rule, false)

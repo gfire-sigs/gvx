@@ -263,26 +263,32 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 				<-sem
 				connWG.Done()
 			}()
-			resp := nf.dnsRelay().answerQuery(ctx, pkt, false)
-			if len(resp) == 0 {
+			reply := nf.dnsRelay().reply(ctx, pkt, false)
+			if len(reply.wire) == 0 {
 				return
 			}
-			writeMu.Lock()
-			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-			if _, err := conn.Write(resp); err != nil {
+			write := func() (int, error) {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+				defer conn.SetWriteDeadline(time.Time{})
+				return conn.Write(reply.wire)
+			}
+			if err := writeDNSReply(ctx, nf.cfg.Bandwidth, reply.local, false, len(reply.wire), timeout, write); err != nil {
 				nf.log.Debug("netbackend: write DNS response to guest", "error", err)
 			}
-			_ = conn.SetWriteDeadline(time.Time{})
-			writeMu.Unlock()
 		}(req)
 	}
 }
 
 func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
-	serveTCPDNSConn(ctx, conn, nf.dnsTimeout(), nf.handleTCPDNSQuery)
+	timeout := nf.dnsTimeout()
+	serveTCPDNSConn(ctx, conn, timeout, nf.cfg.Bandwidth, func(ctx context.Context, req []byte) dnsReply {
+		return nf.queryDNS(ctx, req, true)
+	})
 }
 
-func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, answer func(context.Context, []byte) []byte) {
+func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, shaper *BandwidthShaper, answer func(context.Context, []byte) dnsReply) {
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
@@ -304,18 +310,37 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, 
 		if _, err := io.ReadFull(conn, req); err != nil {
 			return
 		}
-		resp := answer(ctx, req)
-		if len(resp) == 0 {
+		reply := answer(ctx, req)
+		if len(reply.wire) == 0 {
 			return
 		}
-		out := make([]byte, 2+len(resp))
-		binary.BigEndian.PutUint16(out[0:2], uint16(len(resp)))
-		copy(out[2:], resp)
-		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-		if _, err := conn.Write(out); err != nil {
+		out := make([]byte, 2+len(reply.wire))
+		binary.BigEndian.PutUint16(out[0:2], uint16(len(reply.wire)))
+		copy(out[2:], reply.wire)
+		write := func() (int, error) {
+			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+			return conn.Write(out)
+		}
+		if err := writeDNSReply(ctx, shaper, reply.local, true, len(out), timeout, write); err != nil {
 			return
 		}
 	}
+}
+
+func writeDNSReply(ctx context.Context, shaper *BandwidthShaper, local, stream bool, n int, timeout time.Duration, write func() (int, error)) error {
+	if local && shaper.Enabled(BandwidthRX) {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		_, err := shapeDNSPayload(ctx, shaper, BandwidthRX, n, stream, write)
+		return err
+	}
+	_, err := write()
+	return err
+}
+
+type dnsReply struct {
+	wire  []byte
+	local bool
 }
 
 type dnsRelay struct {
@@ -329,6 +354,7 @@ type dnsRelay struct {
 	log             *slog.Logger
 	timeout         time.Duration
 	upstreamTimeout time.Duration
+	bandwidth       *BandwidthShaper
 }
 
 func (nf *NATForwarder) hasGuestIPv6() bool {
@@ -355,6 +381,7 @@ func (nf *NATForwarder) dnsRelay() dnsRelay {
 		log:             nf.log,
 		timeout:         nf.dnsTimeout(),
 		upstreamTimeout: nf.dnsUpstreamTimeout(),
+		bandwidth:       nf.cfg.Bandwidth,
 	}
 }
 
@@ -391,57 +418,77 @@ func (w *WireGuardEndpoint) dnsRelay(log *slog.Logger) dnsRelay {
 // and resolves A and AAAA queries through the LookupHost hook. It forwards
 // other queries to the host DNS servers and answers SERVFAIL when none replies.
 func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
-	return nf.handleDNSQueryProto(ctx, req, false)
+	return nf.queryDNS(ctx, req, false).wire
 }
 
 // handleTCPDNSQuery answers one TCP DNS message, forwarding upstream directly
 // over TCP rather than UDP.
 func (nf *NATForwarder) handleTCPDNSQuery(ctx context.Context, req []byte) []byte {
-	return nf.handleDNSQueryProto(ctx, req, true)
+	return nf.queryDNS(ctx, req, true).wire
 }
 
-func (nf *NATForwarder) handleDNSQueryProto(ctx context.Context, req []byte, viaTCP bool) []byte {
+func (nf *NATForwarder) queryDNS(ctx context.Context, req []byte, viaTCP bool) dnsReply {
 	sem := nf.dnsSemaphore()
 	select {
 	case sem <- struct{}{}:
 		defer func() { <-sem }()
 	case <-ctx.Done():
-		return nil
+		return dnsReply{}
 	}
-	return nf.dnsRelay().answerQuery(ctx, req, viaTCP)
+	return nf.dnsRelay().reply(ctx, req, viaTCP)
 }
 
 // forwardRawDNSUpstream sends the wire query to each host DNS server in turn
 // and returns the first usable answer. A server that fails, answers SERVFAIL,
 // or answers REFUSED does not stop the search.
 func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) ([]byte, error) {
-	return nf.dnsRelay().forwardRawUpstream(ctx, req, false)
+	var sent bool
+	return nf.dnsRelay().forwardRawUpstream(ctx, req, false, &sent)
 }
 
 func (r dnsRelay) answerQuery(ctx context.Context, req []byte, viaTCP bool) []byte {
+	return r.reply(ctx, req, viaTCP).wire
+}
+
+func (r dnsRelay) reply(ctx context.Context, req []byte, viaTCP bool) dnsReply {
+	// Charge the guest leg only when no upstream send accounted for the request.
+	local := func(wire []byte, sent bool) dnsReply {
+		if !sent && r.bandwidth.Enabled(BandwidthTX) {
+			n := len(req)
+			if viaTCP {
+				n += 2
+			}
+			qctx, cancel := context.WithTimeout(ctx, r.timeout)
+			defer cancel()
+			if err := admitDNSPayload(qctx, r.bandwidth, BandwidthTX, n, viaTCP); err != nil {
+				return dnsReply{}
+			}
+		}
+		return dnsReply{wire: wire, local: true}
+	}
 	reqHdr, q, hdrOK, err := parseDNSQuery(req)
 	if !hdrOK {
-		return nil
+		return dnsReply{}
 	}
 	if err != nil {
-		return buildDNSErrorResponse(reqHdr, nil, dnsmessage.RCodeFormatError)
+		return local(buildDNSErrorResponse(reqHdr, nil, dnsmessage.RCodeFormatError), false)
 	}
 	name := q.Name.String()
 
 	if q.Class == dnsmessage.ClassINET {
 		if addrs, found, owned := r.lookupOwnName(name); owned {
 			if !found {
-				return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
+				return local(buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError), false)
 			}
 			if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA {
-				return buildDNSAddressResponse(reqHdr, q, addrs, true)
+				return local(buildDNSAddressResponse(reqHdr, q, addrs, true), false)
 			}
-			return buildDNSAddressResponse(reqHdr, q, nil, true)
+			return local(buildDNSAddressResponse(reqHdr, q, nil, true), false)
 		}
 
 		if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA {
 			if !r.ipv6Enabled && q.Type == dnsmessage.TypeAAAA {
-				return buildDNSAddressResponse(reqHdr, q, nil, false)
+				return local(buildDNSAddressResponse(reqHdr, q, nil, false), false)
 			}
 			if r.lookupHost != nil {
 				addrs, found, handled, lookupErr := r.lookupHookAddrs(ctx, name)
@@ -450,22 +497,23 @@ func (r dnsRelay) answerQuery(ctx context.Context, req []byte, viaTCP bool) []by
 				}
 				if handled {
 					if !found {
-						return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
+						return local(buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError), false)
 					}
-					return buildDNSAddressResponse(reqHdr, q, addrs, true)
+					return local(buildDNSAddressResponse(reqHdr, q, addrs, true), false)
 				}
 			}
 		}
 	}
 
-	resp, err := r.forwardRawUpstream(ctx, req, viaTCP)
+	var sent bool
+	resp, err := r.forwardRawUpstream(ctx, req, viaTCP, &sent)
 	if err != nil {
 		if r.log != nil {
 			r.log.Debug("netbackend: forward DNS query", "name", name, "error", err)
 		}
-		return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeServerFailure)
+		return local(buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeServerFailure), sent)
 	}
-	return resp
+	return dnsReply{wire: resp}
 }
 
 // lookupOwnName resolves the internal names that the relay owns authoritatively.
@@ -544,7 +592,7 @@ func randomDNSTxID() (uint16, error) {
 	return binary.BigEndian.Uint16(b[:]), nil
 }
 
-func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, viaTCP bool) ([]byte, error) {
+func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, viaTCP bool, sent *bool) ([]byte, error) {
 	if len(r.servers) == 0 {
 		return nil, errNoDNSServers
 	}
@@ -563,11 +611,11 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, viaTCP boo
 				respHdr dnsmessage.Header
 			)
 			if viaTCP {
-				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.upstreamTimeout)
+				resp, respHdr, err = r.exchangeUpstream(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, sent)
 			} else {
-				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.upstreamTimeout)
+				resp, respHdr, err = r.exchangeUpstream(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, sent)
 				if err == nil && respHdr.Truncated {
-					resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.upstreamTimeout)
+					resp, respHdr, err = r.exchangeUpstream(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, sent)
 				}
 			}
 			if err != nil {
@@ -585,7 +633,7 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, viaTCP boo
 	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
 }
 
-func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, guestTxID uint16, wantQ dnsmessage.Question, timeout time.Duration) ([]byte, dnsmessage.Header, error) {
+func (r dnsRelay) exchangeUpstream(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, guestTxID uint16, wantQ dnsmessage.Question, sent *bool) ([]byte, dnsmessage.Header, error) {
 	upstreamTxID, err := randomDNSTxID()
 	if err != nil {
 		return nil, dnsmessage.Header{}, err
@@ -593,7 +641,7 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 	upstreamReq := append([]byte(nil), req...)
 	binary.BigEndian.PutUint16(upstreamReq[0:2], upstreamTxID)
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, r.upstreamTimeout)
 	defer cancel()
 	conn, err := dial(ctx, network, server)
 	if err != nil {
@@ -608,19 +656,34 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	if network == "tcp" {
+	stream := network == "tcp"
+	write := func(p []byte) error {
+		n, err := shapeDNSPayload(ctx, r.bandwidth, BandwidthTX, len(p), stream, func() (int, error) { return conn.Write(p) })
+		*sent = *sent || n > 0
+		if err == nil && n != len(p) {
+			return io.ErrShortWrite
+		}
+		return err
+	}
+
+	if stream {
 		framed := make([]byte, 2+len(upstreamReq))
 		binary.BigEndian.PutUint16(framed[0:2], uint16(len(upstreamReq)))
 		copy(framed[2:], upstreamReq)
-		if _, err := conn.Write(framed); err != nil {
+		if err := write(framed); err != nil {
 			return nil, dnsmessage.Header{}, err
 		}
 		var lenBuf [2]byte
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		prefixRead, err := io.ReadFull(conn, lenBuf[:])
+		if err != nil {
+			if prefixRead != 0 {
+				err = errors.Join(err, admitDNSPayload(ctx, r.bandwidth, BandwidthRX, prefixRead, true))
+			}
 			return nil, dnsmessage.Header{}, err
 		}
 		resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
-		if _, err := io.ReadFull(conn, resp); err != nil {
+		n, readErr := io.ReadFull(conn, resp)
+		if err := errors.Join(readErr, admitDNSPayload(ctx, r.bandwidth, BandwidthRX, n+len(lenBuf), true)); err != nil {
 			return nil, dnsmessage.Header{}, err
 		}
 		respHdr, ok := parseDNSResponse(resp, upstreamTxID, wantQ)
@@ -631,13 +694,16 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 		return resp, respHdr, nil
 	}
 
-	if _, err := conn.Write(upstreamReq); err != nil {
+	if err := write(upstreamReq); err != nil {
 		return nil, dnsmessage.Header{}, err
 	}
 	buf := make([]byte, maxDNSMessage)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
+			return nil, dnsmessage.Header{}, err
+		}
+		if err := admitDNSPayload(ctx, r.bandwidth, BandwidthRX, n, false); err != nil {
 			return nil, dnsmessage.Header{}, err
 		}
 		// A connected UDP socket accepts datagrams from the server only. The
@@ -648,6 +714,21 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 			return resp, respHdr, nil
 		}
 	}
+}
+
+func shapeDNSPayload(ctx context.Context, shaper *BandwidthShaper, dir BandwidthDirection, n int, stream bool, write func() (int, error)) (int, error) {
+	if !shaper.Enabled(dir) {
+		return write()
+	}
+	if stream {
+		return shaper.Shape(ctx, dir, n, write)
+	}
+	return shaper.ShapeDatagram(ctx, dir, n, write)
+}
+
+func admitDNSPayload(ctx context.Context, shaper *BandwidthShaper, dir BandwidthDirection, n int, stream bool) error {
+	_, err := shapeDNSPayload(ctx, shaper, dir, n, stream, func() (int, error) { return n, nil })
+	return err
 }
 
 // dialStackDNS opens a UDP or TCP connection to server through s on Eth0NICID.
@@ -787,14 +868,14 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 	defer stop()
 
 	sem := w.dnsSemaphore()
-	answer := func(qctx context.Context, req []byte) []byte {
+	answer := func(qctx context.Context, req []byte) dnsReply {
 		select {
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
 		case <-qctx.Done():
-			return nil
+			return dnsReply{}
 		}
-		return w.dnsRelay(log).answerQuery(qctx, req, true)
+		return w.dnsRelay(log).reply(qctx, req, true)
 	}
 	for {
 		conn, err := ln.Accept()
@@ -804,7 +885,7 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 		w.dnsWG.Add(1)
 		go func(c net.Conn) {
 			defer w.dnsWG.Done()
-			serveTCPDNSConn(ctx, c, w.cfg.Tuning.Duration(tuning.DNSTimeout), answer)
+			serveTCPDNSConn(ctx, c, w.cfg.Tuning.Duration(tuning.DNSTimeout), nil, answer)
 		}(conn)
 	}
 }

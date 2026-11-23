@@ -15,6 +15,7 @@
 package netbackend
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -374,6 +376,104 @@ func TestDNSRelayRetriesTruncatedAnswerOverTCP(t *testing.T) {
 	}
 	if tcpQueries.Load() != 1 {
 		t.Fatalf("TCP queries = %d, want 1", tcpQueries.Load())
+	}
+}
+
+func TestNATDNSBandwidthCountsUpstreamFallbackOnlyOnce(t *testing.T) {
+	query := buildDNSQuery(5, "fallback.test", dnsTypeA)
+	answer := answerWith("192.0.2.200")
+	for _, tc := range []struct {
+		name  string
+		rates BandwidthRates
+		bytes int
+	}{
+		{name: "requests", rates: BandwidthRates{TXBPS: 8000}, bytes: 2*len(query) + 2},
+		{name: "replies", rates: BandwidthRates{RXBPS: 8000}, bytes: 3*len(answer(query, false)) + 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				shaper := NewBandwidthShaper(tc.rates)
+				defer shaper.Close()
+				var upstream sync.WaitGroup
+				const server = "192.0.2.53:53"
+				nf := newNATForwarder(NATConfig{
+					Bandwidth:  shaper,
+					DNSServers: []string{server},
+					DialContext: func(_ context.Context, network, _ string) (net.Conn, error) {
+						conn, peer := net.Pipe()
+						upstream.Go(func() {
+							defer peer.Close()
+							req := make([]byte, len(query))
+							if network == "tcp" {
+								var size [2]byte
+								if _, err := io.ReadFull(peer, size[:]); err != nil {
+									t.Errorf("read upstream TCP length: %v", err)
+									return
+								}
+								if n := binary.BigEndian.Uint16(size[:]); int(n) != len(req) {
+									t.Errorf("upstream TCP length = %d, want %d", n, len(req))
+									return
+								}
+							}
+							if _, err := io.ReadFull(peer, req); err != nil {
+								t.Errorf("read upstream %s query: %v", network, err)
+								return
+							}
+							response := answer(req, network == "tcp")
+							if network == "tcp" {
+								frame := binary.BigEndian.AppendUint16(nil, uint16(len(response)))
+								response = append(frame, response...)
+							} else {
+								flags := binary.BigEndian.Uint16(response[2:4])
+								binary.BigEndian.PutUint16(response[2:4], flags|dnsFlagTC)
+								// The relay still charges a reply with the wrong ID.
+								wrongID := bytes.Clone(response)
+								wrongID[0] ^= 1
+								if _, err := peer.Write(wrongID); err != nil {
+									t.Errorf("write mismatched upstream reply: %v", err)
+									return
+								}
+							}
+							if _, err := peer.Write(response); err != nil {
+								t.Errorf("write upstream %s response: %v", network, err)
+							}
+						})
+						return conn, nil
+					},
+				})
+				defer nf.Close()
+
+				ctx, cancel := context.WithCancel(t.Context())
+				client, relay := net.Pipe()
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					nf.serveUDPDNS(ctx, relay)
+				}()
+				defer func() {
+					cancel()
+					_ = client.Close()
+					<-done
+					upstream.Wait()
+				}()
+				start := time.Now()
+				if _, err := client.Write(query); err != nil {
+					t.Fatal(err)
+				}
+				_ = client.SetReadDeadline(start.Add(time.Second))
+				var buf [512]byte
+				n, err := client.Read(buf[:])
+				if err != nil {
+					t.Fatalf("read guest DNS reply: %v", err)
+				}
+				if got := answerIPs(t, buf[:n]); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("192.0.2.200")}) {
+					t.Fatalf("guest answer = %v, want the TCP fallback reply", got)
+				}
+				if elapsed, want := time.Since(start), time.Duration(tc.bytes)*time.Millisecond; elapsed != want {
+					t.Errorf("guest reply after %v, want %v for %d upstream bytes", elapsed, want, tc.bytes)
+				}
+			})
+		})
 	}
 }
 

@@ -149,6 +149,61 @@ func TestNATAnswersFailedHostDialAsTheHost(t *testing.T) {
 	}
 }
 
+func TestNATBandwidthAdmitsSYNBeforeDialError(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		errno syscall.Errno
+		want  tcpip.Error
+	}{
+		{name: "reset", errno: hostRefusedErrno, want: &tcpip.ErrConnectionRefused{}},
+		{name: "ICMP unreachable", errno: hostUnreachableErrno, want: &tcpip.ErrHostUnreachable{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shaper := NewBandwidthShaper(BandwidthRates{TXBPS: 1})
+			t.Cleanup(shaper.Close)
+			dialed := make(chan struct{}, 1)
+			s, nf, err := NewNATStack(NATConfig{
+				Bandwidth:  shaper,
+				DNSServers: []string{"192.0.2.53"},
+				DialContext: func(context.Context, string, string) (net.Conn, error) {
+					select {
+					case dialed <- struct{}{}:
+					default:
+					}
+					return nil, errnoDialError(tc.errno)
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = nf.Close()
+				s.Close()
+			})
+			ended, result := startGuestConnect(t, s, tcpip.Address{}, unansweredTarget)
+			select {
+			case <-dialed:
+			case <-time.After(testTimeout):
+				t.Fatal("the host dial did not start")
+			}
+			select {
+			case <-ended:
+				t.Fatalf("guest connect ended with %v before its SYN had TX credit", result())
+			case <-time.After(50 * time.Millisecond):
+			}
+			shaper.SetRates(BandwidthRates{})
+			select {
+			case <-ended:
+			case <-time.After(testTimeout):
+				t.Fatal("the dial error did not reach the guest after clearing the TX rate")
+			}
+			if got := result(); fmt.Sprintf("%T", got) != fmt.Sprintf("%T", tc.want) {
+				t.Errorf("guest connect error = %v (%T), want %T", got, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestNATLeavesTheSYNOfATimedOutDialUnanswered verifies that a host dial that
 // times out gives the guest no answer (#206). The guest connect stays open, and
 // each retransmitted SYN of the guest starts a new host dial. A third dial

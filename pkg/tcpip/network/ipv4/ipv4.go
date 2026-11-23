@@ -521,6 +521,9 @@ func (e *endpoint) handleFragments(_ *stack.Route, networkMTU uint32, pkt *stack
 	var n int
 	for {
 		fragPkt, more := buildNextFragment(&pf, networkHeader)
+		if owner, ok := pkt.Owner.(*stack.NATRelayOwner); ok {
+			fragPkt.Owner = owner
+		}
 		err := handler(fragPkt)
 		fragPkt.DecRef()
 		if err != nil {
@@ -814,8 +817,29 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 	// TODO(https://gvisor.dev/issue/7473): For multicast, only create one deep
 	// copy and then clone.
 	newPkt := pkt.DeepCopyForForwarding(int(route.MaxHeaderLength()))
-	newHdr := header.IPv4(newPkt.NetworkHeader().Slice())
 	defer newPkt.DecRef()
+	if input := pkt.NATInput(); input != nil {
+		newPkt.NICID = pkt.NICID
+		newPkt.NetworkPacketInfo.LocalAddressBroadcast = pkt.NetworkPacketInfo.LocalAddressBroadcast
+		if input.Metered() {
+			route.Acquire()
+			input.AdmitWithRelease(newPkt, func(pkt *stack.PacketBuffer) {
+				input.Forwarded(pkt)
+				e.handleForwardingError(e.writeForwardedPacket(route, nil, pkt, updateOptions))
+			}, route.Release)
+			return nil
+		}
+		input.Forwarded(newPkt)
+	}
+	return e.writeForwardedPacket(route, pkt, newPkt, updateOptions)
+}
+
+func (e *endpoint) writeForwardedPacket(route *stack.Route, original, newPkt *stack.PacketBuffer, updateOptions bool) ip.ForwardingError {
+	newHdr := header.IPv4(newPkt.NetworkHeader().Slice())
+	var savedHeader [header.IPv4MaximumHeaderSize]byte
+	if original == nil {
+		copy(savedHeader[:], newHdr)
+	}
 
 	forwardToEp, ok := e.protocol.getEndpointForNIC(route.NICID())
 	if !ok {
@@ -828,7 +852,7 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		}
 	}
 
-	ttl := header.IPv4(pkt.NetworkHeader().Slice()).TTL()
+	ttl := newHdr.TTL()
 	// As per RFC 791 page 30, Time to Live,
 	//
 	//   This field must be decreased at each point that the internet header
@@ -859,9 +883,13 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		// WriteHeaderIncludedPacket checks for the presence of the Don't Fragment bit
 		// while sending the packet and returns this error iff fragmentation is
 		// necessary and the bit is also set.
+		if original == nil {
+			copy(newHdr, savedHeader[:len(newHdr)])
+			original = newPkt
+		}
 		_ = e.protocol.returnError(&icmpReasonFragmentationNeeded{
 			mtu: forwardToEp.nic.MTU(),
-		}, pkt, false /* deliveredLocally */)
+		}, original, false /* deliveredLocally */)
 		return &ip.ErrMessageTooLong{}
 	case *tcpip.ErrNoBufferSpace:
 		return &ip.ErrOutgoingDeviceNoBufferSpace{}
@@ -893,7 +921,7 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 		// We return the original error rather than the result of returning
 		// the ICMP packet because the original error is more relevant to
 		// the caller.
-		_ = e.protocol.returnError(&icmpReasonTTLExceeded{}, pkt, false /* deliveredLocally */)
+		e.replyToPacketError(&icmpReasonTTLExceeded{}, pkt, false /* deliveredLocally */)
 		return &ip.ErrTTLExceeded{}
 	}
 
@@ -910,13 +938,13 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 		// We return the original error rather than the result of returning
 		// the ICMP packet because the original error is more relevant to
 		// the caller.
-		_ = e.protocol.returnError(&icmpReasonNetworkUnreachable{}, pkt, false /* deliveredLocally */)
+		e.replyToPacketError(&icmpReasonNetworkUnreachable{}, pkt, false /* deliveredLocally */)
 		return &ip.ErrHostUnreachable{}
 	case *tcpip.ErrHostUnreachable:
-		_ = e.protocol.returnError(&icmpReasonHostUnreachable{}, pkt, false /* deliveredLocally */)
+		e.replyToPacketError(&icmpReasonHostUnreachable{}, pkt, false /* deliveredLocally */)
 		return &ip.ErrHostUnreachable{}
 	case *tcpip.ErrRouteProhibited:
-		_ = e.protocol.returnError(&icmpReasonAdministrativelyProhibited{}, pkt, false /* deliveredLocally */)
+		e.replyToPacketError(&icmpReasonAdministrativelyProhibited{}, pkt, false /* deliveredLocally */)
 		return &ip.ErrHostUnreachable{}
 	case *tcpip.ErrRouteBlackhole:
 		// A blackhole route drops the packet without a reply.
@@ -1148,7 +1176,7 @@ func (e *endpoint) updateOptionsForForwarding(pkt *stack.PacketBuffer) ip.Forwar
 			if optProblem.NeedICMP {
 				// Note that this will not emit an ICMP error if the destination is
 				// multicast.
-				_ = e.protocol.returnError(&icmpReasonParamProblem{
+				e.replyToPacketError(&icmpReasonParamProblem{
 					pointer: optProblem.Pointer,
 				}, pkt, false /* deliveredLocally */)
 			}
@@ -1386,7 +1414,7 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 			// options as that could lead to double processing later.
 			if _, _, optProblem := e.processIPOptions(pkt, opts, &optionUsageVerify{}); optProblem != nil {
 				if optProblem.NeedICMP {
-					_ = e.protocol.returnError(&icmpReasonParamProblem{
+					e.replyToPacketError(&icmpReasonParamProblem{
 						pointer: optProblem.Pointer,
 					}, pkt, true /* deliveredLocally */)
 					e.stats.ip.MalformedPacketsReceived.Increment()
@@ -1410,7 +1438,7 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 		}
 
 		proto := h.Protocol()
-		resPkt, transProtoNum, ready, err := e.protocol.fragmentation.Process(
+		resPkt, transProtoNum, ready, err := e.protocol.fragmentation.ProcessOnIngress(
 			// As per RFC 791 section 2.3, the identification value is unique
 			// for a source-destination pair and protocol.
 			fragmentation.FragmentID{
@@ -1434,6 +1462,9 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 			return
 		}
 		defer resPkt.DecRef()
+		if resPkt.NATInput().Stale() {
+			return
+		}
 		pkt = resPkt
 		h = header.IPv4(pkt.NetworkHeader().Slice())
 
@@ -1461,6 +1492,10 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 		// headers, the setting of the transport number here should be
 		// unnecessary and removed.
 		pkt.TransportProtocolNumber = p
+		if input := pkt.NATInput(); input.Metered() {
+			input.Admit(pkt, e.handleICMP)
+			return
+		}
 		e.handleICMP(pkt)
 		return
 	}
@@ -1470,7 +1505,7 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 		newOpts, processedOpts, optProblem := e.processIPOptions(pkt, opts, &optionUsageReceive{})
 		if optProblem != nil {
 			if optProblem.NeedICMP {
-				_ = e.protocol.returnError(&icmpReasonParamProblem{
+				e.replyToPacketError(&icmpReasonParamProblem{
 					pointer: optProblem.Pointer,
 				}, pkt, true /* deliveredLocally */)
 				stats.ip.MalformedPacketsReceived.Increment()
@@ -1488,13 +1523,38 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 		}
 	}
 	if p == header.IGMPProtocolNumber {
-		e.mu.Lock()
-		e.igmp.handleIGMP(pkt, hasRouterAlertOption)
-		e.mu.Unlock()
+		if input := pkt.NATInput(); input.Metered() {
+			input.Admit(pkt, func(pkt *stack.PacketBuffer) { e.deliverIGMP(pkt, hasRouterAlertOption) })
+			return
+		}
+		e.deliverIGMP(pkt, hasRouterAlertOption)
 		return
 	}
 
-	switch res := e.dispatcher.DeliverTransportPacket(p, pkt); res {
+	if input := pkt.NATInput(); input.Metered() {
+		stack.DeliverNATLocalTransportPacket(e.dispatcher, p, pkt, e.localTransportDisposition)
+		return
+	}
+	e.localTransportDisposition(pkt, e.dispatcher.DeliverTransportPacket(p, pkt))
+}
+
+func (e *endpoint) deliverIGMP(pkt *stack.PacketBuffer, hasRouterAlertOption bool) {
+	e.mu.Lock()
+	e.igmp.handleIGMP(pkt, hasRouterAlertOption)
+	e.mu.Unlock()
+}
+
+// An IP error before transport dispatch is a packet-only effect.
+func (e *endpoint) replyToPacketError(reason icmpReason, pkt *stack.PacketBuffer, local bool) {
+	if input := pkt.NATInput(); input.Metered() {
+		input.Admit(pkt, func(pkt *stack.PacketBuffer) { _ = e.protocol.returnError(reason, pkt, local) })
+		return
+	}
+	_ = e.protocol.returnError(reason, pkt, local)
+}
+
+func (e *endpoint) localTransportDisposition(pkt *stack.PacketBuffer, res stack.TransportPacketDisposition) {
+	switch res {
 	case stack.TransportPacketHandled:
 	case stack.TransportPacketDestinationPortUnreachable:
 		// As per RFC: 1122 Section 3.2.2.1 A host SHOULD generate Destination

@@ -604,6 +604,12 @@ var boundaryRules = []importRule{
 		forbidden: lowLevelTier2Bans,
 	},
 	{
+		pkg:       "pkg/tcpip/network/internal/fragmentation",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/tcpip/stack"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
 		pkg:       "pkg/tcpip/network/ipv4",
 		tier:      Tier2Sibling,
 		allowed:   []string{"pkg/state", "pkg/tcpip/*"},
@@ -631,6 +637,18 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/tcpip/transport/tcp",
 		tier:      Tier2Sibling,
 		allowed:   []string{"pkg/state", "pkg/tcpip/*", "pkg/waiter"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
+		pkg:       "pkg/tcpip/transport/internal/network",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/tcpip"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
+		pkg:       "pkg/tcpip/transport/udp",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/tcpip/stack"},
 		forbidden: lowLevelTier2Bans,
 	},
 

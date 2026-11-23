@@ -162,6 +162,10 @@ type Config struct {
 	// NetworkMode selects the network backend ("nat", "wg", or "none").
 	NetworkMode NetworkMode
 
+	// NetworkBandwidth limits guest transmit and receive in NAT mode. A zero
+	// rate leaves that direction unlimited.
+	NetworkBandwidth netbackend.BandwidthRates
+
 	// IsolateLAN blocks outbound NAT connections to RFC1918, loopback, and
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
@@ -473,6 +477,15 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	case NetModeNAT, NetModeWireGuard, NetModeNone:
 	default:
 		return fmt.Errorf("%w: unsupported network mode %q", ErrInvalidConfig, c.NetworkMode)
+	}
+	if err := c.NetworkBandwidth.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	if c.NetworkMode != NetModeNAT && c.NetworkBandwidth != (netbackend.BandwidthRates{}) {
+		return fmt.Errorf("%w: network bandwidth limits require -net=nat", ErrInvalidConfig)
+	}
+	if c.StreamInterceptor != nil && c.NetworkBandwidth != (netbackend.BandwidthRates{}) {
+		return fmt.Errorf("%w: NAT bandwidth limits and a custom stream interceptor cannot be combined", ErrInvalidConfig)
 	}
 	for _, pf := range c.PortForwards {
 		if pf.HostSocket != "" && pf.Protocol != "" && pf.Protocol != "tcp" {

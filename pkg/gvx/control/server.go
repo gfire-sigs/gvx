@@ -41,6 +41,7 @@ type ServerConfig struct {
 	SandboxID        string
 	Token            string
 	Capabilities     []string
+	Features         []string
 	AllowFDs         bool
 	MaxConnections   int
 	MaxFrameBytes    int
@@ -257,6 +258,7 @@ func (s *Server) serveConn(ctx context.Context, nc net.Conn) {
 	if allowFDs {
 		features = append(features, "scm_rights")
 	}
+	features = append(features, s.cfg.Features...)
 	helloResp := HelloResponse{
 		OK:            true,
 		Version:       ProtocolVersion,

@@ -183,15 +183,21 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 	ln := s.controlListener()
 	locked := s.lockdown.Applied
 	cfg := s.cfg
+	hasBandwidth := s.bandwidth != nil
 	s.mu.Unlock()
 	if ln == nil {
 		return fmt.Errorf("%w: Config.ControlListener is nil", ErrInvalidConfig)
 	}
 	caps := s.ControlCapabilities()
+	var features []string
+	if hasBandwidth {
+		features = append(features, control.FeatureNetQoS)
+	}
 	srv := control.NewServer(lockedControlListener{Listener: ln, locked: locked}, control.ServerConfig{
 		SandboxID:        cmp.Or(cfg.Name, "gvx-default"),
 		Token:            cfg.ControlToken,
 		Capabilities:     caps,
+		Features:         features,
 		AllowFDs:         slices.Contains(caps, control.CapMountVolumeAttach),
 		MaxConnections:   cfg.Tuning.Int(tuning.ControlMaxConnections),
 		MaxFrameBytes:    int(cfg.Tuning.Size(tuning.ControlMaxFrameBytes)),
@@ -397,7 +403,7 @@ func mapControlErr(err error) error {
 	switch {
 	case errors.Is(err, ErrCheckpointExecActive):
 		return control.NewError(control.CodeExecActive, err.Error())
-	case errors.Is(err, ErrCheckpointRPCFSActive):
+	case errors.Is(err, ErrCheckpointRPCFSActive), errors.Is(err, ErrCheckpointNATTunnelActive):
 		return control.NewError(control.CodeBusy, err.Error())
 	case errors.Is(err, ErrInvalidConfig):
 		return control.NewError(control.CodeInvalidArgument, err.Error())

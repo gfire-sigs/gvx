@@ -237,6 +237,12 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 	if inspect.State != "running" || inspect.PIDCount < 1 {
 		t.Fatalf("inspect = %+v", inspect)
 	}
+	if rs.client.HasFeature(control.FeatureNetQoS) {
+		t.Fatal("non-NAT sandbox advertises NAT bandwidth shaping")
+	}
+	if err := rs.client.Call(ctx, control.MethodResourceUpdate, json.RawMessage(`{"net_rx_bps":0}`), nil); !control.IsCode(err, control.CodeUnsupported) {
+		t.Fatalf("raw bandwidth update in non-NAT mode = %v, want UNSUPPORTED", err)
+	}
 
 	var stats control.StatsSample
 	if err := rs.client.Call(ctx, control.MethodStats, control.StatsRequest{}, &stats); err != nil {
@@ -742,27 +748,67 @@ func TestControlResourceUpdateAndMultiSandboxIsolation(t *testing.T) {
 		RegistryBaseURL: regURL,
 		NetworkMode:     NetModeNAT,
 		Resources:       Resources{MemoryBytes: 512 << 20, CPUMillis: 1000, PidsLimit: 200},
+		ControlDisable:  []string{control.CapResourceNetwork},
 	})
 	sbA.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	sbB.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	ctx := context.Background()
+	if !sbA.client.HasFeature(control.FeatureNetQoS) || !sbB.client.HasFeature(control.FeatureNetQoS) {
+		t.Fatal("HELLO must advertise network QoS support even when policy disables updates")
+	}
 
 	newMem := int64(384 << 20)
 	newCPU := int64(500)
 	newPids := int64(50)
 	isoTrue := true
+	newTX, newRX := uint64(800_000), uint64(400_000)
 	var snapA control.ResourceSnapshot
 	if err := sbA.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
 		MemoryBytes: &newMem,
 		CPUMillis:   &newCPU,
 		PidsLimit:   &newPids,
 		IsolateLAN:  &isoTrue,
+		NetTXBPS:    &newTX,
+		NetRXBPS:    &newRX,
 		Tuning:      map[string]string{"net.nat.dial_timeout": "5s"},
 	}, &snapA); err != nil {
 		t.Fatalf("update sbA: %v", err)
 	}
 	if snapA.MemoryBytes != newMem || snapA.CPUQuotaUSec != 50000 || snapA.PidsLimit != 50 || !snapA.IsolateLAN {
 		t.Fatalf("snapA = %+v", snapA)
+	}
+	if snapA.NetTXBPS != newTX || snapA.NetRXBPS != newRX {
+		t.Fatalf("updated bandwidth = TX %d RX %d, want TX %d RX %d", snapA.NetTXBPS, snapA.NetRXBPS, newTX, newRX)
+	}
+
+	clearTX := uint64(0)
+	if err := sbA.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
+		NetTXBPS: &clearTX,
+	}, &snapA); err != nil || snapA.NetTXBPS != 0 || snapA.NetRXBPS != newRX {
+		t.Fatalf("clear TX bandwidth: TX %d RX %d, err %v, want TX 0 RX %d", snapA.NetTXBPS, snapA.NetRXBPS, err, newRX)
+	}
+
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"memory_bytes":536870912,"net_rx_bps":-1}`),
+		json.RawMessage(`{"memory_bytes":536870912,"net_rx_bps":1000000000001}`),
+	} {
+		if err := sbA.client.Call(ctx, control.MethodResourceUpdate, raw, nil); !control.IsCode(err, control.CodeInvalidArgument) {
+			t.Errorf("update with invalid bandwidth %s returned %v, want INVALID_ARGUMENT", raw, err)
+		}
+	}
+	var inspectA control.InspectResponse
+	if err := sbA.client.Call(ctx, control.MethodInspect, nil, &inspectA); err != nil {
+		t.Fatalf("inspect sbA after invalid updates: %v", err)
+	}
+	if res := inspectA.Resources; res.MemoryBytes != newMem || res.NetTXBPS != 0 || res.NetRXBPS != newRX {
+		t.Fatalf("inspect sbA after invalid updates: memory %d, TX %d RX %d; want memory %d, TX 0 RX %d", res.MemoryBytes, res.NetTXBPS, res.NetRXBPS, newMem, newRX)
+	}
+
+	if err := sbB.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
+		MemoryBytes: &newMem,
+		NetRXBPS:    &newRX,
+	}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
+		t.Fatalf("update when resource.network is disabled returned %v, want FORBIDDEN_BY_POLICY", err)
 	}
 
 	// Verify immutable tunable is rejected.
@@ -839,6 +885,36 @@ func TestControlResourceUpdateAndMultiSandboxIsolation(t *testing.T) {
 	}
 	if inspectB.Resources.MemoryBytes != 512<<20 || inspectB.Resources.CPUQuotaUSec != 100000 || inspectB.Resources.PidsLimit != 200 || inspectB.Resources.IsolateLAN {
 		t.Fatalf("sbB limits leaked from sbA: %+v", inspectB.Resources)
+	}
+	if inspectB.Resources.NetTXBPS != 0 || inspectB.Resources.NetRXBPS != 0 {
+		t.Fatalf("sbB bandwidth changed: TX %d RX %d, want both unlimited", inspectB.Resources.NetTXBPS, inspectB.Resources.NetRXBPS)
+	}
+}
+
+func TestControlNATCustomInterceptorRetainsLANIsolationUpdates(t *testing.T) {
+	cacheDir, regURL, imgRef := buildControlTestImage(t)
+	rs := startControlTestSandbox(t, Config{
+		OCIImage:        imgRef,
+		OCICacheDir:     cacheDir,
+		RegistryBaseURL: regURL,
+		NetworkMode:     NetModeNAT,
+		StreamInterceptor: func(context.Context, string, net.Conn, net.Conn) error {
+			return errors.New("unexpected TCP relay")
+		},
+	})
+	rs.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
+	if rs.client.HasFeature(control.FeatureNetQoS) {
+		t.Fatal("NAT with a custom interceptor advertises bandwidth shaping")
+	}
+	ctx := t.Context()
+	if err := rs.client.Call(ctx, control.MethodResourceUpdate, json.RawMessage(`{"net_tx_bps":0}`), nil); !control.IsCode(err, control.CodeUnsupported) {
+		t.Fatalf("bandwidth update with custom interceptor = %v, want UNSUPPORTED", err)
+	}
+
+	isolate := true
+	var snapshot control.ResourceSnapshot
+	if err := rs.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{IsolateLAN: &isolate}, &snapshot); err != nil || !snapshot.IsolateLAN {
+		t.Fatalf("LAN isolation update with custom interceptor: isolate_lan=%t, err=%v", snapshot.IsolateLAN, err)
 	}
 }
 

@@ -82,12 +82,16 @@ func populateDefaultEtcFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyst
 // initNATStack initializes the L4 NAT network stack and pre-binds any
 // configured host port forwarders before lockdown.
 func (s *Sandbox) initNATStack() error {
+	if s.cfg.StreamInterceptor == nil && (s.controlListener() != nil || s.cfg.NetworkBandwidth != (netbackend.BandwidthRates{})) {
+		s.bandwidth = netbackend.NewBandwidthShaper(s.cfg.NetworkBandwidth)
+	}
 	natCfg := netbackend.NATConfig{
 		IsolateLAN:        s.cfg.IsolateLAN,
 		DNSServers:        s.cfg.HostDNSServers,
 		StreamInterceptor: s.cfg.StreamInterceptor,
 		Stack:             s.stackOptions(),
 		Tuning:            s.cfg.Tuning,
+		Bandwidth:         s.bandwidth,
 	}
 	if !s.cfg.DisableHostLockdown {
 		natCfg.DialContext = hostlockdown.DialContext
@@ -110,6 +114,7 @@ func (s *Sandbox) initPortForwarder() error {
 		return nil
 	}
 	pf := netbackend.NewPortForwarder(s.cfg.Tuning)
+	pf.SetBandwidthShaper(s.bandwidth)
 	if !s.cfg.DisableHostLockdown {
 		pf.SetAccept(hostlockdown.AcceptListener)
 	}

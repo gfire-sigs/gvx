@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"slices"
@@ -243,6 +242,13 @@ func (s *Sandbox) handleNetDial(ctx context.Context, stream *control.Stream, raw
 	if _, _, err := s.activeKernelChecked(ctx); err != nil {
 		return err
 	}
+	tunnels, err := s.admitNATControlTunnel()
+	if err != nil {
+		return err
+	}
+	if tunnels != nil {
+		defer s.releaseNATControlTunnel(tunnels)
+	}
 	s.mu.Lock()
 	st := s.netStack
 	netMode := s.cfg.NetworkMode
@@ -306,16 +312,83 @@ func (s *Sandbox) handleNetDial(ctx context.Context, stream *control.Stream, raw
 	// Client -> Guest
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(guestConn, stream.ChannelReader(ctx, control.ChannelGeneric))
+		_, _ = s.bandwidth.Copy(ctx, netbackend.BandwidthRX, guestConn, stream.ChannelReader(ctx, control.ChannelGeneric))
 		_ = guestConn.CloseWrite()
 	}()
 	// Guest -> Client
 	go func() {
 		defer wg.Done()
 		w := stream.ChannelWriter(ctx, control.ChannelGeneric, false)
-		_, _ = io.Copy(w, guestConn)
+		_, _ = s.bandwidth.Copy(ctx, netbackend.BandwidthTX, w, guestConn)
 		_ = w.Close()
 	}()
 	wg.Wait()
 	return nil
+}
+
+// A tunnel stays in its group until it closes. Clearing both limits starts
+// a new group without releasing old tunnels that can still have queued writes.
+type natTunnelGroup struct {
+	active int
+	shaped bool
+}
+
+func (s *Sandbox) admitNATControlTunnel() (*natTunnelGroup, error) {
+	if s.bandwidth == nil {
+		return nil, nil
+	}
+	if !s.opMu.TryRLock() {
+		return nil, control.NewError(control.CodeBusy, "sandbox lifecycle operation is active")
+	}
+	defer s.opMu.RUnlock() // +checklocksforce: TryRLock succeeds on this path.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.activeKernel == nil {
+		return nil, control.NewError(control.CodeBusy, "sandbox is not running")
+	}
+	if s.natTunnelGroup == nil {
+		s.natTunnelGroup = &natTunnelGroup{shaped: s.bandwidth.Rates() != (netbackend.BandwidthRates{})}
+	}
+	g := s.natTunnelGroup
+	g.active++
+	if g.shaped {
+		s.shapedNATTunnels++
+	}
+	return g, nil
+}
+
+func (s *Sandbox) releaseNATControlTunnel(g *natTunnelGroup) {
+	s.mu.Lock()
+	g.active--
+	if g.shaped {
+		s.shapedNATTunnels--
+	}
+	if g.active == 0 && g == s.natTunnelGroup {
+		s.natTunnelGroup = nil
+	}
+	s.mu.Unlock()
+}
+
+// The caller holds opMu for reading. Checkpoint takes it for writing.
+func (s *Sandbox) setNATBandwidth(rates netbackend.BandwidthRates) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if g := s.natTunnelGroup; g != nil {
+		if rates == (netbackend.BandwidthRates{}) {
+			if g.shaped {
+				s.natTunnelGroup = nil
+			}
+		} else if !g.shaped {
+			g.shaped = true
+			s.shapedNATTunnels += g.active
+		}
+	}
+	s.bandwidth.SetRates(rates)
+}
+
+// Checkpoint holds opMu to exclude rate changes and new tunnel admission.
+func (s *Sandbox) hasShapedNATControlTunnel() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shapedNATTunnels != 0
 }

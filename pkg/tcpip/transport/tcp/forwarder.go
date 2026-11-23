@@ -166,7 +166,7 @@ func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, 
 		TSVal:         r.synOptions.TSVal,
 		TSEcr:         r.synOptions.TSEcr,
 		SACKPermitted: r.synOptions.SACKPermitted,
-	}, queue, nil)
+	}, queue, r.segment.pkt.NATInput().RelayOwner())
 	if err != nil {
 		return nil, err
 	}

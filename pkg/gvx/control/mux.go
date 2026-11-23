@@ -823,17 +823,23 @@ func (s *Stream) WaitResponse(ctx context.Context, out any) error {
 // WriteData writes p to channel ch, respecting flow-control credits and chunking
 // payloads to stay under the negotiated MaxFrameBytes.
 func (s *Stream) WriteData(ctx context.Context, ch Channel, p []byte, compress bool) error {
+	_, err := s.writeData(ctx, ch, p, compress)
+	return err
+}
+
+func (s *Stream) writeData(ctx context.Context, ch Channel, p []byte, compress bool) (int, error) {
 	if int(ch) >= maxChannelsPerStream {
-		return fmt.Errorf("control: invalid data channel %d", ch)
+		return 0, fmt.Errorf("control: invalid data channel %d", ch)
 	}
 	maxChunk := s.conn.maxFrameBytes
 	if maxChunk <= 0 {
 		maxChunk = DefaultMaxFrameBytes
 	}
+	var written int
 	for len(p) > 0 {
 		n, err := s.consumeSendWindow(ctx, len(p), maxChunk)
 		if err != nil {
-			return err
+			return written, err
 		}
 		chunk := p[:n]
 		p = p[n:]
@@ -848,10 +854,11 @@ func (s *Stream) WriteData(ctx context.Context, ch Channel, p []byte, compress b
 			StreamID: s.id,
 			Payload:  chunk,
 		}); err != nil {
-			return err
+			return written, err
 		}
+		written += n
 	}
-	return nil
+	return written, nil
 }
 
 func (s *Stream) consumeSendWindow(ctx context.Context, want, maxChunk int) (int, error) {
@@ -1089,10 +1096,7 @@ type streamChannelWriter struct {
 }
 
 func (w *streamChannelWriter) Write(p []byte) (int, error) {
-	if err := w.stream.WriteData(w.ctx, w.ch, p, w.compress); err != nil {
-		return 0, err
-	}
-	return len(p), nil
+	return w.stream.writeData(w.ctx, w.ch, p, w.compress)
 }
 
 func (w *streamChannelWriter) Close() error {

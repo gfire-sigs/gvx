@@ -108,6 +108,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode (`nat`, `wg`, `none`) and its options. |
+| `--net-tx-bps N`, `--net-rx-bps N` | Set guest transmit and receive limits in bits per second for NAT. `0` leaves that direction unlimited. |
 | `--privileged` | On by default. Enables `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` disables all three. Explicit per-flag values override `--privileged` (see Section 4.8). |
 | `--net-raw` | Allow guest raw sockets and `iptables` (required by `dockerd`). Defaults to `--privileged`. |
 | `--allow-packet-socket-write` | Allow guest writes on `AF_PACKET` sockets (requires `--net-raw`). Defaults to `--privileged` when `--net-raw` is on. |
@@ -359,8 +360,14 @@ A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.me
 | `rungv checkpoint -S SPEC [-checkpoint-dir DIR \| -o DIR\|FILE\|-] [-leave-running] [-z] [--force]` | Connect to `SPEC` and trigger a checkpoint (`rungv snapshot` alias). `-o` streams a tar bundle over the control socket without `-checkpoint-dir`. `-z` compresses streamed frames with `zstd`. `--force` detaches active `exec` sessions before saving. |
 | `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `--auto-publish`, `--dynamic-ports`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-S`/`--control` to reattach mounts, networking, or a new control listener. |
 
+The bundle does not store NAT bandwidth limits. A checkpoint that leaves the current instance running does not change its limits.
+
+The restore command rejects a bundle if its mount paths, `root_volume` setting, layer digests, platform, or network mode differ.
+
 > [!IMPORTANT]
-> Pass the same workspace, volume mounts, and `-rootfs-volume` flag to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the `root_volume` setting, the layer digests, the platform, or the network mode do not match `manifest.json`.
+> Pass the same workspace, volume mounts, and `-rootfs-volume` flag on restore.
+> Pass `--net-tx-bps` and `--net-rx-bps` to set new limits on restore.
+> Close active control tunnels that used bandwidth limits before you save the sandbox.
 
 1. Start a workload with `-checkpoint-dir` and `-control-socket`.
 2. Run `rungv checkpoint` in another terminal to write the bundle and stop the sandbox.
@@ -381,10 +388,28 @@ Every control subcommand accepts `-S`/`--control-socket SPEC` (or `GVX_CONTROL_S
 | `exec` | `rungv exec [-i] [-t] [-d] [-e KEY=VAL] [--env-file FILE] [-w DIR] [-u USER] [--privileged=BOOL] [--detach-keys KEYS] [--pid-file FILE] [--] CMD [ARG...]`. Closes guest stdin (`/dev/null`) unless the caller passes `-i`. |
 | `pause` / `unpause` | `rungv pause [--quiesce-net=true\|false]` and `rungv unpause`. Pauses and resumes all guest tasks. |
 | `cp` / `export` | `rungv cp [-a] [-L] [-q] [-z] [--no-overwrite-dir] [--user U:G] SRC DST` and `rungv export [--upper-only] [-z] [-o FILE\|-] [PATH]`. Streams tar archives while the unlocked client performs all host disk I/O with `os.Root`. |
-| `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
+| `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps N] [--net-rx-bps N] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
 | `port` / `port-forward` | `rungv port <ls\|add\|rm>` lists, adds, and removes host-to-guest NAT rules (requiring `--dynamic-ports` or `--auto-publish` under lockdown). `rungv port-forward` (alias `pf`) listens on the client and tunnels TCP connections via `net.dial` with zero lockdown relaxation. |
 | `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, unmounts targets, or serves a host directory via `rpcfs` (`mount serve HOST_DIR:GUEST_PATH`). |
 | `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect sandbox metadata, stream resource counters and kernel logs, send signals, stop PID 1 cleanly, or adjust Sentry log verbosity. |
+
+### 4.13 NAT bandwidth limits
+
+The rates share one budget per direction across all flows in a sandbox. Transmit means out of the guest. Receive means into the guest. The rates default to `0` (unlimited). Use them only with `-net=nat`.
+
+TCP and UDP relays count payload bytes. The limits also cover upstream DNS traffic, published ports, and `port-forward` tunnels. Traffic that does not use a relay counts IP bytes, including the header of each fragment.
+
+Each direction permits bursts up to 256 KiB. A full queue can drop datagrams or IP packets. Stream relays wait for available bandwidth. The limits do not regulate host socket buffers, traffic that stays inside the guest, or control protocol framing.
+
+The Go SDK does not combine bandwidth limits with `Config.StreamInterceptor`.
+
+Set the rates at startup or change them on a running sandbox. Omit a rate in `update` to keep its current value.
+
+```sh
+rungv run --net=nat --net-tx-bps 2000000 --net-rx-bps 8000000 --name app --control alpine:3.20 sleep 600
+rungv update -n app --net-tx-bps 4000000
+rungv update -n app --net-rx-bps 0
+```
 
 ## 5. Images and registries
 

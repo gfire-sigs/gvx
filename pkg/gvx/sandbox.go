@@ -72,6 +72,9 @@ type Sandbox struct {
 	netStack          *stack.Stack
 	natForwarder      *netbackend.NATForwarder
 	portForwarder     *netbackend.PortForwarder
+	bandwidth         *netbackend.BandwidthShaper
+	natTunnelGroup    *natTunnelGroup // protected by mu
+	shapedNATTunnels  int             // protected by mu
 	wgEndpoint        *netbackend.WireGuardEndpoint
 	wgPeerPort        uint16
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
@@ -688,6 +691,12 @@ func (s *Sandbox) Close() error {
 		s.cfg.CheckpointListener = nil
 	}
 
+	if s.bandwidth != nil {
+		// Queued transfers can hold relay buffers until the shaper stops.
+		s.mu.Unlock()
+		s.bandwidth.Close()
+		s.mu.Lock()
+	}
 	if s.portForwarder != nil {
 		if err := s.portForwarder.Close(); err != nil {
 			errs = append(errs, err)

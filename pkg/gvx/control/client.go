@@ -80,7 +80,7 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 		Version:  ProtocolVersion,
 		Token:    token,
 		Client:   opts.ClientName,
-		Features: []string{"zstd", "scm_rights"},
+		Features: []string{"zstd", "scm_rights", FeatureNetQoS},
 	}
 	reqBytes, err := json.Marshal(helloReq)
 	if err != nil {
@@ -151,7 +151,7 @@ func (c *Client) HasCapability(capName string) bool {
 	return slices.Contains(c.capabilities, capName)
 }
 
-// HasFeature reports whether feature was negotiated during HELLO.
+// HasFeature reports whether the server advertised feature during HELLO.
 func (c *Client) HasFeature(feature string) bool {
 	return slices.Contains(c.features, feature)
 }
@@ -183,27 +183,35 @@ func (c *Client) Close() error {
 
 // OpenStream opens a new multiplexed RPC stream, sends FrameRequest (plus any
 // SCM_RIGHTS fds), and returns the active stream before waiting for FrameResponse.
+// Bandwidth fields in resource.update require FeatureNetQoS.
 func (c *Client) OpenStream(ctx context.Context, method string, params any, fds ...int) (*Stream, error) {
-	stream, err := c.conn.allocStream(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var rawParams json.RawMessage
 	if params != nil {
 		b, err := json.Marshal(params)
 		if err != nil {
-			stream.Close()
 			return nil, fmt.Errorf("control: marshal params for %q: %w", method, err)
 		}
 		rawParams = b
+	}
+	if method == MethodResourceUpdate && len(rawParams) != 0 && !c.HasFeature(FeatureNetQoS) {
+		var update ResourceUpdateRequest
+		if err := json.Unmarshal(rawParams, &update); err != nil {
+			return nil, NewErrorf(CodeInvalidArgument, "invalid resource.update params: %v", err)
+		}
+		if update.NetTXBPS != nil || update.NetRXBPS != nil {
+			return nil, NewError(CodeUnsupported, "control server does not support NAT bandwidth updates")
+		}
 	}
 	payload, err := json.Marshal(RequestEnvelope{
 		Method: method,
 		Params: rawParams,
 	})
 	if err != nil {
-		stream.Close()
 		return nil, fmt.Errorf("control: marshal request %q: %w", method, err)
+	}
+	stream, err := c.conn.allocStream(ctx)
+	if err != nil {
+		return nil, err
 	}
 	if err := c.conn.writeFrame(Frame{
 		Type:     FrameRequest,

@@ -194,6 +194,68 @@ func TestLegacyV1CheckpointCompatibility(t *testing.T) {
 	}
 }
 
+func TestChannelWriterReportsFramesBeforeCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	writeCtx, stopWrite := context.WithCancel(ctx)
+	defer stopWrite()
+	payload := bytes.Repeat([]byte("gvx"), InitialStreamWindow/3+2)
+	type result struct {
+		n   int
+		err error
+	}
+	resultC := make(chan result, 1)
+	handler := &testHandler{
+		streamHandler: func(_ context.Context, s *Stream, _ RequestEnvelope, fds []int) error {
+			closeFDs(fds)
+			if err := s.SendResponse(FSExportResponse{}); err != nil {
+				return err
+			}
+			w := s.ChannelWriter(writeCtx, ChannelGeneric, false)
+			n, err := w.Write(payload)
+			resultC <- result{n, err}
+			return w.Close()
+		},
+	}
+	ep, _, _ := startTestServer(t, "127.0.0.1:0", ListenOptions{}, ServerConfig{
+		Handler: handler, MaxFrameBytes: 64 << 10,
+	})
+	client, err := Dial(ctx, DialOptions{Endpoint: ep.Address})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	s, err := client.OpenStream(ctx, MethodFSExport, FSExportRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.WaitResponse(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	reader := s.ChannelReader(ctx, ChannelGeneric)
+	var first [1]byte
+	if _, err := io.ReadFull(reader, first[:]); err != nil {
+		t.Fatal(err)
+	}
+	stopWrite()
+	var written result
+	select {
+	case written = <-resultC:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := append(first[:], rest...)
+	if !errors.Is(written.err, context.Canceled) || written.n != len(got) ||
+		len(got) >= len(payload) || !bytes.Equal(got, payload[:len(got)]) {
+		t.Fatalf("write returned (%d, %v) after delivering %d of %d bytes", written.n, written.err, len(got), len(payload))
+	}
+}
+
 func TestMultiplexedFlowControlAndCompression(t *testing.T) {
 	// Transfer 3 MiB (> 3x InitialStreamWindow) concurrently across two streams
 	// with zstd compression enabled on one and disabled on the other.

@@ -148,6 +148,8 @@ func TestRunFlagsRejectUnsupportedAndInvalidInput(t *testing.T) {
 		{"host network", []string{"--network", "host", "-image=x"}, "network"},
 		{"small memory", []string{"-m", "1m", "-image=x"}, "-m"},
 		{"bad cpus", []string{"--cpus", "abc", "-image=x"}, "--cpus"},
+		{"negative bandwidth", []string{"--net-tx-bps=-1", "-image=x"}, "--net-tx-bps"},
+		{"non-NAT bandwidth", []string{"--net=none", "--net-rx-bps=0", "-image=x"}, "require -net=nat"},
 		{"bad env name", []string{"-e", "A B=1", "-image=x"}, "-e"},
 		{"unknown pull policy", []string{"--pull", "sometimes", "-image=x"}, "--pull"},
 		{"missing env file", []string{"--env-file", filepath.Join(t.TempDir(), "absent.env"), "-image=x"}, "--env-file"},
@@ -274,5 +276,19 @@ func TestRunFlagsAutoPublishIsOptIn(t *testing.T) {
 				t.Errorf("AutoPublishPorts = %v, want %v", rc.cfg.AutoPublishPorts, tc.want)
 			}
 		})
+	}
+}
+
+func TestRunFlagsSetNATBandwidth(t *testing.T) {
+	rc, code, done, stderr := parse(t, "--network=bridge", "--net-tx-bps", "1000000000000", "--net-rx-bps=100", "-image=x")
+	if done || code != 0 {
+		t.Fatalf("parse NAT bandwidth flags: code=%d, done=%t, stderr=%q", code, done, stderr)
+	}
+	rates := rc.cfg.NetworkBandwidth
+	if rates.TXBPS != 1_000_000_000_000 || rates.RXBPS != 100 {
+		t.Fatalf("configured bandwidth = %+v, want TX 1000000000000 and RX 100 bps", rates)
+	}
+	if _, code, done, _ := parse(t, "--net-tx-bps=1000000000001", "-image=x"); !done || code != 2 {
+		t.Fatalf("parse rate above NAT bandwidth maximum: code=%d, done=%t, want usage error", code, done)
 	}
 }

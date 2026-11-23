@@ -89,17 +89,28 @@ func classifyDialError(err error) dialAnswer {
 	return answerReset
 }
 
-// answerFailedDial completes r after its host dial to targetAddr failed with
-// err. It sends the ICMP message of the answer before it completes r, so a
-// retransmitted SYN cannot start a new dial before the guest gets the error.
-// When the message cannot be sent, the SYN gets no answer.
+// answerFailedDial queues the original SYN before it sends a terminal error.
+// Timeout and unreachable IPv6 dials leave the SYN unanswered.
 func (nf *NATForwarder) answerFailedDial(r *tcp.ForwarderRequest, targetAddr string, err error) {
 	answer := classifyDialError(err)
-	if code, ok := answer.icmpCode(); ok && !nf.sendDestinationUnreachable(r.ID(), code) {
-		answer = answerNone
+	code, unreachable := answer.icmpCode()
+	if unreachable {
+		id := r.ID()
+		if id.LocalAddress.Len() != header.IPv4AddressSize || id.RemoteAddress.Len() != header.IPv4AddressSize {
+			answer = answerNone
+		}
 	}
 	nf.log.Debug("netbackend: dial host TCP target", "target", targetAddr, "error", err, "answer", answer.String())
-	r.Complete(answer == answerReset)
+	switch answer {
+	case answerNone:
+		r.Complete(false)
+	case answerReset:
+		r.CompleteNATRejection(nil)
+	default:
+		r.CompleteNATRejection(func(id stack.TransportEndpointID) {
+			nf.sendDestinationUnreachable(id, code)
+		})
+	}
 }
 
 // sendDestinationUnreachable sends an ICMPv4 destination unreachable message

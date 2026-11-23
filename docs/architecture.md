@@ -450,6 +450,10 @@ A DNS relay (`dns_relay.go`) answers guest UDP and TCP queries to `10.0.2.3:53` 
 
 TCP DNS queries from the guest travel directly over upstream TCP, while truncated UDP answers retry over TCP. The relay answers internal names (`localhost`, `host.docker.internal`, `gateway.docker.internal`, `gvx`) authoritatively for every `IN` query type without leaking them upstream. External `AAAA` queries return empty `NOERROR` when the guest has no IPv6 route on `eth0`. The relay defines no fixed public resolver address. `Config.HostDNSServers` (`--host-dns`) supplies explicit resolvers on hosts without `/etc/resolv.conf`, and `LayerCache.SetDNSServers` passes them to `pkg/oci`.
 
+Each sandbox owns one transmit bucket and one receive bucket. The NAT relay, published ports, DNS relay, private peer, and control tunnels share the buckets. Relays count payload. The private peer counts original IP bytes for traffic outside a relay.
+
+The buckets do not belong to the guest network stack or the host operating system. The checkpoint does not store their state or rates.
+
 #### Track B: L3 In-Memory WireGuard Tunnel (`wireguard_endpoint.go` and `pkg/tcpip/link/wgtun`) (Descriptive Module)
 
 In `-net=wg` mode, `wireguard_endpoint.go` attaches a shared `wgtun.Endpoint` (`pkg/tcpip/link/wgtun`, default MTU 1420) directly to `golang.zx2c4.com/wireguard/device` in Go memory. `wgtun.Endpoint` implements both `stack.LinkEndpoint` and `wireguard-go`'s `tun.Device` with 16-packet batch reads and `Suspend`/`Resume` lifecycle hooks, serving both host `-net=wg` tunnels and in-guest `genetlink/wireguard` interfaces. Before `hostlockdown.Apply()` locks down the process, `wireguard_endpoint.go` opens one host UDP socket (`net.ListenPacket("udp", ":0")`) and passes it to `wireguard_bind.go`. Outbound guest IP packets enter `wireguard-go` in memory for ChaCha20-Poly1305 encryption and exit exclusively through that pre-bound UDP socket. Guest DNS queries to `10.0.2.3:53` resolve through `dns_relay.go`.

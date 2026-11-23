@@ -140,7 +140,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --dynamic-ports -e --env-file -u --user -m --memory --cpus --pids-limit --net --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --dynamic-ports -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --backend --platform --pull --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -152,8 +152,13 @@ _rungv_completions() {
             ;;
         update)
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-S --control-socket -n --name --token --token-file --timeout -m --memory --force-memory --cpus --cpu-quota --cpu-period --pids-limit --isolate-lan --tune -f --format --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-S --control-socket -n --name --token --token-file --timeout -m --memory --force-memory --cpus --cpu-quota --cpu-period --pids-limit --isolate-lan --net-tx-bps --net-rx-bps --tune -f --format --help" -- "${cur}") )
                 return 0
+            fi
+            ;;
+        restore|resume)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--net-tx-bps --net-rx-bps" -- "${cur}") )
             fi
             ;;
     esac
@@ -270,9 +275,16 @@ _rungv() {
                 '--control-token-file[Control token file path]:file:_files' \
                 '--allow-volume-attach[Allow POSIX SCM_RIGHTS volume attachment under lockdown]' \
                 '--net[Network mode]:mode:(nat wg none)' \
+                '--net-tx-bps[Limit NAT traffic from guest to host]:bps:' \
+                '--net-rx-bps[Limit NAT traffic from host to guest]:bps:' \
                 '--backend[Execution backend]:backend:(auto whpx hvf systrap)' \
                 '--platform[Target image platform]:platform:(linux/amd64 linux/arm64)' \
                 '--pull[Image pull policy]:policy:(missing always never)'
+            ;;
+        restore|resume|update)
+            _arguments \
+                '--net-tx-bps[Limit NAT traffic from guest to host]:bps:' \
+                '--net-rx-bps[Limit NAT traffic from host to guest]:bps:'
             ;;
     esac
 }
@@ -332,6 +344,8 @@ complete -c rungv -n "__fish_seen_subcommand_from port; and not __fish_seen_subc
 complete -c rungv -n "__fish_seen_subcommand_from mount; and not __fish_seen_subcommand_from ls list add remount rm remove serve" -a "ls add remount rm serve"
 complete -c rungv -n "__fish_seen_subcommand_from sandbox; and not __fish_seen_subcommand_from inspect" -a "inspect"
 complete -c rungv -n "__fish_seen_subcommand_from completion" -a "bash zsh fish powershell"
+complete -c rungv -n "__fish_seen_subcommand_from run restore resume update" -l net-tx-bps -r -d "Limit NAT traffic from guest to host"
+complete -c rungv -n "__fish_seen_subcommand_from run restore resume update" -l net-rx-bps -r -d "Limit NAT traffic from host to guest"
 `
 
 const powershellCompletionScript = `# PowerShell completion for rungv
@@ -349,6 +363,12 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
     }
 
     $sub = $tokens[1]
+    if ($sub -in @('run','restore','resume','update') -and $wordToComplete -like '-*') {
+        @('--net-tx-bps','--net-rx-bps') | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
+        }
+        return
+    }
     $candidates = switch ($sub) {
         'image'      { @('ls','list','pull','rm','remove','rmi','inspect','tag','save','load','prune') }
         'volume'     { @('create','ls','list','inspect','compact','rm','remove','prune') }
