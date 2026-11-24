@@ -33,7 +33,10 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/rpcfs"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/state/stateio"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -52,12 +55,21 @@ var ErrCheckpointRPCFSActive = errors.New("gvx: unmount active rpcfs proxy mount
 // ErrCheckpointNATTunnelActive reports that a NAT tunnel still needs to drain.
 var ErrCheckpointNATTunnelActive = errors.New("gvx: close active NAT control tunnels that used bandwidth limits before checkpointing")
 
+// ErrCheckpointEphemeralVolume reports that checkpointing rejects sandboxes
+// started with an ephemeral ext4lite volume.
+var ErrCheckpointEphemeralVolume = errors.New("gvx: sandboxes with ephemeral ext4lite volumes cannot be checkpointed")
+
 const (
-	// CheckpointManifestVersion is the version for bundles without a NAT policy.
+	// CheckpointManifestVersion is the version for bundles without a NAT policy
+	// or capped ext4lite volume mounts.
 	CheckpointManifestVersion = 1
 
 	// A runtime that cannot require an explicit policy must reject this bundle.
 	checkpointManifestNATPolicyVersion = 2
+
+	// checkpointManifestVolumeLimitVersion is the manifest version for bundles
+	// with one or more size-capped persistent ext4lite volumes.
+	checkpointManifestVolumeLimitVersion = 3
 
 	checkpointManifestFileName  = "manifest.json"
 	checkpointStateFileName     = "state.img"
@@ -81,31 +93,41 @@ type AddrHoleEntry struct {
 	End   uint64 `json:"end"`
 }
 
+// ManifestVolumeLimit records the persistent ext4lite byte cap of a mount in a
+// version 3 checkpoint manifest.
+type ManifestVolumeLimit struct {
+	MaxBytes int64 `json:"max_bytes"`
+}
+
 // ManifestMount records one configured or runtime-attached mount in a
 // checkpoint manifest.
 type ManifestMount struct {
-	Type       MountKind `json:"type"`
-	GuestPath  string    `json:"guest_path"`
-	ReadOnly   bool      `json:"read_only"`
-	Kind       string    `json:"kind,omitempty"`
-	Dynamic    bool      `json:"dynamic,omitempty"`
-	Label      string    `json:"label,omitempty"`
-	SingleFile bool      `json:"single_file,omitempty"`
+	Type            MountKind            `json:"type"`
+	GuestPath       string               `json:"guest_path"`
+	ReadOnly        bool                 `json:"read_only"`
+	BackingReadOnly *bool                `json:"backing_read_only,omitempty"`
+	Kind            string               `json:"kind,omitempty"`
+	Dynamic         bool                 `json:"dynamic,omitempty"`
+	Label           string               `json:"label,omitempty"`
+	SingleFile      bool                 `json:"single_file,omitempty"`
+	Ephemeral       bool                 `json:"ephemeral,omitempty"`
+	VolumeLimit     *ManifestVolumeLimit `json:"volume_limit,omitempty"`
 }
 
 // CheckpointManifest describes the host and sandbox configuration of a saved
 // checkpoint bundle in manifest.json.
 type CheckpointManifest struct {
-	Version          int             `json:"version"`
-	GOOS             string          `json:"goos"`
-	GOARCH           string          `json:"goarch"`
-	Platform         string          `json:"platform"`
-	Arch             string          `json:"arch"`
-	UserAddressHoles []AddrHoleEntry `json:"user_address_holes,omitempty"`
-	LayerDigests     []string        `json:"layer_digests,omitempty"`
-	RootVolume       bool            `json:"root_volume,omitempty"`
-	Mounts           []ManifestMount `json:"mounts,omitempty"`
-	NetMode          NetMode         `json:"net_mode"`
+	Version           int             `json:"version"`
+	GOOS              string          `json:"goos"`
+	GOARCH            string          `json:"goarch"`
+	Platform          string          `json:"platform"`
+	Arch              string          `json:"arch"`
+	UserAddressHoles  []AddrHoleEntry `json:"user_address_holes,omitempty"`
+	LayerDigests      []string        `json:"layer_digests,omitempty"`
+	RootVolume        bool            `json:"root_volume,omitempty"`
+	Mounts            []ManifestMount `json:"mounts,omitempty"`
+	NetMode           NetMode         `json:"net_mode"`
+	NATPolicyRequired bool            `json:"nat_policy_required,omitempty"`
 	// Eth0 records the addresses, MTU, and routes that the guest set on eth0
 	// in NAT mode. A restore applies them again. The field is absent in other
 	// network modes and in bundles of older runtimes.
@@ -117,6 +139,34 @@ type CheckpointManifest struct {
 	// runtimes.
 	MemoryLimitBytes uint64    `json:"memory_limit_bytes,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
+}
+
+// MarshalJSON writes nat_policy_required explicitly for version 3 manifests
+// while omitting it in version 1 and version 2 manifests.
+func (m CheckpointManifest) MarshalJSON() ([]byte, error) {
+	if m.Version < checkpointManifestVolumeLimitVersion {
+		type legacyManifest CheckpointManifest
+		cp := legacyManifest(m)
+		cp.NATPolicyRequired = false
+		return json.Marshal(cp)
+	}
+	type v3Manifest struct {
+		Version           int                    `json:"version"`
+		GOOS              string                 `json:"goos"`
+		GOARCH            string                 `json:"goarch"`
+		Platform          string                 `json:"platform"`
+		Arch              string                 `json:"arch"`
+		UserAddressHoles  []AddrHoleEntry        `json:"user_address_holes,omitempty"`
+		LayerDigests      []string               `json:"layer_digests,omitempty"`
+		RootVolume        bool                   `json:"root_volume,omitempty"`
+		Mounts            []ManifestMount        `json:"mounts,omitempty"`
+		NetMode           NetMode                `json:"net_mode"`
+		NATPolicyRequired bool                   `json:"nat_policy_required"`
+		Eth0              *netbackend.Eth0Config `json:"eth0,omitempty"`
+		MemoryLimitBytes  uint64                 `json:"memory_limit_bytes,omitempty"`
+		CreatedAt         time.Time              `json:"created_at"`
+	}
+	return json.Marshal(v3Manifest(m))
 }
 
 type checkpointBundleFiles struct {
@@ -244,7 +294,11 @@ func sandboxManifestMounts(mounts []sandboxMount) []ManifestMount {
 	out := make([]ManifestMount, len(mounts))
 	for i, sm := range mounts {
 		kind := "tmpfs"
-		var label string
+		var (
+			label           string
+			backingReadOnly *bool
+			volLimit        *ManifestVolumeLimit
+		)
 		switch sm.Kind {
 		case MountBind:
 			kind = "hostfs"
@@ -253,6 +307,11 @@ func sandboxManifestMounts(mounts []sandboxMount) []ManifestMount {
 			if sm.volume != nil {
 				kind = "ext4lite"
 				label = cmp.Or(sm.VolumeName, sm.ImagePath)
+				if !sm.Ephemeral && sm.SizeBytes > 0 {
+					volLimit = &ManifestVolumeLimit{MaxBytes: sm.SizeBytes}
+					ro := sm.backingReadOnly
+					backingReadOnly = &ro
+				}
 			} else {
 				kind = "hostfs"
 				label = cmp.Or(sm.VolumeName, sm.hostPath)
@@ -266,12 +325,15 @@ func sandboxManifestMounts(mounts []sandboxMount) []ManifestMount {
 			label = sm.Mount.volumeLabel()
 		}
 		out[i] = ManifestMount{
-			Type:      sm.Kind,
-			GuestPath: sm.GuestPath,
-			ReadOnly:  sm.ReadOnly,
-			Kind:      kind,
-			Dynamic:   sm.dynamic,
-			Label:     label,
+			Type:            sm.Kind,
+			GuestPath:       sm.GuestPath,
+			ReadOnly:        sm.ReadOnly,
+			BackingReadOnly: backingReadOnly,
+			Kind:            kind,
+			Dynamic:         sm.dynamic,
+			Label:           label,
+			Ephemeral:       sm.Ephemeral,
+			VolumeLimit:     volLimit,
 		}
 	}
 	return out
@@ -290,8 +352,20 @@ func (s *Sandbox) buildCheckpointManifest() CheckpointManifest {
 	plat := s.plat
 	platName := s.platName
 	s.mu.Unlock()
+	natReq := s.natPolicy.RequiredOnRestore()
+	hasVolumeLimit := false
+	for _, mm := range mounts {
+		if mm.VolumeLimit != nil {
+			hasVolumeLimit = true
+			break
+		}
+	}
 	version := CheckpointManifestVersion
-	if s.natPolicy.RequiredOnRestore() {
+	natPolicyField := false
+	if hasVolumeLimit {
+		version = checkpointManifestVolumeLimitVersion
+		natPolicyField = natReq
+	} else if natReq {
 		version = checkpointManifestNATPolicyVersion
 	}
 
@@ -316,18 +390,128 @@ func (s *Sandbox) buildCheckpointManifest() CheckpointManifest {
 	}
 	s.rpcMountsMu.Unlock()
 	return CheckpointManifest{
-		Version:          version,
-		GOOS:             runtime.GOOS,
-		GOARCH:           runtime.GOARCH,
-		Platform:         platName,
-		Arch:             arch,
-		UserAddressHoles: platformAddrHoles(plat),
-		LayerDigests:     layerDigests,
-		RootVolume:       hasRootVol,
-		Mounts:           mounts,
-		NetMode:          netMode,
-		CreatedAt:        time.Now().UTC(),
+		Version:           version,
+		GOOS:              runtime.GOOS,
+		GOARCH:            runtime.GOARCH,
+		Platform:          platName,
+		Arch:              arch,
+		UserAddressHoles:  platformAddrHoles(plat),
+		LayerDigests:      layerDigests,
+		RootVolume:        hasRootVol,
+		Mounts:            mounts,
+		NetMode:           netMode,
+		NATPolicyRequired: natPolicyField,
+		CreatedAt:         time.Now().UTC(),
 	}
+}
+
+func (s *Sandbox) checkEphemeralCheckpointGuard() error {
+	s.mu.Lock()
+	ephemeral := s.hasEphemeralVolume
+	s.mu.Unlock()
+	if ephemeral {
+		return ErrCheckpointEphemeralVolume
+	}
+	return nil
+}
+
+// syncAndVerifyCappedVolumes verifies each live capped ext4lite volume while k
+// pauses tasks. It prunes unmounted entries and refreshes guest ReadOnly flags.
+func (s *Sandbox) syncAndVerifyCappedVolumes(k *kernel.Kernel) error {
+	s.mu.Lock()
+	capped := append([]cappedVolumeBinding(nil), s.cappedVolumes...)
+	s.mu.Unlock()
+	if len(capped) == 0 {
+		return nil
+	}
+
+	sctx := k.SupervisorContext()
+	root, mntns, rootErr := s.guestRoot(sctx, k)
+	if rootErr == nil {
+		defer root.DecRef(sctx)
+		defer mntns.DecRef(sctx)
+	}
+	vfsObj := k.VFS()
+	creds := auth.NewRootCredentials(k.RootUserNamespace())
+	sctxWithRoot := sctx
+	if rootErr == nil {
+		sctxWithRoot = withGuestVFS(sctx, root, mntns)
+	}
+
+	seenVols := make(map[*ext4lite.Volume]struct{}, len(capped))
+	for _, cv := range capped {
+		if cv.volume == nil {
+			continue
+		}
+		if _, seen := seenVols[cv.volume]; seen {
+			continue
+		}
+		seenVols[cv.volume] = struct{}{}
+
+		uniqueID, live := cv.volume.LiveUniqueID()
+		if !live {
+			s.mu.Lock()
+			s.mounts = slices.DeleteFunc(s.mounts, func(sm sandboxMount) bool {
+				return sm.volume == cv.volume
+			})
+			s.mu.Unlock()
+			continue
+		}
+
+		if rootErr != nil {
+			return fmt.Errorf("gvx: inspect guest root for capped volume %q: %w", cmp.Or(uniqueID, cv.guestPath), rootErr)
+		}
+
+		s.mu.Lock()
+		var candidatePaths []string
+		for _, sm := range s.mounts {
+			if sm.volume == cv.volume && sm.SizeBytes == cv.maxBytes {
+				candidatePaths = append(candidatePaths, sm.GuestPath)
+			}
+		}
+		s.mu.Unlock()
+
+		liveAtUniqueID := false
+		liveByPath := make(map[string]bool, len(candidatePaths))
+		roByPath := make(map[string]bool, len(candidatePaths))
+		for _, gp := range candidatePaths {
+			pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(gp), FollowFinalSymlink: false}
+			vd, err := vfsObj.GetDentryAt(sctxWithRoot, creds, &pop, &vfs.GetDentryOptions{})
+			if err != nil {
+				continue
+			}
+			isMountRoot := vd.Dentry() == vd.Mount().Root() && ext4lite.FilesystemUsesVolume(vd.Mount().Filesystem(), cv.volume)
+			liveRO := vd.Mount().ReadOnly()
+			vd.DecRef(sctxWithRoot)
+			if !isMountRoot {
+				continue
+			}
+			liveByPath[gp] = true
+			roByPath[gp] = liveRO
+			if gp == uniqueID {
+				liveAtUniqueID = true
+			}
+		}
+
+		if !liveAtUniqueID {
+			return fmt.Errorf("gvx: capped volume at %q was detached or overmounted while references remain open; close open descriptors before checkpointing", cmp.Or(uniqueID, cv.guestPath))
+		}
+
+		s.mu.Lock()
+		pruned := s.mounts[:0]
+		for _, sm := range s.mounts {
+			if sm.volume == cv.volume {
+				if !liveByPath[sm.GuestPath] {
+					continue
+				}
+				sm.ReadOnly = roByPath[sm.GuestPath]
+			}
+			pruned = append(pruned, sm)
+		}
+		s.mounts = pruned
+		s.mu.Unlock()
+	}
+	return nil
 }
 
 // AcceptCheckpointConn accepts one connection from Config.ControlListener or
@@ -401,6 +585,9 @@ func (s *Sandbox) snapshotEth0() *netbackend.Eth0Config {
 // resumes the sandbox after writing the bundle. When opts.LeaveRunning is
 // false, Checkpoint stops the guest kernel so Run returns cleanly.
 func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retErr error) {
+	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return err
+	}
 	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
 	// deadlocks with executeActiveKernel.
 	s.mu.Lock()
@@ -439,6 +626,10 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 		}
 	}()
 
+	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	files = s.ckptFiles
 	k := s.activeKernel
@@ -467,10 +658,6 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 		if err := s.forceStopExecSessions(ctx, k); err != nil {
 			return err
 		}
-	}
-
-	if err := files.rewindAndTruncate(); err != nil {
-		return err
 	}
 
 	if !alreadyPaused {
@@ -524,6 +711,12 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	}()
 	if err := k.ReceiveTaskStatesChecked(); err != nil {
 		return fmt.Errorf("gvx: capture task states for checkpoint: %w", err)
+	}
+	if err := s.syncAndVerifyCappedVolumes(k); err != nil {
+		return err
+	}
+	if err := files.rewindAndTruncate(); err != nil {
+		return err
 	}
 
 	if !alreadyQuiesced {
@@ -672,6 +865,9 @@ func (s *Sandbox) checkpointStreamRun(
 	opts CheckpointOptions,
 	streamFn func(manifestBytes, stateBytes, pagesMetaBytes, pagesBytes []byte) error,
 ) (retErr error) {
+	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return err
+	}
 	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
 	// deadlocks with executeActiveKernel.
 	s.mu.Lock()
@@ -704,6 +900,10 @@ func (s *Sandbox) checkpointStreamRun(
 			s.ckptMu.Unlock()
 		}
 	}()
+
+	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	k := s.activeKernel
@@ -788,6 +988,9 @@ func (s *Sandbox) checkpointStreamRun(
 
 	if err := k.ReceiveTaskStatesChecked(); err != nil {
 		return fmt.Errorf("gvx: capture task states for checkpoint: %w", err)
+	}
+	if err := s.syncAndVerifyCappedVolumes(k); err != nil {
+		return err
 	}
 	if !alreadyQuiesced {
 		for _, q := range quiescers {

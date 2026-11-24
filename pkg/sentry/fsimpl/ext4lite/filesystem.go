@@ -64,6 +64,16 @@ func (vol *Volume) chunkMemory() ChunkMemory {
 	return vol.chunkMem.Get()
 }
 
+// FilesystemUsesVolume reports whether vfsfs is an ext4lite filesystem backed
+// by vol.
+func FilesystemUsesVolume(vfsfs *vfs.Filesystem, vol *Volume) bool {
+	if vfsfs == nil || vol == nil {
+		return false
+	}
+	fs, ok := vfsfs.Impl().(*filesystem)
+	return ok && fs.vol == vol
+}
+
 // InternalFilesystemOptions is the vfs.GetFilesystemOptions.InternalData of a
 // mount. The sandbox opens the volume before the host lockdown and passes it
 // here. The ReadOnly option of the volume, not the read-only flag of the mount,
@@ -160,6 +170,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	fs.root.refs.Add(1)
 	fs.mu.Unlock()
 	vol.dataSync.Store(&dataSyncHook{fn: fs.syncMapped})
+	uid := uniqueID
+	vol.liveUniqueID.Store(&uid)
+	vol.liveFS.Store(true)
 	if !fs.readOnly {
 		fs.startFlusher()
 	}
@@ -330,6 +343,8 @@ func (fs *filesystem) Release(ctx context.Context) {
 	fs.mu.Unlock()
 	if fs.vol != nil {
 		fs.vol.dataSync.Store(nil)
+		fs.vol.liveFS.Store(false)
+		fs.vol.liveUniqueID.Store(nil)
 		// Release has no error result, so a failure is logged. An earlier Sync
 		// call already reported the failures that it saw.
 		if err := fs.vol.Close(); err != nil {

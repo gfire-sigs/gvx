@@ -29,6 +29,7 @@ package ext4lite
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 	"sync/atomic"
 )
@@ -308,11 +309,19 @@ func (v *volume) replayJournal(j *journal) error {
 			break
 		}
 	}
+	replayedBlocks := blocks
+	if v.hasMaxBytes && replayedBlocks > uint64(v.maxGroups)*blocksPerGroup {
+		return fmt.Errorf("%w: committed journal replays to %d blocks, limit is %d bytes", ErrVolumeExceedsMaxBytes, replayedBlocks, v.maxBytes)
+	}
 	hostSize, err := v.hf.Size()
 	if err != nil {
 		return hostError(err)
 	}
-	blocks = min(blocks, uint64(hostSize/blockSize), maxGroups*blocksPerGroup)
+	limitBlocks := uint64(maxGroups) * blocksPerGroup
+	if v.hasMaxBytes {
+		limitBlocks = uint64(v.maxGroups) * blocksPerGroup
+	}
+	blocks = min(replayedBlocks, uint64(hostSize/blockSize), limitBlocks)
 	for _, t := range txns {
 		for _, tag := range t.tags {
 			if rt, ok := revoked[tag.blk]; ok && rt >= t.tid {

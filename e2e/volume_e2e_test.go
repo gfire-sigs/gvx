@@ -159,3 +159,65 @@ func requireCleanImage(t *testing.T, image, after string) {
 		t.Errorf("after the %s sandbox the image is not marked clean (s_state %#x)", after, state)
 	}
 }
+
+// TestE2EEphemeralAndCappedVolumeUnderLockdown runs lockdownprobe with a
+// size-capped ephemeral ext4lite volume under default host lockdown and
+// verifies that no private image remains after sandbox exit.
+func TestE2EEphemeralAndCappedVolumeUnderLockdown(t *testing.T) {
+	probe := toolPath(t, lockdownProbePkg)
+	for _, b := range fixedAddressBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireFixedAddressBackend(t, b)
+			guest := acceptprog.BuildVolumeTree(t, hostArch())
+			cacheDir := t.TempDir()
+			outside := t.TempDir()
+			secret := filepath.Join(outside, "secret.txt")
+			if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code := runTool(t, probe,
+				"-bin="+guest, "-cache-dir="+cacheDir, "-platform="+string(b.plat),
+				"-mount=type=volume,dst=/data,ephemeral,size=32m",
+				"-outside-file="+secret, "-outside-dir="+outside,
+				"write", "/data")
+			if code != 0 {
+				t.Fatalf("lockdownprobe ephemeral: exit code %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
+			}
+			var rep lockdownprobe.Report
+			if err := json.Unmarshal([]byte(stdout), &rep); err != nil {
+				t.Fatalf("decode probe report %q: %v", stdout, err)
+			}
+			if msg := rep.NewErr; msg != "" {
+				if strings.Contains(msg, "not position-independent") {
+					t.Skipf("backend cannot hold a fixed-address executable: %s", msg)
+				}
+				t.Fatalf("New failed: %s", msg)
+			}
+			if !rep.Lockdown.Applied || !rep.LockedAPI || !rep.Lockdown.UnboundFileOpenBlocked {
+				t.Fatalf("lockdown = %+v LockedAPI=%v, want Applied, LockedAPI, and UnboundFileOpenBlocked", rep.Lockdown, rep.LockedAPI)
+			}
+			if rep.WriteOutsideErr == "" || rep.ReadOutsideErr == "" {
+				t.Fatalf("outside host access = (read=%q, write=%q), want both denied", rep.ReadOutsideErr, rep.WriteOutsideErr)
+			}
+			if msg := rep.GuestRunErr; strings.Contains(msg, "not position-independent") {
+				t.Skipf("backend cannot hold a fixed-address executable: %s", msg)
+			}
+			if rep.GuestRunErr != "" || rep.GuestExitCode != 0 || rep.GuestStdout != "write ok\n" {
+				t.Fatalf("guest = (code=%d, stdout=%q, err=%q)", rep.GuestExitCode, rep.GuestStdout, rep.GuestRunErr)
+			}
+			if _, err := os.Stat(filepath.Join(cacheDir, "volumes")); !os.IsNotExist(err) {
+				t.Fatalf("ephemeral mount created named volumes directory: err=%v", err)
+			}
+			entries, err := os.ReadDir(filepath.Join(cacheDir, "ephemeral-volumes"))
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("ReadDir(ephemeral-volumes): %v", err)
+			}
+			for _, ent := range entries {
+				if ent.Name() == ".lock" {
+					continue
+				}
+				t.Fatalf("leftover ephemeral file %q after sandbox exit", ent.Name())
+			}
+		})
+	}
+}

@@ -251,7 +251,7 @@ func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
 	registerAlias([]string{"v", "volume"}, func(n string) {
 		fs.Var(&f.volumeFlags, n, "Mount a host directory, one host file, or a named volume (an ext4 image file): src:dst[:ro|rw]")
 	})
-	fs.Var(&f.mountFlags, "mount", "Mount with Docker syntax: type=bind|volume|tmpfs|overlay,src=...,dst=...[,upper=...][,tmpfs-size=...][,readonly][,driver=ext4lite|hostfs]")
+	fs.Var(&f.mountFlags, "mount", "Mount with Docker syntax: type=bind|volume|tmpfs|overlay,src=...,dst=...[,upper=...][,size=...][,ephemeral][,tmpfs-size=...][,readonly][,driver=ext4lite|hostfs]")
 	fs.Var(&f.tmpfsFlags, "tmpfs", "Mount a tmpfs: /path[:size=64m,ro]")
 }
 

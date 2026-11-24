@@ -16,6 +16,7 @@ package ext4lite
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -25,9 +26,36 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 )
 
-// ErrVolumeInUse is the error of OpenVolume when another handle holds a
-// conflicting lock on the host file.
-var ErrVolumeInUse = errVolumeInUse
+const (
+	// MinVolumeBytes is the smallest valid VolumeOptions.MaxBytes value (one 16 MiB group).
+	MinVolumeBytes int64 = groupBytes
+	// MaxVolumeBytes is the largest valid VolumeOptions.MaxBytes value (64 TiB).
+	MaxVolumeBytes int64 = maxVolumeBytes
+)
+
+var (
+	// ErrVolumeInUse is the error of OpenVolume when another handle holds a
+	// conflicting lock on the host file.
+	ErrVolumeInUse = errVolumeInUse
+
+	// ErrInvalidVolumeSize reports an out-of-range or unaligned VolumeOptions.MaxBytes value.
+	ErrInvalidVolumeSize = errors.New("ext4lite: volume size limit must be a multiple of 16 MiB between 16 MiB and 64 TiB")
+
+	// ErrVolumeExceedsMaxBytes reports that an existing or recovered volume exceeds VolumeOptions.MaxBytes.
+	ErrVolumeExceedsMaxBytes = errors.New("ext4lite: volume image exceeds configured size limit")
+)
+
+// ValidateMaxBytes validates a volume size limit against the 16 MiB group
+// geometry. Zero is valid and preserves the 64 TiB maximum.
+func ValidateMaxBytes(maxBytes int64) error {
+	if maxBytes == 0 {
+		return nil
+	}
+	if maxBytes < MinVolumeBytes || maxBytes > MaxVolumeBytes || maxBytes%MinVolumeBytes != 0 {
+		return fmt.Errorf("%w: got %d bytes", ErrInvalidVolumeSize, maxBytes)
+	}
+	return nil
+}
 
 // VolumeLockMode describes the advisory OS lock state of a volume image file.
 type VolumeLockMode uint8
@@ -66,6 +94,9 @@ type VolumeOptions struct {
 	// OpenVolume so CompleteRestore can rebind open unlinked and O_TMPFILE
 	// inodes before sweeping unreferenced orphans.
 	DeferOrphanCleanup bool
+
+	// MaxBytes caps the image in bytes. Zero preserves the existing limit.
+	MaxBytes int64
 }
 
 // Volume is an open image in one host file. The sandbox opens the volume
@@ -78,9 +109,39 @@ type Volume struct {
 	chunkMem chunkcache.ChunkMemoryHolder
 	// mounted is set by the first mount. A volume serves one filesystem.
 	mounted atomic.Bool
+	// liveFS reports whether a VFS filesystem backed by this volume has not yet
+	// finished Release.
+	liveFS       atomic.Bool
+	liveUniqueID atomic.Pointer[string]
 	// dataSync writes the mapped pages of the mounted file system. The mount
 	// sets it.
 	dataSync atomic.Pointer[dataSyncHook]
+}
+
+// MaxBytes returns the configured byte cap of vol, or zero when uncapped.
+func (vol *Volume) MaxBytes() int64 {
+	if vol == nil || vol.v == nil || !vol.v.hasMaxBytes {
+		return 0
+	}
+	return vol.v.maxBytes
+}
+
+// IsLiveFilesystem reports whether a mounted or lazy-detached VFS filesystem
+// still holds references to vol.
+func (vol *Volume) IsLiveFilesystem() bool {
+	return vol != nil && vol.liveFS.Load()
+}
+
+// LiveUniqueID returns the VFS filesystem UniqueID bound to vol and true while
+// a mounted or lazy-detached filesystem still holds references to vol.
+func (vol *Volume) LiveUniqueID() (string, bool) {
+	if vol == nil || !vol.liveFS.Load() {
+		return "", false
+	}
+	if p := vol.liveUniqueID.Load(); p != nil {
+		return *p, true
+	}
+	return "", true
 }
 
 // OpenVolume takes ownership of f. It formats the file as a new volume when
@@ -88,6 +149,12 @@ type Volume struct {
 // opens acquire a shared lock and writable opens acquire an exclusive lock,
 // returning ErrVolumeInUse on lock conflict. On an error, OpenVolume closes f.
 func OpenVolume(f *os.File, opts VolumeOptions) (*Volume, error) {
+	if err := ValidateMaxBytes(opts.MaxBytes); err != nil {
+		if f != nil {
+			_ = f.Close()
+		}
+		return nil, err
+	}
 	hf, err := newHostFileMode(f, opts.ReadOnly)
 	if err != nil {
 		_ = f.Close()
@@ -123,10 +190,16 @@ func RemoveVolumeFile(path string) error {
 }
 
 func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
+	if err := ValidateMaxBytes(opts.MaxBytes); err != nil {
+		return nil, err
+	}
 	hf = &countedFile{hostFile: hf, stats: blockdev.NewStats(nil)}
 	size, err := hf.Size()
 	if err != nil {
 		return nil, hostError(err)
+	}
+	if opts.MaxBytes > 0 && size > opts.MaxBytes {
+		return nil, fmt.Errorf("%w: host file has %d bytes, limit is %d bytes", ErrVolumeExceedsMaxBytes, size, opts.MaxBytes)
 	}
 	freshFormatted := false
 	if !opts.ReadOnly && !opts.DeferOrphanCleanup {
@@ -148,6 +221,7 @@ func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
 		readOnly:           opts.ReadOnly,
 		deferOrphanCleanup: opts.DeferOrphanCleanup,
 		freshFormatted:     freshFormatted,
+		maxBytes:           opts.MaxBytes,
 	})
 }
 

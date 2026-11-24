@@ -36,6 +36,8 @@ type volumeOptions struct {
 	// freshFormatted indicates that formatVolume just preallocated the volume
 	// densely before openVolume, so free blocks have not been hole-punched.
 	freshFormatted bool
+	// maxBytes caps the volume size in bytes. Zero uses maxVolumeBytes.
+	maxBytes int64
 	// now returns the current time. The default is time.Now.
 	now func() time.Time
 }
@@ -47,9 +49,12 @@ type volumeOptions struct {
 type volume struct {
 	hf hostFile
 	// stats counts the host calls on hf as the requests of a block device.
-	stats    *blockdev.Stats
-	readOnly bool
-	now      func() time.Time
+	stats       *blockdev.Stats
+	readOnly    bool
+	hasMaxBytes bool
+	maxGroups   uint32
+	maxBytes    int64
+	now         func() time.Time
 
 	// flushMu serializes flushes and the close.
 	flushMu sync.Mutex
@@ -216,6 +221,15 @@ func checkSuperblock(sb []byte, hostSize int64) (groups uint32, err error) {
 // end cleanly. A writable mount clears the valid bit before it returns, so a
 // crash after that point triggers fsckLite at the next mount.
 func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
+	if err := ValidateMaxBytes(opts.maxBytes); err != nil {
+		return nil, err
+	}
+	limitGroups := uint32(maxGroups)
+	limitBytes := int64(maxVolumeBytes)
+	if opts.maxBytes > 0 {
+		limitGroups = uint32(opts.maxBytes / groupBytes)
+		limitBytes = opts.maxBytes
+	}
 	// Every host call goes through a countedFile. mountHostFile wraps the file
 	// before it formats it, so the counters include the writes of mkfs.
 	counted, ok := hf.(*countedFile)
@@ -224,12 +238,15 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 		hf = counted
 	}
 	v := &volume{
-		hf:         hf,
-		stats:      counted.stats,
-		readOnly:   opts.readOnly,
-		now:        opts.now,
-		nodes:      make(map[uint32]*node),
-		dirtyNodes: make(map[uint32]*node),
+		hf:          hf,
+		stats:       counted.stats,
+		readOnly:    opts.readOnly,
+		hasMaxBytes: opts.maxBytes > 0,
+		maxGroups:   limitGroups,
+		maxBytes:    limitBytes,
+		now:         opts.now,
+		nodes:       make(map[uint32]*node),
+		dirtyNodes:  make(map[uint32]*node),
 	}
 	// Every write to the image goes through v.hf, so one wrapper sees them all.
 	v.hf = &trackedFile{hostFile: hf, v: v}
@@ -244,6 +261,9 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	if err != nil {
 		return nil, hostError(err)
 	}
+	if opts.maxBytes > 0 && size > opts.maxBytes {
+		return nil, fmt.Errorf("%w: host file has %d bytes, limit is %d bytes", ErrVolumeExceedsMaxBytes, size, opts.maxBytes)
+	}
 	v.hostBytes = size
 	var block0 [blockSize]byte
 	if _, err := hf.ReadAt(block0[:], 0); err != nil {
@@ -253,6 +273,9 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	groups, err := checkSuperblock(v.sb[:], size)
 	if err != nil {
 		return nil, err
+	}
+	if groups > v.maxGroups {
+		return nil, fmt.Errorf("%w: superblock has %d groups (%d bytes), limit is %d bytes", ErrVolumeExceedsMaxBytes, groups, int64(groups)*groupBytes, v.maxBytes)
 	}
 	v.state = le.Uint16(v.sb[sbState:])
 
@@ -275,6 +298,9 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 			recovered = true
 			if groups, err = checkSuperblock(v.sb[:], size); err != nil {
 				return nil, err
+			}
+			if groups > v.maxGroups {
+				return nil, fmt.Errorf("%w: recovered superblock has %d groups (%d bytes), limit is %d bytes", ErrVolumeExceedsMaxBytes, groups, int64(groups)*groupBytes, v.maxBytes)
 			}
 			v.state = le.Uint16(v.sb[sbState:])
 			// The replay can change the size of the volume and the journal
@@ -560,16 +586,21 @@ func (v *volume) statfs() statfsInfo {
 		meta += uint64(metaBlocksOf(uint32(gi)))
 	}
 	total := groups*blocksPerGroup - meta
+	limitGroups := uint64(v.maxGroups)
+	if limitGroups == 0 {
+		limitGroups = maxGroups
+	}
 	growBlocks := uint64(0)
-	if groups < maxGroups {
-		growBlocks = (maxGroups - groups) * (blocksPerGroup - 2 - 2 - inodeTableBlocks)
+	if groups < limitGroups {
+		growBlocks = (limitGroups - groups) * (blocksPerGroup - 2 - 2 - inodeTableBlocks)
 		if avail, err := v.hf.AvailBytes(); err == nil {
 			growBlocks = min(growBlocks, avail/blockSize)
 		}
 	}
+	inodeLimitGroups := min(limitGroups, maxInodeGroups)
 	growInodes := uint64(0)
-	if groups < maxInodeGroups {
-		growInodes = (maxInodeGroups - groups) * inodesPerGroup
+	if groups < inodeLimitGroups {
+		growInodes = (inodeLimitGroups - groups) * inodesPerGroup
 		growInodes = min(growInodes, growBlocks)
 	}
 	inodeGroups := min(groups, maxInodeGroups)

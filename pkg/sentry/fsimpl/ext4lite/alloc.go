@@ -322,6 +322,9 @@ func (v *volume) ensureHostLocked(blockEnd uint64) error {
 	if need <= v.hostBytes {
 		return nil
 	}
+	if v.maxBytes > 0 && need > v.maxBytes {
+		return linuxerr.ENOSPC
+	}
 	if err := v.hf.EnsureSize(need); err != nil {
 		return hostError(err)
 	}
@@ -428,7 +431,11 @@ func (v *volume) allocInodePolicy(isDir bool, policy allocPolicy) (uint32, error
 		if policy == allocReuseHeld && v.heldInodesTotal > 0 {
 			return 0, errSpaceHeld
 		}
-		if uint32(len(v.groups)) >= maxInodeGroups {
+		inodeCap := uint32(maxInodeGroups)
+		if v.maxGroups > 0 && v.maxGroups < inodeCap {
+			inodeCap = v.maxGroups
+		}
+		if uint32(len(v.groups)) >= inodeCap {
 			if v.heldInodesTotal > 0 {
 				return 0, errSpaceHeld
 			}
@@ -476,11 +483,18 @@ func (v *volume) freeInode(ino uint32, isDir bool) error {
 
 // appendGroupLocked adds one 16 MiB block group at the end of the host file.
 func (v *volume) appendGroupLocked() error {
+	limitGroups := v.maxGroups
+	if limitGroups == 0 {
+		limitGroups = maxGroups
+	}
 	n := uint32(len(v.groups))
-	if n >= maxGroups {
+	if n >= limitGroups {
 		return linuxerr.ENOSPC
 	}
 	need := int64(n+1) * groupBytes
+	if v.maxBytes > 0 && need > v.maxBytes {
+		return linuxerr.ENOSPC
+	}
 	room := uint64(groupBytes)
 	if v.hf.Tier() == tierFallback {
 		// The fallback tier extends the file on demand. The new group needs its

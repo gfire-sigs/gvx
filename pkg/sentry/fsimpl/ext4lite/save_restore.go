@@ -412,6 +412,9 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 	fs.vol = vol
 	fs.v = vol.v
 	vol.dataSync.Store(&dataSyncHook{fn: fs.syncMapped})
+	uid := fs.uniqueID
+	vol.liveUniqueID.Store(&uid)
+	vol.liveFS.Store(true)
 	if !fs.readOnly {
 		fs.startFlusher()
 	}

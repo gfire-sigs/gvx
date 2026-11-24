@@ -154,6 +154,9 @@ func readAndParseManifest(dir string) (CheckpointManifest, error) {
 func validateManifestNATPolicy(m CheckpointManifest, supplied bool) error {
 	switch m.Version {
 	case CheckpointManifestVersion:
+		if m.NATPolicyRequired {
+			return fmt.Errorf("%w: version %d cannot set nat_policy_required", ErrCheckpointManifest, m.Version)
+		}
 		return nil
 	case checkpointManifestNATPolicyVersion:
 		if m.NetMode != NetModeNAT {
@@ -163,13 +166,168 @@ func validateManifestNATPolicy(m CheckpointManifest, supplied bool) error {
 			return fmt.Errorf("%w: this bundle requires a NAT policy; pass --nat-policy-file", ErrCheckpointManifest)
 		}
 		return nil
+	case checkpointManifestVolumeLimitVersion:
+		if m.NATPolicyRequired {
+			if m.NetMode != NetModeNAT {
+				return fmt.Errorf("%w: version %d with nat_policy_required requires NAT", ErrCheckpointManifest, m.Version)
+			}
+			if !supplied {
+				return fmt.Errorf("%w: this bundle requires a NAT policy; pass --nat-policy-file", ErrCheckpointManifest)
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("%w: unsupported version %d", ErrCheckpointManifest, m.Version)
 	}
 }
 
+func validateManifestMountsPreflight(m CheckpointManifest) error {
+	seenPaths := make(map[string]struct{}, len(m.Mounts))
+	cappedCount := 0
+	for _, mm := range m.Mounts {
+		if err := validateGuestPath(mm.GuestPath); err != nil {
+			return fmt.Errorf("%w: invalid manifest mount path %q: %v", ErrCheckpointManifest, mm.GuestPath, err)
+		}
+		if _, dup := seenPaths[mm.GuestPath]; dup {
+			return fmt.Errorf("%w: duplicate manifest mount path %q", ErrCheckpointManifest, mm.GuestPath)
+		}
+		seenPaths[mm.GuestPath] = struct{}{}
+		if mm.Ephemeral {
+			return fmt.Errorf("%w: manifest mount %q names an ephemeral volume", ErrCheckpointManifest, mm.GuestPath)
+		}
+		if mm.BackingReadOnly != nil && *mm.BackingReadOnly && !mm.ReadOnly {
+			return fmt.Errorf("%w: manifest mount %q has a writable guest view with a read-only backing file", ErrCheckpointManifest, mm.GuestPath)
+		}
+		if mm.VolumeLimit != nil {
+			if m.Version < checkpointManifestVolumeLimitVersion {
+				return fmt.Errorf("%w: manifest version %d cannot contain volume_limit at %q", ErrCheckpointManifest, m.Version, mm.GuestPath)
+			}
+			if mm.Type != MountVolume || mm.Kind != "ext4lite" {
+				return fmt.Errorf("%w: manifest volume_limit at %q requires type=volume and kind=ext4lite", ErrCheckpointManifest, mm.GuestPath)
+			}
+			if mm.VolumeLimit.MaxBytes <= 0 {
+				return fmt.Errorf("%w: manifest volume_limit at %q must be positive, got %d", ErrCheckpointManifest, mm.GuestPath, mm.VolumeLimit.MaxBytes)
+			}
+			if err := ext4lite.ValidateMaxBytes(mm.VolumeLimit.MaxBytes); err != nil {
+				return fmt.Errorf("%w: invalid manifest volume_limit at %q: %v", ErrCheckpointManifest, mm.GuestPath, err)
+			}
+			cappedCount++
+		}
+	}
+	if m.Version == checkpointManifestVolumeLimitVersion && cappedCount == 0 {
+		return fmt.Errorf("%w: manifest version %d requires at least one capped volume mount", ErrCheckpointManifest, m.Version)
+	}
+	return nil
+}
+
+func inheritRestoreMountLimits(cfg *Config, m CheckpointManifest) error {
+	bundleByPath := make(map[string]ManifestMount, len(m.Mounts))
+	for _, mm := range m.Mounts {
+		if mm.Type != MountRPCFS {
+			bundleByPath[mm.GuestPath] = mm
+		}
+	}
+	for i := range cfg.Mounts {
+		cm := &cfg.Mounts[i]
+		if cm.Ephemeral {
+			continue
+		}
+		bm, ok := bundleByPath[cm.GuestPath]
+		if !ok || bm.VolumeLimit == nil {
+			continue
+		}
+		if cm.Kind != MountVolume {
+			return fmt.Errorf("%w: capped mount %q requires type=volume, config has %s", ErrCheckpointManifest, cm.GuestPath, cm.Kind)
+		}
+		if cm.SizeBytes == 0 {
+			cm.SizeBytes = bm.VolumeLimit.MaxBytes
+		} else if cm.SizeBytes != bm.VolumeLimit.MaxBytes {
+			return fmt.Errorf("%w: volume limit mismatch at %q: bundle has %d bytes, config has %d bytes", ErrCheckpointManifest, cm.GuestPath, bm.VolumeLimit.MaxBytes, cm.SizeBytes)
+		}
+	}
+	return nil
+}
+
+func prepareRestoreConfigMounts(cfg *Config, m CheckpointManifest) (map[string]bool, error) {
+	for _, cm := range cfg.Mounts {
+		if cm.Ephemeral {
+			return nil, fmt.Errorf("%w: ephemeral ext4lite volume at %q cannot be restored", ErrInvalidConfig, cm.GuestPath)
+		}
+	}
+	bundleByPath := make(map[string]ManifestMount, len(m.Mounts))
+	for _, mm := range m.Mounts {
+		if mm.Type != MountRPCFS {
+			bundleByPath[mm.GuestPath] = mm
+		}
+	}
+	restoreBackingRO := make(map[string]bool)
+	inherited := false
+	for i := range cfg.Mounts {
+		cm := &cfg.Mounts[i]
+		bm, ok := bundleByPath[cm.GuestPath]
+		if !ok {
+			if cm.SizeBytes > 0 {
+				return nil, fmt.Errorf("%w: mounts mismatch: config has unexpected capped mount %q", ErrCheckpointManifest, cm.GuestPath)
+			}
+			continue
+		}
+		if bm.VolumeLimit != nil {
+			if cm.Kind != MountVolume {
+				return nil, fmt.Errorf("%w: capped mount %q requires type=volume, config has %s", ErrCheckpointManifest, cm.GuestPath, cm.Kind)
+			}
+			driver, err := cfg.resolveVolumeDriver(*cm)
+			if err != nil {
+				return nil, err
+			}
+			if driver != DriverExt4lite {
+				return nil, fmt.Errorf("%w: capped mount %q requires driver %q, resolved %q", ErrInvalidConfig, cm.GuestPath, DriverExt4lite, driver)
+			}
+			savedBackingRO := bm.ReadOnly
+			if bm.BackingReadOnly != nil {
+				savedBackingRO = *bm.BackingReadOnly
+			}
+			if !savedBackingRO && cm.ReadOnly {
+				return nil, fmt.Errorf("%w: capped mount %q was saved with a writable backing file and cannot be restored read-only", ErrCheckpointManifest, cm.GuestPath)
+			}
+			if savedBackingRO && !cm.ReadOnly {
+				return nil, fmt.Errorf("%w: capped mount %q was saved with a read-only backing file and cannot be restored read-write", ErrCheckpointManifest, cm.GuestPath)
+			}
+			restoreBackingRO[cm.GuestPath] = savedBackingRO
+			cm.ReadOnly = bm.ReadOnly
+			if cm.SizeBytes == 0 {
+				cm.SizeBytes = bm.VolumeLimit.MaxBytes
+				inherited = true
+			} else if cm.SizeBytes != bm.VolumeLimit.MaxBytes {
+				return nil, fmt.Errorf("%w: volume limit mismatch at %q: bundle has %d bytes, config has %d bytes", ErrCheckpointManifest, cm.GuestPath, bm.VolumeLimit.MaxBytes, cm.SizeBytes)
+			}
+		} else if cm.SizeBytes > 0 {
+			return nil, fmt.Errorf("%w: mount %q has no saved volume limit in checkpoint bundle, cannot set size=%d on restore", ErrCheckpointManifest, cm.GuestPath, cm.SizeBytes)
+		}
+	}
+	if inherited {
+		rootImg := ""
+		if cfg.RootVolume != "" {
+			rm, err := parseRootVolumeMount(cfg.RootVolume)
+			if err != nil {
+				return nil, err
+			}
+			rootImg, err = cfg.volumeImagePath(rm)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := cfg.validateVolumeConflicts(rootImg); err != nil {
+			return nil, err
+		}
+	}
+	return restoreBackingRO, nil
+}
+
 func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
 	if err := validateManifestNATPolicy(m, s.cfg.NetworkPolicy != nil); err != nil {
+		return err
+	}
+	if err := validateManifestMountsPreflight(m); err != nil {
 		return err
 	}
 	if m.GOOS != runtime.GOOS {
@@ -215,6 +373,13 @@ type manifestMountKey struct {
 	kind      string
 }
 
+func manifestVolumeLimitEqual(a, b *ManifestVolumeLimit) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.MaxBytes == b.MaxBytes
+}
+
 func (s *Sandbox) validateManifestMounts(bundleMounts []ManifestMount) error {
 	seenPaths := make(map[string]struct{}, len(bundleMounts))
 	bundleOther := make(map[string]ManifestMount)
@@ -227,6 +392,9 @@ func (s *Sandbox) validateManifestMounts(bundleMounts []ManifestMount) error {
 			return fmt.Errorf("%w: duplicate manifest mount path %q", ErrCheckpointManifest, mm.GuestPath)
 		}
 		seenPaths[mm.GuestPath] = struct{}{}
+		if mm.Ephemeral {
+			return fmt.Errorf("%w: manifest mount %q names an ephemeral volume", ErrCheckpointManifest, mm.GuestPath)
+		}
 		if mm.Type == MountRPCFS {
 			bundleRPC[mm.GuestPath] = mm
 		} else {
@@ -242,7 +410,8 @@ func (s *Sandbox) validateManifestMounts(bundleMounts []ManifestMount) error {
 		if !ok {
 			return fmt.Errorf("%w: mounts mismatch: config has unexpected mount %q (bundle has %v)", ErrCheckpointManifest, wm.GuestPath, bundleMounts)
 		}
-		if (manifestMountKey{bm.Type, bm.GuestPath, bm.ReadOnly, bm.Kind}) != (manifestMountKey{wm.Type, wm.GuestPath, wm.ReadOnly, wm.Kind}) {
+		if (manifestMountKey{bm.Type, bm.GuestPath, bm.ReadOnly, bm.Kind}) != (manifestMountKey{wm.Type, wm.GuestPath, wm.ReadOnly, wm.Kind}) ||
+			!manifestVolumeLimitEqual(bm.VolumeLimit, wm.VolumeLimit) {
 			return fmt.Errorf("%w: mounts mismatch at %q: bundle has %+v, config has %+v", ErrCheckpointManifest, wm.GuestPath, bm, wm)
 		}
 		if bm.Dynamic {
@@ -380,11 +549,19 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
 	}
+	for _, cm := range cfg.Mounts {
+		if cm.Ephemeral {
+			return nil, fmt.Errorf("%w: ephemeral ext4lite volume at %q cannot be restored", ErrInvalidConfig, cm.GuestPath)
+		}
+	}
 	manifest, err := readAndParseManifest(opts.Dir)
 	if err != nil {
 		return nil, err
 	}
 	if err := validateManifestNATPolicy(manifest, cfg.NetworkPolicy != nil); err != nil {
+		return nil, err
+	}
+	if err := validateManifestMountsPreflight(manifest); err != nil {
 		return nil, err
 	}
 	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
@@ -397,19 +574,27 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if cfg.Architecture == "" && manifest.Arch != "" {
 		cfg.Architecture = manifest.Arch
 	}
+	if err := inheritRestoreMountLimits(&cfg, manifest); err != nil {
+		return nil, err
+	}
 	if err := cfg.normalizeWithMode(len(manifest.LayerDigests) > 0); err != nil {
 		return nil, err
 	}
 	if manifest.RootVolume != (cfg.RootVolume != "") {
 		return nil, fmt.Errorf("%w: root volume mismatch: bundle has %v, config has %v", ErrCheckpointManifest, manifest.RootVolume, cfg.RootVolume != "")
 	}
+	restoreBackingRO, err := prepareRestoreConfigMounts(&cfg, manifest)
+	if err != nil {
+		return nil, err
+	}
 	applyHostMemoryDefaults()
 
 	sb := &Sandbox{
-		cfg:            cfg,
-		kernelReady:    make(chan struct{}),
-		runDone:        make(chan struct{}),
-		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
+		cfg:              cfg,
+		restoreBackingRO: restoreBackingRO,
+		kernelReady:      make(chan struct{}),
+		runDone:          make(chan struct{}),
+		detachDebugLog:   attachDebugLogSink(cfg.DebugLog),
 	}
 	sb.initControlState()
 	if cfg.HostCACerts {

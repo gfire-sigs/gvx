@@ -429,6 +429,8 @@ func mapControlErr(err error) error {
 	switch {
 	case errors.Is(err, ErrCheckpointExecActive):
 		return control.NewError(control.CodeExecActive, err.Error())
+	case errors.Is(err, ErrCheckpointEphemeralVolume):
+		return control.NewError(control.CodeUnsupported, err.Error())
 	case errors.Is(err, ErrCheckpointRPCFSActive), errors.Is(err, ErrCheckpointNATTunnelActive):
 		return control.NewError(control.CodeBusy, err.Error())
 	case errors.Is(err, ErrInvalidConfig):

@@ -59,28 +59,31 @@ type Sandbox struct {
 	fallbackFrom error
 	memFile      *pgalloc.MemoryFile
 	// runMemFile retains consumed backing memory until the platform closes.
-	runMemFile        *pgalloc.MemoryFile
-	resolvedImg       *oci.ResolvedImage
-	layerHandles      []*fd.HostHandle
-	layerDigests      []string
-	layerBytes        uint64
-	workspace         *hostfs.Workspace
-	workspaces        []*hostfs.Workspace
-	volumes           []*ext4lite.Volume
-	rootVolume        *ext4lite.Volume
-	rootUpperExisting bool
-	mounts            []sandboxMount
-	sandboxExtHandles []int64
-	serveMounts       []sandboxServeMount
-	netStack          *stack.Stack
-	natForwarder      *netbackend.NATForwarder
-	portForwarder     *netbackend.PortForwarder
-	bandwidth         *netbackend.BandwidthShaper
-	natPolicy         *netbackend.NATPolicy
-	natTunnelGroup    *natTunnelGroup // protected by mu
-	shapedNATTunnels  int             // protected by mu
-	wgEndpoint        *netbackend.WireGuardEndpoint
-	wgPeerPort        uint16
+	runMemFile         *pgalloc.MemoryFile
+	resolvedImg        *oci.ResolvedImage
+	layerHandles       []*fd.HostHandle
+	layerDigests       []string
+	layerBytes         uint64
+	workspace          *hostfs.Workspace
+	workspaces         []*hostfs.Workspace
+	volumes            []*ext4lite.Volume
+	rootVolume         *ext4lite.Volume
+	rootUpperExisting  bool
+	hasEphemeralVolume bool
+	cappedVolumes      []cappedVolumeBinding
+	restoreBackingRO   map[string]bool
+	mounts             []sandboxMount
+	sandboxExtHandles  []int64
+	serveMounts        []sandboxServeMount
+	netStack           *stack.Stack
+	natForwarder       *netbackend.NATForwarder
+	portForwarder      *netbackend.PortForwarder
+	bandwidth          *netbackend.BandwidthShaper
+	natPolicy          *netbackend.NATPolicy
+	natTunnelGroup     *natTunnelGroup // protected by mu
+	shapedNATTunnels   int             // protected by mu
+	wgEndpoint         *netbackend.WireGuardEndpoint
+	wgPeerPort         uint16
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
 	// host resolver before hostlockdown.Apply runs.
 	guestResolvConf string

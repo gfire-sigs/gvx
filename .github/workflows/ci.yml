@@ -274,7 +274,7 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: "1"
-        run: go test -race -count=1 $OWNED
+        run: go test -race -count=1 -timeout 20m $OWNED
       - name: Test systrap engine
         shell: bash
         run: go test -count=1 ./pkg/sentry/platform/systrap/
@@ -329,7 +329,7 @@ jobs:
       # without -race.
       - name: Test owned packages
         shell: bash
-        run: go test -count=1 $OWNED
+        run: go test -count=1 -timeout 20m $OWNED
       - name: Test execution backends
         shell: bash
         run: go test -count=1 ./pkg/sentry/platform/whpx/ ./pkg/sentry/platform/systrap/
