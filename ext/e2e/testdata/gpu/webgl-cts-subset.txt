@@ -1,0 +1,42 @@
+# WebGL CTS fixed subset (1009 pages at KhronosGroup/WebGL
+# 714857a28445e8f5d8d6ae1c78498578009534d8).
+# One selector on each line: <webgl> <pattern>. A pattern that ends in "/"
+# selects every page below that directory. Any other pattern is a path.Match
+# pattern on the page path. A line that starts with "!" removes pages.
+1 conformance/attribs/
+1 conformance/buffers/
+1 conformance/canvas/
+1 conformance/context/
+1 conformance/extensions/
+1 conformance/glsl/
+1 conformance/limits/
+1 conformance/misc/
+1 conformance/programs/
+1 conformance/reading/
+1 conformance/renderbuffers/
+1 conformance/rendering/
+1 conformance/state/
+1 conformance/uniforms/
+1 conformance/textures/misc/
+1 conformance/textures/image_data/
+1 conformance/textures/webgl_canvas/
+1 deqp/data/gles2/
+2 conformance2/attribs/
+2 conformance2/buffers/
+2 conformance2/context/
+2 conformance2/extensions/
+2 conformance2/glsl3/
+2 conformance2/misc/
+2 conformance2/programs/
+2 conformance2/query/
+2 conformance2/reading/
+2 conformance2/renderbuffers/
+2 conformance2/rendering/
+2 conformance2/samplers/
+2 conformance2/state/
+2 conformance2/sync/
+2 conformance2/transform_feedback/
+2 conformance2/uniforms/
+2 conformance2/vertex_arrays/
+2 conformance2/textures/misc/
+2 conformance2/textures/image_data/

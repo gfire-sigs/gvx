@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta charset="utf-8"><title>gvx-doc</title>
+<style>body{font-family:sans-serif;margin:24px;max-width:900px} .card{border:1px solid #ccc;border-radius:8px;padding:12px;margin:8px 0;box-shadow:0 2px 6px rgba(0,0,0,.2);background:linear-gradient(#fff,#eef)} table{border-collapse:collapse} td{border:1px solid #999;padding:4px}</style></head>
+<body><h1>gvx automation workload</h1><div id="root"></div>
+<script>
+const root = document.getElementById('root');
+for (let i = 0; i < 60; i++) {
+  const c = document.createElement('div'); c.className = 'card';
+  c.innerHTML = '<h3>Section ' + i + '</h3><p>' + 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '.repeat(6) + '</p><table>' + ('<tr>' + '<td>cell</td>'.repeat(8) + '</tr>').repeat(4) + '</table>';
+  const cv = document.createElement('canvas'); cv.width = 300; cv.height = 80; const g = cv.getContext('2d');
+  for (let k = 0; k < 40; k++) { g.fillStyle = 'hsl(' + ((i * 40 + k * 9) % 360) + ',70%,50%)'; g.fillRect(k * 7, 80 - (k * 13 + i) % 80, 6, 80); }
+  c.appendChild(cv); root.appendChild(c);
+}
+</script></body></html>

@@ -1,21 +1,21 @@
 # Research Proposal: GPU Acceleration for Browser and GUI Guests
 
-This document outlines a future research architecture for providing Linux browser and GUI guests access to the host GPU on macOS and Windows. The design comprises three layers: unmodified Mesa drivers inside the guest, a virtual DRM render node inside the Sentry, and a confined host renderer process. **The repository implements no part of this design today.**
+This document outlines the architecture for giving Linux browser and GUI guests access to the host GPU on macOS and Windows. The design comprises three layers: unmodified Mesa drivers inside the guest, a virtual DRM render node inside the Sentry, and a confined host renderer process. The repository implements the Phase 0 browser gates and headless macOS Phase 2 paths (`rungvx run -gpu=venus` and `rungvx run -gpu=virgl`) inside the optional `ext/` submodule behind `-tags ext_gpu`; Windows support and Phase 3 remain proposals.
 
 | Field | Value |
 | :--- | :--- |
-| **Status** | Proposed (Phase 0 not started) |
-| **Target Isolation Tier** | Tier 1 for `pkg/sentry/devices/virtgpu`, the host renderer binary, and its IPC package (registered in `tier1Prefixes` and `file_mask.txt`); Tier 3 `seam` in `pkg/sentry/fsimpl/sys/sys.go`. |
-| **Target Hosts** | `darwin/arm64`, `windows/amd64`, `windows/arm64` (`linux/amd64` and `linux/arm64` optional). |
-| **Companion Specifications** | [`architecture.md`](architecture.md), [`systrap-windows.md`](systrap-windows.md) |
+| **Status** | Phase 0 browser gates and headless macOS Phase 2 (`-gpu=venus`, `-gpu=virgl`) implemented in `ext/` (`-tags ext_gpu`); Windows and Phase 3 proposed. |
+| **Isolation Tier** | Tier 1: `ext/extensions/gpu/` (`virtgpu`, `gpuproto`, `client`, `gpuprobe`), `ext/workers/gpu-renderer/`, `ext/e2e/`, and `scripts/gpu/`; Tier 2: `pkg/sentry/fsimpl/sys/ext_xplat.go`; Tier 3: existing `seam` in `pkg/sentry/fsimpl/sys/sys.go`. |
+| **Target Hosts** | `darwin/arm64` (implemented, headless), `windows/amd64`, `windows/arm64` (proposed); `linux/amd64` and `linux/arm64` optional. |
+| **Companion Specifications** | [`architecture.md`](architecture.md), [`extensions-plan.md`](extensions-plan.md), [`systrap-windows.md`](systrap-windows.md) |
 
 Execution proceeds strictly in phases; each phase begins only after the preceding phase satisfies its exit criterion.
 
 | Phase | Scope | Status |
 | :--- | :--- | :--- |
-| Phase 0 | Software-rendering baseline gates for Chromium, Playwright, and Electron | Not started |
-| Phase 1 | Prototype over `virglrenderer`'s `vtest` socket protocol (no Sentry changes) | Not started |
-| Phase 2 | Virtual DRM render node in the Sentry plus confined headless host renderer | Not started |
+| Phase 0 | Software-rendering baseline gates for Chromium, Playwright, and Electron | Implemented in `ext/e2e/` (`GVX_E2E_BROWSER=1`) on `hvf`; Windows and Linux runs pending |
+| Phase 1 | Renderer bring-up without Sentry changes | Done on macOS; Windows `vtest` prototype not started |
+| Phase 2 | Virtual DRM render node in Sentry (`ext/extensions/gpu/virtgpu`) plus confined headless host renderer (`ext/workers/gpu-renderer`) | Implemented on macOS (`-gpu=venus` and `-gpu=virgl` behind `-tags ext_gpu`); Windows not started |
 | Phase 3 | Display presentation to the host desktop | Not started |
 
 ---

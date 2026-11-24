@@ -1,0 +1,24 @@
+# <mode> <webgl> <pattern> <statuses> # <reason>
+# mode: swiftshader, venus, virgl, or "*" (venus and virgl only). webgl: 1, 2, or "*".
+# pattern: subset syntax (a trailing "/" selects a directory).
+# statuses: comma-separated list of fail, timeout, crash, not-run, software, or "any".
+# The reason is required. Name a known defect (KD-n) or a host limit.
+
+# SwiftShader reference. These pages do not pass in the pinned image on
+# SwiftShader, so the gate does not compare them.
+swiftshader 1 conformance/extensions/angle-instanced-arrays-out-of-bounds.html fail # Chromium crbug.com/849572: Failure on angle-swiftshader and angle-vulkan
+swiftshader 1 conformance/glsl/misc/shader-with-double-underscore.html fail # Chromium crbug.com/486945330: Failure on all configurations
+swiftshader 2 conformance2/extensions/oes-draw-buffers-indexed.html fail # guest stack: ANGLE on SwiftShader gives INVALID_VALUE for undefined color outputs; venus and virgl pass
+swiftshader 2 conformance2/extensions/ovr_multiview2.html fail # guest stack: ANGLE Vulkan accepts GL_OVR_multiview without the extension; Chromium crbug.com/949249 lists the same page for other back ends
+swiftshader 2 conformance2/rendering/instanced-rendering-large-divisor.html timeout # SwiftShader speed: the page does not finish in the page limit; venus and virgl pass
+swiftshader 2 conformance2/textures/misc/immutable-tex-render-feedback.html fail # Chromium crbug.com/angleproject/42267266: Failure on passthrough
+
+# venus: KosmicKrisp 26.3.0 (Mesa) limit that gpurenderer/patches/mesa
+# does not fix. The gate needs a driver built with
+# scripts/gpu/build-renderer.sh --driver-source mesa-source.
+venus 2 conformance2/reading/read-pixels-from-fbo-test.html fail # host limit: KosmicKrisp 26.3.0 has no R5G5B5A1_UNORM_PACK16; the read format of the ANGLE fallback is not valid in WebGL (Chromium crbug.com/1237319)
+
+# virgl: guest stack defects (ANGLE GL and guest Mesa).
+virgl 1 conformance/extensions/khr-parallel-shader-compile.html fail # Chromium crbug.com/1175371: ANGLE GL and guest Mesa compile and link on the calling thread, so the WebGL status query waits; llvmpipe fails the same checks
+virgl 2 conformance2/reading/read-pixels-from-fbo-test.html crash,fail # Chromium crbug.com/577119296: ANGLE GL reports RGB/UNSIGNED_BYTE as the read format of an RGB8 framebuffer, Mesa GLES refuses it, and ANGLE loses the context
+virgl 2 conformance2/rendering/blitframebuffer-filter-outofbounds.html fail # Chromium crbug.com/329698340: guest Mesa _mesa_clip_blit rounds the clip of a scaled out-of-bounds blit to integers; llvmpipe fails the same 12 checks

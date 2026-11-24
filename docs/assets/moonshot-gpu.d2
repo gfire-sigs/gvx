@@ -84,7 +84,7 @@ renderer: "Confined Host Renderer Process (C)" {
     class: box
     style.stroke: "#7C3AED"
   }
-  vk: "MoltenVK or\nHost Vulkan" {
+  vk: "KosmicKrisp (macOS) or\nHost Vulkan" {
     class: box
     style.stroke: "#7C3AED"
   }
@@ -114,11 +114,11 @@ guest.mesa -> sentry.node: "DRM ioctl" {
   style.stroke: "#2563EB"
   style.stroke-width: 2
 }
-sentry.node -> renderer.virgl: "IPC ring" {
+sentry.node -> renderer.virgl: "Unix socketpair" {
   style.stroke: "#16A34A"
   style.stroke-width: 2
 }
-sentry.mem <-> renderer.virgl: "Shared section" {
+sentry.mem <-> renderer.virgl: "Shared blob memory" {
   style.stroke: "#CA8A04"
   style.stroke-width: 2
   style.stroke-dash: 4
