@@ -115,16 +115,19 @@ func newTestNodeWithLimits(t *testing.T, r Renderer, lim Limits) *testNode {
 	t.Cleanup(mf.Destroy)
 
 	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
+	k := &kernel.Kernel{}
+	k.MaxFDLimit.Store(kernel.MaxFdLimit)
+	v := &vfs.VirtualFilesystem{}
 	ctx := context.WithValues(&isolatedContext{Context: context.Background()}, map[any]any{
-		kernel.CtxKernel:          &kernel.Kernel{},
+		kernel.CtxKernel:          k,
 		ktime.CtxRealtimeClock:    fixedClock{},
 		auth.CtxCredentials:       creds,
 		limits.CtxLimits:          limits.NewLimitSet(),
 		uniqueid.CtxInotifyCookie: uint32(1),
 		pgalloc.CtxMemoryFile:     mf,
+		ctxTestVFS{}:              v,
 	})
 
-	v := &vfs.VirtualFilesystem{}
 	if err := v.Init(ctx); err != nil {
 		t.Fatalf("VirtualFilesystem.Init: %v", err)
 	}
@@ -262,32 +265,72 @@ func (m *guestMem) readBytes(addr hostarch.Addr, n int) []byte {
 	return out
 }
 
-// testTaskCtx wraps a test context with signal interruption (Block) and a
-// descriptor table (fdInstaller).
+type ctxTestVFS struct{}
+
+// testTaskCtx wraps a test context with signal interruption (Block), an
+// independent LimitSet, and a real kernel.FDTable (fdInstaller).
 type testTaskCtx struct {
 	context.Context
-	intr chan struct{}
+	intr   chan struct{}
+	limSet *limits.LimitSet
+	fdt    *kernel.FDTable
 
-	mu    sync.Mutex
-	next  int32
-	files map[int32]*vfs.FileDescription
-	flags map[int32]kernel.FDFlags
-	fdErr error
+	mu   sync.Mutex
+	refs []*vfs.FileDescription
 }
 
 var _ fdInstaller = (*testTaskCtx)(nil)
 
 func newTestTaskCtx(t *testing.T, base context.Context) *testTaskCtx {
 	t.Helper()
+	k := kernel.KernelFromContext(base)
+	if k == nil {
+		k = &kernel.Kernel{}
+		k.MaxFDLimit.Store(kernel.MaxFdLimit)
+	}
 	tc := &testTaskCtx{
 		Context: base,
 		intr:    make(chan struct{}),
-		next:    3,
-		files:   make(map[int32]*vfs.FileDescription),
-		flags:   make(map[int32]kernel.FDFlags),
+		limSet:  limits.NewLimitSet(),
+		fdt:     k.NewFDTable(),
+	}
+	// Occupy standard descriptors 0, 1, and 2 so allocated sync_file FDs
+	// start at 3 and RLIMIT_NOFILE=3 exhausts the table.
+	if v, ok := base.Value(ctxTestVFS{}).(*vfs.VirtualFilesystem); ok && v != nil {
+		placeholder, err := newSyncFile(tc, v, &fence{})
+		if err != nil {
+			t.Fatalf("newSyncFile(placeholder): %v", err)
+		}
+		for i := int32(0); i < 3; i++ {
+			if prev, err := tc.fdt.NewFDAt(tc, i, placeholder, kernel.FDFlags{}); err != nil {
+				placeholder.DecRef(tc)
+				t.Fatalf("NewFDAt(%d): %v", i, err)
+			} else if prev != nil {
+				prev.DecRef(tc)
+			}
+		}
+		placeholder.DecRef(tc)
 	}
 	t.Cleanup(tc.closeAll)
 	return tc
+}
+
+func (c *testTaskCtx) Value(key any) any {
+	if key == limits.CtxLimits {
+		return c.limSet
+	}
+	return c.Context.Value(key)
+}
+
+func (c *testTaskCtx) FDTable() *kernel.FDTable {
+	return c.fdt
+}
+
+func (c *testTaskCtx) setNoFileLimit(t *testing.T, n uint64) {
+	t.Helper()
+	if _, err := c.limSet.Set(limits.NumberOfFiles, limits.Limit{Cur: n, Max: n}, true); err != nil {
+		t.Fatalf("Set(RLIMIT_NOFILE, %d): %v", n, err)
+	}
 }
 
 func (c *testTaskCtx) Interrupt() {
@@ -324,38 +367,31 @@ func (c *testTaskCtx) BlockWithTimeout(ch chan struct{}, haveTimeout bool, timeo
 	}
 }
 
-func (c *testTaskCtx) NewFDFrom(minFD int32, file *vfs.FileDescription, flags kernel.FDFlags) (int32, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.fdErr != nil {
-		return -1, c.fdErr
-	}
-	n := max(c.next, minFD)
-	c.next = n + 1
-	file.IncRef()
-	c.files[n] = file
-	c.flags[n] = flags
-	return n, nil
-}
-
 func (c *testTaskCtx) file(fd int32) *vfs.FileDescription {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.files[fd]
+	f, _ := c.fdt.Get(fd)
+	if f != nil {
+		c.mu.Lock()
+		c.refs = append(c.refs, f)
+		c.mu.Unlock()
+	}
+	return f
 }
 
 func (c *testTaskCtx) fdFlags(fd int32) kernel.FDFlags {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.flags[fd]
+	f, flags := c.fdt.Get(fd)
+	if f != nil {
+		f.DecRef(c)
+	}
+	return flags
 }
 
 func (c *testTaskCtx) closeAll() {
 	c.mu.Lock()
-	files := c.files
-	c.files = nil
+	refs := c.refs
+	c.refs = nil
 	c.mu.Unlock()
-	for _, f := range files {
-		f.DecRef(c.Context)
+	for _, f := range refs {
+		f.DecRef(c)
 	}
+	c.fdt.DecRef(c)
 }

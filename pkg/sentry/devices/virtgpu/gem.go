@@ -224,8 +224,22 @@ func (fd *renderFD) createBlob(ctx context.Context, uio usermem.IO, arg []byte) 
 		return linuxerr.EIO
 	}
 
-	var cmd []byte
+	var (
+		cmd         []byte
+		cmdReserved uint64
+	)
 	if req.CmdSize > 0 {
+		cmdSize := uint64(req.CmdSize)
+		if err := fd.dev.submitBudget.acquire(ctx, cmdSize); err != nil {
+			return err
+		}
+		cmdReserved = cmdSize
+		defer func() {
+			if cmdReserved > 0 {
+				fd.dev.submitBudget.release(cmdReserved)
+			}
+		}()
+
 		cmd = make([]byte, req.CmdSize)
 		if _, err := uio.CopyIn(ctx, hostarch.Addr(req.Cmd), cmd, usermem.IOOpts{}); err != nil {
 			return linuxerr.EFAULT
@@ -248,7 +262,11 @@ func (fd *renderFD) createBlob(ctx context.Context, uio usermem.IO, arg []byte) 
 		return linuxerr.EIO
 	}
 	if req.CmdSize > 0 {
-		if _, err := fd.dev.submit(c, 0, cmd, false); err != nil {
+		_, err := fd.dev.submit(c, 0, cmd, false, nil)
+		fd.dev.submitBudget.release(cmdReserved)
+		cmdReserved = 0
+		cmd = nil
+		if err != nil {
 			return err
 		}
 	}

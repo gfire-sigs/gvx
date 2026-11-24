@@ -71,11 +71,11 @@ func (fd *renderFD) logRefusedExecbuf(ctx context.Context, r execbufRefusal, err
 	}
 }
 
-// fdInstaller installs a file in the descriptor table of the calling task.
+// fdInstaller exposes the descriptor table of the calling task.
 // *kernel.Task implements it, and the syscall layer passes the task as the
 // ioctl context.
 type fdInstaller interface {
-	NewFDFrom(minFD int32, file *vfs.FileDescription, flags kernel.FDFlags) (int32, error)
+	FDTable() *kernel.FDTable
 }
 
 var _ fdInstaller = (*kernel.Task)(nil)
@@ -158,27 +158,76 @@ func (fd *renderFD) execbuffer(ctx context.Context, uio usermem.IO, arg []byte) 
 		fd.gemMu.Unlock()
 	}
 
+	wantFenceFD := req.Flags&virtgpuExecbufFenceFDOut != 0
+	var fdt *kernel.FDTable
+	if wantFenceFD {
+		inst, ok := ctx.(fdInstaller)
+		if !ok {
+			log.Warningf("virtgpu: EXECBUFFER FENCE_FD_OUT called without fdInstaller context")
+			return linuxerr.EINVAL
+		}
+		fdt = inst.FDTable()
+		if fdt == nil {
+			log.Warningf("virtgpu: EXECBUFFER FENCE_FD_OUT called with nil FDTable")
+			return linuxerr.EINVAL
+		}
+	}
+
 	var cmd []byte
 	if req.Size > 0 {
+		cmdSize := uint64(req.Size)
+		if err := fd.dev.submitBudget.acquire(ctx, cmdSize); err != nil {
+			return err
+		}
+		defer fd.dev.submitBudget.release(cmdSize)
+
 		cmd = make([]byte, req.Size)
 		if _, err := uio.CopyIn(ctx, hostarch.Addr(req.Command), cmd, usermem.IOOpts{}); err != nil {
 			return linuxerr.EFAULT
 		}
 	}
 
-	wantFenceFD := req.Flags&virtgpuExecbufFenceFDOut != 0
-	var inst fdInstaller
+	// Ordering for FENCE_FD_OUT: create the sync_file and reserve its FD slot
+	// before submit, then publish req.FenceFD only after submit succeeds.
+	// RLIMIT_NOFILE exhaustion returns EMFILE with no renderer side effects.
+	// On submit failure, the defer removes only syncFile from fdt and signals
+	// preFence so no descriptor leaks and no concurrent waiter blocks.
+	var (
+		preFence  *fence
+		syncFile  *vfs.FileDescription
+		fenceFD   int32
+		committed bool
+	)
 	if wantFenceFD {
-		var ok bool
-		inst, ok = ctx.(fdInstaller)
-		if !ok {
-			log.Warningf("virtgpu: EXECBUFFER FENCE_FD_OUT called without fdInstaller context")
-			return linuxerr.EINVAL
+		preFence = &fence{ring: ring}
+		var err error
+		syncFile, err = newSyncFile(ctx, fd.dev.vfs, preFence)
+		if err != nil {
+			return err
 		}
+		defer syncFile.DecRef(ctx)
+
+		// Linux reserves the fd number without a file, so other threads
+		// cannot see it before the ioctl returns. The FDTable has no such
+		// reservation, so another guest thread can see, close, or dup this fd
+		// while submit runs. That affects only the guest. The rollback below
+		// removes only this sync file and signals preFence.
+		fenceFD, err = fdt.NewFD(ctx, 0, syncFile, kernel.FDFlags{CloseOnExec: true})
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if !committed {
+				fdt.RemoveIf(ctx, func(candidate *vfs.FileDescription, _ kernel.FDFlags) bool {
+					return candidate == syncFile
+				})
+				preFence.signal()
+			}
+		}()
 	}
 
 	withFence := wantFenceFD || (c.isVirgl() && len(objs) > 0)
-	f, err := fd.dev.submit(c, ring, cmd, withFence)
+	f, err := fd.dev.submit(c, ring, cmd, withFence, preFence)
 	if err != nil {
 		return err
 	}
@@ -191,27 +240,19 @@ func (fd *renderFD) execbuffer(ctx context.Context, uio usermem.IO, arg []byte) 
 		return nil
 	}
 
-	file, err := newSyncFile(ctx, fd.dev.vfs, f)
-	if err != nil {
-		return err
-	}
-	defer file.DecRef(ctx)
-
-	n, err := inst.NewFDFrom(0, file, kernel.FDFlags{CloseOnExec: true})
-	if err != nil {
-		return err
-	}
-	req.FenceFD = n
+	committed = true
+	req.FenceFD = fenceFD
 	_, _ = binary.Encode(arg, binary.LittleEndian, &req)
 	return nil
 }
 
-// submit sends cmd on c, with a new fence on ring when withFence is set. It
-// holds c.submitMu from fence ID allocation until Submit returns, so fence IDs
-// reach the renderer in increasing order on every ring of c (I-6b.3). The
-// fence is in the pending list before Submit, so a FENCE_DONE that arrives at
-// once finds it.
-func (d *Device) submit(c *fileContext, ring uint32, cmd []byte, withFence bool) (*fence, error) {
+// submit sends cmd on c, with a fence on ring when withFence is set. When f is
+// non-nil, submit assigns f.id under c.submitMu and uses f instead of
+// allocating a new fence. It holds c.submitMu from fence ID allocation until
+// Submit returns, so fence IDs reach the renderer in increasing order on every
+// ring of c (I-6b.3). The fence is in the pending list before Submit, so a
+// FENCE_DONE that arrives at once finds it.
+func (d *Device) submit(c *fileContext, ring uint32, cmd []byte, withFence bool, f *fence) (*fence, error) {
 	c.submitMu.Lock()
 	defer c.submitMu.Unlock()
 
@@ -221,10 +262,10 @@ func (d *Device) submit(c *fileContext, ring uint32, cmd []byte, withFence bool)
 	if !withFence {
 		return nil, rendererErrno(d.renderer.Submit(c.id, cmd, nil))
 	}
-	f := &fence{
-		id:   d.lastFenceID.Add(1),
-		ring: ring,
+	if f == nil {
+		f = &fence{ring: ring}
 	}
+	f.id = d.lastFenceID.Add(1)
 	if err := c.addPending(f, d.limits.FenceTimeout, func() { d.fenceTimedOut(c, f) }); err != nil {
 		if errors.Is(err, errTooManyFences) {
 			return nil, linuxerr.EBUSY

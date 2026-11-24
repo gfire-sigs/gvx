@@ -18,12 +18,18 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 
+	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
+	"z.gfire.dev/gvx/pkg/usermem"
 	"z.gfire.dev/gvx/pkg/waiter"
 )
 
@@ -314,19 +320,31 @@ func TestExecbufferFenceFDOutSubmitErrorRollsBack(t *testing.T) {
 	ctxID := fake.createdCalls()[0].ctxID
 
 	tc := newTestTaskCtx(t, node.ctx)
+	filesBefore := node.vfs.NumFiles()
 	mem := newGuestMem()
 	const structAddr = hostarch.Addr(0x1000)
 
 	fake.setSubmitErr(errors.New("write timeout"))
-	mem.put(t, structAddr, virtgpuExecbuffer{Flags: virtgpuExecbufFenceFDOut})
+	mem.put(t, structAddr, virtgpuExecbuffer{
+		Flags:   virtgpuExecbufFenceFDOut,
+		FenceFD: -1,
+	})
 	if err := node.ioctlWithCtx(tc, fd, cmdVirtgpuExecbuffer, mem, structAddr); !linuxerr.Equals(linuxerr.EIO, err) {
 		t.Fatalf("EXECBUFFER(FENCE_FD_OUT) on Submit error: got %v, want EIO", err)
+	}
+	var failedOut virtgpuExecbuffer
+	mem.get(t, structAddr, &failedOut)
+	if failedOut.FenceFD != -1 {
+		t.Errorf("FenceFD after Submit error = %d, want -1", failedOut.FenceFD)
 	}
 	if tc.file(3) != nil {
 		t.Fatalf("sync_file FD 3 was installed despite Submit error")
 	}
+	if got := node.vfs.NumFiles(); got != filesBefore {
+		t.Errorf("vfs.NumFiles() after Submit error = %d, want %d", got, filesBefore)
+	}
 
-	// Clearing the error leaves ring 0 usable for subsequent fenced submits.
+	// Clearing the error leaves ring 0 and FD slot 3 usable for subsequent fenced submits.
 	fake.setSubmitErr(nil)
 	mem.put(t, structAddr, virtgpuExecbuffer{Flags: virtgpuExecbufFenceFDOut})
 	if err := node.ioctlWithCtx(tc, fd, cmdVirtgpuExecbuffer, mem, structAddr); err != nil {
@@ -351,21 +369,39 @@ func TestExecbufferFenceFDOutSubmitErrorRollsBack(t *testing.T) {
 	}
 }
 
-func TestExecbufferFenceFDOutEMFILEClosesSyncFile(t *testing.T) {
+func TestExecbufferFenceFDOutEMFILEDoesNotSubmit(t *testing.T) {
 	fake := newFakeRenderer()
 	node := newTestNode(t, fake)
 	fd := node.openVenus(t)
 	defer fd.DecRef(node.ctx)
 
 	tc := newTestTaskCtx(t, node.ctx)
-	tc.fdErr = linuxerr.EMFILE
+	// FDs 0, 1, and 2 are already occupied; RLIMIT_NOFILE=3 exhausts the table.
+	tc.setNoFileLimit(t, 3)
 	filesBefore := node.vfs.NumFiles()
 
 	mem := newGuestMem()
-	const structAddr = hostarch.Addr(0x1000)
-	mem.put(t, structAddr, virtgpuExecbuffer{Flags: virtgpuExecbufFenceFDOut})
+	const (
+		structAddr = hostarch.Addr(0x1000)
+		cmdAddr    = hostarch.Addr(0x2000)
+	)
+	mem.writeBytes(cmdAddr, []byte{1, 2, 3, 4})
+	mem.put(t, structAddr, virtgpuExecbuffer{
+		Flags:   virtgpuExecbufFenceFDOut,
+		Size:    4,
+		Command: uint64(cmdAddr),
+		FenceFD: -1,
+	})
 	if err := node.ioctlWithCtx(tc, fd, cmdVirtgpuExecbuffer, mem, structAddr); !linuxerr.Equals(linuxerr.EMFILE, err) {
-		t.Fatalf("EXECBUFFER(FENCE_FD_OUT) with EMFILE: got %v, want EMFILE", err)
+		t.Fatalf("EXECBUFFER(FENCE_FD_OUT) at RLIMIT_NOFILE: got %v, want EMFILE", err)
+	}
+	if got := len(fake.submitCalls()); got != 0 {
+		t.Errorf("Submit calls after EMFILE = %d, want 0", got)
+	}
+	var out virtgpuExecbuffer
+	mem.get(t, structAddr, &out)
+	if out.FenceFD != -1 {
+		t.Errorf("FenceFD after EMFILE = %d, want -1", out.FenceFD)
 	}
 	if tc.file(3) != nil {
 		t.Errorf("FD 3 was installed despite EMFILE")
@@ -473,4 +509,196 @@ func TestExecbufferVenusKeepsNoObjectFence(t *testing.T) {
 	if len(calls) != 1 || calls[0].fence != nil {
 		t.Fatalf("submitCalls = %+v, want 1 call with nil fence", calls)
 	}
+}
+
+// countingIO records bytes copied from command buffer address cmdAddr.
+type countingIO struct {
+	usermem.IO
+	cmdAddr hostarch.Addr
+	copied  *atomic.Int64
+}
+
+func (c *countingIO) CopyIn(ctx context.Context, addr hostarch.Addr, dst []byte, opts usermem.IOOpts) (int, error) {
+	n, err := c.IO.CopyIn(ctx, addr, dst, opts)
+	if err == nil && addr == c.cmdAddr {
+		c.copied.Add(int64(n))
+	}
+	return n, err
+}
+
+func ioctlWithIO(ctx context.Context, fd *vfs.FileDescription, cmd uint32, uio usermem.IO, addr hostarch.Addr) error {
+	var args arch.SyscallArguments
+	args[1] = arch.SyscallArgument{Value: uintptr(cmd)}
+	args[2] = arch.SyscallArgument{Value: uintptr(addr)}
+	_, err := fd.Ioctl(ctx, uio, 0, args)
+	return err
+}
+
+func TestExecbufferSubmitByteBound(t *testing.T) {
+	const (
+		cmdSize    = 16 << 10
+		limitBytes = 32 << 10 // room for 2 concurrent 16 KiB command copies
+		workers    = 6
+		structAddr = hostarch.Addr(0x1000)
+		cmdAddr    = hostarch.Addr(0x2000)
+	)
+
+	t.Run("one context bounds copied bytes while submits block", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			fake := newFakeRenderer()
+			fake.submitGate = make(chan struct{})
+			// Limit to one command buffer on one context so 1 worker blocks in
+			// Submit and the other 5 block durably in submitBudget.acquire.
+			node := newTestNodeWithLimits(t, fake, Limits{SubmitBytes: cmdSize})
+			fd := node.openVenus(t)
+			defer fd.DecRef(node.ctx)
+
+			var copied atomic.Int64
+			errCh := make(chan error, workers)
+			var wg sync.WaitGroup
+			for range workers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					mem := newGuestMem()
+					mem.put(t, structAddr, virtgpuExecbuffer{
+						Size:    cmdSize,
+						Command: uint64(cmdAddr),
+					})
+					uio := &countingIO{IO: &mem.BytesIO, cmdAddr: cmdAddr, copied: &copied}
+					errCh <- ioctlWithIO(node.ctx, fd, cmdVirtgpuExecbuffer, uio, structAddr)
+				}()
+			}
+
+			synctest.Wait()
+			if got := copied.Load(); got != cmdSize {
+				close(fake.submitGate)
+				wg.Wait()
+				t.Fatalf("in-flight copied command bytes = %d, want %d", got, cmdSize)
+			}
+
+			// Release submits one at a time and verify all complete cleanly.
+			for range workers {
+				fake.submitGate <- struct{}{}
+			}
+			wg.Wait()
+			close(errCh)
+			for err := range errCh {
+				if err != nil {
+					t.Fatalf("concurrent EXECBUFFER: %v", err)
+				}
+			}
+			if got := len(fake.submitCalls()); got != workers {
+				t.Errorf("Submit calls = %d, want %d", got, workers)
+			}
+		})
+	})
+
+	t.Run("multiple contexts share per-device bound", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			fake := newFakeRenderer()
+			fake.submitGate = make(chan struct{})
+			node := newTestNodeWithLimits(t, fake, Limits{SubmitBytes: limitBytes})
+
+			fds := make([]*vfs.FileDescription, workers)
+			for i := range fds {
+				fds[i] = node.openVenus(t)
+				defer fds[i].DecRef(node.ctx)
+			}
+
+			var copied atomic.Int64
+			errCh := make(chan error, workers)
+			var wg sync.WaitGroup
+			for i := range workers {
+				wg.Add(1)
+				go func(fd *vfs.FileDescription) {
+					defer wg.Done()
+					mem := newGuestMem()
+					mem.put(t, structAddr, virtgpuExecbuffer{
+						Size:    cmdSize,
+						Command: uint64(cmdAddr),
+					})
+					uio := &countingIO{IO: &mem.BytesIO, cmdAddr: cmdAddr, copied: &copied}
+					errCh <- ioctlWithIO(node.ctx, fd, cmdVirtgpuExecbuffer, uio, structAddr)
+				}(fds[i])
+			}
+
+			synctest.Wait()
+			if got := copied.Load(); got > limitBytes {
+				close(fake.submitGate)
+				wg.Wait()
+				t.Fatalf("multi-context copied bytes = %d, want <= %d", got, limitBytes)
+			}
+
+			// A second Device (second sandbox) has an independent budget.
+			fakeB := newFakeRenderer()
+			nodeB := newTestNodeWithLimits(t, fakeB, Limits{SubmitBytes: limitBytes})
+			fdB := nodeB.openVenus(t)
+			defer fdB.DecRef(nodeB.ctx)
+			memB := newGuestMem()
+			memB.put(t, structAddr, virtgpuExecbuffer{Size: cmdSize, Command: uint64(cmdAddr)})
+			if err := nodeB.ioctl(fdB, cmdVirtgpuExecbuffer, memB, structAddr); err != nil {
+				close(fake.submitGate)
+				wg.Wait()
+				t.Fatalf("second device EXECBUFFER while first is full: %v", err)
+			}
+
+			close(fake.submitGate)
+			wg.Wait()
+			close(errCh)
+			for err := range errCh {
+				if err != nil {
+					t.Fatalf("multi-context EXECBUFFER: %v", err)
+				}
+			}
+		})
+	})
+
+	t.Run("interrupted waiter returns ERESTARTSYS without copying", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			fake := newFakeRenderer()
+			fake.submitGate = make(chan struct{})
+			node := newTestNodeWithLimits(t, fake, Limits{SubmitBytes: cmdSize})
+			fd := node.openVenus(t)
+			defer fd.DecRef(node.ctx)
+
+			// First worker holds the entire cmdSize budget inside Submit.
+			done1 := make(chan error, 1)
+			go func() {
+				mem := newGuestMem()
+				mem.put(t, structAddr, virtgpuExecbuffer{Size: cmdSize, Command: uint64(cmdAddr)})
+				done1 <- node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr)
+			}()
+			synctest.Wait()
+
+			// Second worker blocks in submitBudget.acquire and receives a signal.
+			tc := newTestTaskCtx(t, node.ctx)
+			var copied2 atomic.Int64
+			done2 := make(chan error, 1)
+			go func() {
+				mem := newGuestMem()
+				mem.put(t, structAddr, virtgpuExecbuffer{Size: cmdSize, Command: uint64(cmdAddr)})
+				uio := &countingIO{IO: &mem.BytesIO, cmdAddr: cmdAddr, copied: &copied2}
+				done2 <- ioctlWithIO(tc, fd, cmdVirtgpuExecbuffer, uio, structAddr)
+			}()
+			synctest.Wait()
+
+			tc.Interrupt()
+			if err := <-done2; !linuxerr.Equals(linuxerr.ERESTARTSYS, err) {
+				close(fake.submitGate)
+				<-done1
+				t.Fatalf("interrupted EXECBUFFER: got %v, want ERESTARTSYS", err)
+			}
+			if got := copied2.Load(); got != 0 {
+				close(fake.submitGate)
+				<-done1
+				t.Errorf("interrupted worker copied %d bytes, want 0", got)
+			}
+
+			close(fake.submitGate)
+			if err := <-done1; err != nil {
+				t.Fatalf("first EXECBUFFER: %v", err)
+			}
+		})
+	})
 }

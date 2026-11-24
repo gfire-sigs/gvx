@@ -39,6 +39,8 @@ type fence struct {
 	queue    waiter.Queue
 	// timer fires fenceTimedOut if f stays pending past FenceTimeout.
 	// Assigned under fileContext.fenceMu before f is published to any list.
+	// With FENCE_FD_OUT, the guest can reach f through its sync file before
+	// submit assigns id and timer. Sync file code reads only signaled and queue.
 	timer *time.Timer
 }
 

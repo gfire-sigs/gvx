@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -549,5 +550,307 @@ func TestReleaseUnrefsVirglResources(t *testing.T) {
 	ops := fake.opLog()
 	if len(ops) == 0 || ops[len(ops)-1].kind != "DestroyContext" {
 		t.Errorf("final op = %+v, want DestroyContext after all UnrefResource calls", ops)
+	}
+}
+
+func TestResourceCreateTextureBudget(t *testing.T) {
+	const structAddr = hostarch.Addr(0x1000)
+
+	t.Run("16384x16384 RGBA8 size=0 fails when budget is below 1 GiB", func(t *testing.T) {
+		fake := newFakeVirglRenderer()
+		node := newTestNodeWithLimits(t, fake, Limits{BlobBytes: 512 << 20})
+		fd := node.openVirgl(t)
+		defer fd.DecRef(node.ctx)
+
+		mem := newGuestMem()
+		mem.put(t, structAddr, virtgpuResourceCreate{
+			Target:    pipeTexture2D,
+			Format:    virglFormatR8G8B8A8Unorm,
+			Width:     16384,
+			Height:    16384,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      0,
+		})
+		if err := node.ioctl(fd, cmdVirtgpuResourceCreate, mem, structAddr); !linuxerr.Equals(linuxerr.ENOMEM, err) {
+			t.Fatalf("RESOURCE_CREATE(16384x16384 RGBA8, 512MiB budget): got %v, want ENOMEM", err)
+		}
+		if got := len(fake.resCreateCalls()); got != 0 {
+			t.Errorf("CreateResource calls = %d, want 0", got)
+		}
+		if got := node.dev.BlobBytes(); got != 0 {
+			t.Errorf("BlobBytes = %#x, want 0", got)
+		}
+	})
+
+	t.Run("16384x16384 RGBA8 size=0 charges 1 GiB and releases on close", func(t *testing.T) {
+		requireBlobHost(t)
+		fake := newFakeVirglRenderer()
+		node := newTestNodeWithLimits(t, fake, Limits{BlobBytes: 2 << 30})
+		fd := node.openVirgl(t)
+
+		res := mustCreateResource(t, node, fd, virtgpuResourceCreate{
+			Target:    pipeTexture2D,
+			Format:    virglFormatR8G8B8A8Unorm,
+			Width:     16384,
+			Height:    16384,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      0,
+		})
+		const oneGiB = uint64(1 << 30)
+		if got := node.dev.BlobBytes(); got < oneGiB {
+			fd.DecRef(node.ctx)
+			t.Fatalf("BlobBytes = %#x, want >= %#x", got, oneGiB)
+		}
+
+		// Backing shm remains 4 KiB because guest requested size=0.
+		calls := fake.resCreateCalls()
+		if len(calls) != 1 || calls[0].Size != uint64(hostarch.PageSize) {
+			fd.DecRef(node.ctx)
+			t.Fatalf("CreateResource calls = %+v, want 1 call with Size=%d", calls, hostarch.PageSize)
+		}
+
+		// A second 1 GiB texture fits; a third fails with ENOMEM.
+		_ = mustCreateResource(t, node, fd, virtgpuResourceCreate{
+			Target:    pipeTexture2D,
+			Format:    virglFormatR8G8B8A8Unorm,
+			Width:     16384,
+			Height:    16384,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      0,
+		})
+		mem := newGuestMem()
+		mem.put(t, structAddr, virtgpuResourceCreate{
+			Target:    pipeTexture2D,
+			Format:    virglFormatR8G8B8A8Unorm,
+			Width:     16384,
+			Height:    16384,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      0,
+		})
+		if err := node.ioctl(fd, cmdVirtgpuResourceCreate, mem, structAddr); !linuxerr.Equals(linuxerr.ENOMEM, err) {
+			fd.DecRef(node.ctx)
+			t.Fatalf("3rd 1 GiB texture: got %v, want ENOMEM", err)
+		}
+
+		mustGemClose(t, node, fd, res.BoHandle)
+		if got := node.dev.BlobBytes(); got != oneGiB {
+			fd.DecRef(node.ctx)
+			t.Fatalf("BlobBytes after closing first 1 GiB texture = %#x, want %#x", got, oneGiB)
+		}
+		fd.DecRef(node.ctx)
+		if got := node.dev.BlobBytes(); got != 0 {
+			t.Errorf("BlobBytes after close = %#x, want 0", got)
+		}
+	})
+
+	t.Run("small texture and explicit size charges max of both", func(t *testing.T) {
+		requireBlobHost(t)
+		fake := newFakeVirglRenderer()
+		node := newTestNode(t, fake)
+		fd := node.openVirgl(t)
+		defer fd.DecRef(node.ctx)
+
+		// 64x64 RGBA8 = 16384 bytes; size=0 charges 16384 bytes (one host blob page).
+		_ = mustCreateResource(t, node, fd, virtgpuResourceCreate{
+			Target:    pipeTexture2D,
+			Format:    virglFormatR8G8B8A8Unorm,
+			Width:     64,
+			Height:    64,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      0,
+		})
+		if got := node.dev.BlobBytes(); got != blobAlignment {
+			t.Fatalf("BlobBytes after 64x64 RGBA8 = %#x, want %#x", got, blobAlignment)
+		}
+
+		// Explicit Size 65536 exceeds 16x16 RGBA8 (1024), so charge is 65536.
+		_ = mustCreateResource(t, node, fd, virtgpuResourceCreate{
+			Target:    pipeTexture2D,
+			Format:    virglFormatR8G8B8A8Unorm,
+			Width:     16,
+			Height:    16,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      65536,
+		})
+		if got := node.dev.BlobBytes(); got != blobAlignment+65536 {
+			t.Fatalf("BlobBytes after explicit 64 KiB texture = %#x, want %#x", got, blobAlignment+65536)
+		}
+	})
+
+	t.Run("PIPE_BUFFER keeps size semantics", func(t *testing.T) {
+		requireBlobHost(t)
+		fake := newFakeVirglRenderer()
+		node := newTestNodeWithLimits(t, fake, Limits{BlobBytes: blobAlignment})
+		fd := node.openVirgl(t)
+		defer fd.DecRef(node.ctx)
+
+		_ = mustCreateResource(t, node, fd, virtgpuResourceCreate{
+			Target:    pipeBuffer,
+			Format:    virglFormatR8Unorm,
+			Width:     4096,
+			Height:    1,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      4096,
+		})
+		if got := node.dev.BlobBytes(); got != blobAlignment {
+			t.Errorf("BlobBytes for PIPE_BUFFER = %#x, want %#x", got, blobAlignment)
+		}
+	})
+}
+
+func TestResourceCreateTextureValidation(t *testing.T) {
+	const structAddr = hostarch.Addr(0x1000)
+
+	cases := []struct {
+		name string
+		req  virtgpuResourceCreate
+	}{
+		{
+			name: "width above max",
+			req:  virtgpuResourceCreate{Target: pipeTexture2D, Format: virglFormatR8G8B8A8Unorm, Width: maxTextureDim + 1, Height: 1, Depth: 1, ArraySize: 1},
+		},
+		{
+			name: "height above max",
+			req:  virtgpuResourceCreate{Target: pipeTexture2D, Format: virglFormatR8G8B8A8Unorm, Width: 1, Height: maxTextureDim + 1, Depth: 1, ArraySize: 1},
+		},
+		{
+			name: "depth above max",
+			req:  virtgpuResourceCreate{Target: pipeTexture3D, Format: virglFormatR8G8B8A8Unorm, Width: 1, Height: 1, Depth: maxTextureDim + 1, ArraySize: 1},
+		},
+		{
+			name: "array size above max",
+			req:  virtgpuResourceCreate{Target: pipeTexture2DArray, Format: virglFormatR8G8B8A8Unorm, Width: 1, Height: 1, Depth: 1, ArraySize: maxTextureDim + 1},
+		},
+		{
+			name: "last level above max",
+			req:  virtgpuResourceCreate{Target: pipeTexture2D, Format: virglFormatR8G8B8A8Unorm, Width: 64, Height: 64, Depth: 1, ArraySize: 1, LastLevel: maxTextureLastLevel + 1},
+		},
+		{
+			name: "samples above max",
+			req:  virtgpuResourceCreate{Target: pipeTexture2D, Format: virglFormatR8G8B8A8Unorm, Width: 64, Height: 64, Depth: 1, ArraySize: 1, NrSamples: maxTextureSamples + 1},
+		},
+		{
+			name: "uint64 product overflow within dimension caps",
+			req: virtgpuResourceCreate{
+				Target:    pipeTexture3D,
+				Format:    virglFormatR8G8B8A8Unorm,
+				Width:     maxTextureDim,
+				Height:    maxTextureDim,
+				Depth:     maxTextureDim,
+				ArraySize: maxTextureDim,
+				NrSamples: maxTextureSamples,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeVirglRenderer()
+			node := newTestNode(t, fake)
+			fd := node.openVirgl(t)
+			defer fd.DecRef(node.ctx)
+
+			mem := newGuestMem()
+			mem.put(t, structAddr, tc.req)
+			if err := node.ioctl(fd, cmdVirtgpuResourceCreate, mem, structAddr); !linuxerr.Equals(linuxerr.EINVAL, err) {
+				t.Fatalf("RESOURCE_CREATE(%s): got %v, want EINVAL", tc.name, err)
+			}
+			if got := len(fake.resCreateCalls()); got != 0 {
+				t.Errorf("CreateResource calls = %d, want 0", got)
+			}
+			if got := node.dev.BlobBytes(); got != 0 {
+				t.Errorf("BlobBytes = %#x, want 0", got)
+			}
+		})
+	}
+
+	if _, ok := roundUpBlobSizeChecked(math.MaxUint64); ok {
+		t.Errorf("roundUpBlobSizeChecked(MaxUint64) succeeded, want overflow false")
+	}
+}
+
+func TestVirglTextureBytesMath(t *testing.T) {
+	cases := []struct {
+		name string
+		req  virtgpuResourceCreate
+		want uint64
+	}{
+		{
+			name: "16384x16384 RGBA8 single level",
+			req: virtgpuResourceCreate{
+				Target: pipeTexture2D, Format: virglFormatR8G8B8A8Unorm,
+				Width: 16384, Height: 16384, Depth: 1, ArraySize: 1,
+			},
+			want: 1 << 30,
+		},
+		{
+			name: "mipmaps array and samples",
+			req: virtgpuResourceCreate{
+				Target: pipeTexture2DArray, Format: virglFormatR8G8B8A8Unorm,
+				Width: 128, Height: 64, Depth: 1, ArraySize: 2, LastLevel: 3, NrSamples: 4,
+			},
+			// (128*64 + 64*32 + 32*16 + 16*8) * 2 * 4 * 4 = 10880 * 32
+			want: 348160,
+		},
+		{
+			name: "3D mipmap levels clamp each axis to 1",
+			req: virtgpuResourceCreate{
+				Target: pipeTexture3D, Format: virglFormatR8Unorm,
+				Width: 8, Height: 4, Depth: 2, ArraySize: 0, LastLevel: 3, NrSamples: 0,
+			},
+			// (8*4*2) + (4*2*1) + (2*1*1) + (1*1*1) = 64 + 8 + 2 + 1
+			want: 75,
+		},
+		{
+			name: "cube map enforces 6 faces",
+			req: virtgpuResourceCreate{
+				Target: pipeTextureCube, Format: virglFormatR8G8B8A8Unorm,
+				Width: 64, Height: 64, Depth: 1, ArraySize: 1,
+			},
+			want: 64 * 64 * 6 * 4,
+		},
+		{
+			name: "RGBA16F is 8 bytes per pixel",
+			req: virtgpuResourceCreate{
+				Target: pipeTexture2D, Format: virglFormatR16G16B16A16Float,
+				Width: 32, Height: 32, Depth: 1, ArraySize: 1,
+			},
+			want: 32 * 32 * 8,
+		},
+		{
+			name: "compressed format uses conservative 4 bytes per pixel",
+			req: virtgpuResourceCreate{
+				Target: pipeTexture2D, Format: virglFormatDXT1Rgb,
+				Width: 32, Height: 32, Depth: 1, ArraySize: 1,
+			},
+			want: 32 * 32 * virglCompressedBytesPerPixel,
+		},
+		{
+			name: "unknown format uses conservative 16 bytes per pixel",
+			req: virtgpuResourceCreate{
+				Target: pipeTexture2D, Format: 99999,
+				Width: 32, Height: 32, Depth: 1, ArraySize: 1,
+			},
+			want: 32 * 32 * virglDefaultBytesPerPixel,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := virglTextureBytes(tc.req)
+			if err != nil {
+				t.Fatalf("virglTextureBytes: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("virglTextureBytes = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

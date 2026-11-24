@@ -111,6 +111,9 @@ type Device struct {
 	// budget counts live blobs and their reserved or mapped host bytes.
 	budget blobBudget
 
+	// submitBudget bounds command buffer bytes copied into Sentry memory at once.
+	submitBudget submitByteBudget
+
 	blobsMu sync.Mutex
 	// blobs holds every blob whose view is mapped, for ReleaseBlobViews.
 	// +checklocks:blobsMu
@@ -151,15 +154,16 @@ func Register(vfsObj *vfs.VirtualFilesystem, r Renderer, lim Limits) (*Device, e
 	}
 	lim = lim.withDefaults()
 	d := &Device{
-		vfs:      vfsObj,
-		renderer: r,
-		mode:     mode,
-		modes:    modes,
-		capsets:  capsets,
-		limits:   lim,
-		budget:   blobBudget{limit: lim.BlobBytes},
-		contexts: make(map[uint32]*fileContext),
-		blobs:    map[*blob]struct{}{},
+		vfs:          vfsObj,
+		renderer:     r,
+		mode:         mode,
+		modes:        modes,
+		capsets:      capsets,
+		limits:       lim,
+		budget:       blobBudget{limit: lim.BlobBytes},
+		submitBudget: submitByteBudget{limit: lim.SubmitBytes},
+		contexts:     make(map[uint32]*fileContext),
+		blobs:        map[*blob]struct{}{},
 	}
 	if err := vfsObj.RegisterDevice(vfs.CharDevice, DRMMajor, RenderMinor, d, &vfs.RegisterDeviceOptions{
 		GroupName: "drm",

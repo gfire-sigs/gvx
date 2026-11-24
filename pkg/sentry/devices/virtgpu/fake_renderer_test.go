@@ -85,10 +85,12 @@ type fakeRenderer struct {
 	resCanceled bool
 	nilResShm   bool
 
-	unrefed   []unrefCall
-	submits   []submitCall
-	submitErr error
-	ops       []fakeOp
+	unrefed       []unrefCall
+	submits       []submitCall
+	submitErr     error
+	submitGate    chan struct{}
+	submitEntered chan struct{}
+	ops           []fakeOp
 
 	sink           gpuproto.EventSink
 	sinkSet        bool
@@ -389,6 +391,21 @@ func (f *fakeRenderer) UnrefResource(ctxID, resID uint32) error {
 }
 
 func (f *fakeRenderer) Submit(ctxID uint32, cmd []byte, fence *gpuproto.Fence) error {
+	f.mu.Lock()
+	gate := f.submitGate
+	entered := f.submitEntered
+	f.mu.Unlock()
+
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		<-gate
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.lost {
