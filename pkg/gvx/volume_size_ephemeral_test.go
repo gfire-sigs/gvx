@@ -471,8 +471,10 @@ func TestEphemeralVolumeLifecycleIsolationAndOrphanCleanup(t *testing.T) {
 	}
 	orphanStaging := filepath.Join(ephDir, "ephemeral-deadbeef.ext4.staging")
 	unrelatedFile := filepath.Join(ephDir, "unrelated.note")
-	if err := os.WriteFile(orphanStaging, []byte("orphan"), 0o600); err != nil {
-		t.Fatal(err)
+	if runtime.GOOS != "windows" {
+		if err := os.WriteFile(orphanStaging, []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(unrelatedFile, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
@@ -508,8 +510,24 @@ func TestEphemeralVolumeLifecycleIsolationAndOrphanCleanup(t *testing.T) {
 		t.Fatalf("HostMountsForTest = %+v, want empty", hm)
 	}
 
-	if _, err := os.Stat(orphanStaging); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("owned staging file %q still exists: err = %v", orphanStaging, err)
+	if runtime.GOOS != "windows" {
+		if _, err := os.Stat(orphanStaging); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("owned staging file %q still exists: err = %v", orphanStaging, err)
+		}
+	} else {
+		liveEntries, rErr := os.ReadDir(ephDir)
+		if rErr != nil {
+			t.Fatalf("ReadDir(%q) while open: %v", ephDir, rErr)
+		}
+		foundLiveExt4 := false
+		for _, ent := range liveEntries {
+			if strings.HasPrefix(ent.Name(), ephemeralStagingPrefix) && strings.HasSuffix(ent.Name(), ext4VolumeSuffix) {
+				foundLiveExt4 = true
+			}
+		}
+		if !foundLiveExt4 {
+			t.Fatalf("expected live delete-on-close .ext4 file in %q while sandbox is open", ephDir)
+		}
 	}
 	if got, err := os.ReadFile(unrelatedFile); err != nil || string(got) != "keep" {
 		t.Fatalf("unrelated file = (%q, %v), want preserved", got, err)
