@@ -383,3 +383,171 @@ func TestDownloadArchiveEnforcesSizeAndDigest(t *testing.T) {
 		})
 	}
 }
+
+func TestDownloadFailureSkipsOnlyOnTransportError(t *testing.T) {
+	payload := []byte("pinned-asset")
+	sum := sha256.Sum256(payload)
+	digest := hex.EncodeToString(sum[:])
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/forbidden":
+			http.Error(w, "forbidden", http.StatusForbidden)
+		case "/gone":
+			http.NotFound(w, r)
+		case "/limited":
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+		case "/cut":
+			// The body ends before the declared length.
+			w.Header().Set("Content-Length", "64")
+			_, _ = w.Write(payload)
+		default:
+			_, _ = w.Write(payload)
+		}
+	}))
+	defer srv.Close()
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closedURL := closed.URL
+	closed.Close()
+
+	for _, tc := range []struct {
+		name     string
+		url      string
+		digest   string
+		maxBytes int64
+		dstDir   func(t *testing.T) string
+		wantSkip bool
+	}{
+		{name: "connection refused", url: closedURL + "/ok", digest: digest, maxBytes: 64, wantSkip: true},
+		{name: "body cut short", url: srv.URL + "/cut", digest: digest, maxBytes: 64, wantSkip: true},
+		{name: "status 403", url: srv.URL + "/forbidden", digest: digest, maxBytes: 64},
+		{name: "status 404", url: srv.URL + "/gone", digest: digest, maxBytes: 64},
+		{name: "status 429", url: srv.URL + "/limited", digest: digest, maxBytes: 64},
+		{name: "size above the limit", url: srv.URL + "/ok", digest: digest, maxBytes: 4},
+		{name: "digest mismatch", url: srv.URL + "/ok", digest: strings.Repeat("0", 64), maxBytes: 64},
+		{
+			name: "cache directory absent", url: srv.URL + "/ok", digest: digest, maxBytes: 64,
+			dstDir: func(t *testing.T) string { return filepath.Join(t.TempDir(), "absent") },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.dstDir != nil {
+				dir = tc.dstDir(t)
+			}
+			dst := filepath.Join(dir, "asset")
+			err := downloadArchive(srv.Client(), tc.url, dst, tc.digest, tc.maxBytes)
+			if err == nil {
+				t.Fatal("downloadArchive() = nil, want an error")
+			}
+			if got := downloadFailureSkips(err, false); got != tc.wantSkip {
+				t.Fatalf("downloadFailureSkips(%v, false) = %v, want %v", err, got, tc.wantSkip)
+			}
+			if downloadFailureSkips(err, true) {
+				t.Fatalf("downloadFailureSkips(%v, true) = true, want false with GVX_E2E_REQUIRE_NETWORK", err)
+			}
+			if _, statErr := os.Lstat(dst); statErr == nil {
+				t.Fatalf("%s exists after a failed download", dst)
+			}
+		})
+	}
+}
+
+func TestCachedTreeReuseNeedsCompleteTree(t *testing.T) {
+	newTree := func(t *testing.T) string {
+		t.Helper()
+		archive := writeTestTarGz(t,
+			archiveMember{name: "package/package.json", mode: 0o644, body: "{}"},
+			archiveMember{name: "package/lib/index.js", mode: 0o644, body: "module.exports = 1"},
+		)
+		cache := t.TempDir()
+		tmp := filepath.Join(cache, "extract")
+		if err := os.Mkdir(tmp, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := extractTarGz(archive, tmp, "package"); err != nil {
+			t.Fatalf("extractTarGz: %v", err)
+		}
+		tree := filepath.Join(cache, "tree")
+		if err := installTree(tmp, tree); err != nil {
+			t.Fatalf("installTree: %v", err)
+		}
+		return tree
+	}
+
+	t.Run("complete tree is reused", func(t *testing.T) {
+		tree := newTree(t)
+		ok, err := reuseTree(tree)
+		if err != nil || !ok {
+			t.Fatalf("reuseTree() = %v, %v, want true, nil", ok, err)
+		}
+		requireFile(t, filepath.Join(tree, "lib", "index.js"), "module.exports = 1", false)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		damage func(t *testing.T, tree string)
+	}{
+		{
+			// The host removed an old file and kept the directory.
+			name: "file removed",
+			damage: func(t *testing.T, tree string) {
+				if err := os.Remove(filepath.Join(tree, "lib", "index.js")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "file truncated",
+			damage: func(t *testing.T, tree string) {
+				if err := os.Truncate(filepath.Join(tree, "package.json"), 0); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			// A tree of an older cache format, or a tree whose manifest the host removed.
+			name: "manifest absent",
+			damage: func(t *testing.T, tree string) {
+				if err := os.Remove(filepath.Join(tree, treeManifestName)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := newTree(t)
+			tc.damage(t, tree)
+			if err := verifyTree(tree); !errors.Is(err, errTreeIncomplete) {
+				t.Fatalf("verifyTree() = %v, want errTreeIncomplete", err)
+			}
+			ok, err := reuseTree(tree)
+			if err != nil || ok {
+				t.Fatalf("reuseTree() = %v, %v, want false, nil", ok, err)
+			}
+			if _, err := os.Lstat(tree); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("incomplete tree still exists: %v", err)
+			}
+		})
+	}
+
+	t.Run("lost rename verifies the tree of the winner", func(t *testing.T) {
+		tree := newTree(t)
+		second := filepath.Join(filepath.Dir(tree), "second")
+		if err := os.MkdirAll(filepath.Join(second, "lib"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(second, "lib", "index.js"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := installTree(second, tree); err != nil {
+			t.Fatalf("installTree over a complete tree = %v, want nil", err)
+		}
+		if err := os.Remove(filepath.Join(tree, "package.json")); err != nil {
+			t.Fatal(err)
+		}
+		if err := installTree(second, tree); !errors.Is(err, errTreeIncomplete) {
+			t.Fatalf("installTree over an incomplete tree = %v, want errTreeIncomplete", err)
+		}
+	})
+}

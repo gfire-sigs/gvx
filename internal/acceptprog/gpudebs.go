@@ -34,6 +34,10 @@ type debPackage struct {
 // every published build, also after the Ubuntu archive drops the version.
 const launchpadFiles = "https://launchpad.net/ubuntu/+archive/primary/+files/"
 
+// maxGPUDebDownloadBytes caps the response body of one package download. The
+// largest pinned package has about 19 MiB.
+const maxGPUDebDownloadBytes int64 = 64 << 20
+
 // gpuGuestDebs maps a Linux architecture to the Ubuntu 24.04 packages that
 // add the Mesa Vulkan drivers (with venus) and vulkaninfo to the browser gate
 // image. The Mesa version must equal the mesa-libgallium version of that
@@ -66,7 +70,11 @@ func FetchGPUGuestDebs(tb testing.TB, goarch string) string {
 		io.WriteString(set, d.sha256)
 	}
 	tree := filepath.Join(dir, "gpu-debs-"+goarch+"-"+hex.EncodeToString(set.Sum(nil))[:16])
-	if info, err := os.Stat(tree); err == nil && info.IsDir() {
+	ok, err := reuseTree(tree)
+	if err != nil {
+		tb.Fatalf("remove the incomplete package directory: %v", err)
+	}
+	if ok {
 		return tree
 	}
 	tmp, err := os.MkdirTemp(dir, "gpu-debs-*")
@@ -80,15 +88,8 @@ func FetchGPUGuestDebs(tb testing.TB, goarch string) string {
 			if os.Getenv("GVX_E2E_OFFLINE") == "1" {
 				tb.Skipf("%s download is off (GVX_E2E_OFFLINE=1)", d.file)
 			}
-			if err := download(launchpadFiles+d.file, cached); err != nil {
-				if os.Getenv("GVX_E2E_REQUIRE_NETWORK") != "" {
-					tb.Fatalf("download %s: %v", d.file, err)
-				}
-				tb.Skipf("download %s: %v", d.file, err)
-			}
-			if got := fileDigest(cached); got != d.sha256 {
-				_ = os.Remove(cached)
-				tb.Fatalf("%s digest = %s, want %s", d.file, got, d.sha256)
+			if err := downloadArchive(nil, launchpadFiles+d.file, cached, d.sha256, maxGPUDebDownloadBytes); err != nil {
+				failOrSkipDownload(tb, d.file, err)
 			}
 		}
 		if strings.ContainsAny(d.file, `/\`) {
@@ -98,11 +99,8 @@ func FetchGPUGuestDebs(tb testing.TB, goarch string) string {
 			tb.Fatalf("copy %s: %v", d.file, err)
 		}
 	}
-	if err := os.Rename(tmp, tree); err != nil {
-		// A concurrent test process can win the rename. Its tree is complete.
-		if info, statErr := os.Stat(tree); statErr != nil || !info.IsDir() {
-			tb.Fatalf("install the package directory: %v", err)
-		}
+	if err := installTree(tmp, tree); err != nil {
+		tb.Fatalf("install the package directory: %v", err)
 	}
 	return tree
 }

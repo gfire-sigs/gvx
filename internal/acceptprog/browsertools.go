@@ -28,6 +28,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -62,8 +63,12 @@ const (
 )
 
 var (
-	errArchiveTooLarge   = errors.New("archive download exceeds size limit")
-	errDigestMismatch    = errors.New("archive digest mismatch")
+	errArchiveTooLarge = errors.New("archive download exceeds size limit")
+	errDigestMismatch  = errors.New("archive digest mismatch")
+	// errDownloadTransport marks a download that the network stopped: the
+	// request got no response, or the response body ended with an error.
+	errDownloadTransport = errors.New("download transport error")
+	errTreeIncomplete    = errors.New("cached tree is incomplete")
 	errTooManyMembers    = errors.New("archive exceeds member count limit")
 	errExtractedTooLarge = errors.New("archive exceeds extracted byte limit")
 )
@@ -126,10 +131,126 @@ func FetchElectron(tb testing.TB, goarch string) string {
 	return fetchBrowserArchive(tb, "electron", archive, extractZip)
 }
 
+// treeManifestName is the file at the top of a cached tree that lists the
+// regular files of the tree with their sizes. installTree writes it before the
+// tree gets its final name, so a tree with a manifest was complete at that time.
+const treeManifestName = ".gvx-tree-manifest"
+
+// writeTreeManifest writes the manifest of the tree at dir.
+func writeTreeManifest(dir string) error {
+	var b strings.Builder
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&b, "%d\t%s\n", info.Size(), filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if b.Len() == 0 {
+		return fmt.Errorf("%w: %s has no regular file", errTreeIncomplete, dir)
+	}
+	return os.WriteFile(filepath.Join(dir, treeManifestName), []byte(b.String()), 0o644)
+}
+
+// verifyTree compares the tree at dir with its manifest. It returns an error
+// that wraps errTreeIncomplete when the manifest is absent or empty, or when a
+// listed file is absent, is not a regular file, or has a different size. The
+// host can remove old files of a temporary directory and keep the directory.
+func verifyTree(dir string) error {
+	data, err := os.ReadFile(filepath.Join(dir, treeManifestName))
+	if err != nil {
+		return fmt.Errorf("%w: %w", errTreeIncomplete, err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(data) == 0 {
+		return fmt.Errorf("%w: empty manifest in %s", errTreeIncomplete, dir)
+	}
+	for _, line := range lines {
+		sizeText, rel, ok := strings.Cut(line, "\t")
+		size, perr := strconv.ParseInt(sizeText, 10, 64)
+		if !ok || perr != nil || !filepath.IsLocal(filepath.FromSlash(rel)) {
+			return fmt.Errorf("%w: manifest line %q", errTreeIncomplete, line)
+		}
+		info, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(rel)))
+		if err != nil {
+			return fmt.Errorf("%w: %w", errTreeIncomplete, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() != size {
+			return fmt.Errorf("%w: %s has mode %s and %d bytes, want a regular file of %d bytes", errTreeIncomplete, rel, info.Mode(), info.Size(), size)
+		}
+	}
+	return nil
+}
+
+// reuseTree reports whether the cached tree is complete. It removes a tree
+// that is not complete, so the caller can install a new one under that name.
+func reuseTree(tree string) (bool, error) {
+	if _, err := os.Lstat(tree); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err := verifyTree(tree); err == nil {
+		return true, nil
+	}
+	if err := os.RemoveAll(tree); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// installTree writes the manifest of the new tree at tmp and renames tmp to
+// tree. A concurrent test process can win the rename; installTree then
+// verifies the tree of that process.
+func installTree(tmp, tree string) error {
+	if err := writeTreeManifest(tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, tree); err != nil {
+		if verr := verifyTree(tree); verr != nil {
+			return errors.Join(err, verr)
+		}
+	}
+	return nil
+}
+
+// downloadFailureSkips reports whether a test skips after the download error
+// err. Only a transport error skips, and only when GVX_E2E_REQUIRE_NETWORK is
+// empty. An HTTP status other than 200, a size above the limit, a digest
+// mismatch, and a local file error always fail: a pinned asset that the server
+// removed or refused must not show as a skip.
+func downloadFailureSkips(err error, requireNetwork bool) bool {
+	return errors.Is(err, errDownloadTransport) && !requireNetwork
+}
+
+// failOrSkipDownload ends the test after the download error err with the rule
+// of downloadFailureSkips.
+func failOrSkipDownload(tb testing.TB, name string, err error) {
+	tb.Helper()
+	if downloadFailureSkips(err, os.Getenv("GVX_E2E_REQUIRE_NETWORK") != "") {
+		tb.Skipf("download %s: %v", name, err)
+	}
+	tb.Fatalf("download %s: %v", name, err)
+}
+
 // fetchBrowserArchive downloads the archive on the host, verifies its SHA-256
-// digest, and extracts it into a cache directory that later runs reuse. It
-// skips the test when GVX_E2E_OFFLINE is 1. It also skips when a transport
-// error stops the download and GVX_E2E_REQUIRE_NETWORK is empty.
+// digest, and extracts it into a cache directory that later runs reuse. A
+// later run reuses the tree only when it matches its manifest. It skips the
+// test when GVX_E2E_OFFLINE is 1. It also skips when a transport error stops
+// the download and GVX_E2E_REQUIRE_NETWORK is empty. Every other download
+// error fails the test.
 func fetchBrowserArchive(tb testing.TB, name string, a browserArchive, extract func(archive, dst, strip string) error) string {
 	tb.Helper()
 	dir := filepath.Join(os.TempDir(), "gvx-acceptprog-cache")
@@ -137,19 +258,20 @@ func fetchBrowserArchive(tb testing.TB, name string, a browserArchive, extract f
 		tb.Fatalf("create the %s cache directory: %v", name, err)
 	}
 	tree := filepath.Join(dir, a.sha256+"-"+name)
-	if info, err := os.Stat(tree); err == nil && info.IsDir() {
-		return tree
+	ok, err := reuseTree(tree)
+	if err != nil {
+		tb.Fatalf("remove the incomplete %s tree: %v", name, err)
 	}
-	if os.Getenv("GVX_E2E_OFFLINE") == "1" {
-		tb.Skipf("%s download is off (GVX_E2E_OFFLINE=1)", name)
+	if ok {
+		return tree
 	}
 	archive := filepath.Join(dir, a.sha256+path.Ext(a.url))
 	if fileDigest(archive) != a.sha256 {
+		if os.Getenv("GVX_E2E_OFFLINE") == "1" {
+			tb.Skipf("%s download is off (GVX_E2E_OFFLINE=1)", name)
+		}
 		if err := downloadArchive(nil, a.url, archive, a.sha256, a.maxBytes); err != nil {
-			if errors.Is(err, errArchiveTooLarge) || errors.Is(err, errDigestMismatch) || os.Getenv("GVX_E2E_REQUIRE_NETWORK") != "" {
-				tb.Fatalf("download %s: %v", name, err)
-			}
-			tb.Skipf("download %s: %v", name, err)
+			failOrSkipDownload(tb, name, err)
 		}
 	}
 	tmp, err := os.MkdirTemp(dir, name+"-extract-*")
@@ -160,25 +282,35 @@ func fetchBrowserArchive(tb testing.TB, name string, a browserArchive, extract f
 	if err := extract(archive, tmp, a.strip); err != nil {
 		tb.Fatalf("extract %s from %s: %v", name, archive, err)
 	}
-	if err := os.Rename(tmp, tree); err != nil {
-		// A concurrent test process can win the rename. Its tree is complete.
-		if info, statErr := os.Stat(tree); statErr != nil || !info.IsDir() {
-			tb.Fatalf("install the %s tree: %v", name, err)
-		}
+	if err := installTree(tmp, tree); err != nil {
+		tb.Fatalf("install the %s tree: %v", name, err)
 	}
 	return tree
 }
 
+// transportReader marks every read error of r, except io.EOF, as a transport
+// error.
+type transportReader struct{ r io.Reader }
+
+func (t transportReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err != nil && err != io.EOF {
+		err = fmt.Errorf("%w: %w", errDownloadTransport, err)
+	}
+	return n, err
+}
+
 // downloadArchive streams url into a temporary file beside dst while hashing
 // its SHA-256 digest, aborts if the body exceeds maxBytes, and renames the
-// file to dst only after the digest matches wantSHA256.
+// file to dst only after the digest matches wantSHA256. An error of the
+// request or of a body read wraps errDownloadTransport.
 func downloadArchive(client *http.Client, url, dst, wantSHA256 string, maxBytes int64) error {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Minute}
 	}
 	resp, err := client.Get(url)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errDownloadTransport, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -195,9 +327,9 @@ func downloadArchive(client *http.Client, url, dst, wantSHA256 string, maxBytes 
 	defer os.Remove(tmpName)
 
 	h := sha256.New()
-	var body io.Reader = resp.Body
+	var body io.Reader = transportReader{resp.Body}
 	if maxBytes > 0 {
-		body = io.LimitReader(resp.Body, maxBytes+1)
+		body = io.LimitReader(body, maxBytes+1)
 	}
 	n, copyErr := io.Copy(io.MultiWriter(tmp, h), body)
 	closeErr := tmp.Close()
