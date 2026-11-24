@@ -18,13 +18,19 @@ package gpu
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
+	gpurender "z.gfire.dev/gvx/ext/extensions/gpu/client"
+	"z.gfire.dev/gvx/ext/extensions/gpu/gpuproto"
+	"z.gfire.dev/gvx/ext/extensions/gpu/virtgpu"
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/sys"
 )
 
 // Mode selects the guest GPU acceleration protocol.
@@ -32,14 +38,19 @@ type Mode string
 
 const (
 	ModeOff   Mode = "off"
-	ModeAuto  Mode = "auto"
 	ModeVenus Mode = "venus"
 	ModeVirgl Mode = "virgl"
+
+	defaultMemoryLimit uint64 = 4 << 30
+	minMacOSMajor             = 26
 )
 
-// ErrRendererUnavailable reports that no external gvx-gpu-renderer worker
-// binary is installed or wired for this host yet.
-var ErrRendererUnavailable = errors.New("gpu: external gvx-gpu-renderer worker is unavailable")
+// ErrRendererUnavailable reports that the external gvx-gpu-renderer worker
+// binary cannot be located or started. The runtime never falls back silently
+// to software rendering.
+var ErrRendererUnavailable = errors.New("gpu: gvx-gpu-renderer worker unavailable")
+
+var errAlreadyAttached = errors.New("gpu: render node already attached to kernel")
 
 // Options configures one GPU Sandbox Extension instance.
 type Options struct {
@@ -48,15 +59,19 @@ type Options struct {
 	MemoryLimitBytes uint64
 }
 
-// ParseMode validates a GPU mode string ("off", "auto", "venus", or "virgl").
+// ParseMode validates a GPU mode string ("off", "venus", or "virgl").
+// The value "auto" is reserved and rejected with gvx.ErrInvalidConfig so callers
+// never receive silent software fallback.
 func ParseMode(raw string) (Mode, error) {
 	switch m := Mode(strings.ToLower(strings.TrimSpace(raw))); m {
 	case "", ModeOff:
 		return ModeOff, nil
-	case ModeAuto, ModeVenus, ModeVirgl:
+	case ModeVenus, ModeVirgl:
 		return m, nil
+	case "auto":
+		return "", fmt.Errorf("%w: -gpu mode %q is reserved and unsupported (want off, venus, or virgl)", gvx.ErrInvalidConfig, raw)
 	default:
-		return "", fmt.Errorf("%w: unsupported -gpu mode %q (want off, auto, venus, or virgl)", gvx.ErrInvalidConfig, raw)
+		return "", fmt.Errorf("%w: unsupported -gpu mode %q (want off, venus, or virgl)", gvx.ErrInvalidConfig, raw)
 	}
 }
 
@@ -97,16 +112,48 @@ func ParseMemoryLimit(raw string) (uint64, error) {
 	return n * mult, nil
 }
 
-// Extension implements gvx.Extension for optional GPU acceleration.
+func effectiveMemoryLimit(configured, hostRAM uint64) uint64 {
+	if configured > 0 {
+		return configured
+	}
+	if hostRAM == 0 {
+		return defaultMemoryLimit
+	}
+	return min(defaultMemoryLimit, hostRAM/4)
+}
+
+func parseMacOSMajor(version string) (int, bool) {
+	head, _, _ := strings.Cut(strings.TrimSpace(version), ".")
+	if head == "" {
+		return 0, false
+	}
+	major, err := strconv.Atoi(head)
+	if err != nil || major <= 0 {
+		return 0, false
+	}
+	return major, true
+}
+
+func rendererProtoMode(m Mode) (gpuproto.Mode, error) {
+	switch m {
+	case ModeVenus:
+		return gpuproto.ModeVenus, nil
+	case ModeVirgl:
+		return gpuproto.ModeVirgl, nil
+	default:
+		return 0, fmt.Errorf("%w: gpu extension requires mode venus or virgl", gvx.ErrInvalidConfig)
+	}
+}
+
+// Extension implements gvx.Extension for optional virtio-gpu acceleration.
 type Extension struct {
 	opts Options
+	// macOSVersion overrides hostMacOSVersion in unit tests when non-nil.
+	macOSVersion func() string
 }
 
 // NewExtension constructs an immutable GPU Extension from opts.
 func NewExtension(opts Options) *Extension {
-	if opts.Mode == "" {
-		opts.Mode = ModeAuto
-	}
 	return &Extension{opts: opts}
 }
 
@@ -127,17 +174,196 @@ func (e *Extension) Validate(env gvx.ValidationEnv) error {
 		return err
 	}
 	if mode == ModeOff {
-		return fmt.Errorf("%w: gpu extension requires mode auto, venus, or virgl", gvx.ErrInvalidConfig)
+		return fmt.Errorf("%w: gpu extension requires mode venus or virgl", gvx.ErrInvalidConfig)
 	}
 	if env.IsRestore || env.HasCheckpoint {
 		return gvx.ErrCheckpointExtensionUnsupported
 	}
+	if env.GOOS != "darwin" || env.GOARCH != "arm64" {
+		return fmt.Errorf("%w: GPU mode %s requires darwin/arm64, got %s/%s", gvx.ErrPlatformUnavailable, mode, env.GOOS, env.GOARCH)
+	}
+	versionFn := hostMacOSVersion
+	if e.macOSVersion != nil {
+		versionFn = e.macOSVersion
+	}
+	if ver := versionFn(); ver != "" {
+		if major, ok := parseMacOSMajor(ver); ok && major < minMacOSMajor {
+			return fmt.Errorf("%w: GPU mode %s requires macOS %d or later, got %s", gvx.ErrPlatformUnavailable, mode, minMacOSMajor, ver)
+		}
+	}
+	if env.Platform != "" && env.Platform != gvx.PlatformAuto && env.Platform != gvx.PlatformHVF {
+		return fmt.Errorf("%w: GPU mode %s requires the hvf backend, got %q", gvx.ErrPlatformUnavailable, mode, env.Platform)
+	}
 	return nil
 }
 
-// OpenPreLockdown implements gvx.Extension.OpenPreLockdown.
-func (e *Extension) OpenPreLockdown(_ context.Context, _ gvx.PreLockdownEnv) (gvx.BoundExtension, error) {
-	return nil, fmt.Errorf("%w: mode=%s requires gvx-gpu-renderer worker (Stage 5)", ErrRendererUnavailable, e.opts.Mode)
+// OpenPreLockdown implements gvx.Extension.OpenPreLockdown. It locates and
+// launches gvx-gpu-renderer before hostlockdown.Apply runs.
+func (e *Extension) OpenPreLockdown(ctx context.Context, env gvx.PreLockdownEnv) (gvx.BoundExtension, error) {
+	mode, err := ParseMode(string(e.opts.Mode))
+	if err != nil {
+		return nil, err
+	}
+	protoMode, err := rendererProtoMode(mode)
+	if err != nil {
+		return nil, err
+	}
+	if env.PlatformName != "hvf" {
+		return nil, fmt.Errorf("%w: GPU mode %s requires the hvf backend, got %q", gvx.ErrPlatformUnavailable, mode, env.PlatformName)
+	}
+	path, err := gpurender.Locate(e.opts.RendererPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrRendererUnavailable, err)
+	}
+	topo, err := virtgpu.SysfsTopology()
+	if err != nil {
+		return nil, fmt.Errorf("gpu: build sysfs topology: %w", err)
+	}
+	limit := effectiveMemoryLimit(e.opts.MemoryLimitBytes, env.HostRAMBytes)
+	var logLine func(string)
+	if env.Logf != nil {
+		logLine = func(line string) {
+			env.Logf("gvx-gpu-renderer: %s", line)
+		}
+	}
+	client, err := gpurender.Start(ctx, gpurender.Options{
+		Path:        path,
+		Log:         logLine,
+		MemoryLimit: limit,
+		Mode:        protoMode,
+		SpawnHelper: env.SpawnHelper,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrRendererUnavailable, err)
+	}
+	return &boundGPU{
+		mode:        mode,
+		memoryLimit: limit,
+		topo:        topo,
+		client:      client,
+	}, nil
+}
+
+type boundGPU struct {
+	mode        Mode
+	memoryLimit uint64
+	topo        sys.TopologyAddition
+
+	mu      sync.Mutex
+	client  *gpurender.Client
+	dev     *virtgpu.Device
+	aborted bool
+}
+
+var _ gvx.BoundExtension = (*boundGPU)(nil)
+
+func (*boundGPU) NeedsHelperSpawn() bool {
+	return true
+}
+
+func (*boundGPU) LockdownRequirements() gvx.ExtensionLockdown {
+	return gvx.ExtensionLockdown{}
+}
+
+func (*boundGPU) CheckpointPolicy() gvx.CheckpointPolicy {
+	return gvx.CheckpointUnsupported
+}
+
+func (b *boundGPU) SysfsTopologies() []sys.TopologyAddition {
+	return []sys.TopologyAddition{b.topo}
+}
+
+func (b *boundGPU) AttachKernel(_ context.Context, kenv *gvx.KernelEnv) error {
+	b.mu.Lock()
+	if b.aborted || b.client == nil {
+		b.mu.Unlock()
+		return gvx.ErrSandboxClosing
+	}
+	if b.dev != nil {
+		b.mu.Unlock()
+		return errAlreadyAttached
+	}
+	client := b.client
+	limit := b.memoryLimit
+	b.mu.Unlock()
+
+	dev, err := virtgpu.RegisterWithImporter(kenv.VFS, client, kenv.SharedMemory, virtgpu.Limits{BlobBytes: limit})
+	if err != nil {
+		return fmt.Errorf("gpu: register render node: %w", err)
+	}
+
+	b.mu.Lock()
+	if b.aborted || b.client == nil {
+		b.mu.Unlock()
+		dev.ReleaseBlobViews()
+		return gvx.ErrSandboxClosing
+	}
+	b.dev = dev
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *boundGPU) AbortPending() {
+	b.mu.Lock()
+	b.aborted = true
+	client := b.client
+	b.client = nil
+	b.mu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
+}
+
+func (b *boundGPU) Close(guestUnmapped bool) error {
+	b.mu.Lock()
+	b.aborted = true
+	client := b.client
+	b.client = nil
+	var dev *virtgpu.Device
+	if guestUnmapped {
+		dev = b.dev
+		b.dev = nil
+	}
+	b.mu.Unlock()
+
+	var err error
+	if client != nil {
+		err = client.Close()
+	}
+	if dev != nil {
+		dev.ReleaseBlobViews()
+	}
+	return err
+}
+
+func (b *boundGPU) snapshot() map[string]any {
+	b.mu.Lock()
+	client := b.client
+	dev := b.dev
+	aborted := b.aborted
+	b.mu.Unlock()
+
+	out := map[string]any{
+		"mode":               string(b.mode),
+		"memory_limit_bytes": b.memoryLimit,
+		"aborted":            aborted,
+	}
+	if dev != nil {
+		out["blob_bytes"] = dev.BlobBytes()
+	}
+	if client != nil {
+		out["renderer_pid"] = client.PID()
+		out["renderer_build"] = client.Build()
+	}
+	return out
+}
+
+func (b *boundGPU) Inspect() (json.RawMessage, error) {
+	return json.Marshal(b.snapshot())
+}
+
+func (b *boundGPU) Stats() (json.RawMessage, error) {
+	return json.Marshal(b.snapshot())
 }
 
 // CLIPlugin integrates GPU flags and build metadata into rungvx.
@@ -167,7 +393,7 @@ func (p *CLIPlugin) RegisterFlags(fs *flag.FlagSet) {
 	p.modeRaw = ""
 	p.renderer = ""
 	p.memLimitRaw = ""
-	fs.StringVar(&p.modeRaw, "gpu", "", "Enable virtio-gpu acceleration (off, auto, venus, virgl)")
+	fs.StringVar(&p.modeRaw, "gpu", "", "Enable virtio-gpu acceleration (off, venus, virgl)")
 	fs.StringVar(&p.renderer, "gpu-renderer", "", "Path to the external gvx-gpu-renderer worker binary")
 	fs.StringVar(&p.memLimitRaw, "gpu-memory-limit", "", "Maximum imported GPU shared memory per sandbox (for example 512m, 2g)")
 }

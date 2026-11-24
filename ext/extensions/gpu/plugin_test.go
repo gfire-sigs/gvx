@@ -12,27 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package gpu_test
+package gpu
 
 import (
 	"context"
 	"errors"
 	"flag"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"z.gfire.dev/gvx/ext/extensions/gpu"
 	"z.gfire.dev/gvx/pkg/gvx"
 	"z.gfire.dev/gvx/pkg/gvx/exttest"
 	"z.gfire.dev/gvx/pkg/rungvx"
 )
 
 func TestCLIPluginFlagsAndValidation(t *testing.T) {
-	var _ rungvx.CLIPlugin = (*gpu.CLIPlugin)(nil)
+	var _ rungvx.CLIPlugin = (*CLIPlugin)(nil)
 
-	p := gpu.NewCLIPlugin()
+	p := NewCLIPlugin()
 	if p.Name() != "gpu" || p.BuildSummary() != "modes=venus,virgl" {
 		t.Fatalf("metadata = (%q, %q), want (gpu, modes=venus,virgl)", p.Name(), p.BuildSummary())
 	}
@@ -49,28 +47,55 @@ func TestCLIPluginFlagsAndValidation(t *testing.T) {
 	if len(cfg.Extensions) != 1 || cfg.Extensions[0].Name() != "gpu" {
 		t.Fatalf("cfg.Extensions = %v, want 1 gpu extension", cfg.Extensions)
 	}
-	ext := cfg.Extensions[0].(*gpu.Extension)
-	if ext.Options().Mode != gpu.ModeVenus || ext.Options().MemoryLimitBytes != 512<<20 {
+	ext := cfg.Extensions[0].(*Extension)
+	ext.macOSVersion = func() string { return "26.0" }
+	if ext.Options().Mode != ModeVenus || ext.Options().MemoryLimitBytes != 512<<20 {
 		t.Fatalf("options = %+v, want venus / 512MiB", ext.Options())
 	}
-	if err := ext.Validate(gvx.ValidationEnv{GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}); err != nil {
-		t.Fatalf("Validate(normal) err = %v, want nil", err)
+
+	// Valid darwin/arm64 macOS 26+ hvf environment passes validation.
+	if err := ext.Validate(gvx.ValidationEnv{GOOS: "darwin", GOARCH: "arm64", Platform: gvx.PlatformHVF}); err != nil {
+		t.Fatalf("Validate(darwin/arm64 hvf) err = %v, want nil", err)
 	}
-	if err := ext.Validate(gvx.ValidationEnv{HasCheckpoint: true}); !errors.Is(err, gvx.ErrCheckpointExtensionUnsupported) {
+	// Checkpoint and restore fail closed with ErrCheckpointExtensionUnsupported.
+	if err := ext.Validate(gvx.ValidationEnv{GOOS: "darwin", GOARCH: "arm64", HasCheckpoint: true}); !errors.Is(err, gvx.ErrCheckpointExtensionUnsupported) {
 		t.Fatalf("Validate(HasCheckpoint) err = %v, want ErrCheckpointExtensionUnsupported", err)
 	}
-	if _, err := ext.OpenPreLockdown(context.Background(), gvx.PreLockdownEnv{}); !errors.Is(err, gpu.ErrRendererUnavailable) {
-		t.Fatalf("OpenPreLockdown err = %v, want ErrRendererUnavailable", err)
+	if err := ext.Validate(gvx.ValidationEnv{GOOS: "darwin", GOARCH: "arm64", IsRestore: true}); !errors.Is(err, gvx.ErrCheckpointExtensionUnsupported) {
+		t.Fatalf("Validate(IsRestore) err = %v, want ErrCheckpointExtensionUnsupported", err)
+	}
+	// Non-darwin/arm64 or non-hvf platform returns ErrPlatformUnavailable.
+	if err := ext.Validate(gvx.ValidationEnv{GOOS: "linux", GOARCH: "amd64"}); !errors.Is(err, gvx.ErrPlatformUnavailable) {
+		t.Fatalf("Validate(linux/amd64) err = %v, want ErrPlatformUnavailable", err)
+	}
+	if err := ext.Validate(gvx.ValidationEnv{GOOS: "darwin", GOARCH: "arm64", Platform: gvx.PlatformSystrap}); !errors.Is(err, gvx.ErrPlatformUnavailable) {
+		t.Fatalf("Validate(systrap) err = %v, want ErrPlatformUnavailable", err)
+	}
+	// macOS below 26 returns ErrPlatformUnavailable.
+	ext.macOSVersion = func() string { return "15.4" }
+	if err := ext.Validate(gvx.ValidationEnv{GOOS: "darwin", GOARCH: "arm64", Platform: gvx.PlatformHVF}); !errors.Is(err, gvx.ErrPlatformUnavailable) {
+		t.Fatalf("Validate(macOS 15.4) err = %v, want ErrPlatformUnavailable", err)
+	}
+
+	// OpenPreLockdown rejects non-hvf platforms and missing renderers explicitly.
+	if _, err := ext.OpenPreLockdown(context.Background(), gvx.PreLockdownEnv{PlatformName: "systrap"}); !errors.Is(err, gvx.ErrPlatformUnavailable) {
+		t.Fatalf("OpenPreLockdown(systrap) err = %v, want ErrPlatformUnavailable", err)
+	}
+	extMissing := NewExtension(Options{Mode: ModeVenus, RendererPath: "/nonexistent/gvx-gpu-renderer"})
+	if _, err := extMissing.OpenPreLockdown(context.Background(), gvx.PreLockdownEnv{PlatformName: "hvf"}); !errors.Is(err, ErrRendererUnavailable) {
+		t.Fatalf("OpenPreLockdown(missing renderer) err = %v, want ErrRendererUnavailable", err)
 	}
 }
 
-func TestCLIPluginRejectsInvalidModeAndOrphanFlags(t *testing.T) {
+func TestCLIPluginRejectsInvalidReservedAndOrphanFlags(t *testing.T) {
 	for _, args := range [][]string{
 		{"-gpu=metal"},
+		{"-gpu=auto"},
 		{"-gpu-memory-limit=512m"},
+		{"-gpu-renderer=/tmp/renderer"},
 		{"-gpu=venus", "-gpu-memory-limit=bogus"},
 	} {
-		p := gpu.NewCLIPlugin()
+		p := NewCLIPlugin()
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		p.RegisterFlags(fs)
 		if err := fs.Parse(args); err != nil {
@@ -80,6 +105,21 @@ func TestCLIPluginRejectsInvalidModeAndOrphanFlags(t *testing.T) {
 		if err := p.ApplyConfig(&cfg); !errors.Is(err, gvx.ErrInvalidConfig) {
 			t.Fatalf("ApplyConfig(%v) err = %v, want ErrInvalidConfig", args, err)
 		}
+	}
+}
+
+func TestEffectiveMemoryLimitCapsAtFourGiBOrQuarterRAM(t *testing.T) {
+	if got := effectiveMemoryLimit(512<<20, 64<<30); got != 512<<20 {
+		t.Fatalf("explicit limit = %d, want 512MiB", got)
+	}
+	if got := effectiveMemoryLimit(0, 64<<30); got != defaultMemoryLimit {
+		t.Fatalf("64GiB host = %d, want 4GiB", got)
+	}
+	if got := effectiveMemoryLimit(0, 8<<30); got != 2<<30 {
+		t.Fatalf("8GiB host = %d, want 2GiB", got)
+	}
+	if got := effectiveMemoryLimit(0, 0); got != defaultMemoryLimit {
+		t.Fatalf("unknown RAM = %d, want 4GiB", got)
 	}
 }
 
