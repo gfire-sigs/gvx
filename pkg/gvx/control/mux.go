@@ -245,6 +245,11 @@ func (c *Conn) activeStreams() int {
 func (c *Conn) writeFrame(f Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.writeFrameLocked(f)
+}
+
+// writeFrameLocked requires writeMu through both the frame and any descriptors.
+func (c *Conn) writeFrameLocked(f Frame) error {
 	if len(f.FDs) > 0 {
 		f.Flags |= FlagHasFDs
 	}
@@ -577,9 +582,25 @@ func (s *Stream) ID() uint32 {
 	return s.id
 }
 
+// Conn returns the control connection that owns this stream.
+func (s *Stream) Conn() *Conn {
+	return s.conn
+}
+
+// MaxFrameBytes returns the negotiated maximum payload length per wire frame.
+func (s *Stream) MaxFrameBytes() int {
+	return s.conn.maxFrameBytes
+}
+
 // Context returns the stream context, canceled when the stream or connection ends.
 func (s *Stream) Context() context.Context {
 	return s.ctx
+}
+
+// PeerAddr returns the transport connection's remote address, not an address
+// supplied by the RPC peer. Callers must not modify the address.
+func (s *Stream) PeerAddr() net.Addr {
+	return s.conn.raw.RemoteAddr()
 }
 
 // Close terminates the local stream state and detaches it from its connection.
@@ -754,13 +775,22 @@ func (s *Stream) sendResponse(result any, flags FrameFlags) error {
 		}
 		raw = b
 	}
+	payload, err := json.Marshal(ResponseEnvelope{OK: true, Result: raw})
+	if err != nil {
+		return fmt.Errorf("control: marshal response envelope: %w", err)
+	}
+	if len(payload) > s.conn.maxFrameBytes {
+		return NewError(CodeLimitExceeded, "response exceeds the negotiated frame size")
+	}
 	if !s.respSent.CompareAndSwap(false, true) {
 		return nil
 	}
-	return s.conn.writeResponseEnvelope(s.id, ResponseEnvelope{
-		OK:     true,
-		Result: raw,
-	}, flags)
+	return s.conn.writeFrame(Frame{
+		Type:     FrameResponse,
+		Flags:    flags,
+		StreamID: s.id,
+		Payload:  payload,
+	})
 }
 
 // SendError sends a terminal error response if no response has been sent yet.
@@ -822,18 +852,25 @@ func (s *Stream) WaitResponse(ctx context.Context, out any) error {
 
 // WriteData writes p to channel ch, respecting flow-control credits and chunking
 // payloads to stay under the negotiated MaxFrameBytes.
+// Cancellation prevents subsequent frames without truncating a committed frame.
 func (s *Stream) WriteData(ctx context.Context, ch Channel, p []byte, compress bool) error {
+	_, err := s.writeData(ctx, ch, p, compress)
+	return err
+}
+
+func (s *Stream) writeData(ctx context.Context, ch Channel, p []byte, compress bool) (int, error) {
 	if int(ch) >= maxChannelsPerStream {
-		return fmt.Errorf("control: invalid data channel %d", ch)
+		return 0, fmt.Errorf("control: invalid data channel %d", ch)
 	}
 	maxChunk := s.conn.maxFrameBytes
 	if maxChunk <= 0 {
 		maxChunk = DefaultMaxFrameBytes
 	}
+	var written int
 	for len(p) > 0 {
 		n, err := s.consumeSendWindow(ctx, len(p), maxChunk)
 		if err != nil {
-			return err
+			return written, err
 		}
 		chunk := p[:n]
 		p = p[n:]
@@ -841,17 +878,29 @@ func (s *Stream) WriteData(ctx context.Context, ch Channel, p []byte, compress b
 		if compress {
 			flags |= FlagCompressedZstd
 		}
-		if err := s.conn.writeFrame(Frame{
+		if err := s.writeDataFrame(ctx, Frame{
 			Type:     FrameData,
 			Flags:    flags,
 			Channel:  ch,
 			StreamID: s.id,
 			Payload:  chunk,
 		}); err != nil {
-			return err
+			return written, err
 		}
+		written += n
 	}
-	return nil
+	return written, nil
+}
+
+func (s *Stream) writeDataFrame(ctx context.Context, f Frame) error {
+	s.conn.writeMu.Lock()
+	defer s.conn.writeMu.Unlock()
+	// This check commits the frame. Cancellation after it must not split the frame.
+	if err := ctx.Err(); err != nil {
+		s.addSendWindow(int64(len(f.Payload)))
+		return err
+	}
+	return s.conn.writeFrameLocked(f)
 }
 
 func (s *Stream) consumeSendWindow(ctx context.Context, want, maxChunk int) (int, error) {
@@ -1089,10 +1138,7 @@ type streamChannelWriter struct {
 }
 
 func (w *streamChannelWriter) Write(p []byte) (int, error) {
-	if err := w.stream.WriteData(w.ctx, w.ch, p, w.compress); err != nil {
-		return 0, err
-	}
-	return len(p), nil
+	return w.stream.writeData(w.ctx, w.ch, p, w.compress)
 }
 
 func (w *streamChannelWriter) Close() error {

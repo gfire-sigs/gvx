@@ -128,6 +128,9 @@ type sandboxFlagValues struct {
 	arch                   string
 	net                    string
 	isolateLAN             bool
+	netTXBPS               uint64
+	netRXBPS               uint64
+	natPolicyFile          string
 	privileged             bool
 	netRaw                 bool
 	packetWrite            bool
@@ -140,6 +143,7 @@ type sandboxFlagValues struct {
 	readOnly               bool
 	workDir                string
 	cacheDir               string
+	keepBlobs              bool
 	registryURL            string
 	hostDNS                *multiStringFlag
 	pull                   string
@@ -149,6 +153,7 @@ type sandboxFlagValues struct {
 	detach                 bool
 	publishAll             bool
 	autoPublish            bool
+	autoPublishAddr        string
 	envFlags               listFlag
 	envFileFlags           listFlag
 	entrypoint             string
@@ -166,6 +171,7 @@ type sandboxFlagValues struct {
 	tmpfsFlags             listFlag
 	tune                   *tuneFlags
 	portSpecs              multiStringFlag
+	unixForwardSpecs       listFlag
 	checkpointDir          string
 	controlSocket          string
 	controlAuto            bool
@@ -173,7 +179,9 @@ type sandboxFlagValues struct {
 	controlDisable         multiStringFlag
 	controlTokenFile       string
 	dynamicPorts           bool
+	dynamicPortAddrs       multiStringFlag
 	allowVolumeAttach      bool
+	allowBindAttach        bool
 }
 
 // registerAlias binds a registration callback to each flag name in names.
@@ -204,6 +212,8 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 		fs.StringVar(&f.net, n, defs.netDefault, "Network backend: nat (or bridge), wg, or none")
 	})
 	fs.BoolVar(&f.isolateLAN, "isolate-lan", false, "Block RFC1918 and loopback LAN destinations in NAT mode")
+	registerNetworkBandwidthFlags(fs, &f.netTXBPS, &f.netRXBPS)
+	fs.StringVar(&f.natPolicyFile, "nat-policy-file", "", "Read host NAT firewall policy (.json, .yaml, or .yml)")
 	fs.BoolVar(&f.privileged, "privileged", true, "Turn on --net-raw, --allow-packet-socket-write, and --allow-suid; --privileged=false turns them off")
 	fs.BoolVar(&f.netRaw, "net-raw", true, "Allow raw sockets and iptables in the guest (default from --privileged)")
 	fs.BoolVar(&f.packetWrite, "allow-packet-socket-write", true, "Allow writes on AF_PACKET sockets; needs --net-raw (default from --privileged)")
@@ -212,11 +222,19 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	fs.StringVar(&f.wgConfigAlias, "wg-config", "", "Alias for -wg-conf")
 	f.hostDNS = addHostDNSFlag(fs)
 	fs.BoolVar(&f.publishAll, "P", false, "Publish every port that the image exposes to a free port of 127.0.0.1")
-	fs.BoolVar(&f.autoPublish, "auto-publish", false, "Automatically publish guest TCP listeners and iptables NAT DNAT ports on host 127.0.0.1")
+	fs.BoolVar(&f.autoPublish, "auto-publish", false, "Automatically publish guest TCP listeners and iptables NAT DNAT ports on host 127.0.0.1 (or --auto-publish-addr)")
+	fs.StringVar(&f.autoPublishAddr, "auto-publish-addr", "", "Host IP literal for --auto-publish (defaults to 127.0.0.1; e.g. 0.0.0.0 or a LAN IP)")
 	fs.BoolVar(&f.dynamicPorts, "dynamic-ports", false, "Allow runtime loopback port publishing via `rungv port add` under host lockdown")
+	fs.Var(&f.dynamicPortAddrs, "dynamic-ports-addr", "Repeatable host IP literal allowed for runtime `rungv port add` under host lockdown (e.g. 0.0.0.0 or a LAN IP)")
 	registerAlias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&f.portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
 	})
+	fs.Var(&f.unixForwardSpecs, "unix-forward", "Forward a guest Unix socket to a host Unix socket: GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]")
+}
+
+func registerNetworkBandwidthFlags(fs *flag.FlagSet, tx, rx *uint64) {
+	fs.Uint64Var(tx, "net-tx-bps", 0, "NAT bandwidth from guest to host in bits per second (0 for unlimited)")
+	fs.Uint64Var(rx, "net-rx-bps", 0, "NAT bandwidth from host to guest in bits per second (0 for unlimited)")
 }
 
 func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
@@ -228,6 +246,7 @@ func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
 	})
 	fs.BoolVar(&f.readOnly, "ro", false, "Mount /workspace read-only")
 	fs.StringVar(&f.cacheDir, "cache-dir", "", "EROFS layer cache directory")
+	fs.BoolVar(&f.keepBlobs, "keep-blobs", defaultKeepBlobs(), keepBlobsUsage)
 	fs.StringVar(&f.registryURL, "registry-url", "", "OCI registry base URL")
 	fs.StringVar(&f.pull, "pull", string(gvx.PullMissing), "Pull the image: missing (use the cache first, the default), always (ask the registry first), or never (cache only)")
 	fs.BoolVar(&f.hostCACerts, "host-ca-certs", false, "Make the guest trust the root certificates that the host trusts")
@@ -279,6 +298,7 @@ func (f *sandboxFlagValues) registerResourceAndCheckpointFlags(fs *flag.FlagSet)
 	fs.Var(&f.controlDisable, "control-disable", "Comma-separated control capabilities or groups to disable (e.g. exec,net.dial)")
 	fs.StringVar(&f.controlTokenFile, "control-token-file", "", "Path for the control authentication token file (forces token auth on POSIX Unix sockets)")
 	fs.BoolVar(&f.allowVolumeAttach, "allow-volume-attach", false, "Allow POSIX SCM_RIGHTS ext4lite volume attachment via `rungv mount add --type volume` under lockdown")
+	fs.BoolVar(&f.allowBindAttach, "allow-bind-attach", false, "Allow POSIX SCM_RIGHTS hostfs bind attachment via `rungv mount add --type bind` under lockdown")
 }
 
 // buildPortForwards parses repeatable -p / --publish flags with tuning applied.
@@ -439,6 +459,14 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	if err != nil {
 		return gvx.Config{}, false, err
 	}
+	var unixForwards []gvx.UnixForward
+	for _, spec := range f.unixForwardSpecs {
+		uf, err := gvx.ParseUnixForward(spec)
+		if err != nil {
+			return gvx.Config{}, false, fmt.Errorf("--unix-forward: %w", err)
+		}
+		unixForwards = append(unixForwards, uf)
+	}
 	envv, err := f.buildEnvv()
 	if err != nil {
 		return gvx.Config{}, false, err
@@ -458,6 +486,29 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	gpuMode, err := gvx.ParseGPUMode(f.gpu)
 	if err != nil {
 		return gvx.Config{}, false, fmt.Errorf("-gpu: %w", err)
+	}
+	var networkPolicy *gvx.NATPolicyConfig
+	if flagVisited(fs, "nat-policy-file") {
+		if allowEmptyNet && !flagVisited(fs, "net") && !flagVisited(fs, "network") {
+			netMode = gvx.NetModeNAT
+		}
+		if netMode != gvx.NetModeNAT {
+			return gvx.Config{}, false, fmt.Errorf("--nat-policy-file requires -net=nat")
+		}
+		policy, err := readNATPolicyFile(f.natPolicyFile)
+		if err != nil {
+			return gvx.Config{}, false, fmt.Errorf("--nat-policy-file: %w", err)
+		}
+		networkPolicy = &policy
+	}
+	if flagVisited(fs, "net-tx-bps") || flagVisited(fs, "net-rx-bps") {
+		if netMode == "" {
+			// If restore inherits the mode, the bundle must use NAT.
+			netMode = gvx.NetModeNAT
+		}
+		if netMode != gvx.NetModeNAT {
+			return gvx.Config{}, false, fmt.Errorf("--net-tx-bps and --net-rx-bps require -net=nat")
+		}
 	}
 	priv := resolvePrivileges(fs, f.privileged, f.netRaw, f.packetWrite, f.allowSUID)
 	ctrlPolicy, err := control.ParsePolicy(f.controlPolicy)
@@ -482,17 +533,21 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		AllowUnconfinedSystrap: f.allowUnconfinedSystrap,
 		Architecture:           arch,
 		NetworkMode:            netMode,
+		NetworkPolicy:          networkPolicy,
 		IsolateLAN:             f.isolateLAN,
 		HostDNSServers:         *f.hostDNS,
 		NetRaw:                 priv.netRaw,
 		AllowPacketSocketWrite: priv.packetWrite,
 		AllowSUID:              priv.allowSUID,
 		PortForwards:           portForwards,
+		UnixForwards:           unixForwards,
 		PublishAll:             f.publishAll,
 		AutoPublishPorts:       f.autoPublish,
+		AutoPublishAddr:        strings.TrimSpace(f.autoPublishAddr),
 		WireGuardConfigPath:    f.wireGuardPath(),
 		OCIImage:               strings.TrimSpace(f.image),
 		OCICacheDir:            strings.TrimSpace(f.cacheDir),
+		OCIKeepBlobs:           f.keepBlobs,
 		RegistryBaseURL:        strings.TrimSpace(f.registryURL),
 		PullPolicy:             pullPolicy,
 		Warnings:               warningsOut,
@@ -519,11 +574,17 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		ControlPolicy:          ctrlPolicy,
 		ControlDisable:         append([]string(nil), f.controlDisable...),
 		DynamicPorts:           f.dynamicPorts,
+		DynamicPortAddrs:       append([]string(nil), f.dynamicPortAddrs...),
 		AllowVolumeAttach:      f.allowVolumeAttach,
+		AllowBindAttach:        f.allowBindAttach,
 		GPU: gvx.GPUConfig{
 			Mode:         gpuMode,
 			RendererPath: strings.TrimSpace(f.gpuRenderer),
 		},
+	}
+	cfg.NetworkBandwidth.TXBPS, cfg.NetworkBandwidth.RXBPS = f.netTXBPS, f.netRXBPS
+	if err := cfg.NetworkBandwidth.Validate(); err != nil {
+		return gvx.Config{}, false, err
 	}
 	if err := control.ValidateDisableList(cfg.ControlDisable); err != nil {
 		return gvx.Config{}, false, fmt.Errorf("--control-disable: %w", err)

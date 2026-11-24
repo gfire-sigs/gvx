@@ -15,7 +15,9 @@
 package rpcfs
 
 import (
+	"bytes"
 	goContext "context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +35,7 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/uniqueid"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
@@ -382,6 +386,10 @@ func TestRPCFSReadWriteAndDisconnectEIO(t *testing.T) {
 	}
 	fd.DecRef(ctx)
 
+	if got, err := vfsObj.PathnameInFilesystem(ctx, rootVD); err != nil || got != "/" {
+		t.Fatalf("PathnameInFilesystem(root) = (%q, %v), want (\"/\", nil)", got, err)
+	}
+
 	// Disconnecting the backing client must yield EIO cleanly without panicking.
 	_ = client.Close()
 	if _, err := vfsObj.StatAt(ctx, creds, pop("/sub/hello.txt"), &vfs.StatOptions{}); err != linuxerr.EIO {
@@ -698,4 +706,466 @@ func TestRPCFSReadOnlyPermissionsBoundsAndInterrupt(t *testing.T) {
 			t.Fatal("interrupted StatAt did not unblock")
 		}
 	})
+}
+
+type chunkedWatchClient struct {
+	*localRootClient
+	maxChunk int64
+
+	wmu           sync.Mutex
+	maxWatches    int
+	watched       map[string]struct{}
+	unwatchedCh   chan string
+	notifyHandler func(NotifyEvent)
+}
+
+func (c *chunkedWatchClient) MaxChunkBytes() int64 { return c.maxChunk }
+
+func (c *chunkedWatchClient) Watch(_ goContext.Context, relPath string) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.watched == nil {
+		c.watched = make(map[string]struct{})
+	}
+	if _, ok := c.watched[relPath]; ok {
+		return nil
+	}
+	if c.maxWatches > 0 && len(c.watched) >= c.maxWatches {
+		return linuxerr.ENOSPC
+	}
+	c.watched[relPath] = struct{}{}
+	return nil
+}
+
+func (c *chunkedWatchClient) Unwatch(_ goContext.Context, relPath string) error {
+	c.wmu.Lock()
+	delete(c.watched, relPath)
+	ch := c.unwatchedCh
+	c.wmu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- relPath:
+		default:
+		}
+	}
+	return nil
+}
+
+func (c *chunkedWatchClient) SetNotifyHandler(fn func(NotifyEvent)) {
+	c.wmu.Lock()
+	c.notifyHandler = fn
+	c.wmu.Unlock()
+}
+
+func (c *chunkedWatchClient) emit(ev NotifyEvent) {
+	c.wmu.Lock()
+	fn := c.notifyHandler
+	c.wmu.Unlock()
+	if fn != nil {
+		fn(ev)
+	}
+}
+
+func TestRPCFSReadReturnsIOEOFAtAndBeyondEOF(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &chunkedWatchClient{
+		localRootClient: &localRootClient{root: root},
+		maxChunk:        16 << 10,
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx := gvcontext.Background()
+	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
+	var vfsObj vfs.VirtualFilesystem
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { vfsObj.Release(ctx) })
+
+	fs, rootD, err := NewFilesystem(ctx, &vfsObj, client, "chunked", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mnt := vfsObj.NewDisconnectedMount(fs, rootD, &vfs.MountOptions{})
+	fs.DecRef(ctx)
+	rootVD := vfs.MakeVirtualDentry(mnt, rootD)
+	t.Cleanup(func() { rootVD.DecRef(ctx) })
+
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 6000) // 96,000 bytes (not a chunk multiple)
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "empty.bin"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pop := func(p string) *vfs.PathOperation {
+		return &vfs.PathOperation{Root: rootVD, Start: rootVD, Path: fspath.Parse(p)}
+	}
+
+	// Simulate sendfile(2): loop Read with a large buffer until io.EOF.
+	fd, err := vfsObj.OpenAt(ctx, creds, pop("/blob.bin"), &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	if err != nil {
+		t.Fatalf("OpenAt blob.bin: %v", err)
+	}
+	defer fd.DecRef(ctx)
+
+	var got []byte
+	buf := make([]byte, 128<<10)
+	for range 32 {
+		n, rErr := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+		if n > 0 {
+			got = append(got, buf[:n]...)
+		}
+		if errors.Is(rErr, io.EOF) {
+			break
+		}
+		if rErr != nil {
+			t.Fatalf("Read unexpected err: %v", rErr)
+		}
+		if n == 0 {
+			t.Fatal("Read returned (0, nil) at EOF; must return io.EOF to avoid sendfile infinite loop")
+		}
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("read %d bytes, want %d bytes", len(got), len(payload))
+	}
+
+	// PRead at and beyond EOF must return (0, io.EOF).
+	for _, off := range []int64{int64(len(payload)), int64(len(payload)) + 4096} {
+		n, rErr := fd.PRead(ctx, usermem.BytesIOSequence(buf), off, vfs.ReadOptions{})
+		if n != 0 || !errors.Is(rErr, io.EOF) {
+			t.Fatalf("PRead(off=%d) = (%d, %v), want (0, io.EOF)", off, n, rErr)
+		}
+	}
+
+	// Empty file must return (0, io.EOF) on first Read.
+	efd, err := vfsObj.OpenAt(ctx, creds, pop("/empty.bin"), &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	if err != nil {
+		t.Fatalf("OpenAt empty.bin: %v", err)
+	}
+	defer efd.DecRef(ctx)
+	if n, rErr := efd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{}); n != 0 || !errors.Is(rErr, io.EOF) {
+		t.Fatalf("Read empty.bin = (%d, %v), want (0, io.EOF)", n, rErr)
+	}
+}
+
+type singleFileLocalClient struct {
+	*localRootClient
+	leaf string
+}
+
+func (c *singleFileLocalClient) resolve(rel string) (string, error) {
+	if rel != "." {
+		return "", linuxerr.ENOTDIR
+	}
+	return c.leaf, nil
+}
+
+func (c *singleFileLocalClient) Stat(ctx goContext.Context, rel string) (Entry, error) {
+	p, err := c.resolve(rel)
+	if err != nil {
+		return Entry{}, err
+	}
+	e, err := c.localRootClient.Stat(ctx, p)
+	if err != nil {
+		return Entry{}, err
+	}
+	e.Ino = 1
+	e.Name = ""
+	return e, nil
+}
+
+func (c *singleFileLocalClient) Read(ctx goContext.Context, rel string, offset, length int64) ([]byte, error) {
+	p, err := c.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	return c.localRootClient.Read(ctx, p, offset, length)
+}
+
+func (c *singleFileLocalClient) Write(ctx goContext.Context, rel string, offset int64, data []byte) (int64, error) {
+	p, err := c.resolve(rel)
+	if err != nil {
+		return 0, err
+	}
+	return c.localRootClient.Write(ctx, p, offset, data)
+}
+
+func (c *singleFileLocalClient) Truncate(ctx goContext.Context, rel string, size int64) error {
+	p, err := c.resolve(rel)
+	if err != nil {
+		return err
+	}
+	return c.localRootClient.Truncate(ctx, p, size)
+}
+
+func TestRPCFSSingleFileMount(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app.yml"), []byte("v: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &singleFileLocalClient{
+		localRootClient: &localRootClient{root: root},
+		leaf:            "app.yml",
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx := gvcontext.Background()
+	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
+	var vfsObj vfs.VirtualFilesystem
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { vfsObj.Release(ctx) })
+
+	fs, rootD, err := NewFilesystemWithOptions(ctx, &vfsObj, client, Options{
+		Label:      "app.yml",
+		SingleFile: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mnt := vfsObj.NewDisconnectedMount(fs, rootD, &vfs.MountOptions{})
+	fs.DecRef(ctx)
+	rootVD := vfs.MakeVirtualDentry(mnt, rootD)
+	t.Cleanup(func() { rootVD.DecRef(ctx) })
+
+	pop := func(p string) *vfs.PathOperation {
+		return &vfs.PathOperation{Root: rootVD, Start: rootVD, Path: fspath.Parse(p)}
+	}
+
+	// Trailing slash "/" sets MustBeDir=true and must fail with ENOTDIR on a regular file.
+	if _, err := vfsObj.StatAt(ctx, creds, pop("/"), &vfs.StatOptions{}); !linuxerr.Equals(linuxerr.ENOTDIR, err) {
+		t.Fatalf("StatAt(/) = %v, want ENOTDIR", err)
+	}
+
+	st, err := vfsObj.StatAt(ctx, creds, pop(""), &vfs.StatOptions{})
+	if err != nil {
+		t.Fatalf("StatAt(\"\"): %v", err)
+	}
+	if st.Mode&linux.S_IFMT != linux.S_IFREG || st.Size != 5 {
+		t.Fatalf("StatAt(\"\") = (mode=%#o, size=%d), want S_IFREG size 5", st.Mode, st.Size)
+	}
+
+	// O_CREAT|O_EXCL on existing single-file mount root must fail with EEXIST.
+	if f, err := vfsObj.OpenAt(ctx, creds, pop(""), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT | linux.O_EXCL}); !linuxerr.Equals(linuxerr.EEXIST, err) {
+		if f != nil {
+			f.DecRef(ctx)
+		}
+		t.Fatalf("OpenAt(O_CREAT|O_EXCL) = %v, want EEXIST", err)
+	}
+	// O_DIRECTORY and child lookups on single-file mount must return ENOTDIR.
+	if f, err := vfsObj.OpenAt(ctx, creds, pop(""), &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY}); !linuxerr.Equals(linuxerr.ENOTDIR, err) {
+		if f != nil {
+			f.DecRef(ctx)
+		}
+		t.Fatalf("OpenAt(O_DIRECTORY) = %v, want ENOTDIR", err)
+	}
+	if _, err := vfsObj.StatAt(ctx, creds, pop("/sibling"), &vfs.StatOptions{}); !linuxerr.Equals(linuxerr.ENOTDIR, err) {
+		t.Fatalf("StatAt(/sibling) = %v, want ENOTDIR", err)
+	}
+
+	fd, err := vfsObj.OpenAt(ctx, creds, pop(""), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_TRUNC})
+	if err != nil {
+		t.Fatalf("OpenAt(O_RDWR|O_TRUNC): %v", err)
+	}
+	if _, err := fd.Write(ctx, usermem.BytesIOSequence([]byte("v: 2\n")), vfs.WriteOptions{}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := fd.Seek(ctx, 0, linux.SEEK_SET); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, err := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	fd.DecRef(ctx)
+	if err != nil || string(buf[:n]) != "v: 2\n" {
+		t.Fatalf("Read = (%q, %v), want v: 2", buf[:n], err)
+	}
+}
+
+type inotifyIDCtx struct {
+	gvcontext.Context
+	mu     sync.Mutex
+	nextID uint64
+	cookie uint32
+}
+
+func (c *inotifyIDCtx) Value(key any) any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch key {
+	case uniqueid.CtxGlobalUniqueID:
+		c.nextID++
+		return c.nextID
+	case uniqueid.CtxInotifyCookie:
+		c.cookie++
+		return c.cookie
+	}
+	return c.Context.Value(key)
+}
+
+func readOneInotifyEvent(t *testing.T, ctx gvcontext.Context, inFD *vfs.FileDescription) (wd int32, mask, cookie uint32, name string) {
+	t.Helper()
+	buf := make([]byte, 512)
+	n, err := inFD.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	if err != nil || n < 16 {
+		t.Fatalf("inFD.Read = (%d, %v), want >= 16 bytes", n, err)
+	}
+	wd = int32(binary.LittleEndian.Uint32(buf[0:4]))
+	mask = binary.LittleEndian.Uint32(buf[4:8])
+	cookie = binary.LittleEndian.Uint32(buf[8:12])
+	nameLen := binary.LittleEndian.Uint32(buf[12:16])
+	if nameLen > 0 {
+		name = strings.TrimRight(string(buf[16:16+nameLen]), "\x00")
+	}
+	return wd, mask, cookie, name
+}
+
+func TestRPCFSWatchNotificationsAndLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "one.txt"), []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "two.txt"), []byte("world\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unwatchedCh := make(chan string, 4)
+	client := &chunkedWatchClient{
+		localRootClient: &localRootClient{root: root},
+		maxChunk:        64 << 10,
+		maxWatches:      2,
+		unwatchedCh:     unwatchedCh,
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx := &inotifyIDCtx{Context: gvcontext.Background()}
+	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
+	var vfsObj vfs.VirtualFilesystem
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { vfsObj.Release(ctx) })
+
+	fs, rootD, err := NewFilesystem(ctx, &vfsObj, client, "watch-dir", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mnt := vfsObj.NewDisconnectedMount(fs, rootD, &vfs.MountOptions{})
+	fs.DecRef(ctx)
+	rootVD := vfs.MakeVirtualDentry(mnt, rootD)
+	t.Cleanup(func() { rootVD.DecRef(ctx) })
+
+	pop := func(p string) *vfs.PathOperation {
+		return &vfs.PathOperation{Root: rootVD, Start: rootVD, Path: fspath.Parse(p)}
+	}
+
+	inFD, err := vfs.NewInotifyFD(ctx, &vfsObj, linux.O_NONBLOCK)
+	if err != nil {
+		t.Fatalf("NewInotifyFD: %v", err)
+	}
+	defer inFD.DecRef(ctx)
+	ino := inFD.Impl().(*vfs.Inotify)
+
+	oneVD, err := vfsObj.GetDentryAt(ctx, creds, pop("/one.txt"), &vfs.GetDentryOptions{})
+	if err != nil {
+		t.Fatalf("GetDentryAt(/one.txt): %v", err)
+	}
+	defer oneVD.DecRef(ctx)
+	if err := oneVD.Dentry().Impl().(interface{ AdmitInotifyWatch() error }).AdmitInotifyWatch(); err != nil {
+		t.Fatalf("AdmitInotifyWatch(/one.txt): %v", err)
+	}
+	oneWD := ino.AddWatch(oneVD.Dentry(), linux.IN_MODIFY|linux.IN_DELETE_SELF)
+
+	dirVD, err := vfsObj.GetDentryAt(ctx, creds, pop("/"), &vfs.GetDentryOptions{})
+	if err != nil {
+		t.Fatalf("GetDentryAt(/): %v", err)
+	}
+	defer dirVD.DecRef(ctx)
+	if err := dirVD.Dentry().Impl().(interface{ AdmitInotifyWatch() error }).AdmitInotifyWatch(); err != nil {
+		t.Fatalf("AdmitInotifyWatch(/): %v", err)
+	}
+	dirWD := ino.AddWatch(dirVD.Dentry(), linux.IN_CREATE|linux.IN_DELETE)
+
+	// Third distinct watched path must hit maxWatches=2 and return ENOSPC.
+	twoVD, err := vfsObj.GetDentryAt(ctx, creds, pop("/two.txt"), &vfs.GetDentryOptions{})
+	if err != nil {
+		t.Fatalf("GetDentryAt(/two.txt): %v", err)
+	}
+	defer twoVD.DecRef(ctx)
+	if err := twoVD.Dentry().Impl().(interface{ AdmitInotifyWatch() error }).AdmitInotifyWatch(); !linuxerr.Equals(linuxerr.ENOSPC, err) {
+		t.Fatalf("AdmitInotifyWatch(/two.txt) = %v, want ENOSPC", err)
+	}
+
+	// Host notification on one.txt reaches guest inotify fd.
+	client.emit(NotifyEvent{Path: "one.txt", Mask: linux.IN_MODIFY})
+	gotWD, gotMask, _, gotName := readOneInotifyEvent(t, ctx, inFD)
+	if gotWD != oneWD || gotMask != linux.IN_MODIFY || gotName != "" {
+		t.Fatalf("file notify = (wd=%d mask=%#x name=%q), want (wd=%d IN_MODIFY)", gotWD, gotMask, gotName, oneWD)
+	}
+
+	// Host notification on root directory reaches guest inotify fd with child name.
+	client.emit(NotifyEvent{Path: ".", Name: "added.txt", Mask: linux.IN_CREATE})
+	gotWD, gotMask, _, gotName = readOneInotifyEvent(t, ctx, inFD)
+	if gotWD != dirWD || gotMask != linux.IN_CREATE || gotName != "added.txt" {
+		t.Fatalf("dir notify = (wd=%d mask=%#x name=%q), want (wd=%d IN_CREATE added.txt)", gotWD, gotMask, gotName, dirWD)
+	}
+
+	// Removing watch triggers IN_IGNORED and async Unwatch on the client.
+	if err := ino.RmWatch(ctx, oneWD); err != nil {
+		t.Fatalf("RmWatch(oneWD): %v", err)
+	}
+	if ignWD, ignMask, _, _ := readOneInotifyEvent(t, ctx, inFD); ignWD != oneWD || ignMask != linux.IN_IGNORED {
+		t.Fatalf("RmWatch event = (wd=%d mask=%#x), want (wd=%d IN_IGNORED)", ignWD, ignMask, oneWD)
+	}
+	select {
+	case rel := <-unwatchedCh:
+		if rel != "one.txt" {
+			t.Fatalf("unwatched %q, want one.txt", rel)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Unwatch(one.txt)")
+	}
+
+	// Re-watching one.txt immediately after RmWatch must stay synced on the host.
+	if err := oneVD.Dentry().Impl().(interface{ AdmitInotifyWatch() error }).AdmitInotifyWatch(); err != nil {
+		t.Fatalf("re-AdmitInotifyWatch(/one.txt): %v", err)
+	}
+	reWD := ino.AddWatch(oneVD.Dentry(), linux.IN_MODIFY)
+	client.emit(NotifyEvent{Path: "one.txt", Mask: linux.IN_MODIFY})
+	gotWD, gotMask, _, _ = readOneInotifyEvent(t, ctx, inFD)
+	if gotWD != reWD || gotMask != linux.IN_MODIFY {
+		t.Fatalf("rewatched notify = (wd=%d mask=%#x), want (wd=%d IN_MODIFY)", gotWD, gotMask, reWD)
+	}
+
+	// Unlinking one.txt while an open FD holds a reference must detach its watch
+	// so notifications for a recreated one.txt do not reach the dead dentry.
+	openFD, err := vfsObj.OpenAt(ctx, creds, pop("/one.txt"), &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	if err != nil {
+		t.Fatalf("OpenAt(/one.txt): %v", err)
+	}
+	defer openFD.DecRef(ctx)
+	if err := vfsObj.UnlinkAt(ctx, creds, pop("/one.txt")); err != nil {
+		t.Fatalf("UnlinkAt(/one.txt): %v", err)
+	}
+	select {
+	case rel := <-unwatchedCh:
+		if rel != "one.txt" {
+			t.Fatalf("unwatched after unlink = %q, want one.txt", rel)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Unwatch(one.txt) after unlink with open FD")
+	}
 }

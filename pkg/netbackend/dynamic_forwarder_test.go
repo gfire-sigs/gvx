@@ -548,3 +548,97 @@ func TestDynamicLoopbackSkipsIPv6OnlyAndReconcilesGuestIPChange(t *testing.T) {
 	roundTripTCP(t, c, []byte("after-ip-switch"))
 	_ = c.Close()
 }
+
+func TestDynamicForwarderCustomBindIPAndBindError(t *testing.T) {
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+	})
+	t.Cleanup(s.Close)
+	if err := s.CreateNIC(Eth0NICID, loopback.New()); err != nil {
+		t.Fatalf("CreateNIC(eth0): %s", err)
+	}
+	if err := s.AddProtocolAddress(Eth0NICID, tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: defaultGuestIPv4Addr, PrefixLen: 24},
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress(eth0): %s", err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: Eth0NICID}})
+
+	busyLn, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("Listen busy: %v", err)
+	}
+	t.Cleanup(func() { _ = busyLn.Close() })
+	busyPort := uint16(busyLn.Addr().(*net.TCPAddr).Port)
+	freePort := reserveFreeLoopbackPort(t, "tcp")
+	for freePort == busyPort {
+		freePort = reserveFreeLoopbackPort(t, "tcp")
+	}
+
+	guestFreeLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: Eth0NICID, Addr: defaultGuestIPv4Addr, Port: freePort}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("ListenTCP free: %v", err)
+	}
+	tcpEchoServer(t, guestFreeLn)
+
+	guestBusyLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: Eth0NICID, Addr: defaultGuestIPv4Addr, Port: busyPort}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("ListenTCP busy: %v", err)
+	}
+	tcpEchoServer(t, guestBusyLn)
+
+	var cbMu sync.Mutex
+	var published []PortForwardRule
+	var removed []PortForwardRule
+	var bindErrs []uint16
+	pf := NewPortForwarder(tuning.Values{})
+	t.Cleanup(func() { _ = pf.Close() })
+	pf.EnableDynamicLoopback(DynamicForwardOptions{
+		BindIP:       "0.0.0.0",
+		PollInterval: time.Hour,
+		OnPublish: func(rule PortForwardRule, added bool) {
+			cbMu.Lock()
+			defer cbMu.Unlock()
+			if added {
+				published = append(published, rule)
+			} else {
+				removed = append(removed, rule)
+			}
+		},
+		OnBindError: func(_ string, port uint16, _ error) {
+			cbMu.Lock()
+			defer cbMu.Unlock()
+			bindErrs = append(bindErrs, port)
+		},
+	})
+	pf.Start(s)
+	pf.reconcileDynamicPorts()
+
+	cbMu.Lock()
+	gotPublished := slices.Clone(published)
+	gotBindErrs := slices.Clone(bindErrs)
+	cbMu.Unlock()
+	if len(gotPublished) != 1 || gotPublished[0].HostIP != "0.0.0.0" || gotPublished[0].HostPort != freePort {
+		t.Fatalf("published = %+v, want HostIP=0.0.0.0 HostPort=%d", gotPublished, freePort)
+	}
+	if len(gotBindErrs) != 1 || gotBindErrs[0] != busyPort {
+		t.Fatalf("bindErrs = %v, want [%d]", gotBindErrs, busyPort)
+	}
+	c, err := net.Dial("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(freePort))))
+	if err != nil {
+		t.Fatalf("Dial 127.0.0.1:%d: %v", freePort, err)
+	}
+	roundTripTCP(t, c, []byte("custom-bind-ip"))
+	_ = c.Close()
+
+	_ = guestFreeLn.Close()
+	pf.reconcileDynamicPorts()
+	cbMu.Lock()
+	gotRemoved := slices.Clone(removed)
+	cbMu.Unlock()
+	if len(gotRemoved) != 1 || gotRemoved[0].HostIP != "0.0.0.0" || gotRemoved[0].HostPort != freePort {
+		t.Fatalf("removed = %+v, want HostIP=0.0.0.0 HostPort=%d", gotRemoved, freePort)
+	}
+}

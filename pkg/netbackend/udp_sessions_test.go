@@ -24,14 +24,13 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
-// newTestSession returns a session over two pipes. Its clock shows activity at
-// the offset from the start of the clock.
+// newTestSession returns a session over two pipes with an ordered last activity.
 func newTestSession(t *testing.T, active time.Duration) *udpSession {
 	g1, g2 := net.Pipe()
 	h1, h2 := net.Pipe()
 	t.Cleanup(func() { g2.Close(); h2.Close() })
 	s := &udpSession{guest: g1, host: h1, clock: newActivityClock()}
-	s.clock.last.Store(int64(active))
+	s.clock.last = time.Unix(0, 0).Add(active)
 	return s
 }
 

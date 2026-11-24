@@ -18,6 +18,7 @@ package hostlockdown
 
 import (
 	"fmt"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
@@ -78,6 +79,12 @@ func BuildSeatbeltProfile(opts Options) string {
 		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, given)
 		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, real)
 	}
+	if opts.AllowBindAttach {
+		// Permit access only to paths explicitly delegated by an unlocked
+		// client via sandbox_extension_issue_file and consumed at runtime.
+		b.WriteString("(allow file-read* (extension \"com.apple.app-sandbox.read\"))\n")
+		b.WriteString("(allow file-read* file-write* (extension \"com.apple.app-sandbox.read-write\"))\n")
+	}
 	if opts.TTYPath != "" {
 		fmt.Fprintf(&b, "(allow file-ioctl (literal (param %q)))\n", "TTY_0")
 	}
@@ -86,7 +93,9 @@ func BuildSeatbeltProfile(opts Options) string {
 		b.WriteString(allowOutboundIP)
 		b.WriteString("(allow network-inbound)\n")
 		b.WriteString(denyNewBind)
-		if opts.AllowLoopbackBind {
+		if hasNonLoopbackBindAddr(opts.AllowedBindAddrs) {
+			b.WriteString(allowAnyIPBind)
+		} else if opts.AllowLoopbackBind || len(opts.AllowedBindAddrs) > 0 {
 			b.WriteString(allowLoopbackBind)
 		}
 	case len(opts.OutboundUDPPorts) > 0:
@@ -122,6 +131,22 @@ const denyNewBind = "(deny network-bind)\n"
 // It permits binding host IPv4/IPv6 loopback ports while keeping Unix socket
 // binds denied.
 const allowLoopbackBind = "(allow network-bind (local ip \"localhost:*\"))\n"
+
+// allowAnyIPBind follows denyNewBind when AllowedBindAddrs includes a
+// non-loopback IP. Seatbelt accepts only "*" or "localhost" in IP host filters,
+// so the profile permits IP binds while keeping Unix domain socket binds denied
+// and ListenAllowed enforces the exact IP allowlist.
+const allowAnyIPBind = "(allow network-bind (local ip \"*:*\"))\n"
+
+func hasNonLoopbackBindAddr(addrs []string) bool {
+	for _, raw := range addrs {
+		addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err == nil && !addr.Unmap().IsLoopback() {
+			return true
+		}
+	}
+	return false
+}
 
 // resolveMounts returns the absolute path of every mount and the path after
 // symlink resolution. The result has one entry per mount, in order.

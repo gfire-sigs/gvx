@@ -267,7 +267,10 @@ func stubInit() {
 				panic("failed to map stub code")
 			}
 			r := regions[rand.Uint64()%uint64(n)]
-			stubStart = hostPageRoundUp(r.start + uintptr(rand.Uint64())*hostarch.PageSize%(r.end-r.start-stubROMapEnd))
+			stubStart = hostPageRoundUp(r.start)
+			if r.end > stubStart+stubROMapEnd {
+				stubStart += hostPageRoundDown(uintptr(rand.Uint64()) * hostPageSize % (r.end - stubStart - stubROMapEnd))
+			}
 		}
 		// Map the target address for the stub.
 		addr, _ := hostsyscall.RawSyscall6(
@@ -289,7 +292,11 @@ func stubInit() {
 		panic("failed to map stub")
 	}
 	// Randomize stubSysmsgStack address.
-	gap := hostPageRoundDown(uintptr(rand.Uint64()) * hostPageSize % (maximumUserAddress - stubStart - mapLen))
+	var gap uintptr
+	if stubStart+mapLen < maximumUserAddress {
+		avail := maximumUserAddress - stubStart - mapLen
+		gap = hostPageRoundDown(uintptr(rand.Uint64()) * hostPageSize % avail)
+	}
 	stubSysmsgStack += uintptr(gap)
 	stubContextQueueRegion += uintptr(gap)
 	stubSpinningThreadQueueAddr += uintptr(gap)
@@ -354,7 +361,7 @@ func stubInit() {
 		unix.SYS_MSEAL,
 		stubStart,
 		stubROMapEnd-stubStart,
-		0); errno != 0 && errno != unix.ENOSYS {
+		0); errno != 0 && errno != unix.ENOSYS && errno != unix.EPERM {
 		panic("mseal failed: " + errno.Error())
 	}
 

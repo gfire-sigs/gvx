@@ -981,20 +981,28 @@ func (n *nic) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Packe
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
 func (n *nic) DeliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
-	res, _ := n.deliverTransportPacket(protocol, pkt)
+	res, _ := n.deliverTransportPacket(protocol, pkt, nil)
 	return res
 }
 
 // DeliverTransportPacketWithDefaultHandlerResult implements
 // TransportDispatcherWithDefaultHandlerResult.DeliverTransportPacketWithDefaultHandlerResult.
 func (n *nic) DeliverTransportPacketWithDefaultHandlerResult(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) (TransportPacketDisposition, bool) {
-	return n.deliverTransportPacket(protocol, pkt)
+	return n.deliverTransportPacket(protocol, pkt, nil)
 }
 
-func (n *nic) deliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) (TransportPacketDisposition, bool) {
+func (n *nic) deliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer, done func(*PacketBuffer, TransportPacketDisposition)) (TransportPacketDisposition, bool) {
+	var input *NATPacketInput
+	if done != nil {
+		input = pkt.NATInput()
+	}
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stats.unknownL4ProtocolRcvdPacketCounts.Increment(uint64(protocol))
+		if input != nil {
+			input.Admit(pkt, func(pkt *PacketBuffer) { done(pkt, TransportPacketProtocolUnreachable) })
+			return TransportPacketHandled, false
+		}
 		return TransportPacketProtocolUnreachable, false
 	}
 
@@ -1023,28 +1031,39 @@ func (n *nic) deliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt
 		RemotePort:    srcPort,
 		RemoteAddress: src,
 	}
-	if n.stack.demux.deliverPacket(protocol, pkt, id) {
+	if input == nil && n.stack.demux.deliverPacket(protocol, pkt, id) ||
+		input != nil && n.stack.demux.deliverNATPacket(protocol, pkt, id, input) {
 		return TransportPacketHandled, false
 	}
 
-	// Try to deliver to per-stack default handler.
-	if state.defaultHandler != nil {
-		if state.defaultHandler(id, pkt) {
-			return TransportPacketHandled, true
-		}
+	handler := state.defaultHandler
+	if handler != nil && (input == nil || state.natRelay) && handler(id, pkt) {
+		return TransportPacketHandled, true
 	}
+	if input != nil {
+		callDefault := handler != nil && !state.natRelay
+		input.Admit(pkt, func(pkt *PacketBuffer) {
+			if !callDefault || !handler(id, pkt) {
+				done(pkt, n.unknownTransportDestination(transProto, id, pkt))
+			}
+		})
+		return TransportPacketHandled, false
+	}
+	return n.unknownTransportDestination(transProto, id, pkt), false
+}
 
+func (n *nic) unknownTransportDestination(transProto TransportProtocol, id TransportEndpointID, pkt *PacketBuffer) TransportPacketDisposition {
 	// We could not find an appropriate destination for this packet so
 	// give the protocol specific error handler a chance to handle it.
 	// If it doesn't handle it then we should do so.
 	switch res := transProto.HandleUnknownDestinationPacket(id, pkt); res {
 	case UnknownDestinationPacketMalformed:
 		n.stats.malformedL4RcvdPackets.Increment()
-		return TransportPacketHandled, false
+		return TransportPacketHandled
 	case UnknownDestinationPacketUnhandled:
-		return TransportPacketDestinationPortUnreachable, false
+		return TransportPacketDestinationPortUnreachable
 	case UnknownDestinationPacketHandled:
-		return TransportPacketHandled, false
+		return TransportPacketHandled
 	default:
 		panic(fmt.Sprintf("unrecognized result from HandleUnknownDestinationPacket = %d", res))
 	}

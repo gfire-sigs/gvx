@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,9 +70,15 @@ type Sandbox struct {
 	rootVolume        *ext4lite.Volume
 	rootUpperExisting bool
 	mounts            []sandboxMount
+	sandboxExtHandles []int64
+	serveMounts       []sandboxServeMount
 	netStack          *stack.Stack
 	natForwarder      *netbackend.NATForwarder
 	portForwarder     *netbackend.PortForwarder
+	bandwidth         *netbackend.BandwidthShaper
+	natPolicy         *netbackend.NATPolicy
+	natTunnelGroup    *natTunnelGroup // protected by mu
+	shapedNATTunnels  int             // protected by mu
 	wgEndpoint        *netbackend.WireGuardEndpoint
 	wgPeerPort        uint16
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
@@ -129,6 +136,13 @@ type Sandbox struct {
 	liveMemoryWake    chan struct{}
 	rpcMountsMu       sync.Mutex
 	rpcMounts         map[string]*rpcMountEntry
+	unixFwdMu         sync.Mutex
+	unixForwards      map[string]*activeUnixForward
+	pendingUnixConns  map[uint64]*pendingUnixConn
+	unixClosed        bool
+	unixCloseCh       chan struct{}
+	unixRelayWG       sync.WaitGroup
+	nextUnixConnID    atomic.Uint64
 	closed            bool
 	closeDone         chan struct{}
 	closeErr          error
@@ -149,6 +163,9 @@ func (s *Sandbox) initControlState() {
 	s.liveMemoryBytes.Store(s.cfg.Resources.MemoryBytes)
 	s.liveMemoryWake = make(chan struct{}, 1)
 	s.rpcMounts = make(map[string]*rpcMountEntry)
+	s.unixForwards = make(map[string]*activeUnixForward)
+	s.pendingUnixConns = make(map[uint64]*pendingUnixConn)
+	s.unixCloseCh = make(chan struct{})
 	if dir := strings.TrimSpace(s.cfg.CheckpointDir); dir != "" {
 		s.cleanCkptDir = filepath.Clean(dir)
 		if abs, err := filepath.Abs(s.cleanCkptDir); err == nil {
@@ -198,6 +215,9 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	}
 	if err := cfg.normalize(); err != nil {
 		return nil, err
+	}
+	if len(cfg.ServeMounts) > 0 {
+		return nil, fmt.Errorf("%w: ServeMounts is supported only with Restore", ErrInvalidConfig)
 	}
 	applyHostMemoryDefaults()
 
@@ -260,6 +280,9 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	}
 
 	if !cfg.DisableHostLockdown {
+		if cfg.AllowBindAttach {
+			hostfs.WarmWatchLimit()
+		}
 		st, err := hostlockdown.Apply(sb.lockdownOptions())
 		if err != nil {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", err))
@@ -387,6 +410,7 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 		CPUQuotaMillis:       s.cfg.Resources.CPUMillis,
 		Mounts:               s.hostMounts(),
 		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
+		AllowBindAttach:      s.cfg.AllowBindAttach,
 		TTYPath:              ttyPath,
 		InstallSyscallFilter: s.syscallFilter(),
 	}
@@ -397,9 +421,21 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 			}
 		}
 	}
-	if (s.cfg.AutoPublishPorts || s.cfg.DynamicPorts) && s.cfg.NetworkMode == NetModeNAT {
-		opts.AllowLoopbackBind = true
-		opts.DynamicListeners = s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts)
+	if s.cfg.NetworkMode == NetModeNAT {
+		var allowedBindAddrs []string
+		for _, ip := range s.cfg.DynamicPortAddrs {
+			if !slices.Contains(allowedBindAddrs, ip) {
+				allowedBindAddrs = append(allowedBindAddrs, ip)
+			}
+		}
+		if s.cfg.AutoPublishPorts && s.cfg.AutoPublishAddr != "" && !slices.Contains(allowedBindAddrs, s.cfg.AutoPublishAddr) {
+			allowedBindAddrs = append(allowedBindAddrs, s.cfg.AutoPublishAddr)
+		}
+		if s.cfg.AutoPublishPorts || s.cfg.DynamicPorts || len(allowedBindAddrs) > 0 {
+			opts.AllowLoopbackBind = s.cfg.AutoPublishPorts || s.cfg.DynamicPorts
+			opts.AllowedBindAddrs = allowedBindAddrs
+			opts.DynamicListeners = s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts)
+		}
 	}
 	if s.controlListener() != nil {
 		opts.PreboundListeners++
@@ -727,7 +763,11 @@ func (s *Sandbox) Close() error {
 		s.mu.Lock()
 	}
 
+	s.mu.Unlock()
 	s.closeRPCMounts()
+	s.closeUnixForwards()
+	s.mu.Lock()
+	s.closeServeMounts()
 
 	if s.cfg.ControlListener != nil {
 		if err := s.cfg.ControlListener.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, net.ErrClosed) {
@@ -746,6 +786,15 @@ func (s *Sandbox) Close() error {
 		s.cfg.CheckpointListener = nil
 	}
 
+	if s.natPolicy != nil {
+		s.natPolicy.Close()
+	}
+	if s.bandwidth != nil {
+		// Queued transfers can hold relay buffers until the shaper stops.
+		s.mu.Unlock()
+		s.bandwidth.Close()
+		s.mu.Lock()
+	}
 	if s.portForwarder != nil {
 		if err := s.portForwarder.Close(); err != nil {
 			errs = append(errs, err)

@@ -36,6 +36,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/rpcfs"
 	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
@@ -150,9 +151,26 @@ func readAndParseManifest(dir string) (CheckpointManifest, error) {
 	return m, nil
 }
 
+func validateManifestNATPolicy(m CheckpointManifest, supplied bool) error {
+	switch m.Version {
+	case CheckpointManifestVersion:
+		return nil
+	case checkpointManifestNATPolicyVersion:
+		if m.NetMode != NetModeNAT {
+			return fmt.Errorf("%w: version %d requires NAT", ErrCheckpointManifest, m.Version)
+		}
+		if !supplied {
+			return fmt.Errorf("%w: this bundle requires a NAT policy; pass --nat-policy-file", ErrCheckpointManifest)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported version %d", ErrCheckpointManifest, m.Version)
+	}
+}
+
 func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
-	if m.Version != CheckpointManifestVersion {
-		return fmt.Errorf("%w: unsupported version %d (want %d)", ErrCheckpointManifest, m.Version, CheckpointManifestVersion)
+	if err := validateManifestNATPolicy(m, s.cfg.NetworkPolicy != nil); err != nil {
+		return err
 	}
 	if m.GOOS != runtime.GOOS {
 		return fmt.Errorf("%w: host OS mismatch: bundle has %q, current host is %q", ErrCheckpointManifest, m.GOOS, runtime.GOOS)
@@ -181,12 +199,95 @@ func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
 	if m.RootVolume != hasRootVol {
 		return fmt.Errorf("%w: root volume mismatch: bundle has %v, config has %v", ErrCheckpointManifest, m.RootVolume, hasRootVol)
 	}
-	wantMounts := sandboxManifestMounts(s.mounts)
-	if !slices.Equal(m.Mounts, wantMounts) {
-		return fmt.Errorf("%w: mounts mismatch: bundle has %v, config has %v", ErrCheckpointManifest, m.Mounts, wantMounts)
+	if err := s.validateManifestMounts(m.Mounts); err != nil {
+		return err
 	}
 	if m.NetMode != "" && m.NetMode != s.cfg.NetworkMode {
 		return fmt.Errorf("%w: network mode mismatch: bundle has %q, config has %q", ErrCheckpointManifest, m.NetMode, s.cfg.NetworkMode)
+	}
+	return nil
+}
+
+type manifestMountKey struct {
+	typ       MountKind
+	guestPath string
+	readOnly  bool
+	kind      string
+}
+
+func (s *Sandbox) validateManifestMounts(bundleMounts []ManifestMount) error {
+	seenPaths := make(map[string]struct{}, len(bundleMounts))
+	bundleOther := make(map[string]ManifestMount)
+	bundleRPC := make(map[string]ManifestMount)
+	for _, mm := range bundleMounts {
+		if err := validateGuestPath(mm.GuestPath); err != nil {
+			return fmt.Errorf("%w: invalid manifest mount path %q: %v", ErrCheckpointManifest, mm.GuestPath, err)
+		}
+		if _, dup := seenPaths[mm.GuestPath]; dup {
+			return fmt.Errorf("%w: duplicate manifest mount path %q", ErrCheckpointManifest, mm.GuestPath)
+		}
+		seenPaths[mm.GuestPath] = struct{}{}
+		if mm.Type == MountRPCFS {
+			bundleRPC[mm.GuestPath] = mm
+		} else {
+			bundleOther[mm.GuestPath] = mm
+		}
+	}
+
+	wantOther := sandboxManifestMounts(s.mounts)
+	wantByPath := make(map[string]ManifestMount, len(wantOther))
+	for i, wm := range wantOther {
+		wantByPath[wm.GuestPath] = wm
+		bm, ok := bundleOther[wm.GuestPath]
+		if !ok {
+			return fmt.Errorf("%w: mounts mismatch: config has unexpected mount %q (bundle has %v)", ErrCheckpointManifest, wm.GuestPath, bundleMounts)
+		}
+		if (manifestMountKey{bm.Type, bm.GuestPath, bm.ReadOnly, bm.Kind}) != (manifestMountKey{wm.Type, wm.GuestPath, wm.ReadOnly, wm.Kind}) {
+			return fmt.Errorf("%w: mounts mismatch at %q: bundle has %+v, config has %+v", ErrCheckpointManifest, wm.GuestPath, bm, wm)
+		}
+		if bm.Dynamic {
+			s.mounts[i].dynamic = true
+		}
+	}
+
+	var omittedDynamicTmpfs []sandboxMount
+	for _, bm := range bundleMounts {
+		if bm.Type == MountRPCFS {
+			continue
+		}
+		if _, ok := wantByPath[bm.GuestPath]; ok {
+			continue
+		}
+		if bm.Dynamic && bm.Type == MountTmpfs {
+			omittedDynamicTmpfs = append(omittedDynamicTmpfs, sandboxMount{
+				Mount: Mount{
+					Kind:      MountTmpfs,
+					GuestPath: bm.GuestPath,
+					ReadOnly:  bm.ReadOnly,
+				},
+				dynamic: true,
+			})
+			continue
+		}
+		return fmt.Errorf("%w: mounts mismatch: bundle requires mount %q (%s, ro=%t, label=%q)", ErrCheckpointManifest, bm.GuestPath, bm.Type, bm.ReadOnly, bm.Label)
+	}
+
+	for _, sm := range s.serveMounts {
+		bm, ok := bundleRPC[sm.GuestPath]
+		if !ok {
+			return fmt.Errorf("%w: serve mount %q is not present in checkpoint bundle", ErrCheckpointManifest, sm.GuestPath)
+		}
+		if sm.SingleFile != bm.SingleFile {
+			return fmt.Errorf("%w: serve mount %q single-file mismatch: bundle has %v, config has %v", ErrCheckpointManifest, sm.GuestPath, bm.SingleFile, sm.SingleFile)
+		}
+		if !sm.ReadOnly && bm.ReadOnly {
+			return fmt.Errorf("%w: serve mount %q is read-only in checkpoint bundle and cannot be restored read-write", ErrCheckpointManifest, sm.GuestPath)
+		}
+	}
+
+	if len(omittedDynamicTmpfs) > 0 {
+		s.mounts = append(s.mounts, omittedDynamicTmpfs...)
+		sortMountsByDepth(s.mounts)
 	}
 	return nil
 }
@@ -286,6 +387,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if err != nil {
 		return nil, err
 	}
+	if err := validateManifestNATPolicy(manifest, cfg.NetworkPolicy != nil); err != nil {
+		return nil, err
+	}
 	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
 	if cfg.Platform, err = restorePlatform(runtime.GOOS, cfg.Platform, manifest.Platform, allowUnconfined); err != nil {
 		return nil, err
@@ -380,6 +484,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if err := sb.openMountsForRestore(); err != nil {
 		return cleanup(err)
 	}
+	if err := sb.openServeMountsForRestore(); err != nil {
+		return cleanup(err)
+	}
 
 	if err := sb.validateCheckpointManifest(manifest); err != nil {
 		return cleanup(err)
@@ -407,6 +514,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 
 	if !cfg.DisableHostLockdown {
+		if cfg.AllowBindAttach {
+			hostfs.WarmWatchLimit()
+		}
 		st, lErr := hostlockdown.Apply(sb.lockdownOptions())
 		if lErr != nil {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", lErr))
@@ -473,6 +583,53 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if len(volMap) > 0 {
 		loadCtx = ext4lite.WithRestoreVolumeMap(loadCtx, volMap)
 	}
+
+	manifestRPCByTarget := make(map[string]ManifestMount)
+	for _, mm := range manifest.Mounts {
+		if mm.Type == MountRPCFS {
+			manifestRPCByTarget[mm.GuestPath] = mm
+		}
+	}
+	rpcRestoreClients := make(map[string]rpcfs.RestoreClient, len(sb.serveMounts))
+	serveByTarget := make(map[string]sandboxServeMount, len(sb.serveMounts))
+	for _, sm := range sb.serveMounts {
+		label := cmp.Or(sm.HostPath, sm.hostPath)
+		rpcRestoreClients[sm.GuestPath] = rpcfs.RestoreClient{
+			Client:     sm.Client,
+			Label:      label,
+			ReadOnly:   sm.ReadOnly,
+			SingleFile: sm.SingleFile,
+		}
+		serveByTarget[sm.GuestPath] = sm
+	}
+	loadCtx = rpcfs.WithRestoreConfig(loadCtx, &rpcfs.RestoreConfig{
+		Clients: rpcRestoreClients,
+		OnRestored: func(h *rpcfs.Handle) {
+			target := h.Target()
+			if target == "" {
+				return
+			}
+			mm := manifestRPCByTarget[target]
+			entry := &rpcMountEntry{
+				target:          target,
+				label:           h.Label(),
+				readOnly:        h.ReadOnly() || mm.ReadOnly,
+				backingReadOnly: h.BackingReadOnly(),
+				singleFile:      h.SingleFile(),
+				detached:        h.Detached(),
+				handle:          h,
+			}
+			if sm, ok := serveByTarget[target]; ok {
+				entry.client = sm.Client
+				entry.clientReadOnly = sm.ReadOnly
+				entry.backingReadOnly = h.BackingReadOnly() || sm.ReadOnly
+				entry.readOnly = entry.readOnly || sm.ReadOnly
+			}
+			sb.rpcMountsMu.Lock()
+			sb.rpcMounts[target] = entry
+			sb.rpcMountsMu.Unlock()
+		},
+	})
 
 	rawHost := false
 	if sb.cfg.TTY || isHostTerminalReader(sb.cfg.Stdin) {

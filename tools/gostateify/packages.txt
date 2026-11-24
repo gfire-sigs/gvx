@@ -17,6 +17,7 @@ pkg/sentry/fsimpl/hostfs tier1
 pkg/sentry/fsimpl/kernfs
 pkg/sentry/fsimpl/overlay
 pkg/sentry/fsimpl/proc tier2
+pkg/sentry/fsimpl/rpcfs tier1
 pkg/sentry/fsimpl/sys tier2
 pkg/sentry/fsimpl/tmpfs
 pkg/sentry/inet

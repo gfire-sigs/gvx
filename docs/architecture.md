@@ -99,8 +99,10 @@ gvx/ (Fork of google/gvisor@go)
  │   │   ├── control/                       # [NEW] gvx-ctrl/2 framed mux protocol, auth, and capability policy
  │   │   ├── hostcerts/                     # [NEW] Host root CA bundle collector and guest injector
  │   │   └── tuning/                        # [NEW] Typed runtime tuning registry
- │   ├── oci/                               # [NEW] Multi-arch OCI puller, cache, and Tar-to-EROFS compiler
+ │   ├── oci/                               # [NEW] Multi-arch OCI pull/push client, blob/EROFS cache, and Tar-to-EROFS compiler
  │   │   ├── pull.go
+ │   │   ├── push.go
+ │   │   ├── blobs.go
  │   │   ├── tar2erofs.go
  │   │   ├── erofs_layout.go
  │   │   └── cache.go
@@ -456,6 +458,14 @@ For inbound port forwarding (`-p hostPort:guestPort`, port ranges up to 1,024 po
 A DNS relay (`dns_relay.go`) answers guest UDP and TCP queries to `10.0.2.3:53` through the host resolvers in `-net=nat` and `-net=wg` modes. Before `hostlockdown.Apply()` executes, it reads deduplicated host nameservers, `search` domains, and safe `options`. When `/etc/resolv.conf` lists only `127.0.0.53`, it appends non-loopback fallbacks from `/run/systemd/resolve/resolv.conf`. Guest `/etc/resolv.conf` includes those `search` and `options` lines beside `nameserver 10.0.2.3`. The relay randomizes upstream transaction IDs with `crypto/rand` and bounds concurrent exchanges to 64 slots.
 
 TCP DNS queries from the guest travel directly over upstream TCP, while truncated UDP answers retry over TCP. The relay answers internal names (`localhost`, `host.docker.internal`, `gateway.docker.internal`, `gvx`) authoritatively for every `IN` query type without leaking them upstream. External `AAAA` queries return empty `NOERROR` when the guest has no IPv6 route on `eth0`. The relay defines no fixed public resolver address. `Config.HostDNSServers` (`--host-dns`) supplies explicit resolvers on hosts without `/etc/resolv.conf`, and `LayerCache.SetDNSServers` passes them to `pkg/oci`.
+
+Each sandbox owns one transmit bucket and one receive bucket. The NAT relay, published ports, DNS relay, private peer, and control tunnels share the buckets. Relays count payload. The private peer counts original IP bytes for traffic outside a relay.
+
+The buckets do not belong to the guest network stack or the host operating system. The checkpoint does not store their state or rates.
+
+The NAT firewall owns a separate immutable policy. The host replaces it over `gvx-ctrl/2`. Relays evaluate the actual endpoints before dialing, and the policy cancels relays that a replacement denies. The private peer also filters IP traffic outside those relays.
+
+A protected checkpoint requires the host to supply a policy on restore. It does not include rules or record which policy to use.
 
 #### Track B: L3 In-Memory WireGuard Tunnel (`wireguard_endpoint.go` and `pkg/tcpip/link/wgtun`) (Descriptive Module)
 

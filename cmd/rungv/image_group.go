@@ -28,8 +28,8 @@ import (
 func init() {
 	register(command{
 		name:    "image",
-		summary: "Manage cached OCI images (ls, pull, rm, inspect, tag, save, load, prune).",
-		usage:   []string{"rungv image <ls|pull|rm|inspect|tag|save|load|prune> [flags] [args...]"},
+		summary: "Manage cached OCI images (ls, pull, push, rm, inspect, tag, save, load, prune).",
+		usage:   []string{"rungv image <ls|pull|push|rm|inspect|tag|save|load|prune> [flags] [args...]"},
 		run:     imageGroupSubcommand,
 	})
 }
@@ -49,6 +49,8 @@ func imageGroupSubcommand(ctx context.Context, args []string, streams cliIO) int
 		return runImagesCommand(ctx, "image ls", rest, streams.stdout, streams.stderr)
 	case "pull":
 		return pullSubcommand(ctx, rest, streams.stdout, streams.stderr)
+	case "push":
+		return pushSubcommand(ctx, rest, streams.stdin, streams.stdout, streams.stderr)
 	case "rm", "remove", "rmi":
 		return rmiSubcommand(ctx, rest, streams.stdout, streams.stderr)
 	case "inspect":
@@ -74,6 +76,7 @@ func printImageGroupUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "Subcommands:")
 	_, _ = fmt.Fprintln(w, "  ls, list    List cached images")
 	_, _ = fmt.Fprintln(w, "  pull        Download an OCI image into the EROFS layer cache")
+	_, _ = fmt.Fprintln(w, "  push        Upload a cached OCI image to a registry")
 	_, _ = fmt.Fprintln(w, "  rm, rmi     Remove one or more cached images")
 	_, _ = fmt.Fprintln(w, "  inspect     Print detailed metadata for one or more images")
 	_, _ = fmt.Fprintln(w, "  tag         Create a tag TARGET that refers to SOURCE")

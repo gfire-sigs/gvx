@@ -25,6 +25,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx"
 	"z.gfire.dev/gvx/pkg/gvx/control"
 )
 
@@ -160,11 +161,21 @@ func statusSubcommand(ctx context.Context, cmdName string, args []string, stdout
 		_, _ = fmt.Fprintf(tw, "Platform:\t%s (%s)\n", info.Platform, info.Architecture)
 		_, _ = fmt.Fprintf(tw, "Lockdown:\t%v (%s)\n", info.LockdownApplied, info.SyscallIsolation)
 		_, _ = fmt.Fprintf(tw, "Network:\t%s (eth0=%s mtu=%d isolate-lan=%v)\n", info.NetworkMode, info.Eth0IP, info.Eth0MTU, info.Resources.IsolateLAN)
+		if info.NetworkMode == string(gvx.NetModeNAT) && client.HasFeature(control.FeatureNetQoS) {
+			_, _ = fmt.Fprintf(tw, "Network TX:\t%s\n", formatBandwidth(info.Resources.NetTXBPS))
+			_, _ = fmt.Fprintf(tw, "Network RX:\t%s\n", formatBandwidth(info.Resources.NetRXBPS))
+		}
 		_, _ = fmt.Fprintf(tw, "Memory:\t%s / %s\n", humanBytes(info.MemoryUsedBytes), formatLimitBytes(info.Resources.MemoryBytes))
 		_, _ = fmt.Fprintf(tw, "CPU:\t%d guest CPUs (quota=%dus period=%dus)\n", info.Resources.GuestCPUs, info.Resources.CPUQuotaUSec, info.Resources.CPUPeriodUSec)
 		_, _ = fmt.Fprintf(tw, "PIDs:\t%d (limit=%d)\n", info.PIDCount, info.Resources.PidsLimit)
 		_, _ = fmt.Fprintf(tw, "Exec Sessions:\t%d\n", info.ActiveExecSessions)
 		_, _ = fmt.Fprintf(tw, "Ports:\t%d\n", len(info.Ports))
+		if len(info.DynamicBindAddrs) > 0 {
+			_, _ = fmt.Fprintf(tw, "Dynamic Bind:\t%s\n", strings.Join(info.DynamicBindAddrs, ", "))
+		}
+		if info.AutoPublishAddr != "" {
+			_, _ = fmt.Fprintf(tw, "Auto Publish:\t%s\n", info.AutoPublishAddr)
+		}
 		_, _ = fmt.Fprintf(tw, "Mounts:\t%d\n", len(info.Mounts))
 		_, _ = fmt.Fprintf(tw, "Capabilities:\t%s\n", strings.Join(info.Capabilities, ", "))
 		return tw.Flush()

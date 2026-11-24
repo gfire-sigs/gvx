@@ -41,6 +41,46 @@ This release adds optional GPU paths for headless browsers on macOS (`rungv run 
 - No run covers macOS 26, other Apple Silicon chips, or the WebGL conformance subset.
 - The device and client packages cross-compile for Windows and Linux, but `-gpu=venus` and `-gpu=virgl` return `ErrInvalidConfig` there.
 
+## [v0.21.10012026111600] - 2026-11-24
+
+This release fixes a `systrap` stub initialization panic on Linux and Android hosts with 16 KB pages and kernel-sealed mappings (`EPERM` on `munmap` or `mseal`), and hardens stub region placement and `seccomp` notification probing during startup.
+
+### Bug Fixes
+
+- **16 KB sealed-page `systrap` stub initialization (`pkg/sentry/platform/systrap`)**:
+  - `unmapSegment` now aligns recursive binary-split midpoints to `hostPageSize` instead of a fixed `4096` bytes when `SYS_MUNMAP` returns `EPERM` on sealed host regions such as `[vdso]` or `[vvar]`. On 16 KB Android devices, splitting at 4 KB boundaries produced non-page-aligned `munmap` arguments, failed with `EINVAL`, and panicked inside `openPlatform` (`gvx.New`).
+  - `forkStub` now ignores `EPERM` from the early upper-address `munmap` sweep so `unmapRange` isolates sealed holes page by page.
+  - `stubInit` rounds the fallback `parseMaps` start address down to a host page boundary, guards `avail > 0` before computing the randomized VA gap, and ignores `EPERM` from optional `SYS_MSEAL`.
+  - `initSeccompNotify` treats `ENOSYS`, `EPERM`, and `EACCES` identically to `EINVAL` when probing `SECCOMP_GET_ACTION_AVAIL` so restricted host `seccomp` sandboxes do not panic at startup.
+
+## [v0.21.10002026111600] - 2026-11-23
+
+This release adds kept OCI image blobs, offline `rungv save`, and `rungv push` (#243). It also adds reverse Unix forwarding, live `hostfs` mounts, checkpoint and restore for live mounts, and cgroup v2 block I/O accounting (#232, #233, #235, #237). It includes opt-in non-loopback ports, `--auto-publish` events, host NAT firewall policies, and `rpcfs` fixes (#228, #231, #234, #236).
+
+### Breaking Changes
+
+- **OCI registry HTTP `User-Agent` header format (`pkg/oci`)** (#243, #246): Registry requests now send `User-Agent: gvx-oci/v1.0 (gvisor-everywhere; not-a-whale; <os>/<arch>; +https://z.gfire.dev/gvx; plz-no-429)` instead of `gvx-oci`. Update any registry proxy, firewall rule, allowlist, or log filter that matches the exact `gvx-oci` string. OAuth2 `refresh_token` requests keep `client_id=gvx-oci`.
+  - `gvx-oci/v1.0`: Product name and OCI wire-client version. It stays independent of `rungv` release tags and commits to limit fingerprinting.
+  - `gvisor-everywhere`: Identifies the cross-platform gVisor runtime across macOS, Windows, Linux, and Android.
+  - `not-a-whale`: Signals direct OCI registry traffic without a Docker daemon, while avoiding `docker` substring matches in registry rules.
+  - `<os>/<arch>`: Coarse host platform bucket (`runtime.GOOS`/`runtime.GOARCH`) with no OS version, kernel build, or Go patch number.
+  - `+https://z.gfire.dev/gvx`: Project URL for registry operators reviewing traffic logs.
+  - `plz-no-429`: Polite note to registry rate limiters.
+
+### Features
+
+- **Kept original OCI blobs, offline `rungv save`, and `rungv push` (`pkg/oci`, `pkg/gvx`, `cmd/rungv`)** (#243, #246): Opt-in `-keep-blobs` (or `GVX_KEEP_BLOBS=1`) retains verified layer blobs under `blobs/sha256/` during `pull`, `load`, and `run`. `rungv save` reads kept blobs offline first and preserves exact platform manifest digests for pulled and loaded images. `rungv push` uploads images over OCI Distribution Spec v1.1 with `HEAD` deduplication, cross-repository mounts, bearer scope upgrades, and per-request credentials. `rmi`, `image prune`, and `system df` account for and reclaim kept blobs across formats.
+- **Reverse Unix socket forwarding under host lockdown (`pkg/gvx`, `pkg/gvx/control`, `cmd/rungv`)** (#233, #242): Adds `--unix-forward` on `rungv run` and `rungv restore` plus live `rungv unix-forward` (alias `uf`) over `gvx-ctrl/2`. Guests connect to a guest Unix socket that relays traffic to a host Unix socket without weakening host lockdown.
+- **Checkpoint and restore with live mounts (`pkg/gvx`, `pkg/sentry/fsimpl/rpcfs`, `cmd/rungv`)** (#237, #245): Checkpoints now record runtime `tmpfs`, `ext4lite`, `hostfs`, and `rpcfs` mounts, chained read-only overlays, and lazy unmounts in the bundle manifest. `gvx.Restore` and `rungv restore` reattach backing handles and live `rpcfs` mount sessions across checkpoint and restore cycles.
+- **Live `hostfs` bind attachment under host lockdown (`pkg/gvx`, `pkg/hostlockdown`, `pkg/sentry/fsimpl/hostfs`, `cmd/rungv`)** (#232, #241): Adds `--allow-bind-attach` and `rungv mount add --type bind` to attach host directories or files as `hostfs` mounts via POSIX `SCM_RIGHTS`.
+- **Cgroup v2 block I/O accounting (`pkg/sentry/fsimpl/cgroupfs`, `pkg/sentry/blockdev`, `pkg/gvx`, `cmd/rungv`)** (#235, #244): Adds the Sentry cgroup v2 `io` controller (`io.stat`) with per-device byte and I/O counters for `ext4lite` volumes. Exposes live block I/O metrics in `rungv stats`.
+- **Opt-in non-loopback dynamic ports and `--auto-publish` events (`pkg/gvx`, `pkg/hostlockdown`, `pkg/netbackend`, `cmd/rungv`)** (#234, #236, #240): Adds `--auto-publish-addr` and repeatable `--dynamic-ports-addr` for explicit non-loopback host IP binds under lockdown while blocking unlisted addresses. `--auto-publish` emits `port.added` and `port.removed` events on `rungv events`.
+- **Host NAT firewall policy and per-sandbox bandwidth limits (`pkg/netbackend`, `pkg/gvx`, `cmd/rungv`)** (#228): Adds `--net-tx-bps` and `--net-rx-bps` on `rungv run`, `rungv restore`, and `rungv update`. Adds `--nat-policy-file` and `rungv net-policy get|replace` to install and replace JSON or YAML NAT firewall rules at runtime.
+
+### Bug Fixes
+
+- **`rpcfs` reads, large `readdir`, host `inotify`, and single-file serving (`pkg/sentry/fsimpl/rpcfs`, `pkg/gvx/control`, `cmd/rungv`)** (#231, #238): Fixes read stalls at EOF in `rpcfs` by returning `io.EOF` on zero-byte reads after the offset reaches file size. Paginates `readdir` responses so large directories stay within frame limits. Streams host filesystem watch events to guest `inotify` and serves single regular files with `rungv mount serve`.
+
 ## [v0.20.10012026111600] - 2026-11-23
 
 This release enables live `SCM_RIGHTS` volume attachment and `XDG_RUNTIME_DIR` socket resolution on `GOOS=android` (#230).

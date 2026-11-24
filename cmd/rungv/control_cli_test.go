@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -42,7 +43,12 @@ func TestParseControlRunFlags(t *testing.T) {
 		"--control-policy", "readonly",
 		"--control-disable", "exec,net.dial",
 		"--dynamic-ports",
+		"--dynamic-ports-addr", "0.0.0.0",
+		"--dynamic-ports-addr", "127.0.0.1",
+		"--auto-publish",
+		"--auto-publish-addr", "0.0.0.0",
 		"--allow-volume-attach",
+		"--allow-bind-attach",
 		"--pids-limit", "64",
 		"alpine:3.20",
 	)
@@ -58,8 +64,11 @@ func TestParseControlRunFlags(t *testing.T) {
 	if len(rc.cfg.ControlDisable) != 2 || rc.cfg.ControlDisable[0] != "exec" || rc.cfg.ControlDisable[1] != "net.dial" {
 		t.Errorf("ControlDisable = %v", rc.cfg.ControlDisable)
 	}
-	if !rc.cfg.DynamicPorts || !rc.cfg.AllowVolumeAttach || rc.cfg.Resources.PidsLimit != 64 {
-		t.Errorf("flags mismatch: dyn=%v vol=%v pids=%d", rc.cfg.DynamicPorts, rc.cfg.AllowVolumeAttach, rc.cfg.Resources.PidsLimit)
+	if !rc.cfg.DynamicPorts || !rc.cfg.AutoPublishPorts || rc.cfg.AutoPublishAddr != "0.0.0.0" || !rc.cfg.AllowVolumeAttach || !rc.cfg.AllowBindAttach || rc.cfg.Resources.PidsLimit != 64 {
+		t.Errorf("flags mismatch: dyn=%v auto=%v autoAddr=%q vol=%v bind=%v pids=%d", rc.cfg.DynamicPorts, rc.cfg.AutoPublishPorts, rc.cfg.AutoPublishAddr, rc.cfg.AllowVolumeAttach, rc.cfg.AllowBindAttach, rc.cfg.Resources.PidsLimit)
+	}
+	if len(rc.cfg.DynamicPortAddrs) != 2 || rc.cfg.DynamicPortAddrs[0] != "0.0.0.0" || rc.cfg.DynamicPortAddrs[1] != "127.0.0.1" {
+		t.Errorf("DynamicPortAddrs = %v, want [0.0.0.0 127.0.0.1]", rc.cfg.DynamicPortAddrs)
 	}
 
 	// --control without --name must return exit code 2.
@@ -434,7 +443,7 @@ func (m *mockCLIControlHandler) HandleLegacyCheckpoint(context.Context, control.
 	return nil
 }
 
-func startMockCLIServer(t *testing.T, caps []string, fn func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error) *control.Endpoint {
+func startMockCLIServer(t *testing.T, caps []string, fn func(ctx context.Context, stream *control.Stream, req control.RequestEnvelope) error, features ...string) *control.Endpoint {
 	t.Helper()
 	isolateControlTokenDir(t)
 	addr := freeLoopbackAddr(t)
@@ -447,6 +456,7 @@ func startMockCLIServer(t *testing.T, caps []string, fn func(ctx context.Context
 		SandboxID:    "mock-sbx",
 		Token:        ep.Token,
 		Capabilities: caps,
+		Features:     features,
 		Handler:      &mockCLIControlHandler{onStream: fn},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -575,7 +585,7 @@ func TestControlCLIFlagValidationAndV1Fallback(t *testing.T) {
 	var gotCPUQuota atomic.Int64
 	gotCPUQuota.Store(-999)
 
-	ep := startMockCLIServer(t, []string{control.CapStop, control.CapResourceMemory, control.CapResourceCPU, control.CapPing}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+	ep := startMockCLIServer(t, []string{control.CapStop, control.CapResourceMemory, control.CapResourceCPU, control.CapResourceNetwork, control.CapPing}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
 		switch req.Method {
 		case control.MethodStop:
 			var p control.StopRequest
@@ -612,6 +622,22 @@ func TestControlCLIFlagValidationAndV1Fallback(t *testing.T) {
 	// update --cpu-quota=max sends CPUQuotaUSec == 0.
 	if code, _, errS := runCLI("update", "-S", "tcp://"+ep.Address, "--cpu-quota=max"); code != 0 || gotCPUQuota.Load() != 0 {
 		t.Fatalf("update --cpu-quota=max = (code=%d, quota=%d, stderr=%q), want (0, 0)", code, gotCPUQuota.Load(), errS)
+	}
+
+	if code, _, errS := runCLI("update", "-S", "tcp://"+ep.Address, "--cpu-quota=40000", "--net-tx-bps=0"); code != 1 ||
+		!strings.Contains(errS, string(control.CodeUnsupported)) || gotCPUQuota.Load() != 0 {
+		t.Fatalf("mixed update against old control server = (code=%d, quota=%d, stderr=%q), want unsupported and no CPU change", code, gotCPUQuota.Load(), errS)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	legacyClient, err := control.Dial(ctx, control.DialOptions{Endpoint: ep.Address, Token: ep.Token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyClient.Close()
+	rawUpdate := json.RawMessage(`{"cpu_quota_usec":45000,"net_rx_bps":0}`)
+	if err := legacyClient.Call(ctx, control.MethodResourceUpdate, rawUpdate, nil); !control.IsCode(err, control.CodeUnsupported) || gotCPUQuota.Load() != 0 {
+		t.Fatalf("raw mixed update = %v, CPU quota = %d; want unsupported and unchanged CPU quota", err, gotCPUQuota.Load())
 	}
 
 	// kill --pid 5 --all and --pid -1 return exit 2.
@@ -681,6 +707,27 @@ func TestControlCLIFlagValidationAndV1Fallback(t *testing.T) {
 	// With explicit token (no local error), v2 handshake fails on wire and falls back to v1.
 	if code, _, errS := runCLI("checkpoint", "-S", "tcp://"+v1Ln.Addr().String(), "--token", "tok123", "-checkpoint-dir=ckpt"); code != 0 || v1Hits.Load() != 1 {
 		t.Fatalf("checkpoint v1 fallback = (code=%d, v1Hits=%d, stderr=%q), want (0, 1)", code, v1Hits.Load(), errS)
+	}
+}
+
+func TestCLIUpdateClearsOnlySpecifiedNATRate(t *testing.T) {
+	ep := startMockCLIServer(t, []string{control.CapResourceNetwork}, func(_ context.Context, stream *control.Stream, req control.RequestEnvelope) error {
+		var params control.ResourceUpdateRequest
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		if params.NetTXBPS == nil || *params.NetTXBPS != 0 || params.NetRXBPS != nil {
+			return control.NewErrorf(control.CodeInvalidArgument, "expected explicit TX zero and omitted RX, got %s", req.Params)
+		}
+		return stream.Reply(control.ResourceSnapshot{NetRXBPS: 10_000})
+	}, control.FeatureNetQoS)
+	var stdout, stderr bytes.Buffer
+	if code := executeCLI(t.Context(), []string{"update", "-S", "tcp://" + ep.Address, "--net-tx-bps=0", "-f", "json"}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("update TX bandwidth returned %d: %s", code, &stderr)
+	}
+	var snapshot control.ResourceSnapshot
+	if err := json.Unmarshal(stdout.Bytes(), &snapshot); err != nil || snapshot.NetTXBPS != 0 || snapshot.NetRXBPS != 10_000 {
+		t.Fatalf("update snapshot = %s (err=%v), want TX 0, RX 10000 bps", &stdout, err)
 	}
 }
 
@@ -1088,6 +1135,9 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 			t.Fatalf("update --cpu-quota=max snap = (%+v, %v)", snap, err)
 		}
 	}
+	if code, _, errS := runCmd(nil, "update", "-S", sockPath, "--net-rx-bps=0"); code != 1 || !strings.Contains(errS, string(control.CodeUnsupported)) {
+		t.Fatalf("clear bandwidth in non-NAT mode = (%d, %q), want UNSUPPORTED", code, errS)
+	}
 
 	// mount add tmpfs (small size < 6m allowed!) -> remount ro -> rw -> rm
 	if code, _, errS := runCmd(nil, "mount", "add", "-S", sockPath, "--type", "tmpfs", "--dst", "/mnt/dyn", "--size", "1m"); code != 0 {
@@ -1172,5 +1222,53 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 	}, strings.NewReader("resumed-from-stream\n"), &resOut, &resErr)
 	if resCode != 0 || resOut.String() != "resumed-from-stream\n" {
 		t.Fatalf("restore from streamed checkpoint = (code=%d out=%q err=%q)", resCode, resOut.String(), resErr.String())
+	}
+}
+
+func TestUnixForwardHelperOverflowAndFastEOFExit(t *testing.T) {
+	c2hR, c2hW := io.Pipe()
+	h2cR, h2cW := io.Pipe()
+	helperDone := make(chan int, 1)
+	go func() {
+		helperDone <- runUnixForwardHelper(context.Background(), []string{"/tmp/nonexistent.sock"}, c2hR, h2cW)
+	}()
+
+	pc := &pipeConn{r: h2cR, w: c2hW}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := control.DialConn(ctx, pc, control.DialOptions{
+		ClientName:       "test-helper-client",
+		HandshakeTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("DialConn helper: %v", err)
+	}
+
+	// ConnID = ^uint64(0) must return INVALID_ARGUMENT without panicking.
+	st, err := client.OpenStream(ctx, control.MethodUnixAccept, control.UnixAcceptRequest{ConnID: ^uint64(0)})
+	if err != nil {
+		t.Fatalf("OpenStream overflow conn_id: %v", err)
+	}
+	err = st.WaitResponse(ctx, nil)
+	st.Close()
+	var pe *control.ProtoError
+	if !errors.As(err, &pe) || pe.Code != control.CodeInvalidArgument {
+		t.Fatalf("overflow conn_id err = %v, want INVALID_ARGUMENT", err)
+	}
+
+	// Closing the client pipe must make runUnixForwardHelper exit promptly.
+	start := time.Now()
+	_ = client.Close()
+	_ = pc.Close()
+	select {
+	case code := <-helperDone:
+		if code != 0 {
+			t.Fatalf("helper exit code = %d, want 0", code)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("helper took %v to exit after pipe EOF, want <500ms", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runUnixForwardHelper hung after pipe EOF")
 	}
 }

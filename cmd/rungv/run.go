@@ -15,6 +15,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -178,6 +179,18 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		}()
 	}
 
+	if len(rc.cfg.UnixForwards) > 0 && !rc.cfg.DisableHostLockdown {
+		stopHelper, helperErr := startBootUnixForwardHelper(ctx, rc.cfg.UnixForwards)
+		if helperErr != nil {
+			if rc.cfg.ControlListener != nil {
+				_ = rc.cfg.ControlListener.Close()
+			}
+			_, _ = fmt.Fprintf(stderr, "rungv run: start unix-forward helper: %v\n", helperErr)
+			return 1
+		}
+		defer stopHelper()
+	}
+
 	var err error
 	sb, err = gvx.New(ctx, rc.cfg)
 	if err != nil {
@@ -274,7 +287,7 @@ func reportSandboxStartup(stderr io.Writer, sb *gvx.Sandbox, cfg *gvx.Config, au
 	}
 	reportPublishedPorts(stderr, sb)
 	if cfg.AutoPublishPorts {
-		_, _ = fmt.Fprintln(stderr, "rungv: auto-publish enabled for guest listeners on 127.0.0.1")
+		_, _ = fmt.Fprintf(stderr, "rungv: auto-publish enabled for guest listeners on %s\n", cmp.Or(cfg.AutoPublishAddr, "127.0.0.1"))
 	}
 	if cfg.Resources.CPUMillis > 0 && !sb.Limits().CPUTime {
 		_, _ = fmt.Fprintf(stderr, "rungv: warning: --cpus sets the number of CPUs that the guest sees; this host does not cap the CPU time\n")

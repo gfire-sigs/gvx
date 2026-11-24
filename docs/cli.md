@@ -25,6 +25,7 @@ Run `rungv help` to print this command list.
 | `update` | Update live memory, CPU quota, PID limit, LAN isolation, or mutable tunables. |
 | `port` | Group command for `ls`, `add`, and `rm` on published sandbox ports. |
 | `port-forward` | Tunnel host TCP or Unix sockets into a sandbox over its control socket (alias: `pf`). |
+| `unix-forward` | Forward guest Unix sockets to host Unix sockets over the control socket (alias: `uf`). |
 | `mount` | Group command for `ls`, `add`, `remount`, `rm`, and `serve` on runtime sandbox mounts. |
 | `status` | Inspect a running sandbox over its control socket (also `rungv sandbox inspect`). |
 | `stats` | Display live CPU, memory, network, block I/O, and PID statistics. |
@@ -35,14 +36,15 @@ Run `rungv help` to print this command list.
 | `events` | Stream filtered lifecycle events from a running sandbox. |
 | `ping` | Verify control socket liveness and advertised capabilities. |
 | `debug` | Adjust the active Sentry log level (`warning`, `info`, or `debug`). |
-| `pull` | Download an image into the layer cache (`--platform linux/ARCH` selects the architecture). |
+| `pull` | Download an image into the layer cache (`--platform linux/ARCH` selects the architecture; `-keep-blobs` retains original blobs). |
+| `push` | Upload a cached image to a registry with OCI Distribution Spec v1.1 (`rungv push [flags] IMAGE [TARGET]`). |
 | `images` | List cached images. |
 | `inspect` | Print image metadata as JSON or through a Go template. |
 | `tag` | Add a second name or tag to a cached image. |
 | `rmi` | Remove an image tag or delete an unreferenced image. |
 | `save` | Export images to a tar archive. |
-| `load` | Import images from a tar archive. |
-| `image` | Group command for `ls`, `pull`, `rm`, `inspect`, `tag`, `save`, `load`, and `prune`. |
+| `load` | Import images from a tar archive (`-keep-blobs` retains original blobs). |
+| `image` | Group command for `ls`, `pull`, `push`, `rm`, `inspect`, `tag`, `save`, `load`, and `prune`. |
 | `volume` | Group command for `create`, `ls`, `inspect`, `compact`, `rm`, and `prune` on local volumes. |
 | `system` | Group command for `info`, `df`, and `prune` on host backends and local storage. |
 | `info` | Print the host OS, available execution backends, lockdown profile, and storage paths. |
@@ -56,7 +58,7 @@ Run `rungv help` to print this command list.
 | `license` | Print license texts for `gvx`, upstream gVisor, and linked libraries (see Section 9). |
 | `version` | Print the version, source commit, and Go toolchain of the binary (see Section 10). |
 
-Print the flags of any subcommand with `rungv COMMAND --help`. On `run`, `-h` sets the hostname, as in Docker. Every flag accepts single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image argument, and short clusters expand boolean flags (`-itP`) and value flags (`-itp 8080:80`, `-p8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`). Arguments after `--` or after the image name pass unchanged to the guest command. Non-execution commands (`pull`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`, `image`, `volume`, `system`, `info`, `checkpoint`, `restore`) accept flags before or after positional arguments.
+Print the flags of any subcommand with `rungv COMMAND --help`. On `run`, `-h` sets the hostname, as in Docker. Every flag accepts single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image argument, and short clusters expand boolean flags (`-itP`) and value flags (`-itp 8080:80`, `-p8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`). Arguments after `--` or after the image name pass unchanged to the guest command. Non-execution commands (`pull`, `push`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`, `image`, `volume`, `system`, `info`, `checkpoint`, `restore`) accept flags before or after positional arguments.
 
 ## 3. `rungv run`
 
@@ -80,7 +82,8 @@ The table below lists the `rungv run` flags that match the Docker CLI.
 | `-t` | Allocate a pseudo-terminal. |
 | `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. Omitting the host port or using `0` picks a free port on `127.0.0.1`. Ranges like `8000-8009:8000-8009` publish each port. `unix:PATH:GUEST` exposes a guest TCP port on a host Unix socket (see Section 4.7). |
 | `-P` | Publish every port declared by image `EXPOSE` to a free `127.0.0.1` port. |
-| `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` while the sandbox runs. Static `-p` rules keep precedence (see Section 4.7). |
+| `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` (or `--auto-publish-addr`) while the sandbox runs. Static `-p` rules keep precedence (see Section 4.7). |
+| `--auto-publish-addr IP` | Override the host IP literal for `--auto-publish` (for example, `0.0.0.0` or a LAN IP). Requires `--auto-publish` and NAT mode. |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, a single host file, or a named volume. |
 | `--mount type=bind\|volume\|tmpfs\|overlay,src=...,dst=...,readonly[,driver=ext4lite\|hostfs][,upper=...][,tmpfs-size=...]` | Mount using Docker key-value syntax. `driver` applies to `type=volume` only; a volume `src` with a path separator names a host `.ext4` file. `type=overlay` mounts a copy-on-write branch over a read-only base volume. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
@@ -110,14 +113,17 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode (`nat`, `wg`, `none`) and its options. |
+| `--net-tx-bps N`, `--net-rx-bps N` | Set guest transmit and receive limits in bits per second for NAT. `0` leaves that direction unlimited. |
+| `--nat-policy-file FILE` | Load a host-owned NAT policy on `run` or `restore`. Use `.json`, `.yaml`, or `.yml`. |
 | `--privileged` | On by default. Enables `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` disables all three. Explicit per-flag values override `--privileged` (see Section 4.8). |
 | `--net-raw` | Allow guest raw sockets and `iptables` (required by `dockerd`). Defaults to `--privileged`. |
 | `--allow-packet-socket-write` | Allow guest writes on `AF_PACKET` sockets (requires `--net-raw`). Defaults to `--privileged` when `--net-raw` is on. |
 | `--allow-suid` | Obey `setuid` and `setgid` bits on guest executables (`sudo`, `su`, `passwd` for non-root users). Defaults to `--privileged`. |
 | `--host-ca-certs` | Copy host root CA certificates into the guest (off by default; see Section 4.10). |
 | `-registry-url URL` | Override the registry host of the image reference. |
-| `--host-dns IP[:PORT]` | Specify a host DNS server (repeatable). Replaces host resolver discovery for the guest DNS relay and registry pulls. Also accepted by `pull` and `save` (see Section 5.2). |
+| `--host-dns IP[:PORT]` | Specify a host DNS server (repeatable). Replaces host resolver discovery for the guest DNS relay and registry requests. Also accepted by `pull`, `push`, and `save` (see Section 5.2). |
 | `-cache-dir DIR` | Override the layer cache directory. |
+| `-keep-blobs` | Retain original image layer blobs in the cache during pull or load (default from `GVX_KEEP_BLOBS`). Enables offline `save` and `push` without a source registry. |
 | `-checkpoint-dir DIR` | Pre-open a host directory before lockdown for local checkpoint bundle files. |
 | `-S`, `-control-socket`, `--control-socket SPEC` | Bind an owner-only Unix socket or loopback TCP listener before lockdown for `gvx-ctrl/2` control commands. |
 | `--control` | Automatically bind an owner-only Unix control socket for `--name NAME`. |
@@ -125,7 +131,10 @@ The table below lists the sandbox flags specific to `gvx`.
 | `--control-disable CAPS` | Disable comma-separated control capabilities or groups (for example, `exec,net.dial`). |
 | `--control-token-file PATH` | Write the 256-bit control token to `PATH` and require token authentication even on POSIX Unix sockets. |
 | `--dynamic-ports` | Allow runtime loopback (`127.0.0.1` and `[::1]`) port publishing through `rungv port add` under host lockdown. |
+| `--dynamic-ports-addr IP` | Allow runtime `rungv port add` binds on the listed host IP literal under host lockdown (repeatable). Unlisted addresses and Unix sockets stay denied. |
+| `--unix-forward SPEC` | Forward a guest Unix socket to a host Unix socket (`GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]`, repeatable). Uses a pre-lockdown helper so the locked sandbox never dials host sockets. |
 | `--allow-volume-attach` | Enable Linux seccomp rules for attaching `ext4lite` volumes over POSIX `SCM_RIGHTS` via `rungv mount add --type volume`. |
+| `--allow-bind-attach` | Enable runtime bind attachment for `hostfs` via POSIX `SCM_RIGHTS` under host lockdown. On Linux this skips Landlock while keeping seccomp enforced; Windows uses `rungv mount serve`. |
 | `-lockdown=false` | Skip host lockdown. Use for debugging only. |
 | `--tune KEY=VALUE` | Set a host-side tunable (repeatable; see Section 3.3). Accepted by `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info`. |
 | `--tune-file FILE` | Load host-side tunables from a JSON object. `--tune` flags override the file. Accepted by the same commands. |
@@ -359,10 +368,17 @@ A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.me
 | :--- | :--- |
 | `rungv run -checkpoint-dir DIR -control-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before lockdown. |
 | `rungv checkpoint -S SPEC [-checkpoint-dir DIR \| -o DIR\|FILE\|-] [-leave-running] [-z] [--force]` | Connect to `SPEC` and trigger a checkpoint (`rungv snapshot` alias). `-o` streams a tar bundle over the control socket without `-checkpoint-dir`. `-z` compresses streamed frames with `zstd`. `--force` detaches active `exec` sessions before saving. |
-| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `--auto-publish`, `--dynamic-ports`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-S`/`--control` to reattach mounts, networking, or a new control listener. |
+| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `--attach-bind HOST:GUEST[:ro\|rw]`, `--serve HOST:GUEST[:ro\|rw]`, `-rootfs-volume`, `-p`, `--auto-publish`, `--dynamic-ports`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-S`/`--control` to reattach mounts, networking, or a new control listener. |
+
+The bundle does not store NAT bandwidth limits. A checkpoint that leaves the current instance running does not change its limits.
+The bundle does not store firewall rules. If you save a sandbox with a firewall, restore requires a policy file.
+
+The restore command rejects a bundle if its mount paths, `root_volume` setting, layer digests, platform, or network mode differ.
 
 > [!IMPORTANT]
-> Pass the same workspace, volume mounts, and `-rootfs-volume` flag to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the `root_volume` setting, the layer digests, the platform, or the network mode do not match `manifest.json`.
+> Pass the same workspace, bind, volume mounts, and `-rootfs-volume` flag on restore; pass `--serve HOST:GUEST[:ro|rw]` to reattach saved `rpcfs` mounts immediately (or reconnect later with `rungv mount serve`).
+> Pass `--net-tx-bps` and `--net-rx-bps` to set new NAT bandwidth limits on restore.
+> Close active control tunnels that use bandwidth limits before you save the sandbox.
 
 1. Start a workload with `-checkpoint-dir` and `-control-socket`.
 2. Run `rungv checkpoint` in another terminal to write the bundle and stop the sandbox.
@@ -399,10 +415,79 @@ Every control subcommand accepts `-S`/`--control-socket SPEC` (or `GVX_CONTROL_S
 | `exec` | `rungv exec [-i] [-t] [-d] [-e KEY=VAL] [--env-file FILE] [-w DIR] [-u USER] [--privileged=BOOL] [--detach-keys KEYS] [--pid-file FILE] [--] CMD [ARG...]`. Closes guest stdin (`/dev/null`) unless the caller passes `-i`. |
 | `pause` / `unpause` | `rungv pause [--quiesce-net=true\|false]` and `rungv unpause`. Pauses and resumes all guest tasks. |
 | `cp` / `export` | `rungv cp [-a] [-L] [-q] [-z] [--no-overwrite-dir] [--user U:G] SRC DST` and `rungv export [--upper-only] [-z] [-o FILE\|-] [PATH]`. Streams tar archives while the unlocked client performs all host disk I/O with `os.Root`. |
-| `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
+| `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota USEC] [--cpu-period USEC] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps N] [--net-rx-bps N] [--tune KEY=VAL]... [-f SPEC]`. Updates live limits and mutable tunables without restarting. |
+| `net-policy` | `rungv net-policy get` reads the active NAT policy. `rungv net-policy replace --file FILE` replaces it. Both use the existing control socket. |
 | `port` / `port-forward` | `rungv port <ls\|add\|rm>` lists, adds, and removes host-to-guest NAT rules (requiring `--dynamic-ports` or `--auto-publish` under lockdown). `rungv port-forward` (alias `pf`) listens on the client and tunnels TCP connections via `net.dial` with zero lockdown relaxation. |
-| `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, unmounts targets, or serves a host directory via `rpcfs` (`mount serve HOST_DIR:GUEST_PATH`). |
+| `unix-forward` | `rungv unix-forward [--replace] GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]` (alias `uf`) binds a Unix socket inside the guest and relays connections to a host Unix socket with zero lockdown relaxation. |
+| `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. Adds `tmpfs` or POSIX `SCM_RIGHTS` `ext4lite` volumes, toggles read-only status, and unmounts targets. `mount serve HOST_PATH:GUEST_PATH` serves a host directory or regular file via `rpcfs` with paginated `readdir` and host-to-guest `inotify` events. |
 | `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect sandbox metadata, stream resource counters and kernel logs, send signals, stop PID 1 cleanly, or adjust Sentry log verbosity. |
+
+### 4.13 NAT bandwidth limits
+
+The rates share one budget per direction across all flows in a sandbox. Transmit means out of the guest. Receive means into the guest. The rates default to `0` (unlimited). Use them only with `-net=nat`.
+
+TCP and UDP relays count payload bytes. The limits also cover upstream DNS traffic, published ports, and `port-forward` tunnels. Traffic that does not use a relay counts IP bytes, including the header of each fragment.
+
+Each direction permits bursts up to 256 KiB. A full queue can drop datagrams or IP packets. Stream relays wait for available bandwidth. The limits do not regulate host socket buffers, traffic that stays inside the guest, or control protocol framing.
+
+The Go SDK does not combine bandwidth limits with `Config.StreamInterceptor`.
+
+Set the rates at startup or change them on a running sandbox. Omit a rate in `update` to keep its current value.
+
+```sh
+rungv run --net=nat --net-tx-bps 2000000 --net-rx-bps 8000000 --name app --control alpine:3.20 sleep 600
+rungv update -n app --net-tx-bps 4000000
+rungv update -n app --net-rx-bps 0
+```
+
+### 4.14 Host NAT policy
+
+This policy runs at the NAT boundary, outside the guest. Guest `iptables` does not change the host policy. The policy applies to IPv4 and IPv6.
+
+| Field | Meaning |
+| :--- | :--- |
+| `egress`, `ingress` | Each direction has a `default` action and up to 1,024 ordered rules. The first matching rule determines the verdict. |
+| `action`, `default` | `allow` or `deny`. Use `default` for traffic that matches no rule. |
+| `cidr` | Optional range for the remote address. For egress, the address is a destination. For ingress, it is the client. |
+| `guest_cidr` | Optional range for the guest source on egress or guest target on ingress. |
+| `protocol` | `tcp`, `udp`, `icmp`, `icmpv6`, or a protocol number from 1 through 255. Omit it to match all protocols. |
+| `ports` | Optional service port or inclusive range such as `8000-8010`. It applies to TCP and UDP. |
+
+The CLI selects JSON or YAML from the file extension. It rejects missing or unknown extensions. Both formats use the same schema and a 64 KiB file limit.
+
+Use one YAML document without aliases or merge keys. Quote numeric strings such as `ports: "443"`. The runtime rejects unknown or duplicate fields.
+
+If the runtime cannot read a field that could change the verdict, it denies the operation.
+
+Egress requires permission for the guest destination and the actual host destination when they differ. DNS requires permission for each upstream attempt. Ingress uses the actual publication client and the selected guest service, including loopback fallback. An admitted TCP or UDP relay also permits its replies.
+
+Control tunnels use the authenticated control peer address. A Unix control connection uses `127.0.0.1` as its local identity. The sandbox does not see clients of a tunnel listener on the control client's machine. An active IP policy does not admit Unix socket publications.
+
+An `allow` rule does not override `-isolate-lan`. Keep control credentials outside every guest mount. The sandbox blocks NAT dials to its own TCP control listener.
+
+Use this policy to allow outbound TCP port 443 and deny new ingress flows:
+
+```json
+{
+  "egress": {
+    "default": "deny",
+    "rules": [{"action": "allow", "protocol": "tcp", "ports": "443"}]
+  },
+  "ingress": {"default": "deny"}
+}
+```
+
+Store the policy on the host. Supply it for each start or protected restore. Pass the control socket to read or replace the active policy.
+
+```sh
+rungv run --net=nat --nat-policy-file policy.json --name app --control alpine:3.20 sleep 600
+rungv net-policy get -n app
+rungv net-policy replace -n app --file new-policy.json
+```
+
+Replacement cancels active relays that the new policy denies. The command does not write the file, change bandwidth, or recall bytes the relay already sent.
+
+Both control commands write JSON, regardless of the input format.
 
 ## 5. Images and registries
 
@@ -445,22 +530,23 @@ rungv pull --host-dns 10.0.2.3 alpine:3.20
 
 ## 6. Storage, system, and completion commands
 
-`rungv` provides Docker-style noun-verb groups for local images, named volumes, host diagnostics, and shell completion. Top-level commands (`images`, `pull`, `rmi`, `inspect`, `tag`, `save`, `load`, `info`) remain aliases of the corresponding group subcommands.
+`rungv` provides Docker-style noun-verb groups for local images, named volumes, host diagnostics, and shell completion. Top-level commands (`images`, `pull`, `push`, `rmi`, `inspect`, `tag`, `save`, `load`, `info`) remain aliases of the corresponding group subcommands.
 
 ### 6.1 Image store and `rungv image`
 
-The layer cache holds compiled EROFS layers, one record per image, and one record per tag or digest. The default directory is `%LOCALAPPDATA%\gvx\cache\layers` on Windows, `~/Library/Caches/gvx/layers` on macOS, and `~/.cache/gvx/layers` on Linux.
+The layer cache holds compiled EROFS layers, one record per image, and one record per tag or digest. When `-keep-blobs` (or `GVX_KEEP_BLOBS=1`) is active, `pull`, `load`, and `run` also keep original layer blobs under `blobs/sha256/<hex>`. The default directory is `%LOCALAPPDATA%\gvx\cache\layers` on Windows, `~/Library/Caches/gvx/layers` on macOS, and `~/.cache/gvx/layers` on Linux.
 
 | Command | Behavior |
 | :--- | :--- |
 | `rungv image ls` (`rungv images`) | Lists cached images. `IMAGE ID` shows the first 12 hex digits of the config digest, and `SIZE` sums the EROFS layer files. Accepts `-a`, `-q`, `--no-trunc`, `--digests`, and `--format`. |
-| `rungv image pull` (`rungv pull`) | Downloads an image or archive into the layer cache. Accepts `--platform linux/ARCH`, `-arch`, `-registry-url`, and `--host-dns`. |
+| `rungv image pull` (`rungv pull`) | Downloads an image or archive into the layer cache. Accepts `--platform linux/ARCH`, `-arch`, `-registry-url`, `-keep-blobs`, and `--host-dns`. |
+| `rungv image push` (`rungv push`) | Uploads a cached image (`IMAGE [TARGET]`) to a registry. Queries existing blobs with `HEAD`, attempts cross-repository mounts on the same registry, and uploads the exact manifest bytes. Accepts `--platform`, `-registry-url`, `--host-dns`, `-q`, `-u`/`--username` with `--password-stdin`, `--auth-stdin`, and `--auth-fd N`. |
 | `rungv image inspect` (`rungv inspect`) | Prints a JSON array of image metadata, or evaluates `-f` / `--format` per image. |
-| `rungv image rm` (`rungv rmi`) | Removes a tag or an image record and deletes unreferenced EROFS layers. An image ID with multiple tags requires `-f`. |
+| `rungv image rm` (`rungv rmi`) | Removes a tag or an image record and deletes unreferenced EROFS layers and kept blobs. An image ID with multiple tags requires `-f`. |
 | `rungv image tag` (`rungv tag`) | Creates a second repository or tag reference for a cached image. |
-| `rungv image save` (`rungv save`) | Writes an OCI layout and `docker save` tar archive by fetching verified layer blobs from the origin registry. |
-| `rungv image load` (`rungv load`) | Loads images for the selected architecture from an OCI layout or `docker save` tar archive. |
-| `rungv image prune [-a] [-f]` | Deletes dangling images (or all images for the architecture with `-a`), sweeps orphaned layer files, and prints reclaimed bytes. |
+| `rungv image save` (`rungv save`) | Writes an OCI layout and `docker save` tar archive. Reads kept blobs locally first and fetches only missing blobs from the origin registry. Works offline when the cache holds all blobs. |
+| `rungv image load` (`rungv load`) | Loads images for the selected architecture from an OCI layout or `docker save` tar archive. Accepts `-keep-blobs` to retain original layer blobs for offline `save` and `push`. |
+| `rungv image prune [-a] [-f]` | Deletes dangling images (or all images for the architecture with `-a`), sweeps orphaned layer files and kept blobs, and prints reclaimed bytes. |
 
 ### 6.2 Named volumes and `rungv volume`
 
@@ -512,7 +598,7 @@ The table below lists Docker CLI features that differ or do not exist in `rungv`
 | `--privileged` | On by default. Its privileges stay inside the sandbox. |
 | `--name` | Sets the kernel container ID, and derives the default control socket path with `--control`. |
 | Image with Docker manifest schema 1 | Refused with an error. Docker 28 and later also refuse it; rebuild or re-push the image. |
-| `docker save` of any image | Requires the origin registry to fetch verified compressed layer blobs. |
+| `docker save` of any image | Uses kept blobs offline when pulled or loaded with `-keep-blobs`; otherwise fetches verified layer blobs from the origin registry. |
 | Cgroup limits | `--memory` uses a polling guard. `--cpus` enforces a cross-platform Sentry root CPU bandwidth quota (plus a Windows Job Object cap under lockdown). `--pids-limit` caps total guest tasks through the root `cgroup2` `pids` controller. Inside the guest, nested cgroups enforce `memory.max` (polling) and `cpu.max` (on every engine); `memory.high` and `cpu.weight` are not enforced. |
 | Linux host with an active seccomp user-notify listener | Linux allows one listener per filter chain, so `systrap` prints a warning and falls back to the slower futex loop for stub threads. |
 | Cgroup v1 | Not available. `/sys/fs/cgroup` mounts `cgroup2`. |

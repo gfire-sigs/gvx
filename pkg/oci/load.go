@@ -199,8 +199,8 @@ func (a *archive) registerDockerSave(arch string) ([]LoadedImage, error) {
 			MediaType: ocispec.MediaTypeImageManifest,
 			Config:    ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: cfgDigest, Size: int64(len(img.cfgBytes))},
 		}
-		for i, diffID := range img.diffIDs {
-			manifest.Layers = append(manifest.Layers, ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: diffID, Size: img.layerSizes[i]})
+		for i, layerDigest := range img.layerDigests {
+			manifest.Layers = append(manifest.Layers, ocispec.Descriptor{MediaType: img.layerMediaTypes[i], Digest: layerDigest, Size: img.layerSizes[i]})
 		}
 		body, err := json.Marshal(manifest)
 		if err != nil {

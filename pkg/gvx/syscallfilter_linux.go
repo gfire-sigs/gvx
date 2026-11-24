@@ -43,10 +43,11 @@ func (s *Sandbox) syscallFilter() func() error {
 				return err
 			}
 		}
+		hostDirs := s.usesHostDirs() || s.cfg.AllowBindAttach
 		opt := config.Options{
 			Platform:       s.plat.SeccompInfo(),
 			HostNetwork:    s.cfg.NetworkMode == NetModeNAT,
-			HostFilesystem: s.usesHostDirs(),
+			HostFilesystem: hostDirs,
 			// gvx has no control server and opens no /proc/self/fd directory. No
 			// descriptor has this number.
 			ControllerFD: math.MaxUint32,
@@ -56,7 +57,7 @@ func (s *Sandbox) syscallFilter() func() error {
 			CgoEnabled: cgoBuild,
 		}
 		rules, denyRules := config.Rules(opt)
-		rules.Merge(embedderRules(s.cfg, s.usesHostDirs(), len(s.volumes) > 0 || s.rootVolume != nil))
+		rules.Merge(embedderRules(s.cfg, hostDirs, len(s.volumes) > 0 || s.rootVolume != nil))
 		if cgoBuild {
 			// The cgo rules of runsc allow clone3 for any flags, because runsc
 			// cannot return ENOSYS. Seccomp cannot read the flags of clone3,
@@ -258,9 +259,9 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 				seccomp.EqualTo(unix.TCP_KEEPCNT),
 			},
 		})
-		if cfg.AllowVolumeAttach {
-			// SCM_RIGHTS ext4lite volume attachment receives pre-opened regular
-			// file descriptors over the control Unix socket and acquires
+		if cfg.AllowVolumeAttach || cfg.AllowBindAttach {
+			// SCM_RIGHTS attachment receives pre-opened file or directory
+			// descriptors over the control Unix socket and acquires
 			// non-blocking advisory flock locks on them.
 			rules.Add(unix.SYS_RECVMSG, seccomp.PerArg{
 				seccomp.NonNegativeFD{},

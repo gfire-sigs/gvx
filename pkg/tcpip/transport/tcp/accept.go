@@ -314,6 +314,10 @@ func (l *listenContext) startHandshake(s *segment, opts header.TCPSynOptions, qu
 //
 // Precondition: if l.listenEP != nil, l.listenEP.mu must be locked.
 func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*Endpoint, tcpip.Error) {
+	return l.performHandshakeCancelable(s, opts, queue, owner, nil)
+}
+
+func (l *listenContext) performHandshakeCancelable(s *segment, opts header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner, cancel <-chan struct{}) (*Endpoint, tcpip.Error) {
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
 	queue.EventRegister(&waitEntry)
 	defer queue.EventUnregister(&waitEntry)
@@ -323,10 +327,20 @@ func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, 
 		return nil, err
 	}
 
-	// performHandshake is used by the Forwarder which will block till the
-	// handshake either succeeds or fails. We do this by registering for
-	// events above and block on the notification channel.
-	<-notifyCh
+	if cancel == nil {
+		<-notifyCh
+	} else {
+		select {
+		case <-notifyCh:
+		case <-cancel:
+		}
+		select {
+		case <-cancel:
+			h.ep.Abort()
+			return nil, &tcpip.ErrAborted{}
+		default:
+		}
+	}
 
 	ep := h.ep
 	ep.mu.Lock()

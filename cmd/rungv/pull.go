@@ -43,6 +43,7 @@ func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	cacheFlags := addImageCacheFlags(fs)
 	platformFlag := fs.String("platform", "", "Target image platform (linux/amd64 or linux/arm64)")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL that replaces the registry of the reference")
+	keepBlobs := addKeepBlobsFlag(fs)
 	hostDNS := addHostDNSFlag(fs)
 
 	if code, stop := parseImageFlags(fs, args); stop {
@@ -63,6 +64,7 @@ func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	if err != nil {
 		return imageFail(stderr, "pull", err)
 	}
+	cache.SetKeepBlobs(*keepBlobs)
 
 	if info, statErr := os.Stat(target); statErr == nil && !info.IsDir() {
 		resolved, err := gvx.ResolveImage(ctx, cache, registryURL, target, arch)

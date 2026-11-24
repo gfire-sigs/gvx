@@ -137,6 +137,9 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	if s.cfg.OCIKeepBlobs {
+		cache.SetKeepBlobs(true)
+	}
 	hostDNS, err := ParseHostDNSServers(s.cfg.HostDNSServers)
 	if err != nil {
 		return err

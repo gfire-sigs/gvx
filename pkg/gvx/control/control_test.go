@@ -194,6 +194,157 @@ func TestLegacyV1CheckpointCompatibility(t *testing.T) {
 	}
 }
 
+func TestOversizedPolicyResponseReturnsLimitExceeded(t *testing.T) {
+	const limit = 16 << 10
+	handler := &testHandler{streamHandler: func(_ context.Context, stream *Stream, _ RequestEnvelope, fds []int) error {
+		closeFDs(fds)
+		return stream.Reply(NATPolicyState{Policy: json.RawMessage(`"` + string(bytes.Repeat([]byte{'x'}, limit)) + `"`)})
+	}}
+	ep, _, _ := startTestServer(t, "127.0.0.1:0", ListenOptions{}, ServerConfig{
+		MaxFrameBytes: limit,
+		Capabilities:  []string{CapNATPolicyRead},
+		Handler:       handler,
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, DialOptions{Endpoint: ep.Address})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Call(ctx, MethodNATPolicyGet, nil, nil); !IsCode(err, CodeLimitExceeded) {
+		t.Fatalf("policy response exceeds frame size: %v, want LIMIT_EXCEEDED", err)
+	}
+}
+
+func TestChannelWriterReportsFramesBeforeCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	writeCtx, stopWrite := context.WithCancel(ctx)
+	defer stopWrite()
+	payload := bytes.Repeat([]byte("gvx"), InitialStreamWindow/3+2)
+	type result struct {
+		n   int
+		err error
+	}
+	resultC := make(chan result, 1)
+	handler := &testHandler{
+		streamHandler: func(_ context.Context, s *Stream, _ RequestEnvelope, fds []int) error {
+			closeFDs(fds)
+			if err := s.SendResponse(FSExportResponse{}); err != nil {
+				return err
+			}
+			w := s.ChannelWriter(writeCtx, ChannelGeneric, false)
+			n, err := w.Write(payload)
+			resultC <- result{n, err}
+			return w.Close()
+		},
+	}
+	ep, _, _ := startTestServer(t, "127.0.0.1:0", ListenOptions{}, ServerConfig{
+		Handler: handler, MaxFrameBytes: 64 << 10,
+	})
+	client, err := Dial(ctx, DialOptions{Endpoint: ep.Address})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	s, err := client.OpenStream(ctx, MethodFSExport, FSExportRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.WaitResponse(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	reader := s.ChannelReader(ctx, ChannelGeneric)
+	var first [1]byte
+	if _, err := io.ReadFull(reader, first[:]); err != nil {
+		t.Fatal(err)
+	}
+	stopWrite()
+	var written result
+	select {
+	case written = <-resultC:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := append(first[:], rest...)
+	if !errors.Is(written.err, context.Canceled) || written.n != len(got) ||
+		len(got) >= len(payload) || !bytes.Equal(got, payload[:len(got)]) {
+		t.Fatalf("write returned (%d, %v) after delivering %d of %d bytes", written.n, written.err, len(got), len(payload))
+	}
+}
+
+func TestChannelWriterCancellationPreservesFrameBoundary(t *testing.T) {
+	raw, peer := net.Pipe()
+	conn := newConn(raw, nil, DefaultMaxFrameBytes, false, false, nil)
+	var writers sync.WaitGroup
+	defer func() {
+		_ = peer.Close()
+		_ = conn.Close()
+		writers.Wait()
+	}()
+	if err := peer.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := conn.allocStream(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := conn.allocStream(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const committed = "committed"
+	firstErr := make(chan error, 1)
+	writers.Go(func() {
+		firstErr <- first.WriteData(ctx, ChannelGeneric, []byte(committed), false)
+	})
+	var header [FrameHeaderSize]byte
+	if _, err := io.ReadFull(peer, header[:]); err != nil {
+		t.Fatalf("read first frame header: %v", err)
+	}
+	// net.Pipe holds the first write until the peer reads its payload.
+	started := make(chan struct{})
+	type result struct {
+		n   int
+		err error
+	}
+	secondResult := make(chan result, 1)
+	writers.Go(func() {
+		w := second.ChannelWriter(ctx, ChannelGeneric, false)
+		close(started)
+		n, err := io.WriteString(w, "canceled")
+		secondResult <- result{n, err}
+		_ = w.Close()
+	})
+	<-started
+	cancel()
+
+	f, err := ReadFrame(io.MultiReader(bytes.NewReader(header[:]), peer), DefaultMaxFrameBytes)
+	if err != nil || f.Type != FrameData || f.StreamID != first.ID() || string(f.Payload) != committed {
+		t.Fatalf("committed frame = %+v, %v; want DATA on stream %d with %q", f, err, first.ID(), committed)
+	}
+	if err := <-firstErr; err != nil {
+		t.Fatalf("write committed frame: %v", err)
+	}
+	f, err = ReadFrame(peer, DefaultMaxFrameBytes)
+	if err != nil || f.Type != FrameData || f.StreamID != second.ID() || f.Flags != FlagEndStream || len(f.Payload) != 0 {
+		t.Fatalf("next frame = %+v, %v; want empty end-of-stream DATA on stream %d", f, err, second.ID())
+	}
+	got := <-secondResult
+	if got.n != 0 || !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("canceled write = (%d, %v); want (0, context.Canceled)", got.n, got.err)
+	}
+}
+
 func TestMultiplexedFlowControlAndCompression(t *testing.T) {
 	// Transfer 3 MiB (> 3x InitialStreamWindow) concurrently across two streams
 	// with zstd compression enabled on one and disabled on the other.

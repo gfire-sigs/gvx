@@ -58,6 +58,10 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	}
 
 	flags := registerSandboxFlags(fs, flagDefaults{})
+	var serveFlags listFlag
+	var attachBindFlags listFlag
+	fs.Var(&serveFlags, "serve", "Reattach a checkpointed rpcfs proxy mount: HOST_PATH:GUEST_PATH[:ro|rw]")
+	fs.Var(&attachBindFlags, "attach-bind", "Reattach a checkpointed host bind mount: HOST_PATH:GUEST_PATH[:ro|rw]")
 	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return restoreConfig{}, 0, true
@@ -79,6 +83,20 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	cfg, autoPlatform, err := flags.buildBaseConfig(fs, stdin, stdout, stderr, true)
 	if err != nil {
 		return usageError("%v", err)
+	}
+	for _, spec := range attachBindFlags {
+		m, err := parseAttachBindSpec(spec)
+		if err != nil {
+			return usageError("--attach-bind: %v", err)
+		}
+		cfg.Mounts = append(cfg.Mounts, m)
+	}
+	for _, spec := range serveFlags {
+		sm, err := gvx.ParseServeMount(spec)
+		if err != nil {
+			return usageError("--serve: %v", err)
+		}
+		cfg.ServeMounts = append(cfg.ServeMounts, sm)
 	}
 	ctrlSock, err := flags.resolveControlSocket()
 	if err != nil {
@@ -112,6 +130,18 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 		}()
 	}
 
+	if len(rc.cfg.UnixForwards) > 0 && !rc.cfg.DisableHostLockdown {
+		stopHelper, err := startBootUnixForwardHelper(ctx, rc.cfg.UnixForwards)
+		if err != nil {
+			if rc.cfg.ControlListener != nil {
+				_ = rc.cfg.ControlListener.Close()
+			}
+			_, _ = fmt.Fprintf(stderr, "rungv restore: %v\n", err)
+			return 1
+		}
+		defer stopHelper()
+	}
+
 	var err error
 	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir})
 	if err != nil {
@@ -132,4 +162,17 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 		errOut = rc.cfg.Stderr
 	}
 	return executeSandboxWithControl(ctx, sb, &rc.cfg, rc.autoPlatform, "rungv restore", errOut)
+}
+
+func parseAttachBindSpec(spec string) (gvx.Mount, error) {
+	sm, err := gvx.ParseServeMount(spec)
+	if err != nil {
+		return gvx.Mount{}, fmt.Errorf("invalid bind mount %q (want HOST_PATH:GUEST_PATH[:ro|rw])", spec)
+	}
+	return gvx.Mount{
+		Kind:      gvx.MountBind,
+		HostPath:  sm.HostPath,
+		GuestPath: sm.GuestPath,
+		ReadOnly:  sm.ReadOnly,
+	}, nil
 }

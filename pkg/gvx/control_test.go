@@ -20,11 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -32,8 +34,12 @@ import (
 
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
+	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
+	"z.gfire.dev/gvx/pkg/hostlockdown"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/rpcfs"
 )
 
 func shortControlSocketPath(t *testing.T, filename string) string {
@@ -236,6 +242,12 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 	}
 	if inspect.State != "running" || inspect.PIDCount < 1 {
 		t.Fatalf("inspect = %+v", inspect)
+	}
+	if rs.client.HasFeature(control.FeatureNetQoS) {
+		t.Fatal("non-NAT sandbox advertises NAT bandwidth shaping")
+	}
+	if err := rs.client.Call(ctx, control.MethodResourceUpdate, json.RawMessage(`{"net_rx_bps":0}`), nil); !control.IsCode(err, control.CodeUnsupported) {
+		t.Fatalf("raw bandwidth update in non-NAT mode = %v, want UNSUPPORTED", err)
 	}
 
 	var stats control.StatsSample
@@ -620,9 +632,36 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 			t.Fatalf("host file written by guest via rpcfs = (%q, %v)", hostWritten, err)
 		}
 
-		// Checkpoint while rpcfs is active must return BUSY.
-		if err := rs.client.Call(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: true}, nil); !control.IsCode(err, control.CodeBusy) {
-			t.Fatalf("checkpoint with active rpcfs err = %v, want BUSY", err)
+		// Checkpoint with leave_running while rpcfs is active must succeed,
+		// record the rpcfs mount in manifest.json, and keep rpcfs working.
+		ckptSt, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{LeaveRunning: true})
+		if err != nil {
+			t.Fatalf("checkpoint with active rpcfs open stream: %v", err)
+		}
+		if err := ckptSt.WaitResponse(ctx, nil); err != nil {
+			ckptSt.Close()
+			t.Fatalf("checkpoint with active rpcfs wait response: %v", err)
+		}
+		ckptTar, err := io.ReadAll(ckptSt.ChannelReader(ctx, control.ChannelGeneric))
+		ckptSt.Close()
+		if err != nil || len(ckptTar) == 0 {
+			t.Fatalf("checkpoint with active rpcfs stream = (%d bytes, %v)", len(ckptTar), err)
+		}
+
+		// Verify rpcfs still reads cleanly after checkpoint -leave-running.
+		catAfter, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv: []string{"/bin/cat", "/mnt/proxy/host.txt"},
+		})
+		if err != nil {
+			t.Fatalf("exec cat after checkpoint: %v", err)
+		}
+		if err := catAfter.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("exec cat after checkpoint wait: %v", err)
+		}
+		gotAfter, readErr := io.ReadAll(catAfter.ChannelReader(ctx, control.ChannelStdout))
+		catAfter.Close()
+		if readErr != nil || string(gotAfter) != "hello-from-rpcfs-host\n" {
+			t.Fatalf("guest read from rpcfs after checkpoint = (%q, %v), want hello-from-rpcfs-host", gotAfter, readErr)
 		}
 
 		serveCancel()
@@ -742,27 +781,67 @@ func TestControlResourceUpdateAndMultiSandboxIsolation(t *testing.T) {
 		RegistryBaseURL: regURL,
 		NetworkMode:     NetModeNAT,
 		Resources:       Resources{MemoryBytes: 512 << 20, CPUMillis: 1000, PidsLimit: 200},
+		ControlDisable:  []string{control.CapResourceNetwork},
 	})
 	sbA.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	sbB.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	ctx := context.Background()
+	if !sbA.client.HasFeature(control.FeatureNetQoS) || !sbB.client.HasFeature(control.FeatureNetQoS) {
+		t.Fatal("HELLO must advertise network QoS support even when policy disables updates")
+	}
 
 	newMem := int64(384 << 20)
 	newCPU := int64(500)
 	newPids := int64(50)
 	isoTrue := true
+	newTX, newRX := uint64(800_000), uint64(400_000)
 	var snapA control.ResourceSnapshot
 	if err := sbA.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
 		MemoryBytes: &newMem,
 		CPUMillis:   &newCPU,
 		PidsLimit:   &newPids,
 		IsolateLAN:  &isoTrue,
+		NetTXBPS:    &newTX,
+		NetRXBPS:    &newRX,
 		Tuning:      map[string]string{"net.nat.dial_timeout": "5s"},
 	}, &snapA); err != nil {
 		t.Fatalf("update sbA: %v", err)
 	}
 	if snapA.MemoryBytes != newMem || snapA.CPUQuotaUSec != 50000 || snapA.PidsLimit != 50 || !snapA.IsolateLAN {
 		t.Fatalf("snapA = %+v", snapA)
+	}
+	if snapA.NetTXBPS != newTX || snapA.NetRXBPS != newRX {
+		t.Fatalf("updated bandwidth = TX %d RX %d, want TX %d RX %d", snapA.NetTXBPS, snapA.NetRXBPS, newTX, newRX)
+	}
+
+	clearTX := uint64(0)
+	if err := sbA.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
+		NetTXBPS: &clearTX,
+	}, &snapA); err != nil || snapA.NetTXBPS != 0 || snapA.NetRXBPS != newRX {
+		t.Fatalf("clear TX bandwidth: TX %d RX %d, err %v, want TX 0 RX %d", snapA.NetTXBPS, snapA.NetRXBPS, err, newRX)
+	}
+
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"memory_bytes":536870912,"net_rx_bps":-1}`),
+		json.RawMessage(`{"memory_bytes":536870912,"net_rx_bps":1000000000001}`),
+	} {
+		if err := sbA.client.Call(ctx, control.MethodResourceUpdate, raw, nil); !control.IsCode(err, control.CodeInvalidArgument) {
+			t.Errorf("update with invalid bandwidth %s returned %v, want INVALID_ARGUMENT", raw, err)
+		}
+	}
+	var inspectA control.InspectResponse
+	if err := sbA.client.Call(ctx, control.MethodInspect, nil, &inspectA); err != nil {
+		t.Fatalf("inspect sbA after invalid updates: %v", err)
+	}
+	if res := inspectA.Resources; res.MemoryBytes != newMem || res.NetTXBPS != 0 || res.NetRXBPS != newRX {
+		t.Fatalf("inspect sbA after invalid updates: memory %d, TX %d RX %d; want memory %d, TX 0 RX %d", res.MemoryBytes, res.NetTXBPS, res.NetRXBPS, newMem, newRX)
+	}
+
+	if err := sbB.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{
+		MemoryBytes: &newMem,
+		NetRXBPS:    &newRX,
+	}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
+		t.Fatalf("update when resource.network is disabled returned %v, want FORBIDDEN_BY_POLICY", err)
 	}
 
 	// Verify immutable tunable is rejected.
@@ -840,19 +919,65 @@ func TestControlResourceUpdateAndMultiSandboxIsolation(t *testing.T) {
 	if inspectB.Resources.MemoryBytes != 512<<20 || inspectB.Resources.CPUQuotaUSec != 100000 || inspectB.Resources.PidsLimit != 200 || inspectB.Resources.IsolateLAN {
 		t.Fatalf("sbB limits leaked from sbA: %+v", inspectB.Resources)
 	}
+	if inspectB.Resources.NetTXBPS != 0 || inspectB.Resources.NetRXBPS != 0 {
+		t.Fatalf("sbB bandwidth changed: TX %d RX %d, want both unlimited", inspectB.Resources.NetTXBPS, inspectB.Resources.NetRXBPS)
+	}
+}
+
+func TestControlNATCustomInterceptorRetainsLANIsolationUpdates(t *testing.T) {
+	cacheDir, regURL, imgRef := buildControlTestImage(t)
+	rs := startControlTestSandbox(t, Config{
+		OCIImage:        imgRef,
+		OCICacheDir:     cacheDir,
+		RegistryBaseURL: regURL,
+		NetworkMode:     NetModeNAT,
+		StreamInterceptor: func(context.Context, string, net.Conn, net.Conn) error {
+			return errors.New("unexpected TCP relay")
+		},
+	})
+	rs.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
+	if rs.client.HasFeature(control.FeatureNetQoS) {
+		t.Fatal("NAT with a custom interceptor advertises bandwidth shaping")
+	}
+	ctx := t.Context()
+	if err := rs.client.Call(ctx, control.MethodResourceUpdate, json.RawMessage(`{"net_tx_bps":0}`), nil); !control.IsCode(err, control.CodeUnsupported) {
+		t.Fatalf("bandwidth update with custom interceptor = %v, want UNSUPPORTED", err)
+	}
+
+	isolate := true
+	var snapshot control.ResourceSnapshot
+	if err := rs.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{IsolateLAN: &isolate}, &snapshot); err != nil || !snapshot.IsolateLAN {
+		t.Fatalf("LAN isolation update with custom interceptor: isolate_lan=%t, err=%v", snapshot.IsolateLAN, err)
+	}
 }
 
 func TestControlCheckpointStreamAndRestoreRoundTrip(t *testing.T) {
+	t.Run("no_policy", func(t *testing.T) { testControlCheckpointStreamAndRestore(t, false) })
+	t.Run("nat_policy", func(t *testing.T) { testControlCheckpointStreamAndRestore(t, true) })
+}
+
+func testControlCheckpointStreamAndRestore(t *testing.T, protectNAT bool) {
+	t.Helper()
 	cacheDir, regURL, imgRef := buildControlTestImage(t)
 	// Start WITHOUT CheckpointDir: streaming checkpoint works with zero pre-opened dir.
-	rs := startControlTestSandbox(t, Config{
+	cfg := Config{
 		Name:            "stream-ckpt",
 		OCIImage:        imgRef,
 		OCICacheDir:     cacheDir,
 		RegistryBaseURL: regURL,
-	})
+	}
+	if protectNAT {
+		cfg.NetworkMode = NetModeNAT
+	}
+	rs := startControlTestSandbox(t, cfg)
 	rs.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	ctx := context.Background()
+	if protectNAT {
+		raw := json.RawMessage(`{"egress":{"default":"deny"},"ingress":{"default":"deny"}}`)
+		if err := rs.client.Call(ctx, control.MethodNATPolicySet, control.NATPolicyState{Policy: raw}, nil); err != nil {
+			t.Fatalf("install NAT policy before checkpoint: %v", err)
+		}
+	}
 
 	st, err := rs.client.OpenStream(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{
 		LeaveRunning: false,
@@ -910,6 +1035,19 @@ func TestControlCheckpointStreamAndRestoreRoundTrip(t *testing.T) {
 	restoredCfg.Stdin = strings.NewReader("after-stream-restore\n")
 	restoredCfg.Stdout = &restoredOut
 	restoredCfg.Stderr = io.Discard
+	if protectNAT {
+		_, err := Restore(ctx, restoredCfg, RestoreOptions{Dir: bundleDir})
+		if !errors.Is(err, ErrCheckpointManifest) || !strings.Contains(err.Error(), "requires a NAT policy") {
+			t.Fatalf("restore without a policy = %v, want a required NAT policy error", err)
+		}
+		// The host selects a new policy, not the policy in use at checkpoint time.
+		cfg, err := ParseNATPolicy(strings.NewReader(`{"egress":{"default":"allow"},"ingress":{"default":"deny"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		restoredCfg.NetworkMode = NetModeNAT
+		restoredCfg.NetworkPolicy = &cfg
+	}
 
 	restoredSB, err := Restore(ctx, restoredCfg, RestoreOptions{Dir: bundleDir})
 	if err != nil {
@@ -933,7 +1071,8 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 		OCIImage:        imgRef,
 		OCICacheDir:     cacheDir,
 		RegistryBaseURL: regURL,
-		ControlPolicy:   control.PolicyReadOnly,
+		ControlPolicy:   control.Policy(" READONLY "),
+		NetworkMode:     NetModeNAT,
 	})
 	rs.stdout.waitForSubstring(t, "ready-marker\n", 15*time.Second)
 	ctx := context.Background()
@@ -953,6 +1092,14 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 	if err := rs.client.Call(ctx, control.MethodPause, control.PauseRequest{}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
 		t.Fatalf("pause under readonly policy = %v, want FORBIDDEN_BY_POLICY", err)
 	}
+	var networkPolicy control.NATPolicyState
+	if err := rs.client.Call(ctx, control.MethodNATPolicyGet, nil, &networkPolicy); err != nil || string(networkPolicy.Policy) != "null" {
+		t.Fatalf("read initial NAT policy under readonly = %s, %v; want null", networkPolicy.Policy, err)
+	}
+	raw := json.RawMessage(`{"ingress":{"default":"deny"},"egress":{"default":"deny"}}`)
+	if err := rs.client.Call(ctx, control.MethodNATPolicySet, control.NATPolicyState{Policy: raw}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
+		t.Fatalf("set NAT policy under readonly = %v, want FORBIDDEN_BY_POLICY", err)
+	}
 
 	// Verify Pause directly followed by context cancellation never deadlocks Run().
 	if err := rs.sb.Pause(ctx, true); err != nil {
@@ -963,6 +1110,18 @@ func TestControlPolicyEnforcementAndPausedCancel(t *testing.T) {
 	case <-rs.runDone:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Sandbox.Run deadlocked when context was canceled while paused")
+	}
+}
+
+func TestControlTCPListenerRequiresToken(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	_, err = New(t.Context(), Config{ControlListener: ln})
+	if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "requires a control token") {
+		t.Fatalf("New with an unauthenticated TCP listener = %v, want a token error", err)
 	}
 }
 
@@ -1602,5 +1761,439 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("sandbox did not exit after proc.signal(all=true, SIGKILL)")
 		}
+	}
+}
+
+func TestControlInotifyConstantsMatchLinuxABI(t *testing.T) {
+	checks := []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"IN_MODIFY", control.LinuxInModify, linux.IN_MODIFY},
+		{"IN_ATTRIB", control.LinuxInAttrib, linux.IN_ATTRIB},
+		{"IN_MOVED_FROM", control.LinuxInMovedFrom, linux.IN_MOVED_FROM},
+		{"IN_MOVED_TO", control.LinuxInMovedTo, linux.IN_MOVED_TO},
+		{"IN_CREATE", control.LinuxInCreate, linux.IN_CREATE},
+		{"IN_DELETE", control.LinuxInDelete, linux.IN_DELETE},
+		{"IN_DELETE_SELF", control.LinuxInDeleteSelf, linux.IN_DELETE_SELF},
+		{"IN_ISDIR", control.LinuxInIsDir, linux.IN_ISDIR},
+	}
+	for _, tc := range checks {
+		if tc.got != tc.want {
+			t.Errorf("%s: control=%#x, linux=%#x", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+func TestStreamRPCFSClientReaddirPaginationAndNotifyRelay(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	const smallMaxFrame = 4096
+	const totalEntries = 120
+
+	clientReady := make(chan *streamRPCFSClient, 1)
+	srv := control.NewServer(ln, control.ServerConfig{
+		SandboxID:     "rpcfs-stream-test",
+		Token:         "secret",
+		Capabilities:  []string{control.CapMountServe},
+		MaxFrameBytes: smallMaxFrame,
+		Handler: &testRPCFSStreamHandler{
+			onServe: func(ctx context.Context, st *control.Stream) error {
+				if err := st.SendResponse(control.MountServeResponse{Target: "/mnt/p"}); err != nil {
+					return err
+				}
+				rc := newStreamRPCFSClient(ctx, st)
+				defer rc.Close()
+				clientReady <- rc
+				<-ctx.Done()
+				return nil
+			},
+		},
+	})
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	go func() { _ = srv.Serve(srvCtx) }()
+	defer srv.Close()
+
+	dialed, err := control.Dial(context.Background(), control.DialOptions{
+		Endpoint: "tcp://" + ln.Addr().String(),
+		Token:    "secret",
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer dialed.Close()
+
+	peerCtx, peerCancel := context.WithCancel(context.Background())
+	defer peerCancel()
+	peerSt, err := dialed.OpenStream(peerCtx, control.MethodMountServe, control.MountServeRequest{Target: "/mnt/p"})
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer peerSt.Close()
+	if err := peerSt.WaitResponse(peerCtx, nil); err != nil {
+		t.Fatalf("WaitResponse: %v", err)
+	}
+
+	// Peer serves paginated readdir (25 entries per page) and watch/unwatch.
+	go func() {
+		for {
+			ev, err := peerSt.RecvEvent(peerCtx)
+			if err != nil {
+				return
+			}
+			if ev.Type != "rpcfs.req" {
+				continue
+			}
+			var req control.RPCFSRequest
+			if json.Unmarshal(ev.Data, &req) != nil {
+				continue
+			}
+			resp := control.RPCFSResponse{ID: req.ID}
+			switch req.Op {
+			case "readdir":
+				if req.Path == "bad-loop" {
+					resp.Entries = []control.RPCFSEntry{{Name: "stuck"}}
+					resp.HasMore = true
+					resp.NextOffset = req.Offset // non-advancing offset must fail with EIO
+				} else {
+					start := int(req.Offset)
+					end := min(start+25, totalEntries)
+					for i := start; i < end; i++ {
+						resp.Entries = append(resp.Entries, control.RPCFSEntry{
+							Name: fmt.Sprintf("f-%03d.txt", i),
+							Ino:  uint64(i + 2),
+							Mode: control.LinuxSIFREG | 0o644,
+						})
+					}
+					if end < totalEntries {
+						resp.HasMore = true
+						resp.NextOffset = int64(end)
+					}
+				}
+			case "watch", "unwatch":
+			}
+			_ = peerSt.SendEvent(peerCtx, "rpcfs.resp", resp)
+		}
+	}()
+
+	rc := <-clientReady
+	if gotChunk := rc.MaxChunkBytes(); gotChunk != 2304 {
+		t.Fatalf("MaxChunkBytes(4096 frame) = %d, want 2304", gotChunk)
+	}
+
+	entries, err := rc.Readdir(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("paginated Readdir: %v", err)
+	}
+	if len(entries) != totalEntries {
+		t.Fatalf("Readdir count = %d, want %d", len(entries), totalEntries)
+	}
+	if entries[0].Name != "f-000.txt" || entries[totalEntries-1].Name != fmt.Sprintf("f-%03d.txt", totalEntries-1) {
+		t.Fatalf("Readdir boundary names = (%q, %q)", entries[0].Name, entries[totalEntries-1].Name)
+	}
+
+	// Non-advancing pagination must fail closed with EIO rather than spinning forever.
+	if _, err := rc.Readdir(context.Background(), "bad-loop"); !linuxerr.Equals(linuxerr.EIO, err) {
+		t.Fatalf("non-advancing Readdir err = %v, want EIO", err)
+	}
+
+	// Notify relay delivers rpcfs.notify events to registered handler.
+	gotNotify := make(chan rpcfs.NotifyEvent, 1)
+	rc.SetNotifyHandler(func(ev rpcfs.NotifyEvent) {
+		gotNotify <- ev
+	})
+	if err := rc.Watch(context.Background(), "one.txt"); err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if err := peerSt.SendEvent(peerCtx, "rpcfs.notify", control.RPCFSNotifyEvent{
+		Path: "one.txt",
+		Mask: control.LinuxInModify,
+	}); err != nil {
+		t.Fatalf("SendEvent rpcfs.notify: %v", err)
+	}
+	select {
+	case ev := <-gotNotify:
+		if ev.Path != "one.txt" || ev.Mask != linux.IN_MODIFY {
+			t.Fatalf("received notify = %+v, want one.txt IN_MODIFY", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for rpcfs.notify event")
+	}
+	if err := rc.Unwatch(context.Background(), "one.txt"); err != nil {
+		t.Fatalf("Unwatch: %v", err)
+	}
+}
+
+type testRPCFSStreamHandler struct {
+	onServe func(ctx context.Context, st *control.Stream) error
+}
+
+func (h *testRPCFSStreamHandler) HandleStream(ctx context.Context, st *control.Stream, _ control.RequestEnvelope, _ []int) error {
+	return h.onServe(ctx, st)
+}
+
+func (h *testRPCFSStreamHandler) HandleLegacyCheckpoint(context.Context, control.LegacyCheckpointRequest) error {
+	return nil
+}
+
+func TestControlAutoPublishEventsAndDynamicPortAddrs(t *testing.T) {
+	// Config validation for DynamicPortAddrs and AutoPublishAddr.
+	badAuto := Config{NetworkMode: NetModeNAT, AutoPublishAddr: "0.0.0.0"}
+	if err := badAuto.normalize(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("AutoPublishAddr without AutoPublishPorts err = %v, want ErrInvalidConfig", err)
+	}
+	badIP := Config{NetworkMode: NetModeNAT, DynamicPortAddrs: []string{"not-an-ip"}}
+	if err := badIP.normalize(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid DynamicPortAddrs err = %v, want ErrInvalidConfig", err)
+	}
+	badNet := Config{NetworkMode: NetModeNone, DynamicPortAddrs: []string{"0.0.0.0"}}
+	if err := badNet.normalize(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("DynamicPortAddrs with net=none err = %v, want ErrInvalidConfig", err)
+	}
+
+	// Reserve one free port and hold one busy port on the host.
+	freeLn, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("Listen free: %v", err)
+	}
+	freePort := uint16(freeLn.Addr().(*net.TCPAddr).Port)
+	_ = freeLn.Close()
+
+	busyLn, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("Listen busy: %v", err)
+	}
+	t.Cleanup(func() { _ = busyLn.Close() })
+	busyPort := uint16(busyLn.Addr().(*net.TCPAddr).Port)
+
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	freeHTTPELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, freePort, "/etc/ready.txt", "", "")
+	if err != nil {
+		t.Fatalf("BuildGuestHTTPServerELF64(free): %v", err)
+	}
+	busyHTTPELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, busyPort, "/etc/ready.txt", "", "")
+	if err != nil {
+		t.Fatalf("BuildGuestHTTPServerELF64(busy): %v", err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "bin/httpfree", Data: freeHTTPELF, Mode: 0o755},
+		testimage.File{Name: "bin/httpbusy", Data: busyHTTPELF, Mode: 0o755},
+		testimage.File{Name: "etc/ready.txt", Data: []byte("ap-events-ready\n"), Mode: 0o644},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+	regURL := testimage.NewRegistry(t, "apev", "latest", testimage.Image{
+		Arch:       runtime.GOARCH,
+		Layers:     [][]byte{layer},
+		Entrypoint: []string{"/bin/cat"},
+		Cmd:        []string{"/etc/ready.txt", "/proc/self/fd/0"},
+	})
+
+	tv, err := (tuning.Values{}).Set("net.forward.dynamic_poll_interval", "50ms")
+	if err != nil {
+		t.Fatalf("tuning.Set: %v", err)
+	}
+	// Warnings is intentionally nil to prove control events emit without stderr warnings.
+	rs := startControlTestSandbox(t, Config{
+		Name:             "ctrl-apev",
+		OCIImage:         "apev:latest",
+		RegistryBaseURL:  regURL,
+		NetworkMode:      NetModeNAT,
+		AutoPublishPorts: true,
+		AutoPublishAddr:  "0.0.0.0",
+		DynamicPortAddrs: []string{"0.0.0.0"},
+		Tuning:           tv,
+	})
+	rs.stdout.waitForSubstring(t, "ap-events-ready\n", 15*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Inspect and ping advertise port.dynamic_any and bind addresses.
+	var ping control.PingResponse
+	if err := rs.client.Call(ctx, control.MethodPing, nil, &ping); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	if !slices.Contains(ping.Capabilities, control.CapPortDynamicAny) {
+		t.Fatalf("ping capabilities = %v, want %s", ping.Capabilities, control.CapPortDynamicAny)
+	}
+	var inspect control.InspectResponse
+	if err := rs.client.Call(ctx, control.MethodInspect, nil, &inspect); err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !slices.Equal(inspect.DynamicBindAddrs, []string{"0.0.0.0"}) || inspect.AutoPublishAddr != "0.0.0.0" {
+		t.Fatalf("inspect bind addrs = (%v, %q), want ([0.0.0.0], 0.0.0.0)", inspect.DynamicBindAddrs, inspect.AutoPublishAddr)
+	}
+
+	// Subscribe to port events before starting guest listeners.
+	evStream, err := rs.client.OpenStream(ctx, control.MethodEvents, control.EventsRequest{
+		Filters: []string{"type=port"},
+	})
+	if err != nil {
+		t.Fatalf("events open: %v", err)
+	}
+	defer evStream.Close()
+	if err := evStream.WaitResponse(ctx, nil); err != nil {
+		t.Fatalf("events wait: %v", err)
+	}
+
+	eventsCh := make(chan control.SandboxEvent, 32)
+	go func() {
+		for {
+			ev, err := evStream.RecvEvent(ctx)
+			if err != nil {
+				return
+			}
+			var se control.SandboxEvent
+			if json.Unmarshal(ev.Data, &se) == nil {
+				eventsCh <- se
+			}
+		}
+	}()
+
+	waitPortEvent := func(wantAction string, wantPort uint16) control.SandboxEvent {
+		t.Helper()
+		portStr := strconv.Itoa(int(wantPort))
+		deadline := time.After(10 * time.Second)
+		for {
+			select {
+			case se := <-eventsCh:
+				if se.Type == "port" && se.Action == wantAction &&
+					se.Attributes["source"] == "auto" &&
+					se.Attributes["guest_port"] == portStr {
+					return se
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for auto port event action=%s port=%d", wantAction, wantPort)
+			}
+		}
+	}
+
+	// 1. Start guest listener on freePort -> expect add(source=auto, host_ip=0.0.0.0).
+	freeExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+		Argv: []string{"/bin/httpfree"},
+	})
+	if err != nil {
+		t.Fatalf("exec httpfree: %v", err)
+	}
+	var freeResp control.ExecStartResponse
+	if err := freeExec.WaitResponse(ctx, &freeResp); err != nil {
+		t.Fatalf("exec httpfree wait: %v", err)
+	}
+	addEv := waitPortEvent("add", freePort)
+	if addEv.Attributes["host_ip"] != "0.0.0.0" || addEv.Attributes["proto"] != "tcp" || addEv.Attributes["host_port"] != strconv.Itoa(int(freePort)) {
+		t.Fatalf("auto add event attrs = %+v", addEv.Attributes)
+	}
+
+	// 2. Kill guest listener on freePort -> expect remove(source=auto).
+	if err := rs.client.Call(ctx, control.MethodProcSignal, control.ProcSignalRequest{
+		PID:    freeResp.PID,
+		Signal: "SIGKILL",
+	}, nil); err != nil {
+		t.Fatalf("kill httpfree: %v", err)
+	}
+	freeExec.Close()
+	rmEv := waitPortEvent("remove", freePort)
+	if rmEv.Attributes["host_ip"] != "0.0.0.0" || rmEv.Attributes["proto"] != "tcp" {
+		t.Fatalf("auto remove event attrs = %+v", rmEv.Attributes)
+	}
+
+	// 3. Start guest listener on busyPort -> expect bind_failed(source=auto, error!=empty).
+	busyExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+		Argv: []string{"/bin/httpbusy"},
+	})
+	if err != nil {
+		t.Fatalf("exec httpbusy: %v", err)
+	}
+	defer busyExec.Close()
+	if err := busyExec.WaitResponse(ctx, nil); err != nil {
+		t.Fatalf("exec httpbusy wait: %v", err)
+	}
+	failEv := waitPortEvent("bind_failed", busyPort)
+	if failEv.Attributes["host_ip"] != "0.0.0.0" || failEv.Attributes["proto"] != "tcp" || failEv.Attributes["error"] == "" {
+		t.Fatalf("auto bind_failed event attrs = %+v", failEv.Attributes)
+	}
+}
+
+func TestControlDynamicPortAddrCapabilitiesAndPolicy(t *testing.T) {
+	// 1. AutoPublishAddr=0.0.0.0 without DynamicPortAddrs does not advertise port.dynamic_any.
+	sbAuto := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			AutoPublishPorts: true,
+			AutoPublishAddr:  "0.0.0.0",
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	autoCaps := sbAuto.ControlCapabilities()
+	if slices.Contains(autoCaps, control.CapPortDynamicAny) {
+		t.Fatalf("auto-publish-addr only caps = %v, must not advertise %s", autoCaps, control.CapPortDynamicAny)
+	}
+	if !slices.Contains(autoCaps, control.CapPortDynamicLoopback) {
+		t.Fatalf("auto-publish-addr only caps = %v, want %s", autoCaps, control.CapPortDynamicLoopback)
+	}
+	if opts := sbAuto.lockdownOptions(); !slices.Contains(opts.AllowedBindAddrs, "0.0.0.0") {
+		t.Fatalf("lockdown AllowedBindAddrs = %v, want 0.0.0.0 for AutoPublishAddr", opts.AllowedBindAddrs)
+	}
+
+	// 2. --control-disable port.dynamic_any removes port.dynamic_any even with DynamicPortAddrs.
+	sbDisabled := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			DynamicPorts:     true,
+			DynamicPortAddrs: []string{"0.0.0.0"},
+			ControlDisable:   []string{control.CapPortDynamicAny},
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	disCaps := sbDisabled.ControlCapabilities()
+	if slices.Contains(disCaps, control.CapPortDynamicAny) {
+		t.Fatalf("disabled caps = %v, must not include %s", disCaps, control.CapPortDynamicAny)
+	}
+	if !slices.Contains(disCaps, control.CapPortDynamicLoopback) {
+		t.Fatalf("disabled caps = %v, want %s", disCaps, control.CapPortDynamicLoopback)
+	}
+
+	// 3. PolicyReadOnly strips all port.add capabilities.
+	sbRO := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			DynamicPorts:     true,
+			DynamicPortAddrs: []string{"0.0.0.0"},
+			ControlPolicy:    control.PolicyReadOnly,
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	if control.MethodAllowed(control.MethodPortAdd, sbRO.ControlCapabilities()) {
+		t.Fatalf("PolicyReadOnly allowed MethodPortAdd")
+	}
+
+	// 4. DynamicPortAddrs=[127.0.0.1] without DynamicPorts advertises loopback only (not dynamic_any).
+	sbLoopOnly := &Sandbox{
+		cfg: Config{
+			NetworkMode:      NetModeNAT,
+			DynamicPortAddrs: []string{"127.0.0.1"},
+		},
+		lockdown: hostlockdown.Status{Applied: true},
+	}
+	loopCaps := sbLoopOnly.ControlCapabilities()
+	if slices.Contains(loopCaps, control.CapPortDynamicAny) || !slices.Contains(loopCaps, control.CapPortDynamicLoopback) {
+		t.Fatalf("loopback-only DynamicPortAddrs caps = %v", loopCaps)
+	}
+	if !dynamicBindAddrAllowed(sbLoopOnly.cfg.DynamicPortAddrs, "127.0.0.1") ||
+		dynamicBindAddrAllowed(sbLoopOnly.cfg.DynamicPortAddrs, "::1") ||
+		dynamicBindAddrAllowed(sbLoopOnly.cfg.DynamicPortAddrs, "0.0.0.0") {
+		t.Fatalf("dynamicBindAddrAllowed mismatch for [127.0.0.1]")
 	}
 }

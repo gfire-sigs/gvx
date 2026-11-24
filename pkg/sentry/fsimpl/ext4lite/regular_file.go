@@ -24,6 +24,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
@@ -132,6 +133,7 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	r := nodeReader{n: ino.n, off: offset}
 	read, err := dst.CopyOutFrom(ctx, &r)
 	if read > 0 {
+		fd.dentry.fs.dev.AccountIO(ctx, blockdev.Read, uint64(read), 1)
 		ino.touchAtime(fd.vfsfd.Mount())
 	}
 	switch {
@@ -229,11 +231,17 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 		}
 		if d.fs.v.hasHeld() {
 			if serr := d.fs.v.sync(); serr != nil {
+				if total > 0 {
+					d.fs.dev.AccountIO(ctx, blockdev.Write, uint64(total), 1)
+				}
 				return total, finalOff, toLinuxErr(serr)
 			}
 		}
 		cur, pos = cur.DropFirst64(n), end
 		retryKillCap = killCapFailed
+	}
+	if total > 0 {
+		d.fs.dev.AccountIO(ctx, blockdev.Write, uint64(total), 1)
 	}
 	if werr != nil {
 		return total, finalOff, toLinuxErr(werr)

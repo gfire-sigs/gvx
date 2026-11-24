@@ -42,6 +42,10 @@ const (
 	MethodPortAdd          = "port.add"
 	MethodPortRemove       = "port.remove"
 	MethodNetDial          = "net.dial"
+	MethodNATPolicyGet     = "net.policy_get"
+	MethodNATPolicySet     = "net.policy_set"
+	MethodUnixForward      = "net.unix_forward"
+	MethodUnixAccept       = "net.unix_accept"
 	MethodMountList        = "mount.list"
 	MethodMountAdd         = "mount.add"
 	MethodMountRemount     = "mount.remount"
@@ -75,13 +79,18 @@ const (
 	CapPortList            = "port.list"
 	CapPortRemove          = "port.remove"
 	CapPortDynamicLoopback = "port.dynamic_loopback"
+	CapPortDynamicAny      = "port.dynamic_any"
 	CapPortAnyBind         = "port.any_bind"
 	CapNetDial             = "net.dial"
+	CapNATPolicyRead       = "net.policy.read"
+	CapNATPolicyWrite      = "net.policy.write"
+	CapUnixForward         = "net.unix_forward"
 	CapMountList           = "mount.list"
 	CapMountTmpfs          = "mount.tmpfs"
 	CapMountRemount        = "mount.remount"
 	CapMountRemove         = "mount.remove"
 	CapMountVolumeAttach   = "mount.volume_attach"
+	CapMountBindAttach     = "mount.bind_attach"
 	CapMountBind           = "mount.bind"
 	CapMountServe          = "mount.serve"
 	CapProcList            = "proc.list"
@@ -112,13 +121,18 @@ var allKnownCapabilities = []string{
 	CapPortList,
 	CapPortRemove,
 	CapPortDynamicLoopback,
+	CapPortDynamicAny,
 	CapPortAnyBind,
 	CapNetDial,
+	CapNATPolicyRead,
+	CapNATPolicyWrite,
+	CapUnixForward,
 	CapMountList,
 	CapMountTmpfs,
 	CapMountRemount,
 	CapMountRemove,
 	CapMountVolumeAttach,
+	CapMountBindAttach,
 	CapMountBind,
 	CapMountServe,
 	CapProcList,
@@ -175,15 +189,16 @@ func ParsePolicy(raw string) (Policy, error) {
 }
 
 var readOnlyCapabilities = map[string]bool{
-	CapPing:      true,
-	CapInspect:   true,
-	CapStats:     true,
-	CapEvents:    true,
-	CapFSExport:  true,
-	CapPortList:  true,
-	CapMountList: true,
-	CapProcList:  true,
-	CapKernelLog: true,
+	CapPing:          true,
+	CapInspect:       true,
+	CapStats:         true,
+	CapEvents:        true,
+	CapFSExport:      true,
+	CapPortList:      true,
+	CapNATPolicyRead: true,
+	CapMountList:     true,
+	CapProcList:      true,
+	CapKernelLog:     true,
 }
 
 var checkpointOnlyCapabilities = map[string]bool{
@@ -213,6 +228,10 @@ var methodRequiredCap = map[string]string{
 	MethodPortAdd:          CapPortDynamicLoopback,
 	MethodPortRemove:       CapPortRemove,
 	MethodNetDial:          CapNetDial,
+	MethodNATPolicyGet:     CapNATPolicyRead,
+	MethodNATPolicySet:     CapNATPolicyWrite,
+	MethodUnixForward:      CapUnixForward,
+	MethodUnixAccept:       CapUnixForward,
 	MethodMountList:        CapMountList,
 	MethodMountAdd:         CapMountTmpfs, // checked per-kind as well
 	MethodMountRemount:     CapMountRemount,
@@ -276,10 +295,10 @@ func MethodAllowed(method string, caps []string) bool {
 		return false
 	}
 	if method == MethodPortAdd {
-		return slices.Contains(caps, CapPortDynamicLoopback) || slices.Contains(caps, CapPortAnyBind)
+		return slices.Contains(caps, CapPortDynamicLoopback) || slices.Contains(caps, CapPortDynamicAny) || slices.Contains(caps, CapPortAnyBind)
 	}
 	if method == MethodMountAdd {
-		return slices.Contains(caps, CapMountTmpfs) || slices.Contains(caps, CapMountVolumeAttach) || slices.Contains(caps, CapMountBind)
+		return slices.Contains(caps, CapMountTmpfs) || slices.Contains(caps, CapMountVolumeAttach) || slices.Contains(caps, CapMountBindAttach) || slices.Contains(caps, CapMountBind)
 	}
 	req, ok := methodRequiredCap[method]
 	if !ok {
@@ -287,6 +306,9 @@ func MethodAllowed(method string, caps []string) bool {
 	}
 	return slices.Contains(caps, req)
 }
+
+// FeatureNetQoS advertises support for NAT bandwidth fields in resource updates.
+const FeatureNetQoS = "net_qos"
 
 // HelloRequest is sent by the client as the first v2 frame on StreamID 0.
 type HelloRequest struct {
@@ -470,14 +492,17 @@ type FSImportResponse struct {
 
 // ResourceUpdateRequest updates live sandbox resource limits and mutable tunables.
 type ResourceUpdateRequest struct {
-	MemoryBytes   *int64            `json:"memory_bytes,omitempty"`
-	ForceMemory   bool              `json:"force_memory,omitempty"`
-	CPUMillis     *int64            `json:"cpu_millis,omitempty"`
-	CPUQuotaUSec  *int64            `json:"cpu_quota_usec,omitempty"`
-	CPUPeriodUSec *int64            `json:"cpu_period_usec,omitempty"`
-	PidsLimit     *int64            `json:"pids_limit,omitempty"`
-	IsolateLAN    *bool             `json:"isolate_lan,omitempty"`
-	Tuning        map[string]string `json:"tuning,omitempty"`
+	MemoryBytes   *int64 `json:"memory_bytes,omitempty"`
+	ForceMemory   bool   `json:"force_memory,omitempty"`
+	CPUMillis     *int64 `json:"cpu_millis,omitempty"`
+	CPUQuotaUSec  *int64 `json:"cpu_quota_usec,omitempty"`
+	CPUPeriodUSec *int64 `json:"cpu_period_usec,omitempty"`
+	PidsLimit     *int64 `json:"pids_limit,omitempty"`
+	IsolateLAN    *bool  `json:"isolate_lan,omitempty"`
+	// Rates are guest-relative bits per second. Nil leaves a rate unchanged; zero clears it.
+	NetTXBPS *uint64           `json:"net_tx_bps,omitempty"`
+	NetRXBPS *uint64           `json:"net_rx_bps,omitempty"`
+	Tuning   map[string]string `json:"tuning,omitempty"`
 }
 
 // ResourceSnapshot describes active sandbox resource limits.
@@ -489,6 +514,8 @@ type ResourceSnapshot struct {
 	GuestCPUs     int               `json:"guest_cpus"`
 	PidsLimit     int64             `json:"pids_limit"`
 	IsolateLAN    bool              `json:"isolate_lan"`
+	NetTXBPS      uint64            `json:"net_tx_bps"` // Guest to host; zero is unlimited.
+	NetRXBPS      uint64            `json:"net_rx_bps"` // Host to guest; zero is unlimited.
 	Tuning        map[string]string `json:"tuning,omitempty"`
 }
 
@@ -544,6 +571,46 @@ type NetDialResponse struct {
 	RemoteAddr string `json:"remote_addr"`
 }
 
+// NATPolicyState carries a NAT policy. A get result contains null if no policy
+// is installed. A set request requires a policy object.
+type NATPolicyState struct {
+	Policy json.RawMessage `json:"policy"`
+}
+
+// UnixForwardRequest binds a listening Unix stream socket inside the guest VFS
+// and forwards each guest connect() to the control client.
+type UnixForwardRequest struct {
+	GuestPath string `json:"guest_path"`
+	UID       uint32 `json:"uid,omitempty"`
+	GID       uint32 `json:"gid,omitempty"`
+	Mode      uint32 `json:"mode,omitempty"`
+	Replace   bool   `json:"replace,omitempty"`
+}
+
+// UnixForwardResponse confirms that GuestPath is bound and listening.
+type UnixForwardResponse struct {
+	GuestPath string `json:"guest_path"`
+}
+
+// UnixAcceptEvent notifies the client of a new guest connection waiting to be
+// claimed via MethodUnixAccept.
+type UnixAcceptEvent struct {
+	ConnID uint64 `json:"conn_id"`
+}
+
+// UnixRejectEvent notifies the sandbox that dialing the host socket failed for
+// ConnID so the pending guest socket can be closed immediately.
+type UnixRejectEvent struct {
+	ConnID uint64 `json:"conn_id"`
+	Error  string `json:"error,omitempty"`
+}
+
+// UnixAcceptRequest claims a pending guest Unix socket connection for binary
+// streaming on ChannelGeneric.
+type UnixAcceptRequest struct {
+	ConnID uint64 `json:"conn_id"`
+}
+
 // MountInfo describes one guest mount entry.
 type MountInfo struct {
 	Target   string `json:"target"`
@@ -565,6 +632,8 @@ type MountAddRequest struct {
 	Target         string `json:"target"`
 	ReadOnly       bool   `json:"read_only,omitempty"`
 	TmpfsSizeBytes int64  `json:"tmpfs_size_bytes,omitempty"`
+	SingleFileName string `json:"single_file_name,omitempty"`
+	SandboxToken   string `json:"sandbox_token,omitempty"`
 }
 
 // MountRemountRequest toggles read-only status on an existing mount.
@@ -581,9 +650,10 @@ type MountRemoveRequest struct {
 
 // MountServeRequest attaches a client-served proxy filesystem at Target.
 type MountServeRequest struct {
-	Target   string `json:"target"`
-	ReadOnly bool   `json:"read_only,omitempty"`
-	Label    string `json:"label,omitempty"`
+	Target     string `json:"target"`
+	ReadOnly   bool   `json:"read_only,omitempty"`
+	Label      string `json:"label,omitempty"`
+	SingleFile bool   `json:"single_file,omitempty"`
 }
 
 // MountServeResponse confirms attachment of the proxy mount.
@@ -595,7 +665,7 @@ type MountServeResponse struct {
 // a connected `mount serve` client over FrameEvent / FrameData.
 type RPCFSRequest struct {
 	ID       uint64 `json:"id"`
-	Op       string `json:"op"` // "stat", "readdir", "read", "write", "create", "mkdir", "unlink", "rmdir", "rename", "truncate", "chmod", "utimens", "readlink", "symlink"
+	Op       string `json:"op"` // "stat", "readdir", "read", "write", "create", "mkdir", "unlink", "rmdir", "rename", "truncate", "chmod", "utimens", "readlink", "symlink", "watch", "unwatch"
 	Path     string `json:"path"`
 	NewPath  string `json:"new_path,omitempty"`
 	Offset   int64  `json:"offset,omitempty"`
@@ -628,23 +698,45 @@ type RPCFSEntry struct {
 
 // RPCFSResponse is the client reply to one RPCFSRequest.
 type RPCFSResponse struct {
-	ID      uint64       `json:"id"`
-	Errno   int          `json:"errno,omitempty"`
-	Error   string       `json:"error,omitempty"`
-	Entry   *RPCFSEntry  `json:"entry,omitempty"`
-	Entries []RPCFSEntry `json:"entries,omitempty"`
-	Data    []byte       `json:"data,omitempty"`
-	Written int64        `json:"written,omitempty"`
+	ID         uint64       `json:"id"`
+	Errno      int          `json:"errno,omitempty"`
+	Error      string       `json:"error,omitempty"`
+	Entry      *RPCFSEntry  `json:"entry,omitempty"`
+	Entries    []RPCFSEntry `json:"entries,omitempty"`
+	HasMore    bool         `json:"has_more,omitempty"`
+	NextOffset int64        `json:"next_offset,omitempty"`
+	Data       []byte       `json:"data,omitempty"`
+	EOF        bool         `json:"eof,omitempty"`
+	Written    int64        `json:"written,omitempty"`
 }
 
-// Canonical Linux open(2) flags, mode_t file-type bits, and errno numbers
-// transmitted in rpcfs wire payloads across heterogeneous host OSes.
+// RPCFSNotifyEvent reports one host-side change on a watched rpcfs path to the
+// sandbox over an "rpcfs.notify" stream event.
+type RPCFSNotifyEvent struct {
+	Path   string `json:"path"`
+	Name   string `json:"name,omitempty"`
+	Mask   uint32 `json:"mask"`
+	Cookie uint32 `json:"cookie,omitempty"`
+}
+
+// Canonical Linux open(2) flags, mode_t file-type bits, inotify(7) event bits,
+// and errno numbers transmitted in rpcfs wire payloads across heterogeneous
+// host OSes.
 const (
 	LinuxOExcl  uint32 = 0o200
 	LinuxSIFMT  uint32 = 0o170000
 	LinuxSIFDIR uint32 = 0o040000
 	LinuxSIFREG uint32 = 0o100000
 	LinuxSIFLNK uint32 = 0o120000
+
+	LinuxInModify     uint32 = 0x00000002
+	LinuxInAttrib     uint32 = 0x00000004
+	LinuxInMovedFrom  uint32 = 0x00000040
+	LinuxInMovedTo    uint32 = 0x00000080
+	LinuxInCreate     uint32 = 0x00000100
+	LinuxInDelete     uint32 = 0x00000200
+	LinuxInDeleteSelf uint32 = 0x00000400
+	LinuxInIsDir      uint32 = 0x40000000
 
 	LinuxEPERM        = 1
 	LinuxENOENT       = 2
@@ -799,6 +891,8 @@ type InspectResponse struct {
 	Resources          ResourceSnapshot `json:"resources"`
 	MemoryUsedBytes    uint64           `json:"memory_used_bytes"`
 	Ports              []PortRuleInfo   `json:"ports,omitempty"`
+	DynamicBindAddrs   []string         `json:"dynamic_bind_addrs,omitempty"`
+	AutoPublishAddr    string           `json:"auto_publish_addr,omitempty"`
 	Mounts             []MountInfo      `json:"mounts,omitempty"`
 	ActiveExecSessions int              `json:"active_exec_sessions"`
 	PIDCount           int              `json:"pid_count"`

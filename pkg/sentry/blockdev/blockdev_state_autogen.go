@@ -5,6 +5,7 @@ package blockdev
 import (
 	"context"
 
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/state"
 )
 
@@ -78,15 +79,25 @@ func (r *Registry) beforeSave() {}
 // +checklocksignore
 func (r *Registry) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
-	stateSinkObject.Save(0, &r.vfs)
+	vfsValue := r.saveVfs()
+	_ = (*vfs.VirtualFilesystem)(vfsValue)
 	stateSinkObject.Save(1, &r.devices)
+	stateSinkObject.SaveValue(0, vfsValue)
 }
 
 // +checklocksignore
 func (r *Registry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &r.vfs)
 	stateSourceObject.Load(1, &r.devices)
+	stateSourceObject.LoadValueTo(0, (**vfs.VirtualFilesystem)(nil), r)
 	stateSourceObject.AfterLoadTo(r)
+}
+
+// +checklocksignore
+func (r *Registry) StateLoadValue(ctx context.Context, stateSlot int, stateValue any) {
+	switch stateSlot {
+	case 0:
+		r.loadVfs(ctx, stateValue.(*vfs.VirtualFilesystem))
+	}
 }
 
 // +checklocksignore

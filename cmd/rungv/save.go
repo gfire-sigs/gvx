@@ -29,8 +29,8 @@ func init() {
 	register(command{
 		name: "save",
 		summary: "Write images to a tar archive that is an OCI image layout and a docker save archive.\n" +
-			"The command fetches the original layer blobs from the registry that the image came from.\n" +
-			"An image that came from an archive has no registry source and cannot be saved.",
+			"The command reads kept layer blobs from the local cache first and fetches only missing blobs from the origin registry.\n" +
+			"Pull or load images with -keep-blobs to save any image offline.",
 		usage: []string{"rungv save [-o FILE] [-cache-dir DIR] [-arch ARCH] IMAGE..."},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return saveSubcommand(ctx, args, streams.stdout, streams.stderr)

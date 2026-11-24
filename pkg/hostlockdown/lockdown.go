@@ -23,9 +23,12 @@ package hostlockdown
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -80,13 +83,27 @@ type Options struct {
 	// AllowLoopbackBind permits binding new TCP and UDP listeners on host
 	// loopback addresses (127.0.0.1 and ::1) after Apply while
 	// AllowOutboundNet is true. Non-loopback interfaces and Unix domain
-	// sockets remain blocked.
+	// sockets remain blocked unless listed in AllowedBindAddrs.
 	AllowLoopbackBind bool
 
+	// AllowedBindAddrs lists explicit host IP literals (such as "0.0.0.0",
+	// "::", or a LAN IP) that ListenAllowed and ListenPacketAllowed may bind
+	// after Apply while AllowOutboundNet is true. Unlisted addresses and Unix
+	// domain sockets remain blocked.
+	AllowedBindAddrs []string
+
 	// DynamicListeners bounds concurrent dynamic TCP listeners that call
-	// AcceptListener while AllowLoopbackBind is true. Windows pre-warms enough
-	// locked accept-broker threads for PreboundListeners plus DynamicListeners.
+	// AcceptListener while AllowLoopbackBind or AllowedBindAddrs is enabled.
+	// Windows pre-warms enough locked accept-broker threads for
+	// PreboundListeners plus DynamicListeners.
 	DynamicListeners int
+
+	// AllowBindAttach authorizes runtime hostfs bind-mount attachment via
+	// control-socket FD transfer after Apply. On macOS Seatbelt, this permits
+	// consuming explicit per-path sandbox file extension tokens issued by the
+	// unlocked client while keeping all other host paths denied. On Linux,
+	// Landlock is skipped while seccomp remains enforced on descriptor opens.
+	AllowBindAttach bool
 
 	// OutboundUDPPorts lists remote UDP ports that pre-bound UDP sockets may
 	// send to and receive from. The -net=wg backend sets the WireGuard peer
@@ -157,6 +174,7 @@ var (
 	lockdownMu          sync.Mutex
 	lockedDownFlag      atomic.Bool
 	loopbackBindAllowed atomic.Bool
+	allowedBindAddrs    atomic.Pointer[[]netip.Addr]
 	lastStatus          Status
 )
 
@@ -184,6 +202,10 @@ func Apply(opts Options) (Status, error) {
 	if err := validateMounts(opts.Mounts); err != nil {
 		return Status{}, err
 	}
+	parsedBindAddrs, err := parseAllowedBindAddrs(opts.AllowedBindAddrs)
+	if err != nil {
+		return Status{}, err
+	}
 	pinGOMAXPROCS()
 	st, err := applyOSLockdown(opts)
 	if err != nil {
@@ -192,8 +214,47 @@ func Apply(opts Options) (Status, error) {
 	st.Applied = true
 	lastStatus = st
 	loopbackBindAllowed.Store(opts.AllowOutboundNet && opts.AllowLoopbackBind)
+	if opts.AllowOutboundNet && len(parsedBindAddrs) > 0 {
+		copied := slices.Clone(parsedBindAddrs)
+		allowedBindAddrs.Store(&copied)
+	} else {
+		allowedBindAddrs.Store(nil)
+	}
 	lockedDownFlag.Store(true)
 	return st, nil
+}
+
+func parseAllowedBindAddrs(raw []string) ([]netip.Addr, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]netip.Addr, 0, len(raw))
+	for _, entry := range raw {
+		s := strings.TrimSpace(entry)
+		addr, err := netip.ParseAddr(s)
+		if err != nil || addr.Zone() != "" {
+			return nil, fmt.Errorf("hostlockdown: invalid AllowedBindAddrs entry %q: want a bare IP literal", entry)
+		}
+		addr = addr.Unmap()
+		if !slices.Contains(out, addr) {
+			out = append(out, addr)
+		}
+	}
+	return out, nil
+}
+
+func isBindAddrAllowed(addr netip.Addr) bool {
+	if !IsLockedDown() {
+		return true
+	}
+	addr = addr.Unmap()
+	if addr.IsLoopback() && loopbackBindAllowed.Load() {
+		return true
+	}
+	if ptr := allowedBindAddrs.Load(); ptr != nil {
+		return slices.Contains(*ptr, addr)
+	}
+	return false
 }
 
 // pinGOMAXPROCS fixes GOMAXPROCS at its current value.

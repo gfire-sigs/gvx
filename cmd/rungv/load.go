@@ -28,7 +28,7 @@ func init() {
 		name: "load",
 		summary: "Load images from an OCI image layout or docker save archive.\n" +
 			"The archive can be gzip or zstd compressed. The command reads standard input without -i.",
-		usage: []string{"rungv load [-i FILE] [-q] [-cache-dir DIR] [-arch ARCH]"},
+		usage: []string{"rungv load [-i FILE] [-q] [-keep-blobs] [-cache-dir DIR] [-arch ARCH]"},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return loadSubcommand(ctx, args, streams.stdin, streams.stdout, streams.stderr)
 		},
@@ -44,6 +44,7 @@ func loadSubcommand(_ context.Context, args []string, stdin io.Reader, stdout, s
 	fs.StringVar(&input, "input", "", "Read the archive from FILE instead of standard input")
 	fs.BoolVar(&quiet, "q", false, "Suppress the output")
 	fs.BoolVar(&quiet, "quiet", false, "Suppress the output")
+	keepBlobs := addKeepBlobsFlag(fs)
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
 	}
@@ -71,6 +72,7 @@ func loadSubcommand(_ context.Context, args []string, stdin io.Reader, stdout, s
 	if err != nil {
 		return imageFail(stderr, "load", err)
 	}
+	cache.SetKeepBlobs(*keepBlobs)
 	images, err := oci.LoadArchive(source, cache, arch)
 	if err != nil {
 		return imageFail(stderr, "load", err)

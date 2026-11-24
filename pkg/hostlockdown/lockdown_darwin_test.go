@@ -52,6 +52,10 @@ const (
 	childUDPEnv  = "GVX_HOSTLOCKDOWN_UDP_ADDR"
 	childTCP6Env = "GVX_HOSTLOCKDOWN_TCP6_ADDR"
 	childUnixEnv = "GVX_HOSTLOCKDOWN_UNIX_PATHS"
+	childExtDir  = "GVX_HOSTLOCKDOWN_EXT_DIR"
+	childExtTok  = "GVX_HOSTLOCKDOWN_EXT_TOK"
+	childExtFile = "GVX_HOSTLOCKDOWN_EXT_FILE"
+	childExtFTok = "GVX_HOSTLOCKDOWN_EXT_FTOK"
 )
 
 func TestMain(m *testing.M) {
@@ -452,6 +456,10 @@ func runLockedChild(mode string) error {
 		return childNetNATUnix()
 	case "net-loopback-bind":
 		return childNetLoopbackBind()
+	case "net-allowed-bind":
+		return childNetAllowedBind()
+	case "bind-attach-ext":
+		return childBindAttachExt()
 	case "net-udp":
 		return childNetUDP()
 	case "net-fresh":
@@ -967,6 +975,214 @@ func childNetLoopbackBind() error {
 	}
 	_, err = conn.Write([]byte("pong\n"))
 	return err
+}
+
+func TestLockdownDarwinAllowedBindAddrs(t *testing.T) {
+	// Use a short directory under /tmp so the Unix socket path stays below
+	// macOS's 104-byte sun_path limit and triggers Seatbelt EPERM, not EINVAL.
+	dir, err := os.MkdirTemp("/tmp", "gvx-ab-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	ws, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	child := startChild(t, "net-allowed-bind", childWSEnv+"="+ws)
+	addr := child.readLine(t)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", addr, err)
+	}
+	conn, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", port), 10*time.Second)
+	if err != nil {
+		t.Fatalf("dial child wildcard listener %s: %v\nchild stderr:\n%s", addr, err, child.stderr.String())
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("write to child listener: %v", err)
+	}
+	reply, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || reply != "pong\n" {
+		t.Fatalf("child listener reply = %q, %v; want pong\\n\nchild stderr:\n%s", reply, err, child.stderr.String())
+	}
+	child.wait(t)
+}
+
+func childNetAllowedBind() error {
+	ws := os.Getenv(childWSEnv)
+	st, err := Apply(Options{
+		Mounts:           []HostMount{{Path: ws}},
+		AllowOutboundNet: true,
+		AllowedBindAddrs: []string{"0.0.0.0"},
+		DynamicListeners: 4,
+	})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	c.expect(!st.NetworkOutboundBlocked, "NetworkOutboundBlocked = true with AllowOutboundNet")
+
+	// Unlisted IP addresses (including 127.0.0.1 when AllowLoopbackBind is false)
+	// and Unix domain sockets must remain denied.
+	if ln, err := ListenAllowed("tcp4", "127.0.0.1:0"); err == nil {
+		_ = ln.Close()
+		c.expect(false, "ListenAllowed accepted unlisted 127.0.0.1:0")
+	}
+	if ln, err := ListenAllowed("tcp4", "192.0.2.1:0"); err == nil {
+		_ = ln.Close()
+		c.expect(false, "ListenAllowed accepted unlisted 192.0.2.1:0")
+	}
+	if ln, err := net.Listen("unix", filepath.Join(ws, "denied.sock")); err == nil {
+		_ = ln.Close()
+		c.expect(false, "unix socket bind inside writable mount succeeded, want permission error")
+	} else {
+		c.expect(errors.Is(err, fs.ErrPermission), "unix socket bind = %v, want permission error", err)
+	}
+
+	// Listed wildcard IP UDP and TCP binds succeed under Seatbelt.
+	if pc, err := ListenPacketAllowed("udp4", "0.0.0.0:0"); err != nil {
+		c.expect(false, "ListenPacketAllowed(udp4, 0.0.0.0:0): %v", err)
+	} else {
+		_ = pc.Close()
+	}
+
+	ln, err := ListenAllowed("tcp4", "0.0.0.0:0")
+	if err != nil {
+		return fmt.Errorf("ListenAllowed(tcp4, 0.0.0.0:0): %w", err)
+	}
+	defer func() { _ = ln.Close() }()
+	if err := c.err(); err != nil {
+		return err
+	}
+	fmt.Println(ln.Addr().String())
+	conn, err := AcceptListener(ln)
+	if err != nil {
+		return fmt.Errorf("AcceptListener: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || line != "ping\n" {
+		return fmt.Errorf("dynamic inbound read = %q, %v", line, err)
+	}
+	_, err = conn.Write([]byte("pong\n"))
+	return err
+}
+
+func TestLockdownDarwinBindAttachExtension(t *testing.T) {
+	ws := realTempDir(t)
+	outside := realTempDir(t)
+	attachDir := realTempDir(t)
+	fileParent := realTempDir(t)
+	attachFile := filepath.Join(fileParent, "target.txt")
+	siblingFile := filepath.Join(fileParent, "sibling.txt")
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("host-secret"), 0o600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(attachDir, "a.txt"), []byte("dir-ok"), 0o600); err != nil {
+		t.Fatalf("WriteFile attachDir: %v", err)
+	}
+	if err := os.WriteFile(attachFile, []byte("file-ok"), 0o600); err != nil {
+		t.Fatalf("WriteFile attachFile: %v", err)
+	}
+	if err := os.WriteFile(siblingFile, []byte("sibling-secret"), 0o600); err != nil {
+		t.Fatalf("WriteFile siblingFile: %v", err)
+	}
+
+	dirTok, err := IssueFileExtension(attachDir, false)
+	if err != nil {
+		t.Fatalf("IssueFileExtension(dir): %v", err)
+	}
+	fileTok, err := IssueFileExtension(attachFile, true)
+	if err != nil {
+		t.Fatalf("IssueFileExtension(file): %v", err)
+	}
+	if _, err := IssueFileExtension("/", true); err == nil {
+		t.Fatal("IssueFileExtension(/) succeeded, want error")
+	}
+
+	runChildToCompletion(t, "bind-attach-ext",
+		childWSEnv+"="+ws,
+		childOutEnv+"="+outside,
+		childExtDir+"="+attachDir,
+		childExtTok+"="+dirTok,
+		childExtFile+"="+attachFile,
+		childExtFTok+"="+fileTok,
+	)
+}
+
+func childBindAttachExt() error {
+	ws := os.Getenv(childWSEnv)
+	outside := os.Getenv(childOutEnv)
+	attachDir := os.Getenv(childExtDir)
+	dirTok := os.Getenv(childExtTok)
+	attachFile := os.Getenv(childExtFile)
+	fileTok := os.Getenv(childExtFTok)
+
+	st, err := Apply(Options{
+		Mounts:          []HostMount{{Path: ws}},
+		AllowBindAttach: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	c.expect(st.UnboundFileOpenBlocked, "UnboundFileOpenBlocked = false")
+
+	// Before consuming tokens, both delegated paths and outside path must be denied.
+	if _, err := os.ReadFile(filepath.Join(attachDir, "a.txt")); !errors.Is(err, fs.ErrPermission) {
+		c.expect(false, "read attachDir before consume = %v, want permission error", err)
+	}
+	if _, err := os.ReadFile(attachFile); !errors.Is(err, fs.ErrPermission) {
+		c.expect(false, "read attachFile before consume = %v, want permission error", err)
+	}
+
+	// Consume directory read-write extension.
+	dirH, err := ConsumeFileExtension(dirTok)
+	if err != nil {
+		return fmt.Errorf("ConsumeFileExtension(dir): %w", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(attachDir, "a.txt")); err != nil || string(data) != "dir-ok" {
+		c.expect(false, "read attachDir after consume = (%q, %v)", data, err)
+	}
+	if err := os.WriteFile(filepath.Join(attachDir, "w.txt"), []byte("written"), 0o600); err != nil {
+		c.expect(false, "write attachDir after consume: %v", err)
+	}
+	// Unrelated host path must remain denied.
+	if _, err := os.ReadFile(filepath.Join(outside, "secret.txt")); !errors.Is(err, fs.ErrPermission) {
+		c.expect(false, "read outside after consume = %v, want permission error", err)
+	}
+	// Release revokes access immediately.
+	if err := ReleaseFileExtension(dirH); err != nil {
+		c.expect(false, "ReleaseFileExtension(dir): %v", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(attachDir, "a.txt")); !errors.Is(err, fs.ErrPermission) {
+		c.expect(false, "read attachDir after release = %v, want permission error", err)
+	}
+
+	// Consume single-file read-only extension.
+	fileH, err := ConsumeFileExtension(fileTok)
+	if err != nil {
+		return fmt.Errorf("ConsumeFileExtension(file): %w", err)
+	}
+	if data, err := os.ReadFile(attachFile); err != nil || string(data) != "file-ok" {
+		c.expect(false, "read attachFile after consume = (%q, %v)", data, err)
+	}
+	if err := os.WriteFile(attachFile, []byte("nope"), 0o600); !errors.Is(err, fs.ErrPermission) {
+		c.expect(false, "write read-only attachFile = %v, want permission error", err)
+	}
+	sibling := filepath.Join(filepath.Dir(attachFile), "sibling.txt")
+	if _, err := os.ReadFile(sibling); !errors.Is(err, fs.ErrPermission) {
+		c.expect(false, "read sibling file = %v, want permission error", err)
+	}
+	if err := ReleaseFileExtension(fileH); err != nil {
+		c.expect(false, "ReleaseFileExtension(file): %v", err)
+	}
+	if _, err := os.ReadFile(attachFile); !errors.Is(err, fs.ErrPermission) {
+		c.expect(false, "read attachFile after release = %v, want permission error", err)
+	}
+	return c.err()
 }
 
 func childNetUDP() error {

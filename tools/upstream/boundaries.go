@@ -181,7 +181,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:               "cmd/rungv",
 		tier:              Tier1Additive,
-		allowed:           []string{"pkg/gvx", "pkg/gvx/control", "pkg/oci"},
+		allowed:           []string{"pkg/gvx", "pkg/gvx/control", "pkg/oci", "gopkg.in/yaml.v3"},
 		forbidden:         []string{pkgSentryAll, "pkg/hostlockdown/*", "pkg/netbackend/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
 		forbiddenLiterals: []string{winHvDLL},
 	},
@@ -304,7 +304,7 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/fsimpl/rpcfs",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/sync"},
+		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/state", "pkg/sync"},
 		forbidden: append([]string{"pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
@@ -630,6 +630,12 @@ var boundaryRules = []importRule{
 		forbidden: lowLevelTier2Bans,
 	},
 	{
+		pkg:       "pkg/tcpip/network/internal/fragmentation",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/tcpip/stack"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
 		pkg:       "pkg/tcpip/network/ipv4",
 		tier:      Tier2Sibling,
 		allowed:   []string{"pkg/state", "pkg/tcpip/*"},
@@ -659,6 +665,18 @@ var boundaryRules = []importRule{
 		allowed:   []string{"pkg/state", "pkg/tcpip/*", "pkg/waiter"},
 		forbidden: lowLevelTier2Bans,
 	},
+	{
+		pkg:       "pkg/tcpip/transport/internal/network",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/tcpip"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
+		pkg:       "pkg/tcpip/transport/udp",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/tcpip/stack"},
+		forbidden: lowLevelTier2Bans,
+	},
 
 	// Sentry Tier 2 packages.
 	{
@@ -676,7 +694,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:           "pkg/sentry/fsimpl/cgroup2fs",
 		tier:          Tier2Sibling,
-		allowed:       []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/kernel", "pkg/sentry/usage", "pkg/sentry/vfs"},
+		allowed:       []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel", "pkg/sentry/usage", "pkg/sentry/vfs", "pkg/usermem"},
 		forbidden:     append([]string{xSysWindows}, append(slices.Clone(platformSiblings), tier2UpperBans...)...),
 		forbiddenProd: []string{"pkg/sentry/platform/*"},
 	},
@@ -690,7 +708,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:           "pkg/sentry/fsimpl/erofs",
 		tier:          Tier2Sibling,
-		allowed:       []string{"pkg/abi/linux", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel/auth", "pkg/sentry/vfs"},
+		allowed:       []string{"pkg/abi/linux", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel/auth", "pkg/sentry/vfs"},
 		forbidden:     append([]string{xSysWindows}, append(slices.Clone(platformSiblings), without(tier2UpperBans, "pkg/oci/*")...)...),
 		forbiddenProd: []string{"pkg/sentry/platform/*", "pkg/oci/*"},
 	},
@@ -703,7 +721,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/fsimpl/overlay",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/sentry/uniqueid", "pkg/sentry/vfs", "pkg/state"},
+		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/sentry/blockdev", "pkg/sentry/uniqueid", "pkg/sentry/vfs", "pkg/state", "pkg/usermem"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
@@ -938,6 +956,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/gvx"}, "pkg/cpuid", "kernel.Init requires a cpuid.FeatureSet"},
 	{[]string{"pkg/gvx"}, "pkg/marshal/primitive", "guest memory copies use primitive marshal types"},
 	{[]string{"pkg/gvx"}, "pkg/memutil", "kernel memory files require host memory views"},
+	{[]string{"pkg/gvx"}, "pkg/syserr", "reverse Unix socket forwarding converts transport syserr values to errors"},
 	{[]string{"pkg/gvx"}, "pkg/waiter", "stdio file descriptions implement waiter.Waitable for blocking reads"},
 
 	// pkg/netbackend: Netstack foundation packages live outside pkg/tcpip.

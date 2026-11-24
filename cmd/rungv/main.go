@@ -78,6 +78,9 @@ func executeCLI(ctx context.Context, args []string, stdin io.Reader, stdout, std
 
 	streams := cliIO{stdin: stdin, stdout: stdout, stderr: stderr}
 	subcmd := args[0]
+	if subcmd == unixForwardHelperSubcmd {
+		return runUnixForwardHelper(ctx, args[1:], stdin, stdout)
+	}
 	switch subcmd {
 	case "-h", "--help", "help":
 		printUsage(stdout)

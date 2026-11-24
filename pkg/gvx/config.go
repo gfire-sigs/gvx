@@ -17,14 +17,18 @@
 package gvx
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/gvx/control"
@@ -72,6 +76,108 @@ const (
 	// NetworkNone is an alias for NetModeNone.
 	NetworkNone = NetModeNone
 )
+
+// UnixForward specifies a reverse Unix stream socket forward from a listening
+// socket inside the guest VFS (GuestPath) to a host Unix domain socket
+// (HostSocket) or a caller-supplied Dial callback.
+type UnixForward struct {
+	// GuestPath is the absolute path of the listening Unix socket inside the
+	// guest VFS (for example "/run/host-services/ssh-auth.sock").
+	GuestPath string
+
+	// HostSocket is the host Unix domain socket path dialed for each guest
+	// connect() when Dial is nil. Under host lockdown, Dial must be supplied by
+	// a pre-lockdown helper or the runtime net.unix_forward control RPC.
+	HostSocket string
+
+	// UID and GID set the owner of the guest Unix socket inode.
+	UID uint32
+	GID uint32
+
+	// Mode sets the permission bits (0..0777) of the guest Unix socket inode.
+	// Zero defaults to 0o666.
+	Mode uint32
+
+	// Dial establishes one host connection per accepted guest Unix socket
+	// connection. When set, HostSocket is used only as metadata.
+	Dial func(ctx context.Context) (net.Conn, error)
+}
+
+const maxUnixSocketPathLen = 107
+
+func validateUnixForwardGuestPath(guestPath string) error {
+	if err := validateGuestPath(guestPath); err != nil {
+		return err
+	}
+	if len(guestPath) > maxUnixSocketPathLen {
+		return fmt.Errorf("guest Unix socket path length %d exceeds Linux sun_path limit %d", len(guestPath), maxUnixSocketPathLen)
+	}
+	return nil
+}
+
+// ParseUnixForward parses "GUEST_PATH=HOST_SOCKET[,uid=N][,gid=N][,mode=0600]".
+func ParseUnixForward(spec string) (UnixForward, error) {
+	raw := strings.TrimSpace(spec)
+	guestPath, rhs, ok := strings.Cut(raw, "=")
+	if !ok {
+		return UnixForward{}, fmt.Errorf("gvx: invalid unix forward %q (want GUEST_PATH=HOST_SOCKET[,uid=N][,gid=N][,mode=0600])", spec)
+	}
+	guestPath = strings.TrimSpace(guestPath)
+	if err := validateUnixForwardGuestPath(guestPath); err != nil {
+		return UnixForward{}, fmt.Errorf("gvx: invalid unix forward guest path %q: %w", guestPath, err)
+	}
+	parts := strings.Split(rhs, ",")
+	hostSock := strings.TrimSpace(parts[0])
+	if hostSock == "" {
+		return UnixForward{}, fmt.Errorf("gvx: invalid unix forward %q: empty host socket path", spec)
+	}
+	if rest, hasTilde := strings.CutPrefix(hostSock, "~/"); hasTilde {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return UnixForward{}, fmt.Errorf("gvx: resolve ~ in host socket %q: %w", hostSock, err)
+		}
+		hostSock = filepath.Join(home, rest)
+	}
+	uf := UnixForward{
+		GuestPath:  guestPath,
+		HostSocket: hostSock,
+	}
+	for _, opt := range parts[1:] {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		k, v, hasEq := strings.Cut(opt, "=")
+		if !hasEq {
+			return UnixForward{}, fmt.Errorf("gvx: invalid unix forward option %q in %q (want key=value)", opt, spec)
+		}
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		switch k {
+		case "uid":
+			n, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				return UnixForward{}, fmt.Errorf("gvx: invalid unix forward uid %q: %w", v, err)
+			}
+			uf.UID = uint32(n)
+		case "gid":
+			n, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				return UnixForward{}, fmt.Errorf("gvx: invalid unix forward gid %q: %w", v, err)
+			}
+			uf.GID = uint32(n)
+		case "mode":
+			n, err := strconv.ParseUint(v, 8, 32)
+			if err != nil || n == 0 || n > 0o777 {
+				return UnixForward{}, fmt.Errorf("gvx: invalid unix forward mode %q (want octal 0001..0777)", v)
+			}
+			uf.Mode = uint32(n)
+		default:
+			return UnixForward{}, fmt.Errorf("gvx: unknown unix forward option %q (want uid, gid, or mode)", k)
+		}
+	}
+	return uf, nil
+}
 
 // PortForward specifies an inbound host-to-guest port forward (-p host:guest).
 type PortForward struct {
@@ -163,6 +269,16 @@ type Config struct {
 	// NetworkMode selects the network backend ("nat", "wg", or "none").
 	NetworkMode NetworkMode
 
+	// NetworkBandwidth limits guest transmit and receive in NAT mode. A zero
+	// rate leaves that direction unlimited.
+	NetworkBandwidth netbackend.BandwidthRates
+
+	// NetworkPolicy supplies the initial host policy for NAT. A nil policy
+	// leaves the firewall off until a control client installs a policy.
+	NetworkPolicy *netbackend.NATPolicyConfig
+
+	compiledNATPolicy *netbackend.CompiledNATPolicy
+
 	// IsolateLAN blocks outbound NAT connections to RFC1918, loopback, and
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
@@ -192,6 +308,10 @@ type Config struct {
 	// PortForwards lists inbound host-to-guest port forwardings (-p host:guest).
 	PortForwards []PortForward
 
+	// UnixForwards lists reverse guest-to-host Unix stream socket forwardings
+	// (--unix-forward GUEST_PATH=HOST_SOCKET[,uid=...,gid=...,mode=...]).
+	UnixForwards []UnixForward
+
 	// WireGuardConfigPath is the path to a WireGuard INI configuration file
 	// when NetworkMode is NetModeWireGuard.
 	WireGuardConfigPath string
@@ -214,6 +334,11 @@ type Config struct {
 
 	// OCICacheDir overrides the default host EROFS layer cache directory.
 	OCICacheDir string
+
+	// OCIKeepBlobs retains original image blobs in the layer cache when pulling
+	// or loading OCIImage, so SaveImages works offline and PushImage needs no
+	// source registry.
+	OCIKeepBlobs bool
 
 	// RegistryBaseURL specifies an optional HTTP/HTTPS OCI registry base URL.
 	RegistryBaseURL string
@@ -249,6 +374,12 @@ type Config struct {
 	// shorthand for the bind mount at /workspace, so no entry of Mounts may use
 	// /workspace when WorkspacePath is set.
 	Mounts []Mount
+
+	// ServeMounts lists rpcfs mounts to reattach during Restore. Each entry
+	// must match a MountRPCFS entry in the checkpoint manifest. Entries in the
+	// manifest omitted from ServeMounts restore in detached mode and return EIO
+	// until a client reconnects via mount.serve.
+	ServeMounts []ServeMount
 
 	// ReadOnlyRoot mounts the root file system of the guest in read-only mode
 	// after the guest setup. /proc, /sys, /dev, /dev/shm, /dev/pts, and every
@@ -333,17 +464,35 @@ type Config struct {
 	PublishAll bool
 
 	// AutoPublishPorts publishes guest TCP listeners and iptables NAT DNAT
-	// ports on host 127.0.0.1 automatically while the sandbox runs. Static
-	// rules in PortForwards keep precedence. It needs the nat network mode.
+	// ports on host 127.0.0.1 (or AutoPublishAddr) automatically while the
+	// sandbox runs. Static rules in PortForwards keep precedence. It needs the
+	// nat network mode.
 	AutoPublishPorts bool
+
+	// AutoPublishAddr overrides the host bind IP address used by
+	// AutoPublishPorts (defaults to "127.0.0.1"). Setting a non-loopback IP
+	// authorizes that address under host lockdown for automatic publishing.
+	// Requires AutoPublishPorts and the nat network mode.
+	AutoPublishAddr string
 
 	// DynamicPorts enables runtime loopback port publishing (`port add`) under
 	// host lockdown without automatic guest port polling. It needs nat mode.
 	DynamicPorts bool
 
+	// DynamicPortAddrs lists explicit host IP literals (such as "0.0.0.0" or a
+	// LAN IP) that runtime `port add` may bind under host lockdown. Unlisted
+	// addresses and Unix domain sockets remain denied. It needs nat mode.
+	DynamicPortAddrs []string
+
 	// AllowVolumeAttach enables POSIX Unix SCM_RIGHTS ext4lite volume attachment
 	// over the control socket under Linux seccomp lockdown.
 	AllowVolumeAttach bool
+
+	// AllowBindAttach enables POSIX Unix SCM_RIGHTS hostfs bind-mount attachment
+	// (`mount add --type bind`) over the control socket under host lockdown. On
+	// macOS Seatbelt this permits consuming per-path sandbox file extensions
+	// issued by the unlocked client while keeping all other paths denied.
+	AllowBindAttach bool
 
 	// WorkDir is the initial guest working directory (defaults to "/workspace"
 	// when WorkspacePath is set, or "/").
@@ -490,6 +639,25 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	default:
 		return fmt.Errorf("%w: unsupported network mode %q", ErrInvalidConfig, c.NetworkMode)
 	}
+	if err := c.NetworkBandwidth.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	if c.NetworkMode != NetModeNAT && c.NetworkBandwidth != (netbackend.BandwidthRates{}) {
+		return fmt.Errorf("%w: network bandwidth limits require -net=nat", ErrInvalidConfig)
+	}
+	if c.StreamInterceptor != nil && c.NetworkBandwidth != (netbackend.BandwidthRates{}) {
+		return fmt.Errorf("%w: NAT bandwidth limits and a custom stream interceptor cannot be combined", ErrInvalidConfig)
+	}
+	if c.NetworkPolicy != nil {
+		if c.NetworkMode != NetModeNAT || c.StreamInterceptor != nil {
+			return fmt.Errorf("%w: NAT policy requires NAT without a custom stream interceptor", ErrInvalidConfig)
+		}
+		compiled, err := netbackend.CompileNATPolicy(c.NetworkPolicy)
+		if err != nil {
+			return fmt.Errorf("%w: NAT policy: %w", ErrInvalidConfig, err)
+		}
+		c.compiledNATPolicy = compiled
+	}
 	for _, pf := range c.PortForwards {
 		if pf.HostSocket != "" && pf.Protocol != "" && pf.Protocol != "tcp" {
 			return fmt.Errorf("%w: the Unix socket %s forwards tcp only, not %s", ErrInvalidConfig, pf.HostSocket, pf.Protocol)
@@ -497,6 +665,30 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	}
 	if len(c.PortForwards) > 0 && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: port forwards need network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+	}
+	if len(c.UnixForwards) > 0 {
+		seen := make(map[string]struct{}, len(c.UnixForwards))
+		for i := range c.UnixForwards {
+			uf := &c.UnixForwards[i]
+			if err := validateUnixForwardGuestPath(uf.GuestPath); err != nil {
+				return fmt.Errorf("%w: unix forward guest path %q: %w", ErrInvalidConfig, uf.GuestPath, err)
+			}
+			if _, dup := seen[uf.GuestPath]; dup {
+				return fmt.Errorf("%w: duplicate unix forward guest path %q", ErrInvalidConfig, uf.GuestPath)
+			}
+			seen[uf.GuestPath] = struct{}{}
+			if uf.Mode > 0o777 {
+				return fmt.Errorf("%w: unix forward mode %#o out of range [0, 0777]", ErrInvalidConfig, uf.Mode)
+			}
+			if uf.Dial == nil {
+				if strings.TrimSpace(uf.HostSocket) == "" {
+					return fmt.Errorf("%w: unix forward %q requires HostSocket or Dial", ErrInvalidConfig, uf.GuestPath)
+				}
+				if !c.DisableHostLockdown {
+					return fmt.Errorf("%w: unix forward %q without a pre-lockdown Dial callback is denied under host lockdown; use rungv --unix-forward, the net.unix_forward control RPC, or DisableHostLockdown", ErrInvalidConfig, uf.GuestPath)
+				}
+			}
+		}
 	}
 	if c.NetworkMode == NetModeWireGuard && c.WireGuardConfig == nil && c.WireGuardConfigPath == "" {
 		return fmt.Errorf("%w: network mode %q needs WireGuardConfig or WireGuardConfigPath", ErrInvalidConfig, NetModeWireGuard)
@@ -524,8 +716,17 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if p := c.Resources.PidsLimit; p < 0 || p > maxPidsLimit {
 		return fmt.Errorf("%w: pids limit %d out of range [0, %d]", ErrInvalidConfig, p, maxPidsLimit)
 	}
-	if _, err := control.ParsePolicy(string(c.ControlPolicy)); err != nil {
+	ctrlPolicy, err := control.ParsePolicy(string(c.ControlPolicy))
+	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	c.ControlPolicy = ctrlPolicy
+	ln := c.ControlListener
+	if ln == nil {
+		ln = c.CheckpointListener
+	}
+	if ln != nil && c.ControlToken == "" && (runtime.GOOS == "windows" || ln.Addr().Network() != "unix") {
+		return fmt.Errorf("%w: this control listener requires a control token", ErrInvalidConfig)
 	}
 	if err := control.ValidateDisableList(c.ControlDisable); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
@@ -539,8 +740,35 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if c.AutoPublishPorts && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: auto-publishing guest ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
 	}
+	if c.AutoPublishAddr != "" {
+		if !c.AutoPublishPorts {
+			return fmt.Errorf("%w: AutoPublishAddr requires AutoPublishPorts", ErrInvalidConfig)
+		}
+		addr, err := parseBareIPAddr(c.AutoPublishAddr)
+		if err != nil {
+			return fmt.Errorf("%w: invalid AutoPublishAddr %q: %w", ErrInvalidConfig, c.AutoPublishAddr, err)
+		}
+		c.AutoPublishAddr = addr.String()
+	}
 	if c.DynamicPorts && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: dynamic port publishing needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+	}
+	if len(c.DynamicPortAddrs) > 0 {
+		if c.NetworkMode != NetModeNAT {
+			return fmt.Errorf("%w: dynamic port bind addresses need network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+		}
+		normalized := make([]string, 0, len(c.DynamicPortAddrs))
+		for _, raw := range c.DynamicPortAddrs {
+			addr, err := parseBareIPAddr(raw)
+			if err != nil {
+				return fmt.Errorf("%w: invalid DynamicPortAddrs entry %q: %w", ErrInvalidConfig, raw, err)
+			}
+			s := addr.String()
+			if !slices.Contains(normalized, s) {
+				normalized = append(normalized, s)
+			}
+		}
+		c.DynamicPortAddrs = normalized
 	}
 	if err := c.validateMounts(); err != nil {
 		return err
@@ -563,4 +791,13 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 		}
 	}
 	return nil
+}
+
+func parseBareIPAddr(raw string) (netip.Addr, error) {
+	s := strings.TrimSpace(raw)
+	addr, err := netip.ParseAddr(s)
+	if err != nil || addr.Zone() != "" {
+		return netip.Addr{}, errors.New("want a bare IP literal without port or zone")
+	}
+	return addr.Unmap(), nil
 }

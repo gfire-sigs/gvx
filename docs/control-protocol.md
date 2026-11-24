@@ -72,7 +72,7 @@ Every control endpoint restricts access to the local owner account.
 | Policy | Permitted Capabilities |
 | :--- | :--- |
 | `default` | All capabilities compatible with the active host lockdown and runtime flags. |
-| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log` (excludes `kernel.log_clear`). |
+| `readonly` | `system.ping`, `sandbox.inspect`, `sandbox.stats`, `sandbox.events`, `fs.export`, `port.list`, `mount.list`, `proc.list`, `kernel.log` (without `kernel.log_clear`), and `net.policy.read`. |
 | `checkpoint-only` | `system.ping`, `sandbox.inspect`, `checkpoint.local`, `checkpoint.stream`. |
 
 ### 2.3 Lockdown Compatibility Matrix
@@ -83,14 +83,16 @@ Host lockdown blocks new host file opens, child process creation, and arbitrary 
 | :--- | :--- | :--- |
 | `exec`, `pause`, `unpause`, `stop`, `kill` | Allowed; operates purely inside the Sentry kernel. | None. |
 | `cp`, `export`, `checkpoint -o` | Allowed; the unlocked client performs all host disk I/O over framed tar streams. | None. |
-| `update` (`-m`, `--cpus`, `--pids-limit`, `--isolate-lan`, `--tune`) | Allowed; modifies per-sandbox Sentry limits, root CPU bandwidth, root cgroup2 `pids.max`, and NAT settings. | None. |
+| `update` (`-m`, `--cpus`, `--pids-limit`, `--isolate-lan`, `--net-tx-bps`, `--net-rx-bps`, `--tune`) | Allowed; modifies per-sandbox Sentry limits, root CPU bandwidth, root cgroup2 `pids.max`, and NAT settings. | None. |
+| `net-policy` | Reads or replaces the NAT policy in memory. The client reads policy files outside lockdown. | NAT without a custom stream interceptor. |
 | `port-forward` (`net.dial`) | Allowed; the unlocked client binds host sockets and tunnels TCP streams into the guest stack. | None. |
-| `port add` | Allowed on `127.0.0.1` or `[::1]` only when loopback binds are pre-authorized; non-loopback and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports` or `--auto-publish`. |
+| `unix-forward` (`net.unix_forward`) | Allowed; the sandbox binds a guest Unix socket and streams each guest connection to the unlocked client, which dials the host Unix socket. | None. |
+| `port add` | Allowed on `127.0.0.1` or `[::1]` with loopback opt-in, or on listed IP literals with `--dynamic-ports-addr`. Unlisted addresses and `unix:` binds return `LOCKDOWN_DENIED`. | `--dynamic-ports`, `--auto-publish`, or `--dynamic-ports-addr IP`. |
 | `mount add --type tmpfs`, `mount rm` | Allowed; no host path opens occur. | None. |
 | `mount remount` | The server always allows remounting `rw` to `ro`; remounting `ro` to `rw` succeeds only when the host backing opened writable before lockdown. | Original writable mount. |
 | `mount add --type volume` | Allowed over POSIX `AF_UNIX` via `SCM_RIGHTS` FD transfer; server verifies `S_IFREG` before opening `ext4lite`. | `--allow-volume-attach` (Linux seccomp rule). |
-| `mount serve` (`rpcfs`) | Allowed on all host OSes; the unlocked client serves an `os.Root`-pinned directory over stream events. | None. |
-| `mount add --type bind` | Always rejected with `LOCKDOWN_DENIED` under lockdown. | `-lockdown=false` (debugging only). |
+| `mount serve` (`rpcfs`) | Allowed on all host OSes; the unlocked client serves an `os.Root`-pinned directory or single file over stream events. Supports paginated `readdir` and host-to-guest `inotify` events. | None. |
+| `mount add --type bind` | Allowed over POSIX `AF_UNIX` via transfer of a directory FD over `SCM_RIGHTS` (with file-extension tokens for macOS Seatbelt). Linux skips Landlock while keeping seccomp; rejected without opt-in and unsupported under Windows lockdown. | `--allow-bind-attach` (POSIX) or `-lockdown=false`. |
 
 ---
 
@@ -103,7 +105,7 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `system.ping` | Unary | Report protocol version, sandbox ID, state, uptime, and capabilities. |
 | `sandbox.inspect` | Unary | Return full runtime configuration, limits, ports, mounts, and security posture. |
 | `sandbox.stats` | Unary or event stream | Return one-shot or periodic CPU, memory, network, block I/O, and PID counters. |
-| `sandbox.events` | Event stream | Stream filtered lifecycle events (`exec`, `lifecycle`, `port`, `mount`, `resource`, `oom`). |
+| `sandbox.events` | Event stream | Stream filtered lifecycle events (`exec`, `lifecycle`, `port`, `unix_forward`, `mount`, `resource`, `oom`). Auto-published ports emit `port` events with `source=auto` and actions `add`, `remove`, or `bind_failed`. |
 | `lifecycle.pause` | Unary | Pause all guest tasks and optionally quiesce host network forwarders. |
 | `lifecycle.unpause` | Unary | Resume a paused sandbox. |
 | `lifecycle.stop` | Unary | Send a signal to PID 1, wait up to `timeout_ms`, and escalate to `SIGKILL`. |
@@ -113,20 +115,39 @@ Every `REQUEST` frame carries `{"method": "...", "params": {...}}`. Every `RESPO
 | `fs.stat` | Unary | Inspect one guest filesystem entry. |
 | `fs.export` | Server data stream | Stream a guest file, directory, or root overlay upper layer (`upper_only: true`) as tar on channel `0`. |
 | `fs.import` | Client data stream | Extract a client tar stream from channel `0` into a guest directory. |
-| `resource.update` | Unary | Update live memory, CPU quota, PIDs limit, LAN isolation, or mutable tunables. |
+| `resource.update` | Unary | Update memory, CPU bandwidth, PIDs, LAN isolation, NAT bandwidth, or mutable tunables. |
 | `port.list` | Unary | List static, auto-published, and dynamic host-to-guest port rules. |
 | `port.add` | Unary | Bind dynamic host-to-guest port rules on the sandbox forwarder. |
 | `port.remove` | Unary | Close dynamic or specified host-to-guest port rules. |
 | `net.dial` | Bidirectional stream | Dial a guest TCP endpoint inside the sandbox network stack and relay bytes on channel `0`. |
+| `net.policy_get` | Unary | Read the active host NAT policy. Requires `net.policy.read`. |
+| `net.policy_set` | Unary | Replace the active host NAT policy. Requires `net.policy.write`. |
+| `net.unix_forward` | Control event stream | Bind a listening Unix stream socket in the guest VFS and emit `unix.accept` events for guest connections. |
+| `net.unix_accept` | Bidirectional stream | Claim a pending guest Unix connection by `conn_id` and relay bytes on channel `0`. |
 | `mount.list` | Unary | List active guest mounts and mutability status. |
 | `mount.add` | Unary (optional FD) | Mount a `tmpfs`, `SCM_RIGHTS` `ext4lite` volume, or `-lockdown=false` bind mount. |
 | `mount.remount` | Unary | Toggle a mount between read-only and read-write. |
 | `mount.remove` | Unary | Unmount one guest mount point (optional `MNT_DETACH`). |
-| `mount.serve` | Bidirectional event stream | Attach an `rpcfs` proxy mount backed by client `rpcfs.req` and `rpcfs.resp` events. |
+| `mount.serve` | Bidirectional event stream | Attach or reconnect an `rpcfs` directory or single-file proxy mount backed by client `rpcfs.req`, `rpcfs.resp`, `rpcfs.notify`, and `rpcfs.detached` events. |
 | `proc.list` | Unary | Return a snapshot of guest thread groups from `TaskSet`. |
 | `proc.signal` | Unary | Send a POSIX signal to PID 1, a specific guest PID, or all guest processes. |
 | `kernel.log` | Unary or event stream | Read or follow records from the guest kernel log ring. |
 | `debug.log_level` | Unary | Change the active Sentry log level (`warning`, `info`, or `debug`). |
+
+The `net_qos` feature in `HELLO` identifies support for the NAT bandwidth fields in `resource.update`. The client verifies that feature before sending a request with either field. Both fields require the `resource.network` capability.
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `net_tx_bps` | Optional unsigned integer | Guest transmit limit in bits per second. |
+| `net_rx_bps` | Optional unsigned integer | Guest receive limit in bits per second. |
+
+An omitted field leaves that rate unchanged. A value of `0` removes the limit for that direction. The server installs both requested rates as one pair. `sandbox.inspect` and a successful `resource.update` report the effective rates in the resource snapshot.
+
+`net.policy_get` returns an object with a `policy` field. The value is the active JSON policy or `null` before the first installation. `net.policy_set` accepts the same object with a non-null policy. The server validates the complete document before replacing the rules. It returns the installed document.
+
+The encoded request and response must fit the negotiated frame size. Keep the default frame size to use the full 64 KiB policy limit.
+
+The `net.policy` group disables both capabilities. The `readonly` profile permits `net.policy.read` but not `net.policy.write`. Policy changes leave `resource.update` bandwidth values unchanged.
 
 ### 3.1 Structured Error Codes
 
@@ -143,7 +164,7 @@ Failed RPCs return a `ProtoError` object with a stable `code`, a diagnostic `mes
 | `NOT_PAUSED` | `1` | `lifecycle.unpause` called on a running sandbox. |
 | `NOT_FOUND` | `1` | Target PID, path, port rule, or mount does not exist. |
 | `ALREADY_EXISTS` | `1` | Conflicting port rule or mount target already exists. |
-| `BUSY` | `1` | Target mount is in use, or an `rpcfs` mount blocks checkpointing. |
+| `BUSY` | `1` | Target mount or volume image is in use, or a shaped NAT tunnel blocks checkpointing. |
 | `LIMIT_EXCEEDED` | `1` | Resource limit or concurrency ceiling exceeded (for example, memory cap below usage without `--force-memory`). |
 | `EXEC_ACTIVE` | `1` | Active `exec` sessions block checkpointing without `--force`. |
 | `SANDBOX_EXITING` | `1` | Sandbox is shutting down and accepts no new streams. |

@@ -27,10 +27,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/gvx/control"
+	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
@@ -40,29 +42,80 @@ import (
 )
 
 type rpcMountEntry struct {
-	target          string
-	label           string
-	readOnly        bool
-	backingReadOnly bool
-	cancel          context.CancelFunc
-	client          *streamRPCFSClient
+	target            string
+	label             string
+	readOnly          bool
+	backingReadOnly   bool
+	clientReadOnly    bool
+	singleFile        bool
+	detached          bool
+	checkpointClosing atomic.Bool
+	handle            *rpcfs.Handle
+	stream            *control.Stream
+	cancel            context.CancelFunc
+	client            rpcfs.Client
 }
 
-func (s *Sandbox) hasActiveRPCMounts() bool {
+func (s *Sandbox) rpcSaveQuiescers() []saveQuiescer {
 	s.rpcMountsMu.Lock()
 	defer s.rpcMountsMu.Unlock()
-	return len(s.rpcMounts) > 0
+	if len(s.rpcMounts) == 0 {
+		return nil
+	}
+	out := make([]saveQuiescer, 0, len(s.rpcMounts))
+	for _, e := range s.rpcMounts {
+		if e.handle != nil {
+			out = append(out, e.handle)
+		}
+	}
+	return out
+}
+
+// detachRPCMountsForStop marks every active rpcfs mount as closing for a
+// stopping checkpoint, notifies serving clients with an rpcfs.detached event,
+// detaches the clients without unmounting the VFS mount, and cancels their
+// serve streams.
+func (s *Sandbox) detachRPCMountsForStop() {
+	s.rpcMountsMu.Lock()
+	entries := make([]*rpcMountEntry, 0, len(s.rpcMounts))
+	for _, e := range s.rpcMounts {
+		e.checkpointClosing.Store(true)
+		entries = append(entries, e)
+	}
+	s.rpcMountsMu.Unlock()
+
+	for _, e := range entries {
+		if e.stream != nil {
+			notifyCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = e.stream.SendEvent(notifyCtx, "rpcfs.detached", map[string]string{
+				"target": e.target,
+				"reason": "checkpoint",
+			})
+			cancel()
+			e.stream.CloseEvents()
+		}
+		if e.handle != nil {
+			e.handle.DetachClient()
+		}
+		if e.cancel != nil {
+			e.cancel()
+		}
+	}
 }
 
 func (s *Sandbox) closeRPCMounts() {
 	s.rpcMountsMu.Lock()
 	entries := make([]*rpcMountEntry, 0, len(s.rpcMounts))
 	for k, e := range s.rpcMounts {
+		e.checkpointClosing.Store(true)
 		entries = append(entries, e)
 		delete(s.rpcMounts, k)
 	}
 	s.rpcMountsMu.Unlock()
 	for _, e := range entries {
+		if e.handle != nil {
+			e.handle.DetachClient()
+		}
 		if e.cancel != nil {
 			e.cancel()
 		}
@@ -129,7 +182,7 @@ func (s *Sandbox) listMountInfos() []control.MountInfo {
 			Type:     rpcfs.Name,
 			Source:   cmp.Or(rm.label, "client-proxy"),
 			ReadOnly: rm.readOnly,
-			Mutable:  !rm.backingReadOnly,
+			Mutable:  !rm.backingReadOnly && !rm.clientReadOnly,
 		})
 	}
 	s.rpcMountsMu.Unlock()
@@ -314,8 +367,114 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 		})
 
 	case "bind":
+		if len(fds) > 0 {
+			if !slices.Contains(caps, control.CapMountBindAttach) {
+				if runtime.GOOS == "windows" {
+					return control.NewError(control.CodeUnsupported, "live hostfs bind attachment via SCM_RIGHTS is POSIX-only; use rungv mount serve or -lockdown=false")
+				}
+				if locked && !s.cfg.AllowBindAttach {
+					return control.NewError(control.CodeLockdownDenied, "live hostfs bind attachment under host lockdown requires --allow-bind-attach; or use rungv mount serve")
+				}
+				return control.NewError(control.CodeForbiddenByPolicy, "bind attachment is disabled by policy")
+			}
+			if len(fds) != 1 {
+				return control.NewError(control.CodeInvalidArgument, "bind attach requires exactly one SCM_RIGHTS directory file descriptor")
+			}
+
+			var (
+				extHandle int64 = -1
+				hasExt    bool
+			)
+			if runtime.GOOS == "darwin" && locked {
+				if req.SandboxToken == "" {
+					return control.NewError(control.CodeInvalidArgument, "bind attach under macOS Seatbelt lockdown requires sandbox_token")
+				}
+				h, extErr := hostlockdown.ConsumeFileExtension(req.SandboxToken)
+				if extErr != nil {
+					return control.NewErrorf(control.CodeLockdownDenied, "consume sandbox file extension: %v", extErr)
+				}
+				extHandle, hasExt = h, true
+			}
+			releaseExt := func() {
+				if hasExt {
+					_ = hostlockdown.ReleaseFileExtension(extHandle)
+					hasExt = false
+				}
+			}
+
+			dirFD := fds[0]
+			fds = nil // ownership transferred to OpenWorkspaceFromDirFD below
+			label := cmp.Or(strings.TrimSpace(req.Source), target)
+			ws, wsErr := hostfs.OpenWorkspaceFromDirFD(dirFD, label, req.SingleFileName, req.ReadOnly)
+			if wsErr != nil {
+				releaseExt()
+				return control.NewErrorf(control.CodeInvalidArgument, "open attached hostfs bind %q: %v", label, wsErr)
+			}
+			if sharedChunkMemory && mf != nil {
+				ws.SetChunkMemory(&memoryFileChunks{MemoryFile: mf})
+			}
+			isFile := ws.SingleFile()
+			if isFile {
+				if err := vfsEnsureEmptyFile(sctxWithRoot, vfsObj, creds, root, target, 0o644); err != nil {
+					_ = ws.Close()
+					releaseExt()
+					return control.NewErrorf(control.CodeInternal, "create guest file %q: %v", target, err)
+				}
+			} else if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
+				_ = ws.Close()
+				releaseExt()
+				return control.NewErrorf(control.CodeInternal, "create guest dir %q: %v", target, err)
+			}
+			pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
+			if _, err := vfsObj.MountAt(sctxWithRoot, creds, "", &pop, hostfs.Name, &vfs.MountOptions{
+				ReadOnly: ws.ReadOnly(),
+				GetFilesystemOptions: vfs.GetFilesystemOptions{
+					InternalMount: true,
+					InternalData: hostfs.InternalFilesystemOptions{
+						Workspace: ws,
+						UniqueID: checkpoint.ResourceID{
+							ContainerName: cmp.Or(s.cfg.Name, "gvx-default"),
+							Path:          target,
+						},
+					},
+				},
+			}); err != nil {
+				_ = ws.Close()
+				releaseExt()
+				return control.NewErrorf(control.CodeInternal, "mount hostfs at %q: %v", target, err)
+			}
+			m := Mount{Kind: MountBind, HostPath: label, GuestPath: target, ReadOnly: req.ReadOnly}
+			s.mu.Lock()
+			s.workspaces = append(s.workspaces, ws)
+			if hasExt {
+				s.sandboxExtHandles = append(s.sandboxExtHandles, extHandle)
+			}
+			s.mounts = append(s.mounts, sandboxMount{
+				Mount:            m,
+				hostPath:         label,
+				hostFile:         isFile,
+				backingReadOnly:  ws.ReadOnly(),
+				dynamic:          true,
+				workspace:        ws,
+				hasSandboxExt:    hasExt,
+				sandboxExtHandle: extHandle,
+			})
+			sortMountsByDepth(s.mounts)
+			s.mu.Unlock()
+			s.emitEvent("mount", "add", map[string]string{"type": "hostfs", "target": target})
+			return stream.Reply(control.MountInfo{
+				Target: target, Type: "hostfs", Source: label, ReadOnly: req.ReadOnly, Mutable: !req.ReadOnly,
+			})
+		}
+
 		if locked {
-			return control.NewError(control.CodeLockdownDenied, "dynamic host bind mounts are denied under host lockdown; use rungv mount serve or start with -lockdown=false")
+			if !s.cfg.AllowBindAttach {
+				return control.NewError(control.CodeLockdownDenied, "dynamic host bind mounts are denied under host lockdown; start with --allow-bind-attach, use rungv mount serve, or start with -lockdown=false")
+			}
+			if runtime.GOOS == "windows" {
+				return control.NewError(control.CodeUnsupported, "live hostfs bind attach under lockdown is POSIX-only; use rungv mount serve or start with -lockdown=false")
+			}
+			return control.NewError(control.CodeInvalidArgument, "bind attach under host lockdown requires one SCM_RIGHTS directory file descriptor over a Unix control socket")
 		}
 		if !slices.Contains(caps, control.CapMountBind) {
 			return control.NewError(control.CodeForbiddenByPolicy, "bind mounts are disabled by policy")
@@ -521,6 +680,8 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 
 	var closeVol *ext4lite.Volume
 	var closeWS *hostfs.Workspace
+	var releaseExtHandle int64
+	var hasReleaseExt bool
 	s.mu.Lock()
 	kept := s.mounts[:0]
 	for _, m := range s.mounts {
@@ -533,6 +694,13 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 				if m.workspace != nil {
 					closeWS = m.workspace
 					s.workspaces = slices.DeleteFunc(s.workspaces, func(w *hostfs.Workspace) bool { return w == closeWS })
+				}
+				if m.hasSandboxExt {
+					releaseExtHandle = m.sandboxExtHandle
+					hasReleaseExt = true
+					if idx := slices.Index(s.sandboxExtHandles, releaseExtHandle); idx >= 0 {
+						s.sandboxExtHandles = slices.Delete(s.sandboxExtHandles, idx, idx+1)
+					}
 				}
 			}
 			continue
@@ -547,13 +715,25 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 	if closeWS != nil {
 		_ = closeWS.Close()
 	}
+	if hasReleaseExt {
+		_ = hostlockdown.ReleaseFileExtension(releaseExtHandle)
+	}
 
 	s.rpcMountsMu.Lock()
 	rm := s.rpcMounts[target]
 	delete(s.rpcMounts, target)
 	s.rpcMountsMu.Unlock()
-	if rm != nil && rm.cancel != nil {
-		rm.cancel()
+	if rm != nil {
+		if rm.handle != nil {
+			rm.handle.MarkUnmounted()
+			rm.handle.DetachClient()
+		}
+		if rm.cancel != nil {
+			rm.cancel()
+		}
+		if rm.client != nil {
+			_ = rm.client.Close()
+		}
 	}
 
 	s.emitEvent("mount", "remove", map[string]string{"target": target})
@@ -566,10 +746,11 @@ type streamRPCFSClient struct {
 	cancel context.CancelFunc
 	stream *control.Stream
 
-	nextID  atomic.Uint64
-	mu      sync.Mutex
-	pending map[uint64]chan control.RPCFSResponse
-	closed  bool
+	nextID        atomic.Uint64
+	mu            sync.Mutex
+	pending       map[uint64]chan control.RPCFSResponse
+	notifyHandler func(rpcfs.NotifyEvent)
+	closed        bool
 }
 
 func newStreamRPCFSClient(parent context.Context, stream *control.Stream) *streamRPCFSClient {
@@ -584,6 +765,28 @@ func newStreamRPCFSClient(parent context.Context, stream *control.Stream) *strea
 	return c
 }
 
+func (c *streamRPCFSClient) MaxChunkBytes() int64 {
+	maxFrame := c.stream.MaxFrameBytes()
+	if maxFrame <= 0 {
+		maxFrame = control.DefaultMaxFrameBytes
+	}
+	overhead := min(4096, maxFrame/4)
+	chunk := int64(((maxFrame - overhead) * 3) / 4)
+	if chunk < 512 {
+		return 512
+	}
+	if chunk > 1<<20 {
+		return 1 << 20
+	}
+	return chunk
+}
+
+func (c *streamRPCFSClient) SetNotifyHandler(fn func(rpcfs.NotifyEvent)) {
+	c.mu.Lock()
+	c.notifyHandler = fn
+	c.mu.Unlock()
+}
+
 func (c *streamRPCFSClient) recvLoop() {
 	defer func() {
 		_ = c.Close()
@@ -593,19 +796,35 @@ func (c *streamRPCFSClient) recvLoop() {
 		if err != nil {
 			return
 		}
-		if ev.Type != "rpcfs.resp" {
-			continue
-		}
-		var resp control.RPCFSResponse
-		if json.Unmarshal(ev.Data, &resp) != nil {
-			continue
-		}
-		c.mu.Lock()
-		ch := c.pending[resp.ID]
-		delete(c.pending, resp.ID)
-		c.mu.Unlock()
-		if ch != nil {
-			ch <- resp
+		switch ev.Type {
+		case "rpcfs.resp":
+			var resp control.RPCFSResponse
+			if json.Unmarshal(ev.Data, &resp) != nil {
+				continue
+			}
+			c.mu.Lock()
+			ch := c.pending[resp.ID]
+			delete(c.pending, resp.ID)
+			c.mu.Unlock()
+			if ch != nil {
+				ch <- resp
+			}
+		case "rpcfs.notify":
+			var nev control.RPCFSNotifyEvent
+			if json.Unmarshal(ev.Data, &nev) != nil {
+				continue
+			}
+			c.mu.Lock()
+			handler := c.notifyHandler
+			c.mu.Unlock()
+			if handler != nil {
+				handler(rpcfs.NotifyEvent{
+					Path:   nev.Path,
+					Name:   nev.Name,
+					Mask:   nev.Mask,
+					Cookie: nev.Cookie,
+				})
+			}
 		}
 	}
 }
@@ -617,6 +836,7 @@ func (c *streamRPCFSClient) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.notifyHandler = nil
 	for id, ch := range c.pending {
 		close(ch)
 		delete(c.pending, id)
@@ -736,16 +956,36 @@ func (c *streamRPCFSClient) Stat(ctx context.Context, rel string) (rpcfs.Entry, 
 	return toRPCFSEntry(*resp.Entry), nil
 }
 
+const (
+	maxRPCFSReaddirPages   = 4096
+	maxRPCFSReaddirEntries = 1 << 20
+)
+
 func (c *streamRPCFSClient) Readdir(ctx context.Context, rel string) ([]rpcfs.Entry, error) {
-	resp, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "readdir", Path: rel})
-	if err != nil {
-		return nil, err
+	var (
+		out    []rpcfs.Entry
+		offset int64
+	)
+	for range maxRPCFSReaddirPages {
+		resp, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "readdir", Path: rel, Offset: offset})
+		if err != nil {
+			return nil, err
+		}
+		if len(out)+len(resp.Entries) > maxRPCFSReaddirEntries {
+			return nil, linuxerr.EIO
+		}
+		for _, e := range resp.Entries {
+			out = append(out, toRPCFSEntry(e))
+		}
+		if !resp.HasMore {
+			return out, nil
+		}
+		if len(resp.Entries) == 0 || resp.NextOffset <= offset {
+			return nil, linuxerr.EIO
+		}
+		offset = resp.NextOffset
 	}
-	out := make([]rpcfs.Entry, len(resp.Entries))
-	for i, e := range resp.Entries {
-		out[i] = toRPCFSEntry(e)
-	}
-	return out, nil
+	return nil, linuxerr.EIO
 }
 
 func (c *streamRPCFSClient) Read(ctx context.Context, rel string, offset, length int64) ([]byte, error) {
@@ -828,6 +1068,16 @@ func (c *streamRPCFSClient) Symlink(ctx context.Context, target, linkRel string)
 	return err
 }
 
+func (c *streamRPCFSClient) Watch(ctx context.Context, rel string) error {
+	_, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "watch", Path: rel})
+	return err
+}
+
+func (c *streamRPCFSClient) Unwatch(ctx context.Context, rel string) error {
+	_, err := c.roundTrip(ctx, control.RPCFSRequest{Op: "unwatch", Path: rel})
+	return err
+}
+
 func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, raw json.RawMessage) error {
 	var req control.MountServeRequest
 	if err := decodeParams(raw, &req); err != nil {
@@ -875,7 +1125,8 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		return control.NewErrorf(control.CodeAlreadyExists, "mount target %q already exists", target)
 	}
 	s.rpcMountsMu.Lock()
-	if _, dup := s.rpcMounts[target]; dup {
+	existing := s.rpcMounts[target]
+	if existing != nil && !existing.detached {
 		s.rpcMountsMu.Unlock()
 		return control.NewErrorf(control.CodeAlreadyExists, "mount target %q already exists", target)
 	}
@@ -897,45 +1148,110 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	creds := auth.NewRootCredentials(k.RootUserNamespace())
 	vfsObj := k.VFS()
 
-	if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
-		return control.NewErrorf(control.CodeInternal, "create rpcfs mount point %q: %v", target, err)
-	}
-	fs, rootD, err := rpcfs.NewFilesystem(sctxWithRoot, vfsObj, rpcClient, req.Label, req.ReadOnly)
-	if err != nil {
-		return control.NewErrorf(control.CodeInternal, "init rpcfs at %q: %v", target, err)
-	}
-	mnt := vfsObj.NewDisconnectedMount(fs, rootD, &vfs.MountOptions{ReadOnly: req.ReadOnly})
-	fs.DecRef(sctxWithRoot)
-	rootD.DecRef(sctxWithRoot)
-
-	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
-	if err := vfsObj.ConnectMountAt(sctxWithRoot, creds, mnt, &pop); err != nil {
-		mnt.DecRef(sctxWithRoot)
-		return control.NewErrorf(control.CodeInternal, "connect rpcfs mount at %q: %v", target, err)
-	}
-	mnt.DecRef(sctxWithRoot)
-
-	entry := &rpcMountEntry{
-		target:          target,
-		label:           req.Label,
-		readOnly:        req.ReadOnly,
-		backingReadOnly: req.ReadOnly,
-		cancel:          serveCancel,
-		client:          rpcClient,
-	}
-	s.rpcMountsMu.Lock()
-	s.rpcMounts[target] = entry
-	s.rpcMountsMu.Unlock()
-
-	if err := stream.SendResponse(control.MountServeResponse{Target: target}); err != nil {
-		s.rpcMountsMu.Lock()
-		if s.rpcMounts[target] == entry {
-			delete(s.rpcMounts, target)
+	var entry *rpcMountEntry
+	if existing != nil {
+		// Reconnect to a restored detached rpcfs mount in place so existing
+		// guest file descriptors become valid again.
+		if existing.singleFile != req.SingleFile {
+			return control.NewErrorf(control.CodeInvalidArgument, "restored rpcfs mount %q single_file=%t does not match client single_file=%t", target, existing.singleFile, req.SingleFile)
 		}
+		if !req.ReadOnly && existing.backingReadOnly {
+			return control.NewErrorf(control.CodeLockdownDenied, "restored rpcfs mount %q is read-only and cannot be served read-write", target)
+		}
+		if err := existing.handle.AttachClient(rpcClient, req.ReadOnly, req.Label); err != nil {
+			return control.NewErrorf(control.CodeInternal, "reattach rpcfs at %q: %v", target, err)
+		}
+		prevLabel := existing.label
+		prevReadOnly := existing.readOnly
+		prevClientReadOnly := existing.clientReadOnly
+		s.rpcMountsMu.Lock()
+		existing.detached = false
+		existing.clientReadOnly = req.ReadOnly
+		existing.readOnly = existing.readOnly || existing.backingReadOnly || req.ReadOnly
+		if req.Label != "" {
+			existing.label = req.Label
+		}
+		existing.stream = stream
+		existing.cancel = serveCancel
+		existing.client = rpcClient
+		existing.checkpointClosing.Store(false)
 		s.rpcMountsMu.Unlock()
-		umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
-		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
-		return err
+		entry = existing
+
+		if err := stream.SendResponse(control.MountServeResponse{Target: target}); err != nil {
+			existing.handle.DetachClient()
+			s.rpcMountsMu.Lock()
+			if s.rpcMounts[target] == existing {
+				existing.detached = true
+				existing.label = prevLabel
+				existing.readOnly = prevReadOnly
+				existing.clientReadOnly = prevClientReadOnly
+				existing.stream = nil
+				existing.cancel = nil
+				existing.client = nil
+			}
+			s.rpcMountsMu.Unlock()
+			return err
+		}
+	} else {
+		if req.SingleFile {
+			if err := vfsEnsureEmptyFile(sctxWithRoot, vfsObj, creds, root, target, 0o644); err != nil {
+				return control.NewErrorf(control.CodeInternal, "create rpcfs mount file %q: %v", target, err)
+			}
+		} else {
+			if err := vfsEnsureDirAll(sctxWithRoot, vfsObj, creds, root, target, 0o755); err != nil {
+				return control.NewErrorf(control.CodeInternal, "create rpcfs mount point %q: %v", target, err)
+			}
+		}
+		fs, rootD, err := rpcfs.NewFilesystemWithOptions(sctxWithRoot, vfsObj, rpcClient, rpcfs.Options{
+			Target:     target,
+			Label:      req.Label,
+			ReadOnly:   req.ReadOnly,
+			SingleFile: req.SingleFile,
+		})
+		if err != nil {
+			return control.NewErrorf(control.CodeInternal, "init rpcfs at %q: %v", target, err)
+		}
+		handle, _ := rpcfs.HandleOf(fs)
+		mnt := vfsObj.NewDisconnectedMount(fs, rootD, &vfs.MountOptions{ReadOnly: req.ReadOnly})
+		fs.DecRef(sctxWithRoot)
+		rootD.DecRef(sctxWithRoot)
+
+		pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
+		if err := vfsObj.ConnectMountAt(sctxWithRoot, creds, mnt, &pop); err != nil {
+			mnt.DecRef(sctxWithRoot)
+			return control.NewErrorf(control.CodeInternal, "connect rpcfs mount at %q: %v", target, err)
+		}
+		mnt.DecRef(sctxWithRoot)
+
+		entry = &rpcMountEntry{
+			target:          target,
+			label:           req.Label,
+			readOnly:        req.ReadOnly,
+			backingReadOnly: req.ReadOnly,
+			singleFile:      req.SingleFile,
+			handle:          handle,
+			stream:          stream,
+			cancel:          serveCancel,
+			client:          rpcClient,
+		}
+		s.rpcMountsMu.Lock()
+		s.rpcMounts[target] = entry
+		s.rpcMountsMu.Unlock()
+
+		if err := stream.SendResponse(control.MountServeResponse{Target: target}); err != nil {
+			s.rpcMountsMu.Lock()
+			if s.rpcMounts[target] == entry {
+				delete(s.rpcMounts, target)
+			}
+			s.rpcMountsMu.Unlock()
+			if handle != nil {
+				handle.MarkUnmounted()
+			}
+			umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
+			_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
+			return err
+		}
 	}
 	unlockMount()
 	unlockOp()
@@ -946,8 +1262,8 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		"read_only": strconv.FormatBool(req.ReadOnly),
 	})
 
-	// Hold the mount active until the client disconnects, sandbox exits, or
-	// mount.remove cancels serveCtx.
+	// Hold the mount active until the client disconnects, sandbox exits,
+	// checkpoint stops the sandbox, or mount.remove cancels serveCtx.
 	var sandboxExited bool
 	select {
 	case <-serveCtx.Done():
@@ -955,12 +1271,14 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		sandboxExited = true
 	}
 
-	if sandboxExited {
-		s.rpcMountsMu.Lock()
-		if s.rpcMounts[target] == entry {
-			delete(s.rpcMounts, target)
+	if sandboxExited || entry.checkpointClosing.Load() {
+		if sandboxExited {
+			s.rpcMountsMu.Lock()
+			if s.rpcMounts[target] == entry {
+				delete(s.rpcMounts, target)
+			}
+			s.rpcMountsMu.Unlock()
 		}
-		s.rpcMountsMu.Unlock()
 		return nil
 	}
 
@@ -969,6 +1287,11 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	// cannot observe a half-unmounted rpcfs or clobber a replacement mount.
 	s.opMu.RLock()
 	s.mountOpMu.Lock()
+	if entry.checkpointClosing.Load() {
+		s.mountOpMu.Unlock()
+		s.opMu.RUnlock()
+		return nil
+	}
 	s.mu.Lock()
 	active := s.activeKernel == k
 	s.mu.Unlock()
@@ -979,6 +1302,12 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 	if stillMounted && active {
 		umPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(target)}
 		_ = vfsObj.UmountAt(sctxWithRoot, creds, &umPop, &vfs.UmountOptions{Flags: linux.MNT_DETACH})
+	}
+	if entry.handle != nil {
+		if stillMounted {
+			entry.handle.MarkUnmounted()
+		}
+		entry.handle.DetachClient()
 	}
 	s.rpcMountsMu.Lock()
 	if s.rpcMounts[target] == entry {
