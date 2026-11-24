@@ -1,0 +1,49 @@
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 21:45:00 +0900
+Subject: [PATCH] kk: scalarize clip and cull distance inputs
+
+In src/kosmickrisp/compiler/msl_nir_lower_common.c,
+msl_nir_lower_clip_cull_distance lowers only nir_var_shader_out stores
+to scalar. Because msl_iomap maps clip and cull distances to scalar
+struct fields, a vector load in a fragment shader reads component 0 for
+every element.
+
+Accept nir_intrinsic_load_input and
+nir_intrinsic_load_interpolated_input in
+scalarize_clip_cull_distance_filter, update the comment above the
+filter, and include nir_var_shader_in in the nir_lower_io_to_scalar
+pass.
+
+License: MIT
+---
+diff --git a/src/kosmickrisp/compiler/msl_nir_lower_common.c b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+index c4f6645..2a832fc 100644
+--- a/src/kosmickrisp/compiler/msl_nir_lower_common.c
++++ b/src/kosmickrisp/compiler/msl_nir_lower_common.c
+@@ -724,12 +724,14 @@ msl_nir_lower_cull_distance_fs(nir_shader *s, unsigned nr_distances)
+    return nir_progress(true, b->impl, nir_metadata_control_flow);
+ }
+ 
+-/* Scalarize stores to CLIP_DIST* varyings */
++/* Scalarize clip and cull distance output stores and fragment input loads. */
+ static bool
+ scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
+                                     UNUSED const void *_data)
+ {
+-   if (intrin->intrinsic != nir_intrinsic_store_output)
++   if (intrin->intrinsic != nir_intrinsic_store_output &&
++       intrin->intrinsic != nir_intrinsic_load_input &&
++       intrin->intrinsic != nir_intrinsic_load_interpolated_input)
+       return false;
+    nir_io_semantics semantics = nir_intrinsic_io_semantics(intrin);
+    return semantics.location == VARYING_SLOT_CLIP_DIST0 ||
+@@ -741,7 +743,8 @@ scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
+ void
+ msl_nir_lower_clip_cull_distance(nir_shader *nir, unsigned num_cull_distances)
+ {
+-   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out,
++   NIR_PASS(_, nir, nir_lower_io_to_scalar,
++            nir_var_shader_in | nir_var_shader_out,
+             scalarize_clip_cull_distance_filter, NULL);
+    NIR_PASS(_, nir, nir_separate_merged_clip_cull_io);
+    if (nir->info.stage == MESA_SHADER_FRAGMENT)

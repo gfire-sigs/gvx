@@ -1,0 +1,62 @@
+From b5fe23d30a15b90c168e6f5a57fd845bdb0bfb80 Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 17:37:23 +0900
+Subject: [PATCH] vrend: use shader blitter for sRGB color blits before OpenGL
+ 4.4
+
+Desktop OpenGL 4.1 does not perform sRGB conversion in
+glBlitFramebuffer (encode arrived in OpenGL 4.2 and decode arrived in
+OpenGL 4.4). Apple OpenGL 4.1 copies raw byte values even with
+GL_FRAMEBUFFER_SRGB enabled, which breaks WebGL 2 sRGB blits and
+mipmaps.
+
+On desktop OpenGL below 4.4, set can_fbo_blit to false for single-sample
+color blits that require sRGB conversion. Those cases are one sRGB
+format paired with one linear format, or two sRGB formats with scaling
+and a linear filter. The shader blitter decodes sRGB inputs during
+sampling and encodes sRGB outputs through GL_FRAMEBUFFER_SRGB.
+
+Keep the FBO blit when either the source or the destination is
+multisample (nr_samples > 1). A shader blit cannot resolve MSAA sources
+in general or preserve multisample targets, so multisample blits stay on
+glBlitFramebuffer. This patch does not change the desktop-GL
+texture_view path, which is a known limit that GLES guests cannot reach.
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 91b8e4a..c8ee44c 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -11533,6 +11533,25 @@ static void vrend_renderer_prepare_blit_extra_info(struct vrend_context *ctx,
+    if (info->needs_swizzle && vrend_get_format_table_entry(dst_res->base.format)->flags & VIRGL_TEXTURE_NEED_SWIZZLE)
+       memcpy(info->swizzle, tex_conv_table[dst_res->base.format].swizzle, sizeof(info->swizzle));
+ 
++   /* Desktop OpenGL below 4.4 omits sRGB decode or encode in
++    * glBlitFramebuffer. Route single-sample sRGB conversions and scaled
++    * linear sRGB blits to the shader blitter. Keep multisample sources
++    * and targets on the FBO blit, because a shader blit cannot resolve
++    * MSAA. */
++   if (!vrend_state.use_gles && epoxy_gl_version() < 44 &&
++       (info->b.mask & PIPE_MASK_RGBA) &&
++       src_res->base.nr_samples <= 1 && dst_res->base.nr_samples <= 1) {
++      bool src_srgb = util_format_is_srgb(info->b.src.format);
++      bool dst_srgb = util_format_is_srgb(info->b.dst.format);
++      bool scaled = llabs((long long)info->b.src.box.width) !=
++                       llabs((long long)info->b.dst.box.width) ||
++                    llabs((long long)info->b.src.box.height) !=
++                       llabs((long long)info->b.dst.box.height);
++      if (src_srgb != dst_srgb ||
++          (src_srgb && scaled && info->b.filter != PIPE_TEX_FILTER_NEAREST))
++         info->can_fbo_blit = false;
++   }
++
+    if (vrend_blit_needs_redblue_swizzle(src_res, dst_res, &info->b)) {
+       VREND_DEBUG(dbg_blit, ctx, "Applying red/blue swizzle during blit involving an external BGR* resource\n");
+       uint8_t temp = info->swizzle[0];
+-- 
+2.55.0
+

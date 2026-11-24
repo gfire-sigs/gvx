@@ -1,0 +1,176 @@
+From a750a20bc35bce06e787f4c7a851c32f87afde4a Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 17:37:50 +0900
+Subject: [PATCH] vkr: add KosmicKrisp viewport and pipeline cache workarounds
+
+Add two driver workarounds for KosmicKrisp (Mesa 26.3), gated on
+VK_DRIVER_ID_MESA_KOSMICKRISP. Other Vulkan drivers keep their existing
+behavior.
+
+- KosmicKrisp reports maxViewportDimensions of 32768, but draws with
+  viewports of about 29000 or more produce no pixels. Clamp
+  maxViewportDimensions[0] and maxViewportDimensions[1] to
+  maxFramebufferWidth and maxFramebufferHeight (16384) in both
+  vkGetPhysicalDeviceProperties and vkGetPhysicalDeviceProperties2.
+  Clamp viewportBoundsRange to [-2 * max_dim, 2 * max_dim - 1] when vkr
+  clamps maxViewportDimensions, so the bounds stay valid under Vulkan
+  rules.
+- KosmicKrisp omits the location map for color attachments
+  (VkRenderingAttachmentLocationInfo) from its pipeline cache key. A
+  second pipeline with matching attachment count and formats then reuses
+  the first pipeline with wrong output locations. Pass VK_NULL_HANDLE in
+  place of the guest pipeline cache when any VkGraphicsPipelineCreateInfo
+  chains VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO. The Vulkan
+  1.4 core value equals
+  VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR.
+
+License: MIT
+---
+ src/venus/vkr_physical_device.c | 41 ++++++++++++++++++++++++++++++++-
+ src/venus/vkr_physical_device.h | 12 ++++++++++
+ src/venus/vkr_pipeline.c        | 25 ++++++++++++++++++++
+ 3 files changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index f69dc26..9ac6ac4 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -151,6 +151,39 @@ vkr_instance_lookup_physical_device(struct vkr_instance *instance,
+    return NULL;
+ }
+ 
++static void
++vkr_physical_device_fixup_properties(const struct vkr_physical_device *physical_dev,
++                                     VkPhysicalDeviceProperties *props)
++{
++   if (!physical_dev->viewport_limit_quirk)
++      return;
++
++   VkPhysicalDeviceLimits *limits = &props->limits;
++   bool clamped = false;
++   if (limits->maxViewportDimensions[0] > limits->maxFramebufferWidth) {
++      limits->maxViewportDimensions[0] = limits->maxFramebufferWidth;
++      clamped = true;
++   }
++   if (limits->maxViewportDimensions[1] > limits->maxFramebufferHeight) {
++      limits->maxViewportDimensions[1] = limits->maxFramebufferHeight;
++      clamped = true;
++   }
++   if (!clamped)
++      return;
++
++   /* Narrow viewportBoundsRange together with max_dim while keeping the
++    * minimum span [-2 * max_dim, 2 * max_dim - 1] that Vulkan requires.
++    */
++   const float max_dim =
++      (float)MAX2(limits->maxViewportDimensions[0], limits->maxViewportDimensions[1]);
++   const float min_bound = -2.0f * max_dim;
++   const float max_bound = 2.0f * max_dim - 1.0f;
++   if (limits->viewportBoundsRange[0] < min_bound)
++      limits->viewportBoundsRange[0] = min_bound;
++   if (limits->viewportBoundsRange[1] > max_bound)
++      limits->viewportBoundsRange[1] = max_bound;
++}
++
+ static void
+ vkr_physical_device_init_extra_properties(struct vkr_physical_device *physical_dev)
+ {
+@@ -208,8 +241,13 @@ vkr_physical_device_init_extra_properties(struct vkr_physical_device *physical_d
+ 
+    physical_dev->texel_buffer_alignment.pNext = NULL;
+    physical_dev->max_buffer_size = maintenance4_props.maxBufferSize;
+-   physical_dev->image_3d_alias_quirk =
++   const bool is_kosmickrisp =
+       driver_props.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP;
++   physical_dev->image_3d_alias_quirk = is_kosmickrisp;
++   physical_dev->viewport_limit_quirk = is_kosmickrisp;
++   physical_dev->pipeline_cache_location_quirk = is_kosmickrisp;
++
++   vkr_physical_device_fixup_properties(physical_dev, &physical_dev->properties);
+ }
+ 
+ static void
+@@ -781,6 +819,7 @@ vkr_dispatch_vkGetPhysicalDeviceProperties2(
+ 
+    vn_replace_vkGetPhysicalDeviceProperties2_args_handle(args);
+    vk->GetPhysicalDeviceProperties2(args->physicalDevice, args->pProperties);
++   vkr_physical_device_fixup_properties(physical_dev, &args->pProperties->properties);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index 7e60cd4..3fa9601 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -50,6 +50,18 @@ struct vkr_physical_device {
+     */
+    bool image_3d_alias_quirk;
+ 
++   /* KosmicKrisp (Mesa 26.3) reports maxViewportDimensions of 32768, but
++    * draws with viewports of about 29000 or more produce no pixels.  Clamp
++    * maxViewportDimensions to maxFramebufferWidth and maxFramebufferHeight.
++    */
++   bool viewport_limit_quirk;
++
++   /* KosmicKrisp (Mesa 26.3) omits the location map for color attachments
++    * (VkRenderingAttachmentLocationInfo) from its pipeline cache key.  Pass
++    * VK_NULL_HANDLE as the pipeline cache when create info chains that struct.
++    */
++   bool pipeline_cache_location_quirk;
++
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    bool mem_type_spoof;
+    VkPhysicalDeviceIDProperties id_properties;
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index 76709b9..e14f291 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -5,6 +5,7 @@
+ 
+ #include "vkr_pipeline.h"
+ 
++#include "vkr_physical_device.h"
+ #include "vkr_pipeline_gen.h"
+ 
+ static void
+@@ -105,6 +106,22 @@ vkr_dispatch_vkMergePipelineCaches(UNUSED struct vn_dispatch_context *dispatch,
+                                        args->pSrcCaches);
+ }
+ 
++static bool
++vkr_graphics_pipelines_have_attachment_locations(
++   const VkGraphicsPipelineCreateInfo *infos,
++   uint32_t count)
++{
++   if (!infos)
++      return false;
++
++   for (uint32_t i = 0; i < count; i++) {
++      if (vkr_find_struct(infos[i].pNext,
++                          VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO))
++         return true;
++   }
++   return false;
++}
++
+ static void
+ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+                                        struct vn_command_vkCreateGraphicsPipelines *args)
+@@ -114,6 +131,14 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct object_array arr;
+ 
++   /* See vkr_physical_device::pipeline_cache_location_quirk. */
++   if (dev->physical_device->pipeline_cache_location_quirk &&
++       args->pipelineCache != VK_NULL_HANDLE &&
++       vkr_graphics_pipelines_have_attachment_locations(args->pCreateInfos,
++                                                        args->createInfoCount)) {
++      args->pipelineCache = VK_NULL_HANDLE;
++   }
++
+    if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
+       return;
+ 
+-- 
+2.55.0
+

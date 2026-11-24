@@ -1,0 +1,183 @@
+From ec8fd2628e8e61ba64e1d8d0d86717f6233df7f3 Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 13:28:12 +0900
+Subject: [PATCH] vrend: end transform feedback with its program bound
+
+vrend pauses transform feedback after each draw. It ends transform
+feedback only when the guest destroys a stream output target. At that
+time the current program is usually not the program that was in use at
+glBeginTransformFeedback. vrend binds program 0 for clears and transfers.
+It binds other programs for draws without stream output. The guest can
+also destroy the shaders first.
+
+Apple OpenGL 4.1 reads the current program in glEndTransformFeedback
+without a check. With program 0 current, the call is a NULL pointer read
+and the process stops (SIGSEGV in glEndTransformFeedback_Exec). With a
+different program current, the call returns GL_INVALID_OPERATION. vrend
+reports that error as a context error on DESTROY_OBJECT. An unmodified
+guest causes the two results (Mesa virgl below Chromium, WebGL 2
+transform feedback tests).
+
+Record the linked program at glBeginTransformFeedback. Bind it before
+glEndTransformFeedback, and bind program 0 after the call. End each
+transform feedback that uses a program before vrend deletes that
+program. End it also before vrend deletes the transform feedback object,
+because glDeleteTransformFeedbacks fails on an active object.
+
+glResumeTransformFeedback has the same rule for the program. vrend can
+link a different program for the same guest shaders when other state
+changes. If the program of a draw is not the recorded program, end the
+transform feedback and start it again. The capture then starts at the
+start of the buffers again.
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 93 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 86 insertions(+), 7 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 15440df..1546048 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -679,6 +679,9 @@ struct vrend_streamout_object {
+    uint32_t handles[16];
+    struct list_head head;
+    int xfb_state;
++   /* The program in use at glBeginTransformFeedback. Not NULL only while
++    * xfb_state is XFB_STATE_STARTED or XFB_STATE_PAUSED. */
++   struct vrend_linked_shader_program *xfb_prog;
+    struct vrend_so_target *so_targets[16];
+ };
+ 
+@@ -2494,9 +2497,71 @@ static struct vrend_linked_shader_program *lookup_shader_program(struct vrend_su
+    return NULL;
+ }
+ 
++/* End the transform feedback of a stream output object.
++ *
++ * glEndTransformFeedback operates on the program that was in use at
++ * glBeginTransformFeedback. A different program can be current here.
++ * vrend binds program 0 for clears and transfers. It binds other programs
++ * for draws without stream output.
++ *
++ * Some drivers (Apple OpenGL 4.1) read the current program in
++ * glEndTransformFeedback without a check. The call stops the process when
++ * program 0 is current. It returns GL_INVALID_OPERATION when a different
++ * program is current. Thus bind the program of the object before the call.
++ *
++ * After this call the transform feedback object of obj is bound and
++ * program 0 is current. The caller must bind the objects that it needs. */
++static void vrend_streamout_object_end_xfb(struct vrend_streamout_object *obj)
++{
++   struct vrend_linked_shader_program *prog = obj->xfb_prog;
++   bool paused = obj->xfb_state == XFB_STATE_PAUSED;
++
++   if (!paused && obj->xfb_state != XFB_STATE_STARTED)
++      return;
++
++   obj->xfb_prog = NULL;
++   obj->xfb_state = XFB_STATE_STARTED_NEED_BEGIN;
++
++   /* Without a recorded program there is no safe procedure to end the
++    * transform feedback. The object stays active until the GL context is
++    * destroyed. */
++   if (!prog)
++      return;
++
++   if (has_feature(feat_transform_feedback2))
++      glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, obj->id);
++   /* A transform feedback that is not paused has its program current, and
++    * glUseProgram is then not permitted. */
++   if (paused)
++      vrend_use_program(prog);
++   glEndTransformFeedback();
++   /* Do not keep the program current. The caller can delete it. */
++   vrend_use_program(NULL);
++}
++
+ static void vrend_destroy_program(struct vrend_linked_shader_program *ent)
+ {
+    int i;
++
++   /* End each transform feedback that uses this program while the program
++    * exists. vrend cannot bind a deleted program for
++    * glEndTransformFeedback. */
++   if (ent->ref_context) {
++      struct vrend_sub_context *sub_ctx = ent->ref_context;
++      bool ended = false;
++
++      list_for_each_entry(struct vrend_streamout_object, obj, &sub_ctx->streamout_list, head) {
++         if (obj->xfb_prog == ent) {
++            vrend_streamout_object_end_xfb(obj);
++            obj->xfb_prog = NULL;
++            ended = true;
++         }
++      }
++      if (ended && has_feature(feat_transform_feedback2))
++         glBindTransformFeedback(GL_TRANSFORM_FEEDBACK,
++                                 sub_ctx->current_so ? sub_ctx->current_so->id : 0);
++   }
++
+    if (ent->ref_context && ent->ref_context->prog == ent)
+       ent->ref_context->prog = NULL;
+ 
+@@ -2545,6 +2610,10 @@ static void vrend_free_programs(struct vrend_sub_context *sub)
+ static void vrend_destroy_streamout_object(struct vrend_streamout_object *obj)
+ {
+    unsigned i;
++
++   /* glDeleteTransformFeedbacks fails on an active object. */
++   vrend_streamout_object_end_xfb(obj);
++
+    list_del(&obj->head);
+    for (i = 0; i < obj->num_targets; i++)
+       vrend_so_target_reference(&obj->so_targets[i], NULL);
+@@ -2694,14 +2763,11 @@ static void vrend_destroy_so_target_object(void *obj_ptr)
+          if (obj->so_targets[i] == target) {
+             if (obj == sub_ctx->current_so)
+                sub_ctx->current_so = NULL;
+-            if (obj->xfb_state == XFB_STATE_PAUSED) {
+-                  if (has_feature(feat_transform_feedback2))
+-                     glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, obj->id);
+-                  glEndTransformFeedback();
+-               if (sub_ctx->current_so && has_feature(feat_transform_feedback2))
+-                  glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, sub_ctx->current_so->id);
+-            }
++            /* This call ends the transform feedback of obj. The deleted
++             * object can stay bound, and then object 0 is bound. */
+             vrend_destroy_streamout_object(obj);
++            if (sub_ctx->current_so && has_feature(feat_transform_feedback2))
++               glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, sub_ctx->current_so->id);
+             break;
+          }
+       }
+@@ -6283,6 +6349,18 @@ int vrend_draw_vbo(struct vrend_context *ctx,
+       glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+ 
+    if (sub_ctx->current_so) {
++      /* glResumeTransformFeedback returns GL_INVALID_OPERATION when the
++       * current program is not the program of glBeginTransformFeedback.
++       * The guest can keep its program, but vrend can link a different
++       * program for it when other state changes. End the transform
++       * feedback and start it again with the new program. The start
++       * position in the buffers is then the start of the buffers again. */
++      if (sub_ctx->current_so->xfb_state == XFB_STATE_PAUSED &&
++          sub_ctx->current_so->xfb_prog != sub_ctx->prog) {
++         vrend_streamout_object_end_xfb(sub_ctx->current_so);
++         vrend_use_program(sub_ctx->prog);
++      }
++
+       if (sub_ctx->current_so->xfb_state == XFB_STATE_STARTED_NEED_BEGIN) {
+          if (sub_ctx->shaders[PIPE_SHADER_GEOMETRY])
+             glBeginTransformFeedback(get_gs_xfb_mode(sub_ctx->shaders[PIPE_SHADER_GEOMETRY]->sinfo.gs_out_prim));
+@@ -6292,6 +6370,7 @@ int vrend_draw_vbo(struct vrend_context *ctx,
+          else
+             glBeginTransformFeedback(get_xfb_mode(info->mode));
+          sub_ctx->current_so->xfb_state = XFB_STATE_STARTED;
++         sub_ctx->current_so->xfb_prog = sub_ctx->prog;
+       } else if (sub_ctx->current_so->xfb_state == XFB_STATE_PAUSED) {
+          glResumeTransformFeedback();
+          sub_ctx->current_so->xfb_state = XFB_STATE_STARTED;
+-- 
+2.55.0
+

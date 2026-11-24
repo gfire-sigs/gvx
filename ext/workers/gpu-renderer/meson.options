@@ -1,0 +1,8 @@
+option('vulkan_include_dir', type: 'string', value: '',
+  description: 'Directory that holds vulkan/vulkan.h (the pinned venus-protocol include directory)')
+option('driver_lib', type: 'string', value: '',
+  description: 'Path of the staged libvulkan_kosmickrisp.dylib that the libvulkan.dylib shim links')
+option('min_macos', type: 'string', value: '',
+  description: 'Lowest macOS version that the staged driver runs on, such as 27.2 (MIN_MACOS of driver.txt)')
+option('build_info', type: 'string', value: 'unknown',
+  description: 'Build description that the HELLO reply carries (at most 55 bytes)')

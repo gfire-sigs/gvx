@@ -1,0 +1,268 @@
+From 23d9756b4d709ce22e775734d3cf896b9083a26f Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 17:35:41 +0900
+Subject: [PATCH] vrend: fix integer vertex attributes on the legacy vertex
+ path
+
+Apple OpenGL 4.1 converts integer vertex attributes to floats when a
+vertex shader declares the input as vec4. vrend relies on floatBitsToInt
+for untyped inputs, so integer attributes receive wrong bit patterns.
+That breaks WebGL 2 integer attributes and Skia canvas text on virgl.
+
+Four changes fix integer vertex attributes on hosts without
+GL_ARB_vertex_attrib_binding:
+
+1. Return true from use_integer when GL_VENDOR is "Apple".
+2. Populate signed_int_bitmask and unsigned_int_bitmask in
+   vrend_create_vertex_elements_state when
+   feat_gles31_vertex_attrib_binding is off. Use unsigned 1u shifts for
+   UPDATE_INT_SIGN_MASK and zyxw_bitmask.
+3. On the legacy zero-stride path, sum buffer_offset and src_offset in
+   64 bits and verify PIPE_BUFFER bounds before glMapBufferRange. Map
+   the format block size for pure integer formats, unpack each channel
+   by type, and upload through glVertexAttribI4iv or glVertexAttribI4uiv.
+4. Set SHADER_REQ_INTS in vrend_shader.c when a vertex shader input has
+   an integer type, because the emitted code calls intBitsToFloat or
+   uintBitsToFloat.
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 157 +++++++++++++++++++++++++++++++------
+ src/vrend/vrend_shader.c   |   5 +-
+ 2 files changed, 136 insertions(+), 26 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 273fd9b..e00da44 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -3752,9 +3752,9 @@ void vrend_set_viewport_states(struct vrend_context *ctx,
+    if (vrend_state.use_integer && \
+        util_format_is_pure_integer(fmt)) { \
+       if (util_format_is_pure_uint(fmt)) \
+-         unsigned_mask |= (1 << i); \
++         unsigned_mask |= (1u << i); \
+       else \
+-         signed_mask |= (1 << i); \
++         signed_mask |= (1u << i); \
+    }
+ 
+ int vrend_create_vertex_elements_state(struct vrend_context *ctx,
+@@ -3837,8 +3837,16 @@ int vrend_create_vertex_elements_state(struct vrend_context *ctx,
+          v->elements[i].norm = GL_TRUE;
+       v->elements[i].nr_chan = desc->nr_channels;
+ 
++      /* The legacy vertex path skips vrend_bind_vertex_elements_state VAO
++       * setup, so it needs the integer sign masks populated here. */
++      if (!has_feature(feat_gles31_vertex_attrib_binding)) {
++         UPDATE_INT_SIGN_MASK(elements[i].src_format, i,
++                              v->signed_int_bitmask,
++                              v->unsigned_int_bitmask);
++      }
++
+       if (desc->nr_channels == 4 && desc->swizzle[0] == PIPE_SWIZZLE_Z)
+-         v->zyxw_bitmask |= 1 << i;
++         v->zyxw_bitmask |= 1u << i;
+    }
+ 
+    ret_handle = vrend_renderer_object_insert(ctx, v, handle,
+@@ -3880,7 +3888,7 @@ void vrend_bind_vertex_elements_state(struct vrend_context *ctx,
+       glBindVertexArray(v->id);
+       for (uint32_t i = 0; i < v->count; i++) {
+          struct vrend_vertex_element *ve = &v->elements[i];
+-         GLint size = !vrend_state.use_gles && (v->zyxw_bitmask & (1 << i)) ? GL_BGRA : ve->nr_chan;
++         GLint size = !vrend_state.use_gles && (v->zyxw_bitmask & (1u << i)) ? GL_BGRA : ve->nr_chan;
+ 
+          if (util_format_is_pure_integer(ve->base.src_format)) {
+             UPDATE_INT_SIGN_MASK(ve->base.src_format, i,
+@@ -5495,6 +5503,86 @@ static GLenum get_xfb_mode(GLenum mode)
+    }
+ }
+ 
++static void vrend_upload_pure_int_attrib(GLint loc,
++                                         const struct vrend_vertex_element *ve,
++                                         const void *data,
++                                         uint64_t map_size)
++{
++   unsigned nchan = MIN2(ve->nr_chan, 4u);
++
++   if (util_format_is_pure_uint(ve->base.src_format)) {
++      GLuint uv[4] = {0, 0, 0, 1};
++      switch (ve->type) {
++      case GL_UNSIGNED_BYTE: {
++         const uint8_t *p = data;
++         if ((uint64_t)nchan * sizeof(*p) > map_size)
++            return;
++         for (unsigned c = 0; c < nchan; c++)
++            uv[c] = p[c];
++         break;
++      }
++      case GL_UNSIGNED_SHORT: {
++         if ((uint64_t)nchan * sizeof(uint16_t) > map_size)
++            return;
++         for (unsigned c = 0; c < nchan; c++) {
++            uint16_t val;
++            memcpy(&val, (const char *)data + c * sizeof(val), sizeof(val));
++            uv[c] = val;
++         }
++         break;
++      }
++      case GL_UNSIGNED_INT: {
++         if ((uint64_t)nchan * sizeof(uint32_t) > map_size)
++            return;
++         for (unsigned c = 0; c < nchan; c++) {
++            uint32_t val;
++            memcpy(&val, (const char *)data + c * sizeof(val), sizeof(val));
++            uv[c] = val;
++         }
++         break;
++      }
++      default:
++         return;
++      }
++      glVertexAttribI4uiv(loc, uv);
++   } else {
++      GLint iv[4] = {0, 0, 0, 1};
++      switch (ve->type) {
++      case GL_BYTE: {
++         const int8_t *p = data;
++         if ((uint64_t)nchan * sizeof(*p) > map_size)
++            return;
++         for (unsigned c = 0; c < nchan; c++)
++            iv[c] = p[c];
++         break;
++      }
++      case GL_SHORT: {
++         if ((uint64_t)nchan * sizeof(int16_t) > map_size)
++            return;
++         for (unsigned c = 0; c < nchan; c++) {
++            int16_t val;
++            memcpy(&val, (const char *)data + c * sizeof(val), sizeof(val));
++            iv[c] = val;
++         }
++         break;
++      }
++      case GL_INT: {
++         if ((uint64_t)nchan * sizeof(int32_t) > map_size)
++            return;
++         for (unsigned c = 0; c < nchan; c++) {
++            int32_t val;
++            memcpy(&val, (const char *)data + c * sizeof(val), sizeof(val));
++            iv[c] = val;
++         }
++         break;
++      }
++      default:
++         return;
++      }
++      glVertexAttribI4iv(loc, iv);
++   }
++}
++
+ static void vrend_draw_bind_vertex_legacy(struct vrend_context *ctx,
+                                           struct vrend_vertex_element_array *va)
+ {
+@@ -5548,30 +5636,49 @@ static void vrend_draw_bind_vertex_legacy(struct vrend_context *ctx,
+       struct vrend_vertex_buffer *vbo = &ctx->sub->vbo[vbo_index];
+ 
+       if (vbo->base.stride == 0) {
+-         void *data;
+-         /* for 0 stride we are kinda screwed */
+-         data = glMapBufferRange(GL_ARRAY_BUFFER, vbo->base.buffer_offset, ve->nr_chan * sizeof(GLfloat), GL_MAP_READ_BIT);
++         bool is_pure_int = util_format_is_pure_integer(ve->base.src_format);
++         uint64_t offset = (uint64_t)vbo->base.buffer_offset + (uint64_t)ve->base.src_offset;
++         uint64_t map_size = is_pure_int
++            ? (uint64_t)util_format_get_blocksize(ve->base.src_format)
++            : (uint64_t)ve->nr_chan * sizeof(GLfloat);
+ 
+-         switch (ve->nr_chan) {
+-         case 1:
+-            glVertexAttrib1fv(loc, data);
+-            break;
+-         case 2:
+-            glVertexAttrib2fv(loc, data);
+-            break;
+-         case 3:
+-            glVertexAttrib3fv(loc, data);
+-            break;
+-         case 4:
+-            glVertexAttrib4fv(loc, data);
+-            break;
++         /* for 0 stride we are kinda screwed */
++         if (res->base.target == PIPE_BUFFER &&
++             map_size > 0 &&
++             offset <= (uint64_t)res->base.width0 &&
++             map_size <= (uint64_t)res->base.width0 - offset) {
++            void *data = glMapBufferRange(GL_ARRAY_BUFFER,
++                                          (GLintptr)offset,
++                                          (GLsizeiptr)map_size,
++                                          GL_MAP_READ_BIT);
++
++            if (data) {
++               if (is_pure_int) {
++                  vrend_upload_pure_int_attrib(loc, ve, data, map_size);
++               } else {
++                  switch (ve->nr_chan) {
++                  case 1:
++                     glVertexAttrib1fv(loc, data);
++                     break;
++                  case 2:
++                     glVertexAttrib2fv(loc, data);
++                     break;
++                  case 3:
++                     glVertexAttrib3fv(loc, data);
++                     break;
++                  case 4:
++                     glVertexAttrib4fv(loc, data);
++                     break;
++                  }
++               }
++               glUnmapBuffer(GL_ARRAY_BUFFER);
++            }
+          }
+-         glUnmapBuffer(GL_ARRAY_BUFFER);
+-         disable_bitmask |= (1 << loc);
++         disable_bitmask |= (1u << loc);
+       } else {
+-         GLint size = !vrend_state.use_gles && (va->zyxw_bitmask & (1 << i)) ? GL_BGRA : ve->nr_chan;
++         GLint size = !vrend_state.use_gles && (va->zyxw_bitmask & (1u << i)) ? GL_BGRA : ve->nr_chan;
+ 
+-         enable_bitmask |= (1 << loc);
++         enable_bitmask |= (1u << loc);
+          if (util_format_is_pure_integer(ve->base.src_format)) {
+             glVertexAttribIPointer(loc, size, ve->type, vbo->base.stride, (void *)(uintptr_t)(ve->base.src_offset + vbo->base.buffer_offset));
+          } else {
+@@ -7994,7 +8101,7 @@ static bool use_integer(void) {
+    const char * a = (const char *) glGetString(GL_VENDOR);
+    if (!a)
+        return false;
+-   if (strcmp(a, "ARM") == 0)
++   if (strcmp(a, "ARM") == 0 || strcmp(a, "Apple") == 0)
+       return true;
+    return false;
+ }
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index 4b92dfa..b1ea467 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -1342,6 +1342,9 @@ iter_declaration(struct tgsi_iterate_context *iter,
+          ctx->inputs[i].type = get_type(ctx->key->vs.attrib_signed_int_bitmask,
+                                         ctx->key->vs.attrib_unsigned_int_bitmask,
+                                         decl->Range.First);
++         /* Typed integer inputs emit intBitsToFloat or uintBitsToFloat. */
++         if (ctx->inputs[i].type != VEC_FLOAT)
++            ctx->shader_req_bits |= SHADER_REQ_INTS;
+       }
+       ctx->inputs[i].name = decl->Semantic.Name;
+       ctx->inputs[i].sid = decl->Semantic.Index;
+@@ -4832,7 +4835,7 @@ get_source_info(struct dump_ctx *ctx,
+          struct vrend_shader_io *input = &ctx->inputs[j];
+ 
+          if (ctx->prog_type == TGSI_PROCESSOR_VERTEX) {
+-            if (ctx->key->vs.attrib_zyxw_bitmask & (1 << input->first)) {
++            if (ctx->key->vs.attrib_zyxw_bitmask & (1u << input->first)) {
+                swizzle_writer[swz_idx++] = '.';
+                swizzle_writer[swz_idx++] = 'z';
+                swizzle_writer[swz_idx++] = 'y';
+-- 
+2.55.0
+

@@ -1,0 +1,76 @@
+From fed599fba1498e355781f4596174b0b21663baa3 Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 13:28:12 +0900
+Subject: [PATCH] vrend: do not copy color 0 in dual source fragment shaders
+
+A fragment shader with TGSI_PROPERTY_FS_COLOR0_WRITES_ALL_CBUFS gets one
+output for each color buffer (fsout_c0 to fsout_c7). It copies color 0
+to each of them. The shader can also write the second source color of
+dual source blending (gl_SecondaryFragColorEXT, color output index 1).
+The program then binds fsout_c0 and fsout_c1 to location 0 with index 0
+and index 1. The linker gives fsout_c2 to fsout_c7 the locations 1 to 6.
+
+Apple OpenGL 4.1 refuses that program: "Exceeded max dual source draw
+buffers of 1, shader uses up to 6". vrend reports an illegal shader and
+drops the draw. The guest context goes into the error state (WebGL
+tests webgl-blend-func-extended).
+
+Dual source blending writes only color buffer 0 on a host with
+GL_MAX_DUAL_SOURCE_DRAW_BUFFERS = 1. Emit only fsout_c0 and fsout_c1
+when the shader has a color output with index 1.
+
+License: MIT
+---
+ src/vrend/vrend_shader.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index 0bb26a3..4b92dfa 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -2186,12 +2186,32 @@ static char get_swiz_char(int swiz)
+    }
+ }
+ 
++/* Number of fsout_c<n> outputs of a fragment shader that writes color 0 to
++ * all color buffers (TGSI_PROPERTY_FS_COLOR0_WRITES_ALL_CBUFS).
++ *
++ * A color output with index 1 in such a shader is the second source color
++ * of dual source blending (gl_SecondaryFragColorEXT). The program then
++ * binds fsout_c0 and fsout_c1 to location 0. The linker gives each other
++ * output its own location. A driver with only one dual source draw buffer
++ * can refuse that program (Apple OpenGL 4.1: "Exceeded max dual source
++ * draw buffers of 1"). Dual source blending writes only color buffer 0,
++ * so the copies of color 0 are not necessary. */
++static int fs_num_all_cbufs_outputs(const struct dump_ctx *ctx)
++{
++   for (uint32_t i = 0; i < ctx->num_outputs; i++) {
++      if (ctx->outputs[i].name == TGSI_SEMANTIC_COLOR &&
++          ctx->outputs[i].sid == 1)
++         return 2;
++   }
++   return ctx->cfg->max_draw_buffers;
++}
++
+ static void emit_cbuf_writes(const struct dump_ctx *ctx,
+                              struct vrend_glsl_strbufs *glsl_strbufs)
+ {
+    int i;
+ 
+-   for (i = ctx->num_outputs; i < ctx->cfg->max_draw_buffers; i++) {
++   for (i = ctx->num_outputs; i < fs_num_all_cbufs_outputs(ctx); i++) {
+       emit_buff(glsl_strbufs, "fsout_c%d = fsout_c0;\n", i);
+    }
+ }
+@@ -7393,7 +7413,7 @@ static void emit_ios_fs(const struct dump_ctx *ctx,
+       else if (ctx->key->fs.cbufs_signed_int_bitmask)
+          type = "ivec4";
+ 
+-      for (i = 0; i < (uint32_t)ctx->cfg->max_draw_buffers; i++) {
++      for (i = 0; i < (uint32_t)fs_num_all_cbufs_outputs(ctx); i++) {
+          if (ctx->cfg->use_gles) {
+             if (ctx->key->fs.logicop_enabled)
+                emit_hdrf(glsl_strbufs, "%s fsout_tmp_c%d;\n", type, i);
+-- 
+2.55.0
+

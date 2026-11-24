@@ -1,0 +1,12 @@
+# component|spdx|license file (LICENSES/<name>)|bundle kinds (pinned, mesa-source)
+virglrenderer|MIT|virglrenderer.txt|pinned,mesa-source
+venus-protocol|MIT AND (Apache-2.0 OR MIT)|venus-protocol.txt|pinned,mesa-source
+libepoxy|MIT|libepoxy.txt|pinned,mesa-source
+mesa|MIT AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND HPND AND HPND-sell-variant AND ICU AND MIT-Khronos-old AND SGI-B-2.0 AND LicenseRef-Homebrew-public-domain AND (GPL-1.0-or-later WITH Linux-syscall-note) AND (GPL-2.0-only WITH Linux-syscall-note)|mesa.txt|pinned,mesa-source
+spirv-tools|Apache-2.0|spirv-tools.txt|pinned,mesa-source
+zstd|BSD-3-Clause AND BSD-2-Clause AND MIT|zstd.txt|pinned
+xcb-util-keysyms|X11|xcb-util-keysyms.txt|pinned
+libxcb|MIT|libxcb.txt|pinned
+libx11|MIT|libx11.txt|pinned
+libxau|MIT|libxau.txt|pinned
+libxdmcp|MIT|libxdmcp.txt|pinned

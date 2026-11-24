@@ -1,0 +1,91 @@
+From 05e146a084e8c633dc1eb82efccbc8e6fb12a56d Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 13:28:12 +0900
+Subject: [PATCH] vrend: bind the location of a sole fragment shader output
+
+vrend binds fragment shader outputs to their locations by name, but only
+when the shader has more than one output. A shader can have one color
+output at a location above 0, for example "layout(location = 1) out vec4
+color". The linker gives that output location 0. A draw then writes
+color buffer 0 and not the color buffer that the guest selected (WebGL
+test oes-draw-buffers-indexed, testColorMaskDrawNoOp).
+
+Bind the output also when it is the only output and its color index is
+above 0. Use glBindFragDataLocationIndexed on desktop GL with dual source
+blending, and glBindFragDataLocation on desktop GL without it. Use
+glBindFragDataLocationIndexedEXT on GLES with dual source blending. On
+GLES without dual source blending the shader source has the layout.
+
+Only the desktop GL path with dual source blending has a test (Apple
+OpenGL 4.1).
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 86dddf9..4d23756 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -2151,6 +2151,36 @@ static bool vrend_link(GLuint id)
+    return true;
+ }
+ 
++/* Bind the output of a fragment shader that has only one output.
++ *
++ * The callers bind the outputs by name only when the shader has more than
++ * one output. A sole color output can have an index above 0, for example
++ * "layout(location = 1) out vec4 color". The linker then gives it
++ * location 0. A draw then writes color buffer 0 and not the color buffer
++ * that the guest selected. */
++static void vrend_bind_sole_fs_output(GLuint prog_id,
++                                      const struct vrend_shader_info *sinfo)
++{
++   char buf[64];
++   int location;
++
++   if (sinfo->num_outputs != 1 || sinfo->fs_output_layout[0] <= 0)
++      return;
++
++   location = sinfo->fs_output_layout[0];
++   snprintf(buf, sizeof(buf), "fsout_c%d", location);
++
++   if (vrend_state.use_gles) {
++      /* Without dual source blending the shader source has the layout. */
++      if (has_feature(feat_dual_src_blend))
++         glBindFragDataLocationIndexedEXT(prog_id, location, 0, buf);
++   } else if (has_feature(feat_dual_src_blend)) {
++      glBindFragDataLocationIndexed(prog_id, location, 0, buf);
++   } else {
++      glBindFragDataLocation(prog_id, location, buf);
++   }
++}
++
+ static bool vrend_link_separable_shader(struct vrend_sub_context *sub_ctx,
+                                         struct vrend_shader *shader, int type)
+ {
+@@ -2189,6 +2219,8 @@ static bool vrend_link_separable_shader(struct vrend_sub_context *sub_ctx,
+             }
+          }
+       }
++   } else if (type == PIPE_SHADER_FRAGMENT) {
++      vrend_bind_sole_fs_output(shader->program_id, &shader->sel->sinfo);
+    }
+ 
+    if (type == PIPE_SHADER_VERTEX && has_feature(feat_gles31_vertex_attrib_binding)) {
+@@ -2329,8 +2361,10 @@ static struct vrend_linked_shader_program *add_shader_program(struct vrend_sub_c
+             }
+          }
+       }
+-   } else
++   } else {
+       sprog->dual_src_linked = false;
++      vrend_bind_sole_fs_output(fs_id, &fs->sel->sinfo);
++   }
+ 
+    if (has_feature(feat_gles31_vertex_attrib_binding)) {
+       uint32_t mask = vs->sel->sinfo.attrib_input_mask;
+-- 
+2.55.0
+

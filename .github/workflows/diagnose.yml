@@ -10,7 +10,7 @@ on:
         description: "Hosted runner"
         type: choice
         default: windows-latest
-        options: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-latest, windows-11-arm]
+        options: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-26, windows-latest, windows-11-arm]
       packages:
         description: "Package patterns for go test"
         default: ./pkg/sentry/fsimpl/hostfs/...

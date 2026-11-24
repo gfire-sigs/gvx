@@ -1,0 +1,103 @@
+From e24dd904219c061346d625ffba485928806029db Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 13:28:12 +0900
+Subject: [PATCH] vrend: give blitter shaders a core profile GLSL version
+
+The desktop GL blitter shaders start with "#version 130". A core profile
+context does not accept GLSL 1.30 (Apple OpenGL 4.1: "version '130' is
+not supported"). Each blitter shader then fails to compile, and each
+blit that needs the blitter does nothing.
+
+The shaders are also valid GLSL 1.50 and GLSL 4.00. On a desktop core
+profile context, replace the version line with "#version 400" (OpenGL
+4.0 and later) or "#version 150".
+
+Change the cube map array extension line from "require" to "enable". A
+core profile context has the feature from GLSL 4.00 and does not list
+the extension.
+
+License: MIT
+---
+ src/vrend/vrend_blitter.c | 48 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/src/vrend/vrend_blitter.c b/src/vrend/vrend_blitter.c
+index eed56e4..dd8680c 100644
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -26,6 +26,7 @@
+ /* for when we can't use glBlitFramebuffer */
+ 
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include "util/hash_table.h"
+ #include "util/macros.h"
+@@ -123,11 +124,52 @@ prog_key_to_uint64( struct blit_prog_key prog_key )
+    return pu.u;
+ }
+ 
++/* The desktop GL blitter shaders start with "#version 130". A core profile
++ * context (for example Apple OpenGL 4.1) does not accept GLSL 1.30. Each
++ * blit that needs the blitter then fails.
++ *
++ * The shaders are also valid GLSL 1.50 and GLSL 4.00. Thus give a core
++ * profile context a version that it accepts. GLSL 4.00 also has cube map
++ * array samplers without an extension.
++ *
++ * Return NULL when the shaders can keep their version. */
++static const char *blit_core_profile_version(void)
++{
++   GLint mask = 0;
++   int gl_ver;
++
++   if (!epoxy_is_desktop_gl())
++      return NULL;
++
++   gl_ver = epoxy_gl_version();
++   if (gl_ver < 32)
++      return NULL;
++
++   glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &mask);
++   if (!(mask & GL_CONTEXT_CORE_PROFILE_BIT))
++      return NULL;
++
++   return gl_ver >= 40 ? "#version 400\n" : "#version 150\n";
++}
++
+ static GLint blit_shader_build_and_check(GLenum shader_type, const char *buf)
+ {
++   static const char gl_version[] = "#version 130\n";
++   const char *strings[2] = { buf, NULL };
++   GLsizei num_strings = 1;
++   const char *core_version = NULL;
+    GLint param;
+    GLint id = glCreateShader(shader_type);
+-   glShaderSource(id, 1, (const char **)&buf, NULL);
++
++   if (!strncmp(buf, gl_version, sizeof(gl_version) - 1))
++      core_version = blit_core_profile_version();
++   if (core_version) {
++      strings[0] = core_version;
++      strings[1] = buf + sizeof(gl_version) - 1;
++      num_strings = 2;
++   }
++
++   glShaderSource(id, num_strings, strings, NULL);
+    glCompileShader(id);
+ 
+    glGetShaderiv(id, GL_COMPILE_STATUS, &param);
+@@ -293,7 +335,9 @@ static GLuint blit_build_frag_tex_col(struct vrend_blitter_ctx *blit_ctx,
+       if (blit_ctx->use_gles)
+          ext_str = "#extension GL_EXT_texture_cube_map_array : require\n";
+       else
+-         ext_str = "#extension GL_ARB_texture_cube_map_array : require\n";
++         /* "enable" and not "require": a core profile context has this
++          * feature from GLSL 4.00 and does not list the extension. */
++         ext_str = "#extension GL_ARB_texture_cube_map_array : enable\n";
+    }
+ 
+    if (blit_ctx->use_gles)
+-- 
+2.55.0
+
