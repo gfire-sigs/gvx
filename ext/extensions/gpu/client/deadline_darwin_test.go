@@ -645,3 +645,143 @@ func TestDeadlineProductionBudgetsSynctest(t *testing.T) {
 		})
 	})
 }
+
+// TestDeadlineBlockedWriteWaitsForEarlierRequests uses a peer that obeys the
+// read order of ext/workers/gpu-renderer/src/server.c: it reads one request, works, replies,
+// and only then reads the next request. A frame above the socket buffer then
+// blocks in its write for the whole work time of the earlier requests. That
+// time is above one submit budget, while each request stays inside its own.
+func TestDeadlineBlockedWriteWaitsForEarlierRequests(t *testing.T) {
+	const (
+		reqTimeout    = 1000 * time.Millisecond
+		submitTimeout = 2000 * time.Millisecond
+		perSubmitWork = 1500 * time.Millisecond
+		largeBytes    = 64 * 1024
+	)
+	c, peerFD, sink, cleanup := newDeadlineTestClient(t, reqTimeout, submitTimeout)
+	defer cleanup()
+
+	for i := range 2 {
+		if err := c.Submit(1, nil, nil); err != nil {
+			t.Fatalf("Submit %d: %v", i, err)
+		}
+	}
+	largeErrCh := make(chan error, 1)
+	go func() {
+		largeErrCh <- c.Submit(1, make([]byte, largeBytes), nil)
+	}()
+
+	for i := range 2 {
+		hdr, _ := readPeerFrame(t, peerFD)
+		if hdr.Op != gpuproto.OpSubmit || hdr.PayloadLen >= largeBytes {
+			t.Fatalf("frame %d = %s with %d payload bytes, want a small SUBMIT", i, hdr.Op, hdr.PayloadLen)
+		}
+		time.Sleep(perSubmitWork)
+		select {
+		case err := <-largeErrCh:
+			t.Fatalf("large Submit returned before the peer read it (err=%v); the write did not block", err)
+		default:
+		}
+		writePeerOKReply(t, peerFD, hdr, sink)
+	}
+
+	largeHdr, _ := readPeerFrame(t, peerFD)
+	if largeHdr.Op != gpuproto.OpSubmit || largeHdr.PayloadLen < largeBytes {
+		t.Fatalf("frame 2 = %s with %d payload bytes, want the large SUBMIT", largeHdr.Op, largeHdr.PayloadLen)
+	}
+	select {
+	case err := <-largeErrCh:
+		if err != nil {
+			t.Fatalf("large Submit behind two served Submits failed: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("large Submit did not return after the peer read it")
+	}
+	writePeerOKReply(t, peerFD, largeHdr, sink)
+
+	select {
+	case lostErr := <-sink.rendererLost:
+		t.Fatalf("unexpected RendererLost: %v", lostErr)
+	default:
+	}
+}
+
+// TestDeadlineStalledWriteLosesRenderer verifies that a write still has a
+// budget: the budget starts when the renderer can read the frame.
+func TestDeadlineStalledWriteLosesRenderer(t *testing.T) {
+	const largeBytes = 64 * 1024
+
+	t.Run("head frame that the peer never reads", func(t *testing.T) {
+		const (
+			reqTimeout    = 3600 * time.Millisecond
+			submitTimeout = 1000 * time.Millisecond
+		)
+		c, _, sink, cleanup := newDeadlineTestClient(t, reqTimeout, submitTimeout)
+		defer cleanup()
+
+		start := time.Now()
+		err := c.Submit(1, make([]byte, largeBytes), nil)
+		elapsed := time.Since(start)
+		if !errors.Is(err, gpuproto.ErrRendererLost) || !errors.Is(err, ErrRendererHung) {
+			t.Fatalf("Submit error = %v, want ErrRendererLost and ErrRendererHung", err)
+		}
+		if elapsed < submitTimeout || elapsed >= 8*time.Second {
+			t.Fatalf("stalled write elapsed = %s, want [%s, 8s)", elapsed, submitTimeout)
+		}
+		if lostErr := waitRendererLost(t, sink); !errors.Is(lostErr, ErrRendererHung) {
+			t.Fatalf("RendererLost error = %v, want ErrRendererHung", lostErr)
+		}
+	})
+
+	t.Run("follower frame that the peer never reads after the head reply", func(t *testing.T) {
+		const (
+			reqTimeout    = 3600 * time.Millisecond
+			submitTimeout = 1200 * time.Millisecond
+			headWork      = 2000 * time.Millisecond
+		)
+		c, peerFD, sink, cleanup := newDeadlineTestClient(t, reqTimeout, submitTimeout)
+		defer cleanup()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- c.CreateContext(context.Background(), 1, gpuproto.CapsetVenus, "")
+		}()
+		headHdr, _ := readPeerFrame(t, peerFD)
+		if headHdr.Op != gpuproto.OpCtxCreate {
+			t.Fatalf("peer op = %s, want CTX_CREATE", headHdr.Op)
+		}
+		largeErrCh := make(chan error, 1)
+		go func() {
+			largeErrCh <- c.Submit(1, make([]byte, largeBytes), nil)
+		}()
+
+		// The head works for longer than the submit budget of the follower.
+		time.Sleep(headWork)
+		select {
+		case err := <-largeErrCh:
+			t.Fatalf("follower Submit returned while the head was in its budget (err=%v)", err)
+		default:
+		}
+		headRepliedAt := time.Now()
+		writePeerOKReply(t, peerFD, headHdr, sink)
+		if err := <-errCh; err != nil {
+			t.Fatalf("CreateContext: %v", err)
+		}
+
+		select {
+		case err := <-largeErrCh:
+			afterHead := time.Since(headRepliedAt)
+			if !errors.Is(err, gpuproto.ErrRendererLost) || !errors.Is(err, ErrRendererHung) {
+				t.Fatalf("Submit error = %v, want ErrRendererLost and ErrRendererHung", err)
+			}
+			if afterHead < submitTimeout {
+				t.Fatalf("follower write elapsed after head reply = %s, want at least %s", afterHead, submitTimeout)
+			}
+		case <-time.After(8 * time.Second):
+			t.Fatal("stalled follower Submit did not time out")
+		}
+		if lostErr := waitRendererLost(t, sink); !errors.Is(lostErr, ErrRendererHung) {
+			t.Fatalf("RendererLost error = %v, want ErrRendererHung", lostErr)
+		}
+	})
+}

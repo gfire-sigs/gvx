@@ -76,7 +76,7 @@ type call struct {
 	timeout          time.Duration
 	seq              uint32      // guarded by Client.mu; assigned by register
 	writtenAt        time.Time   // guarded by Client.mu; zero until frame write finishes
-	deadline         time.Time   // guarded by Client.mu; non-zero only for the written FIFO head
+	deadline         time.Time   // guarded by Client.mu; non-zero only for the FIFO head: write budget, then reply budget
 	prev, next       *call       // guarded by Client.mu; intrusive FIFO queue links
 	done             chan result // nil for fire-and-forget; else capacity 1
 	abandoned        bool        // guarded by Client.mu; the caller left after cancellation
@@ -420,8 +420,9 @@ func (c *Client) UnrefResource(ctxID, resID uint32) error {
 }
 
 // Submit sends cmd with an optional fence and returns once the request is
-// written. It does not wait for the reply. A write that blocks past the submit
-// timeout loses the renderer.
+// written. It does not wait for the reply. The write can block while the
+// renderer serves earlier requests. A write that blocks past the submit
+// timeout after the renderer answered every earlier request loses the renderer.
 func (c *Client) Submit(ctxID uint32, cmd []byte, fence *gpuproto.Fence) error {
 	if err := c.lostErr(); err != nil {
 		return err
@@ -553,6 +554,10 @@ func (c *Client) register(cl *call) (uint32, error) {
 	cl.deadline = time.Time{}
 	c.pending[seq] = cl
 	c.enqueueLocked(cl)
+	if c.head == cl {
+		// The renderer has no earlier request, so it can read this frame now.
+		cl.deadline = time.Now().Add(cl.timeout)
+	}
 	return seq, nil
 }
 
@@ -596,20 +601,24 @@ func (c *Client) armHeadDeadlineLocked(cl *call) {
 }
 
 // advanceHeadLocked promotes the next FIFO entry after a head reply arrives at now.
-// The caller holds c.mu.
+// A written head gets its reply budget. An unwritten head gets its write
+// budget, because the renderer reads its frame only from now on. The caller
+// holds c.mu.
 func (c *Client) advanceHeadLocked(now time.Time) {
 	if c.head == nil {
 		c.headSince = time.Time{}
 		return
 	}
 	c.headSince = now
-	if !c.head.writtenAt.IsZero() {
-		c.armHeadDeadlineLocked(c.head)
+	if c.head.writtenAt.IsZero() {
+		c.head.deadline = now.Add(c.head.timeout)
+		return
 	}
+	c.armHeadDeadlineLocked(c.head)
 }
 
-// markWritten records the frame write completion time and arms the deadline
-// when cl is the FIFO head. Callers hold writeSem across register,
+// markWritten records the frame write completion time. When cl is the FIFO
+// head, it replaces the write budget with the reply budget. Callers hold writeSem across register,
 // writeFrameLocked, and markWritten so the queue matches wire order.
 func (c *Client) markWritten(cl *call) {
 	c.mu.Lock()
@@ -656,7 +665,7 @@ func (c *Client) roundTrip(ctx context.Context, cl *call, fixedPayload, tail []b
 		return result{}, err
 	}
 	frame := buildFrame(cl.op, seq, cl.ctxID, fixedPayload, tail)
-	err = c.writeFrameLocked(cl.op, frame, cl.timeout)
+	err = c.writeFrameLocked(cl.op, frame)
 	if err == nil {
 		c.markWritten(cl)
 	}
@@ -693,7 +702,7 @@ func (c *Client) send(cl *call, fixedPayload, tail []byte) error {
 		return err
 	}
 	frame := buildFrame(cl.op, seq, cl.ctxID, fixedPayload, tail)
-	err = c.writeFrameLocked(cl.op, frame, cl.timeout)
+	err = c.writeFrameLocked(cl.op, frame)
 	if err == nil {
 		c.markWritten(cl)
 	}
@@ -734,8 +743,14 @@ func (c *Client) lose(cause error, kill bool) {
 }
 
 // deadlineLoop inspects the FIFO head every deadlineTick and loses the
-// renderer when that head exceeds its budget. Queued calls behind the head do
-// not expire until earlier replies arrive. It exits when c.done closes.
+// renderer when that head exceeds its budget. The budget of an unwritten head
+// bounds its frame write, and the budget of a written head bounds its reply.
+// Queued calls behind the head do not expire until earlier replies arrive: the
+// renderer reads a frame only after it answers the frame before it, so the
+// write of a follower can block for as long as the head is in its budget.
+// Invariant: only the request that the renderer can serve now has a running
+// clock. The loss closes the socket, which ends a blocked write. It exits when
+// c.done closes.
 func (c *Client) deadlineLoop() {
 	defer c.wg.Done()
 	ticker := time.NewTicker(deadlineTick)
@@ -747,6 +762,7 @@ func (c *Client) deadlineLoop() {
 		case now := <-ticker.C:
 			var (
 				expired bool
+				written bool
 				expSeq  uint32
 				expOp   gpuproto.Op
 				expTO   time.Duration
@@ -757,8 +773,13 @@ func (c *Client) deadlineLoop() {
 				expSeq = cl.seq
 				expOp = cl.op
 				expTO = cl.timeout
+				written = !cl.writtenAt.IsZero()
 			}
 			c.mu.Unlock()
+			if expired && !written {
+				c.lose(fmt.Errorf("%w: write of %s seq %d did not finish within %s", ErrRendererHung, expOp, expSeq, expTO), true)
+				return
+			}
 			if expired {
 				c.lose(fmt.Errorf("%w: no reply to %s seq %d within %s", ErrRendererHung, expOp, expSeq, expTO), true)
 				return

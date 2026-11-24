@@ -38,6 +38,8 @@ const (
 	DefaultStartTimeout = 20 * time.Second
 	// DefaultRequestTimeout bounds the reply to every request except SUBMIT
 	// and TRANSFER, and the write of every frame except SUBMIT and TRANSFER.
+	// The clock of a request starts when the renderer answered every earlier
+	// request.
 	DefaultRequestTimeout = 10 * time.Second
 	// DefaultSubmitTimeout bounds the write of a SUBMIT or TRANSFER frame and
 	// its reply.

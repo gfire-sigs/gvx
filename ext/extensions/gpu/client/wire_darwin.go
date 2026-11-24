@@ -260,27 +260,22 @@ func (c *Client) acquireWriteSem(ctx context.Context) error {
 	}
 }
 
-// writeFrameLocked writes the whole frame while the caller holds writeSem.
-// A write error or timeout loses the renderer.
-func (c *Client) writeFrameLocked(op gpuproto.Op, frame net.Buffers, timeout time.Duration) error {
+// writeFrameLocked writes the whole frame while the caller holds writeSem. A
+// write error loses the renderer. The write has no socket deadline: it can
+// block while the renderer serves earlier requests, and deadlineLoop bounds it
+// from the time that its call is the FIFO head. A loss closes the socket and
+// ends the write.
+func (c *Client) writeFrameLocked(op gpuproto.Op, frame net.Buffers) error {
 	if err := c.lostErr(); err != nil {
 		return err
 	}
-	if err := c.conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		c.lose(fmt.Errorf("write %s deadline: %w", op, err), true)
-		return c.lostErr()
-	}
 	if _, err := frame.WriteTo(c.conn); err != nil {
-		if isTimeoutErr(err) {
-			c.lose(fmt.Errorf("%w: write of %s did not finish within %s", ErrRendererHung, op, timeout), true)
-		} else {
-			fallback := fmt.Errorf("write %s: %w", op, err)
-			cause, kill := fallback, true
-			if isPeerCloseErr(err) {
-				cause, kill = c.peerExitCause(fallback)
-			}
-			c.lose(cause, kill)
+		fallback := fmt.Errorf("write %s: %w", op, err)
+		cause, kill := fallback, true
+		if isPeerCloseErr(err) {
+			cause, kill = c.peerExitCause(fallback)
 		}
+		c.lose(cause, kill)
 		return c.lostErr()
 	}
 	return nil
