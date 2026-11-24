@@ -154,7 +154,7 @@ func (c *Config) validateGPU(goos, goarch, macOS string) error {
 	if c.Platform != PlatformAuto && c.Platform != PlatformHVF {
 		return fmt.Errorf("%w: GPU mode %s needs the hvf backend, not %s", ErrInvalidConfig, c.GPU.Mode, c.Platform)
 	}
-	if c.CheckpointDir != "" || c.CheckpointListener != nil {
+	if c.CheckpointDir != "" {
 		return fmt.Errorf("%w: GPU mode %s cannot be combined with checkpoint: the renderer state is not saved", ErrInvalidConfig, c.GPU.Mode)
 	}
 	return nil
@@ -163,9 +163,11 @@ func (c *Config) validateGPU(goos, goarch, macOS string) error {
 // refuseGPUCheckpointLocked rejects a checkpoint of a sandbox with a GPU.
 // The bundle would not hold the renderer state. The control socket can ask
 // for a checkpoint stream without Config.CheckpointDir, so validateGPU alone
-// does not stop it. The caller holds s.mu.
+// does not stop it. It reads s.cfg.GPU.Mode rather than s.gpu, so the refusal
+// holds even after closeGPU(false) clears the renderer client while the kernel
+// still runs. The caller holds s.mu.
 func (s *Sandbox) refuseGPUCheckpointLocked() error {
-	if s.gpu == nil {
+	if s.cfg.GPU.Mode == GPUOff {
 		return nil
 	}
 	return fmt.Errorf("%w: a sandbox with a GPU cannot make a checkpoint: the renderer state is not saved", ErrInvalidConfig)
@@ -243,6 +245,10 @@ func (s *Sandbox) registerGPU(vfsObj *vfs.VirtualFilesystem) error {
 		s.mu.Unlock()
 		return nil
 	}
+	if s.gpuClosing || g.client == nil {
+		s.mu.Unlock()
+		return errSandboxClosing
+	}
 	if g.device != nil {
 		s.mu.Unlock()
 		return errGPUAlreadyRegistered
@@ -281,13 +287,15 @@ func (s *Sandbox) sysfsData() *sys.InternalData {
 	}
 }
 
-// stopKernelForGPU makes sure that no guest task of a GPU sandbox can run.
-// It kills the running kernel and waits until Run returns. It reports false
-// when Run did not return within gpuKernelStopTimeout. A sandbox without a GPU
-// returns true at once and keeps today's Close behavior.
+// stopKernelForGPU enforces this invariant: Close of a GPU sandbox stops the
+// guest kernel before the renderer closes, and a paused sandbox is unpaused
+// first. It unpauses a paused kernel, kills the running kernel, and waits until
+// Run returns. It reports false when Run does not return within
+// gpuKernelStopTimeout. A sandbox without a GPU returns true at once and keeps
+// the non-GPU Close behavior.
 func (s *Sandbox) stopKernelForGPU() bool {
 	s.mu.Lock()
-	if s.gpu == nil {
+	if s.cfg.GPU.Mode == GPUOff && s.gpu == nil {
 		s.mu.Unlock()
 		return true
 	}
@@ -300,6 +308,8 @@ func (s *Sandbox) stopKernelForGPU() bool {
 		return true
 	}
 	if k != nil {
+		s.unpauseForShutdown(k, nil)
+		s.closeRPCMounts()
 		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	}
 	timer := time.NewTimer(gpuKernelStopTimeout)
@@ -313,16 +323,23 @@ func (s *Sandbox) stopKernelForGPU() bool {
 	}
 }
 
-// closeGPU ends the renderer of the sandbox and, when releaseViews is true,
-// releases the device's claim on leftover blob views. The caller holds s.mu
-// and has closed the platform.
+// closeGPU ends the renderer client of the sandbox. When releaseViews is true,
+// it also releases the render node claim on leftover blob views and clears
+// s.gpu. Keeping s.gpu while releaseViews is false lets a later Close retry
+// release leftover blob views after the kernel exits. The caller holds s.mu,
+// and has closed the platform when releaseViews is true.
 func (s *Sandbox) closeGPU(releaseViews bool) {
 	if s.gpu == nil {
 		return
 	}
-	_ = s.gpu.client.Close()
-	if releaseViews && s.gpu.device != nil {
-		s.gpu.device.ReleaseBlobViews()
+	if s.gpu.client != nil {
+		_ = s.gpu.client.Close()
+		s.gpu.client = nil
 	}
-	s.gpu = nil
+	if releaseViews {
+		if s.gpu.device != nil {
+			s.gpu.device.ReleaseBlobViews()
+		}
+		s.gpu = nil
+	}
 }

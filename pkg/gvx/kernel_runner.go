@@ -612,8 +612,11 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	s.closeRPCMounts()
 	s.ckptMu.Lock()
 	s.clearActiveKernel()
-	k.WaitExited()
+	// Release ckptMu before k.WaitExited. Once activeKernel is nil, no pause
+	// or checkpoint can start, and holding ckptMu across k.WaitExited would
+	// deadlock with unpauseForShutdown during Close if a child outlives PID 1.
 	s.ckptMu.Unlock()
+	k.WaitExited()
 	close(doneCh)
 	k.Pause()
 	s.mu.Lock()

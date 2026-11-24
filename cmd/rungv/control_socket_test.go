@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -316,5 +317,41 @@ func TestControlFailedBindKeepsTheTokenOfTheLiveListener(t *testing.T) {
 	}
 	if got != first.Token {
 		t.Fatalf("token file holds %q after a failed second bind, want the token %q of the live listener", got, first.Token)
+	}
+}
+
+func TestRunBindControlSocketAcceptsGPUConfig(t *testing.T) {
+	sockPath := filepath.Join(shortSocketDir(t), "gpu.sock")
+	absentRenderer := filepath.Join(t.TempDir(), "absent-renderer")
+	rc, code, done, parseStderr := parse(t, "-gpu=venus", "-gpu-renderer="+absentRenderer, "-S", sockPath, "-net=none", "-lockdown=false", "-cache-dir="+t.TempDir(), "-image=x")
+	if done {
+		t.Fatalf("parseRunArgs ended with code %d: %s", code, parseStderr)
+	}
+
+	var stderr bytes.Buffer
+	ep, ok := bindControlSocket(&rc.cfg, rc.controlSocket, rc.controlTokenFile, "rungv run", &stderr)
+	if !ok || ep == nil {
+		t.Fatalf("bindControlSocket failed: %s", stderr.String())
+	}
+	t.Cleanup(ep.Cleanup)
+	t.Cleanup(func() { _ = ep.Listener.Close() })
+
+	if rc.cfg.ControlListener != ep.Listener || rc.cfg.CheckpointListener != ep.Listener {
+		t.Fatalf("listeners = (%v, %v), want both set to control endpoint listener", rc.cfg.ControlListener, rc.cfg.CheckpointListener)
+	}
+
+	sb, err := gvx.New(context.Background(), rc.cfg)
+	if sb != nil {
+		_ = sb.Close()
+		t.Fatal("gvx.New unexpectedly succeeded with absent renderer")
+	}
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		if errors.Is(err, gvx.ErrInvalidConfig) {
+			t.Fatalf("gvx.New(-gpu=venus -S) rejected config: %v", err)
+		}
+	} else {
+		if !errors.Is(err, gvx.ErrInvalidConfig) || !strings.Contains(err.Error(), "darwin/arm64") {
+			t.Fatalf("gvx.New(-gpu=venus -S) on %s/%s = %v, want darwin/arm64 ErrInvalidConfig", runtime.GOOS, runtime.GOARCH, err)
+		}
 	}
 }

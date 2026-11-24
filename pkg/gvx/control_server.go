@@ -199,7 +199,7 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 		Handler:          s,
 	})
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.gpuClosing {
 		s.mu.Unlock()
 		return nil
 	}

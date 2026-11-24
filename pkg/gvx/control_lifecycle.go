@@ -51,6 +51,10 @@ func (s *Sandbox) Pause(ctx context.Context, quiesceNet bool) error {
 	}
 
 	s.mu.Lock()
+	if s.gpuClosing || s.closed {
+		s.mu.Unlock()
+		return control.NewError(control.CodeSandboxExiting, "sandbox is closing")
+	}
 	if s.userPaused {
 		s.mu.Unlock()
 		return control.NewError(control.CodeAlreadyPaused, "sandbox is already paused")

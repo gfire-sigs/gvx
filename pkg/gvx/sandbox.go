@@ -634,6 +634,12 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 // Close releases all host handles owned by the Sandbox: port forwarders,
 // WireGuard endpoint, Netstack, the os.Root of every mount, EROFS layer handles, and
 // the hypervisor platform.
+//
+// For a sandbox with a GPU, Close first stops the guest kernel. If the kernel
+// does not stop within 30 seconds, Close kills the renderer, closes the
+// control endpoints, and returns an error. It keeps the platform, memory,
+// and mounts, because the guest can still use them. Call Close again after
+// Run returns to release them. No other code calls Close again.
 func (s *Sandbox) Close() error {
 	kernelStopped := s.stopKernelForGPU()
 	s.mu.Lock()
@@ -648,6 +654,41 @@ func (s *Sandbox) Close() error {
 		s.mu.Unlock()
 		return err
 	}
+	if !kernelStopped {
+		// Kill the renderer so guest GPU calls fail with EIO, and close
+		// control endpoints that do not back guest memory. Keep s.closed false
+		// so a later Close can release the platform, memory, mounts, and GPU
+		// blob views once the guest kernel stops.
+		s.closeGPU(false)
+		srv := s.controlSrv
+		s.controlSrv = nil
+		ctrlLn := s.cfg.ControlListener
+		ckptLn := s.cfg.CheckpointListener
+		if ckptLn == ctrlLn {
+			ckptLn = nil
+		}
+		s.cfg.ControlListener = nil
+		s.cfg.CheckpointListener = nil
+		s.mu.Unlock()
+
+		var errs []error
+		if srv != nil {
+			_ = srv.Close()
+		}
+		s.closeRPCMounts()
+		if ctrlLn != nil {
+			if err := ctrlLn.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		if ckptLn != nil {
+			if err := ckptLn.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		stopErr := fmt.Errorf("gvx: the guest kernel did not stop within %v; the sandbox keeps its platform, memory, and mounts", gpuKernelStopTimeout)
+		return errors.Join(append([]error{stopErr}, errs...)...)
+	}
 	s.closed = true
 	done := make(chan struct{})
 	s.closeDone = done
@@ -655,12 +696,6 @@ func (s *Sandbox) Close() error {
 		s.mu.Unlock()
 		close(done)
 	}()
-
-	if !kernelStopped {
-		s.closeGPU(false) // kills the renderer; guest GPU calls then get EIO
-		s.closeErr = fmt.Errorf("gvx: the guest kernel did not stop within %v; the sandbox keeps its platform, memory, and mounts", gpuKernelStopTimeout)
-		return s.closeErr
-	}
 
 	if s.restoredKernel != nil {
 		if tk := s.restoredKernel.Timekeeper(); tk != nil {

@@ -41,6 +41,7 @@ import (
 	"z.gfire.dev/gvx/internal/gpurender/gpurendertest"
 	"z.gfire.dev/gvx/internal/testimage"
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu"
 	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
 )
@@ -1134,6 +1135,142 @@ func TestGPUVirglMemoryLimitReachesDevice(t *testing.T) {
 	if err := sbDefault.Close(); err != nil {
 		t.Fatalf("Close(default): %v", err)
 	}
+	if got := rendererChildren(t); len(got) != 0 {
+		t.Fatalf("rendererChildren after Close = %v, want empty", got)
+	}
+}
+
+func TestGPUClosePausedSandboxStopsKernel(t *testing.T) {
+	sb, runCh := startGPUProbeWaitLine(t, "hold", "HOLDING")
+
+	if err := sb.Pause(context.Background(), true); err != nil {
+		t.Fatalf("Pause(GPUVenus): %v", err)
+	}
+
+	closeStart := time.Now()
+	closeErr := sb.Close()
+	closeElapsed := time.Since(closeStart)
+	if closeErr != nil {
+		t.Fatalf("Close paused GPU sandbox: %v", closeErr)
+	}
+	if closeElapsed >= 15*time.Second {
+		t.Fatalf("Close paused GPU sandbox took %v, want < 15s", closeElapsed)
+	}
+
+	res := <-runCh
+	wantCode := 128 + int(linux.SIGKILL)
+	if res.err != nil || res.code != wantCode {
+		t.Fatalf("Run after Close paused GPU sandbox = (code=%d, err=%v), want (code=%d, err=nil)", res.code, res.err, wantCode)
+	}
+	if got := rendererChildren(t); len(got) != 0 {
+		t.Fatalf("rendererChildren after Close = %v, want empty", got)
+	}
+}
+
+func TestGPUSandboxControlSocketAllowsPingAndRefusesCheckpoint(t *testing.T) {
+	sockPath := shortControlSocketPath(t, "gpu-live.sock")
+	ep, err := control.Listen(sockPath, control.ListenOptions{})
+	if err != nil {
+		t.Fatalf("control.Listen(%q): %v", sockPath, err)
+	}
+	t.Cleanup(ep.Cleanup)
+
+	cfg := gpuTestConfig(t)
+	cfg.Name = "gpu-live-ctrl"
+	cfg.ControlListener = ep.Listener
+	cfg.CheckpointListener = ep.Listener
+	cfg.ControlToken = ep.Token
+	cfg.Argv = []string{"/bin/gpuprobe", "hold"}
+
+	pr, pw := io.Pipe()
+	var errBuf bytes.Buffer
+	cfg.Stdout = pw
+	cfg.Stderr = &errBuf
+
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		_ = ep.Listener.Close()
+		t.Fatalf("New(GPUVenus with control socket): %v", err)
+	}
+	t.Cleanup(func() { _ = sb.Close() })
+
+	ctrlCtx, ctrlCancel := context.WithCancel(context.Background())
+	ctrlDone := make(chan struct{})
+	go func() {
+		defer close(ctrlDone)
+		_ = sb.ServeControl(ctrlCtx)
+	}()
+	stopCtrl := func() {
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = sb.ShutdownControl(drainCtx)
+		drainCancel()
+		ctrlCancel()
+		<-ctrlDone
+	}
+	t.Cleanup(stopCtrl)
+
+	runCh := make(chan gpuRunResult, 1)
+	go func() {
+		code, rerr := sb.Run(context.Background())
+		_ = pw.Close()
+		runCh <- gpuRunResult{code: code, err: rerr}
+	}()
+
+	readyCh := make(chan error, 1)
+	go func() {
+		sc := bufio.NewScanner(pr)
+		for sc.Scan() {
+			if sc.Text() == "HOLDING" {
+				readyCh <- nil
+				_, _ = io.Copy(io.Discard, pr)
+				return
+			}
+		}
+		readyCh <- fmt.Errorf("gpuprobe hold exited before HOLDING (scanErr=%v)", sc.Err())
+	}()
+
+	select {
+	case rerr := <-readyCh:
+		if rerr != nil {
+			res := <-runCh
+			t.Fatalf("%v (run code=%d err=%v stderr=%q)", rerr, res.code, res.err, errBuf.String())
+		}
+	case <-time.After(15 * time.Second):
+		_ = sb.Close()
+		<-runCh
+		t.Fatalf("timed out waiting for gpuprobe hold to print HOLDING (stderr=%q)", errBuf.String())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := control.Dial(ctx, control.DialOptions{
+		Endpoint: sockPath,
+		Token:    ep.Token,
+	})
+	if err != nil {
+		t.Fatalf("control.Dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	var pingResp control.PingResponse
+	if err := client.Call(ctx, control.MethodPing, nil, &pingResp); err != nil {
+		t.Fatalf("MethodPing: %v", err)
+	}
+	if pingResp.SandboxID != "gpu-live-ctrl" || pingResp.State != "running" {
+		t.Fatalf("PingResponse = %+v, want SandboxID=gpu-live-ctrl State=running", pingResp)
+	}
+	if err := client.Call(ctx, control.MethodCheckpointStream, control.CheckpointStreamRequest{}, nil); !control.IsCode(err, control.CodeInvalidArgument) {
+		t.Fatalf("MethodCheckpointStream error = %v, want INVALID_ARGUMENT", err)
+	}
+	if err := client.Call(ctx, control.MethodCheckpoint, control.CheckpointRequest{}, nil); !control.IsCode(err, control.CodeForbiddenByPolicy) {
+		t.Fatalf("MethodCheckpoint error = %v, want FORBIDDEN_BY_POLICY", err)
+	}
+
+	stopCtrl()
+	if err := sb.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	<-runCh
 	if got := rendererChildren(t); len(got) != 0 {
 		t.Fatalf("rendererChildren after Close = %v, want empty", got)
 	}
