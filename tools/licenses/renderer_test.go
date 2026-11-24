@@ -58,6 +58,22 @@ func TestCheckRenderer(t *testing.T) {
 			mutate: func(t *testing.T, root string) {},
 		},
 		{
+			name: "CRLF manifest and lock pass",
+			mutate: func(t *testing.T, root string) {
+				for _, rel := range []string{rendererComponentsRelPath, rendererLockRelPath} {
+					p := filepath.Join(root, filepath.FromSlash(rel))
+					data, err := os.ReadFile(p)
+					if err != nil {
+						t.Fatalf("read %s: %v", rel, err)
+					}
+					crlf := strings.ReplaceAll(lfOnly(string(data)), "\n", "\r\n")
+					if err := os.WriteFile(p, []byte(crlf), 0o644); err != nil {
+						t.Fatalf("write %s: %v", rel, err)
+					}
+				}
+			},
+		},
+		{
 			name: "missing libepoxy line fails",
 			mutate: func(t *testing.T, root string) {
 				p := filepath.Join(root, filepath.FromSlash(rendererComponentsRelPath))
@@ -66,8 +82,9 @@ func TestCheckRenderer(t *testing.T) {
 					t.Fatalf("read manifest: %v", err)
 				}
 				const target = "libepoxy|MIT|libepoxy.txt|pinned,mesa-source\n"
-				updated := strings.Replace(string(data), target, "", 1)
-				if updated == string(data) {
+				normalized := lfOnly(string(data))
+				updated := strings.Replace(normalized, target, "", 1)
+				if updated == normalized {
 					t.Fatal("failed to remove libepoxy line")
 				}
 				if err := os.WriteFile(p, []byte(updated), 0o644); err != nil {
@@ -206,6 +223,21 @@ func TestCheckRenderer(t *testing.T) {
 				}
 			},
 			wantErr: `malformed BOTTLE key`,
+		},
+		{
+			name: "malformed toolchain lock key fails",
+			mutate: func(t *testing.T, root string) {
+				p := filepath.Join(root, filepath.FromSlash(rendererLockRelPath))
+				data, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatalf("read lock: %v", err)
+				}
+				data = append(data, []byte("\nTOOLCHAIN.badkey=1\n")...)
+				if err := os.WriteFile(p, data, 0o644); err != nil {
+					t.Fatalf("write lock: %v", err)
+				}
+			},
+			wantErr: `malformed TOOLCHAIN key`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -20,14 +20,24 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+/*
+ * Records that fork() failed with EPERM under Seatbelt before confine_apply()
+ * lowered RLIMIT_NPROC to 0. Once RLIMIT_NPROC is 0, XNU enforces the rlimit
+ * before the Seatbelt MAC hook and returns EAGAIN instead of EPERM.
+ */
+static _Atomic bool g_seatbelt_fork_eperm_verified = false;
+
 uint8_t confine_check_fork(char *detail, size_t detail_len)
 {
+	errno = 0;
 	pid_t pid = fork();
 	if (pid == 0) {
 		_exit(0);
@@ -38,7 +48,21 @@ uint8_t confine_check_fork(char *detail, size_t detail_len)
 		snprintf(detail, detail_len, "fork succeeded");
 		return GVX_GPU_CONFINE_ALLOWED;
 	}
-	return GVX_GPU_CONFINE_DENIED;
+	int err = errno;
+	if (err == EPERM) {
+		atomic_store_explicit(&g_seatbelt_fork_eperm_verified, true, memory_order_release);
+		return GVX_GPU_CONFINE_DENIED;
+	}
+	if (err == EAGAIN &&
+	    atomic_load_explicit(&g_seatbelt_fork_eperm_verified, memory_order_acquire)) {
+		struct rlimit nproc;
+		if (getrlimit(RLIMIT_NPROC, &nproc) == 0 &&
+		    nproc.rlim_cur == 0 && nproc.rlim_max == 0) {
+			return GVX_GPU_CONFINE_DENIED;
+		}
+	}
+	snprintf(detail, detail_len, "unexpected fork errno %d (%s)", err, strerror(err));
+	return GVX_GPU_CONFINE_UNEXPECTED;
 }
 
 uint8_t confine_check_exec(char *detail, size_t detail_len)

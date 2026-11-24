@@ -35,6 +35,12 @@ MESA_BOTTLE_SHA256=""
 DRIVER_SOURCE_VERSION=""
 DRIVER_SOURCE_SHA256=""
 DRIVER_SOURCE_PYTHON_REQUIREMENTS=""
+TOOLCHAIN_LLVM_VERSION=""
+TOOLCHAIN_LIBCLC_VERSION=""
+TOOLCHAIN_SPIRV_LLVM_TRANSLATOR_VERSION=""
+TOOLCHAIN_SPIRV_TOOLS_VERSION=""
+
+readonly DRIVER_STAGE_MANIFEST=".gvx-stage.sha256"
 
 DRIVER_STAGE_DIR=""
 DRIVER_LIB=""
@@ -273,6 +279,22 @@ step_lock_file() {
 			[[ -z $DRIVER_SOURCE_PYTHON_REQUIREMENTS ]] || die "duplicate key in $lock_file: $key"
 			DRIVER_SOURCE_PYTHON_REQUIREMENTS=$val
 			;;
+		TOOLCHAIN.llvm.version)
+			[[ -z $TOOLCHAIN_LLVM_VERSION ]] || die "duplicate key in $lock_file: $key"
+			TOOLCHAIN_LLVM_VERSION=$val
+			;;
+		TOOLCHAIN.libclc.version)
+			[[ -z $TOOLCHAIN_LIBCLC_VERSION ]] || die "duplicate key in $lock_file: $key"
+			TOOLCHAIN_LIBCLC_VERSION=$val
+			;;
+		TOOLCHAIN.spirv-llvm-translator.version)
+			[[ -z $TOOLCHAIN_SPIRV_LLVM_TRANSLATOR_VERSION ]] || die "duplicate key in $lock_file: $key"
+			TOOLCHAIN_SPIRV_LLVM_TRANSLATOR_VERSION=$val
+			;;
+		TOOLCHAIN.spirv-tools.version)
+			[[ -z $TOOLCHAIN_SPIRV_TOOLS_VERSION ]] || die "duplicate key in $lock_file: $key"
+			TOOLCHAIN_SPIRV_TOOLS_VERSION=$val
+			;;
 		BOTTLE.* | DRIVER_*)
 			;;
 		*)
@@ -293,13 +315,58 @@ step_lock_file() {
 	if [[ $driver_source == "pinned" ]]; then
 		required_keys+=(MESA_VERSION MESA_BOTTLE_SHA256)
 	elif [[ $driver_source == "mesa-source" ]]; then
-		required_keys+=(DRIVER_SOURCE_VERSION DRIVER_SOURCE_SHA256 DRIVER_SOURCE_PYTHON_REQUIREMENTS)
+		required_keys+=(
+			DRIVER_SOURCE_VERSION
+			DRIVER_SOURCE_SHA256
+			DRIVER_SOURCE_PYTHON_REQUIREMENTS
+			TOOLCHAIN_LLVM_VERSION
+			TOOLCHAIN_LIBCLC_VERSION
+			TOOLCHAIN_SPIRV_LLVM_TRANSLATOR_VERSION
+			TOOLCHAIN_SPIRV_TOOLS_VERSION
+		)
 	fi
 	for key in "${required_keys[@]}"; do
 		if [[ -z ${!key} ]]; then
 			die "missing key in $lock_file: $key"
 		fi
 	done
+}
+
+verify_brew_formula_version() {
+	local formula=$1 want=$2
+	local ver_line
+	ver_line=$(brew list --versions "$formula" 2>/dev/null || true)
+	if [[ -z $ver_line ]]; then
+		die "homebrew formula $formula is not installed (want $want from gpurenderer/third_party.lock)"
+	fi
+	local parts=()
+	read -r -a parts <<<"$ver_line"
+	local actual=""
+	if [[ ${parts[0]} != "$formula" ]]; then
+		die "unexpected brew list --versions output for $formula: $ver_line"
+	fi
+	if ((${#parts[@]} == 2)); then
+		actual=${parts[1]}
+	elif ((${#parts[@]} > 2)); then
+		local keg_dir
+		keg_dir=$(brew --prefix "$formula" 2>/dev/null || true)
+		if [[ -n $keg_dir && -d $keg_dir ]]; then
+			actual=$(basename -- "$(cd -- "$keg_dir" && pwd -P)")
+		fi
+	fi
+	if [[ $actual != "$want" ]]; then
+		die "homebrew formula $formula version is ${actual:-unknown} (brew list --versions: $ver_line), want $want from gpurenderer/third_party.lock"
+	fi
+}
+
+step_verify_toolchain() {
+	if [[ $driver_source != "mesa-source" ]]; then
+		return 0
+	fi
+	verify_brew_formula_version llvm "$TOOLCHAIN_LLVM_VERSION"
+	verify_brew_formula_version libclc "$TOOLCHAIN_LIBCLC_VERSION"
+	verify_brew_formula_version spirv-llvm-translator "$TOOLCHAIN_SPIRV_LLVM_TRANSLATOR_VERSION"
+	verify_brew_formula_version spirv-tools "$TOOLCHAIN_SPIRV_TOOLS_VERSION"
 }
 
 fetch_git_source() {
@@ -424,6 +491,50 @@ step_epoxy() {
 	export PKG_CONFIG_PATH="$epoxy_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 }
 
+compute_driver_stage_manifest() {
+	local stage_dir=$1
+	(
+		# The caller runs this function on the left side of ||, so set -e is off.
+		# Each command that can fail exits the subshell explicitly.
+		cd -- "$stage_dir" || exit 1
+		LC_ALL=C find . -mindepth 1 \( -type f -o -type l \) ! -name "$DRIVER_STAGE_MANIFEST" |
+			sed 's|^\./||' |
+			LC_ALL=C sort |
+			while IFS= read -r rel; do
+				if [[ -L $rel ]]; then
+					exit 1
+				fi
+				shasum -a 256 -- "$rel" || exit 1
+			done
+	)
+}
+
+write_driver_stage_manifest() {
+	local stage_dir=$1
+	local manifest="$stage_dir/$DRIVER_STAGE_MANIFEST"
+	local content
+	content=$(compute_driver_stage_manifest "$stage_dir") || die "failed to hash staged driver outputs in $stage_dir"
+	if [[ -z $content ]]; then
+		die "staged driver directory has no files: $stage_dir"
+	fi
+	printf '%s\n' "$content" >"$manifest"
+}
+
+verify_driver_stage_manifest() {
+	local stage_dir=$1
+	local manifest="$stage_dir/$DRIVER_STAGE_MANIFEST"
+	if [[ ! -f $manifest || -L $manifest || ! -s $manifest ]]; then
+		return 1
+	fi
+	if [[ ! -f "$stage_dir/driver.txt" || ! -f "$stage_dir/lib/libvulkan_kosmickrisp.dylib" ]]; then
+		return 1
+	fi
+	local actual expected
+	actual=$(compute_driver_stage_manifest "$stage_dir") || return 1
+	expected=$(cat -- "$manifest") || return 1
+	[[ -n $actual && $actual == "$expected" ]]
+}
+
 step_driver() {
 	if [[ $driver_source == "pinned" ]]; then
 		local lock_digest
@@ -435,7 +546,16 @@ step_driver() {
 				awk '{print substr($1, 1, 16)}'
 		)
 		DRIVER_STAGE_DIR="$cache_dir/driver-${bottle_tag}-${lock_digest}"
+		local reuse_stage=0
 		if [[ -d $DRIVER_STAGE_DIR ]]; then
+			if verify_driver_stage_manifest "$DRIVER_STAGE_DIR"; then
+				reuse_stage=1
+			else
+				printf 'build-renderer: staged driver manifest missing or mismatched in %s; rebuilding\n' "$DRIVER_STAGE_DIR" >&2
+				rm -rf -- "$DRIVER_STAGE_DIR"
+			fi
+		fi
+		if ((reuse_stage)); then
 			"$venv_python" -I "$repo_root/scripts/gpu/stage_driver.py" \
 				--lock "$repo_root/gpurenderer/third_party.lock" \
 				--cache "$cache_dir" \
@@ -457,6 +577,8 @@ step_driver() {
 				stage_args+=(--offline)
 			fi
 			"$venv_python" -I "$repo_root/scripts/gpu/stage_driver.py" "${stage_args[@]}"
+			write_driver_stage_manifest "$tmp_stage"
+			rm -rf -- "$DRIVER_STAGE_DIR"
 			mv -- "$tmp_stage" "$DRIVER_STAGE_DIR"
 		fi
 	elif [[ $driver_source == "mesa-source" ]]; then
@@ -478,7 +600,16 @@ step_driver() {
 			} | shasum -a 256 | awk '{print substr($1, 1, 16)}'
 		)
 		DRIVER_STAGE_DIR="$cache_dir/driver-mesa-source-${mesa_key}"
-		if [[ -d $DRIVER_STAGE_DIR && -f "$DRIVER_STAGE_DIR/driver.txt" && -f "$DRIVER_STAGE_DIR/lib/libvulkan_kosmickrisp.dylib" ]]; then
+		local reuse_stage=0
+		if [[ -d $DRIVER_STAGE_DIR ]]; then
+			if verify_driver_stage_manifest "$DRIVER_STAGE_DIR"; then
+				reuse_stage=1
+			else
+				printf 'build-renderer: staged driver manifest missing or mismatched in %s; rebuilding\n' "$DRIVER_STAGE_DIR" >&2
+				rm -rf -- "$DRIVER_STAGE_DIR"
+			fi
+		fi
+		if ((reuse_stage)); then
 			"$venv_python" -I "$repo_root/scripts/gpu/stage_driver.py" \
 				--lock "$repo_root/gpurenderer/third_party.lock" \
 				--source mesa-source \
@@ -503,6 +634,7 @@ step_driver() {
 				stage_args+=(--offline)
 			fi
 			"$venv_python" -I "$repo_root/scripts/gpu/stage_driver.py" "${stage_args[@]}"
+			write_driver_stage_manifest "$tmp_stage"
 			rm -rf -- "$DRIVER_STAGE_DIR"
 			mv -- "$tmp_stage" "$DRIVER_STAGE_DIR"
 		fi
@@ -828,6 +960,7 @@ step_check() {
 
 step_args_and_host "$@"
 step_lock_file
+step_verify_toolchain
 step_sources
 step_python
 step_epoxy

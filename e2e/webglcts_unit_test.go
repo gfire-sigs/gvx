@@ -18,8 +18,11 @@ package e2e
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -932,6 +935,12 @@ func TestMergeCTSRunsDelayedLossCorrectionKeepsAttempts(t *testing.T) {
 }
 
 func TestCTSDeviceProbeBuildsForLinuxArches(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go toolchain unavailable: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join("testdata", "gpuprobe", "main.go")); errors.Is(err, fs.ErrNotExist) {
+		t.Skipf("gpuprobe source unavailable: %v", err)
+	}
 	for _, arch := range []string{"arm64", "amd64"} {
 		t.Run(arch, func(t *testing.T) {
 			dir := ctsDeviceProbeDir(t, arch)
@@ -1139,6 +1148,9 @@ func TestVerifyVenusMesaPatches(t *testing.T) {
 
 	t.Run("matches repository Mesa patches", func(t *testing.T) {
 		repoPatches := filepath.Join("..", "gpurenderer", "patches", "mesa")
+		if _, err := os.Stat(repoPatches); errors.Is(err, fs.ErrNotExist) {
+			t.Skipf("repository Mesa patch directory unavailable: %v", err)
+		}
 		entries, err := os.ReadDir(repoPatches)
 		if err != nil {
 			t.Fatalf("read %s: %v", repoPatches, err)

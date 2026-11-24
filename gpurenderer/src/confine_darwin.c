@@ -114,11 +114,6 @@ int confine_apply(const char *bundle_dir, char *err, size_t err_len)
 		return -1;
 	}
 
-	if (setrlimit(RLIMIT_NPROC, &zero) != 0) {
-		snprintf(err, err_len, "setrlimit(RLIMIT_NPROC): %s", strerror(errno));
-		return -1;
-	}
-
 	/*
 	 * Resolve the per-user cache directory while Mach lookups still work.
 	 * Metal finds its shader cache through confstr(_CS_DARWIN_USER_CACHE_DIR),
@@ -146,6 +141,25 @@ int confine_apply(const char *bundle_dir, char *err, size_t err_len)
 	}
 	if (sb_err != NULL) {
 		sandbox_free_error(sb_err);
+	}
+
+	/*
+	 * Verify that Seatbelt rejects fork() with EPERM before lowering
+	 * RLIMIT_NPROC to 0. XNU enforces RLIMIT_NPROC before the Seatbelt MAC
+	 * hook, so setting the limit first would return EAGAIN and mask a
+	 * missing (deny process-fork) rule.
+	 */
+	char fork_detail[128];
+	fork_detail[0] = '\0';
+	if (confine_check_fork(fork_detail, sizeof(fork_detail)) != GVX_GPU_CONFINE_DENIED) {
+		snprintf(err, err_len, "Seatbelt deny process-fork verification failed: %s",
+		         fork_detail[0] != '\0' ? fork_detail : "unexpected result");
+		return -1;
+	}
+
+	if (setrlimit(RLIMIT_NPROC, &zero) != 0) {
+		snprintf(err, err_len, "setrlimit(RLIMIT_NPROC): %s", strerror(errno));
+		return -1;
 	}
 
 	return 0;

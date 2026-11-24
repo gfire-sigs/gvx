@@ -100,11 +100,19 @@ func readRendererLockComponents(path string) (map[string]bool, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		key, _, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) == "" {
+		key, val, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) == "" || strings.TrimSpace(val) == "" {
 			return nil, fmt.Errorf("%s:%d: malformed lock entry %q", rendererLockRelPath, idx+1, line)
 		}
-		rest, isBottle := strings.CutPrefix(strings.TrimSpace(key), "BOTTLE.")
+		trimmedKey := strings.TrimSpace(key)
+		if rest, isToolchain := strings.CutPrefix(trimmedKey, "TOOLCHAIN."); isToolchain {
+			formula, field, ok := strings.Cut(rest, ".")
+			if !ok || formula == "" || field == "" || strings.Contains(field, ".") {
+				return nil, fmt.Errorf("%s:%d: malformed TOOLCHAIN key %q", rendererLockRelPath, idx+1, key)
+			}
+			continue
+		}
+		rest, isBottle := strings.CutPrefix(trimmedKey, "BOTTLE.")
 		if !isBottle {
 			continue
 		}

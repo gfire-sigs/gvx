@@ -2,6 +2,8 @@
 
 These `gvx` patches apply to the pinned KosmicKrisp 26.3.0 source tarball during `scripts/gpu/build-renderer.sh --driver-source mesa-source`. Every patch uses the MIT license of Mesa. As of Mesa `main` commit `22c08cc53`, upstream does not include a fix for any of these five defects.
 
+Release reproducibility for `--driver-source mesa-source` depends on the pinned Homebrew toolchain versions in `gpurenderer/third_party.lock`. Mesa links static archives or bitcode from `llvm`, `libclc`, `spirv-llvm-translator`, and `spirv-tools` into `libvulkan_kosmickrisp.dylib`. `scripts/gpu/build-renderer.sh` verifies `brew list --versions` against each `TOOLCHAIN.<formula>.version` pin before building and records the installed versions in `BUILDINFO`.
+
 | Patch | File | Purpose |
 | :--- | :--- | :--- |
 | `0001-kk-restart-only-for-indexed-draws.patch` | `src/kosmickrisp/vulkan/kk_cmd_draw.c` | Enables `data->restart` only when `data->indexed` is true. Prevents non-indexed flat-shaded draws on the unroll path from dropping vertex 0. First bad upstream commit: `1388ec1b7`. |

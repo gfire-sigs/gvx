@@ -168,6 +168,10 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # build-renderer.sh --driver-source mesa-source verifies the installed
+      # versions of llvm, libclc, spirv-llvm-translator, and spirv-tools
+      # against TOOLCHAIN.*.version in gpurenderer/third_party.lock and records
+      # them in BUILDINFO.
       - name: Install the driver build tools
         run: brew install meson ninja cmake pkgconf llvm libclc spirv-llvm-translator spirv-tools
       - name: Build the renderer bundle

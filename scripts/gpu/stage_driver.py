@@ -41,7 +41,14 @@ VALID_DRIVER_KEYS = (
     "DRIVER_SOURCE_PYTHON_REQUIREMENTS",
 )
 VALID_BOTTLE_FIELDS = ("version", "arm64_golden_gate", "arm64_tahoe")
+VALID_TOOLCHAIN_FIELDS = ("version",)
 MESA_SOURCE_RUNTIME_FORMULAS = ("spirv-tools",)
+MESA_SOURCE_TOOLCHAIN_FORMULAS = (
+    "llvm",
+    "libclc",
+    "spirv-llvm-translator",
+    "spirv-tools",
+)
 MESA_SOURCE_BUILD_TOOLS = (
     "llvm",
     "libclc",
@@ -98,12 +105,13 @@ def parse_lock(
     lock_path: Path,
     tag: str | None,
     source: str,
-) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+) -> tuple[dict[str, str], dict[str, dict[str, str]], dict[str, str]]:
     if not lock_path.is_file():
         die(f"missing lock file: {lock_path}")
 
     driver: dict[str, str] = {}
     bottles: dict[str, dict[str, str]] = {}
+    toolchain: dict[str, str] = {}
     seen_keys: set[str] = set()
 
     for lineno, raw_line in enumerate(lock_path.read_text(encoding="utf-8").splitlines(), 1):
@@ -113,7 +121,7 @@ def parse_lock(
         if "=" not in line:
             die(f"malformed line {lineno} in {lock_path}: {line}")
         key, val = line.split("=", 1)
-        if not (key.startswith("DRIVER_") or key.startswith("BOTTLE.")):
+        if not (key.startswith("DRIVER_") or key.startswith("BOTTLE.") or key.startswith("TOOLCHAIN.")):
             continue
         if key in seen_keys:
             die(f"duplicate key in {lock_path}: {key}")
@@ -125,6 +133,18 @@ def parse_lock(
             if key not in VALID_DRIVER_KEYS:
                 die(f"unknown driver key in {lock_path}: {key}")
             driver[key] = val
+            continue
+
+        if key.startswith("TOOLCHAIN."):
+            parts = key.split(".")
+            if len(parts) != 3 or parts[0] != "TOOLCHAIN" or not parts[1]:
+                die(f"malformed toolchain key in {lock_path}: {key}")
+            _, formula, field = parts
+            if field not in VALID_TOOLCHAIN_FIELDS:
+                die(f"unknown toolchain field in {lock_path}: {key}")
+            if formula not in MESA_SOURCE_TOOLCHAIN_FORMULAS:
+                die(f"unknown toolchain formula in {lock_path}: {key}")
+            toolchain[formula] = val
             continue
 
         parts = key.split(".")
@@ -156,6 +176,10 @@ def parse_lock(
             if tag not in fields:
                 die(f"formula {formula} missing {tag} hash in {lock_path}")
 
+    for formula in MESA_SOURCE_TOOLCHAIN_FORMULAS:
+        if formula not in toolchain:
+            die(f"missing key in {lock_path}: TOOLCHAIN.{formula}.version")
+
     mesa_bottle_ver = bottles[driver["DRIVER_FORMULA"]]["version"]
     if driver["DRIVER_SOURCE_VERSION"] != mesa_bottle_ver:
         die(
@@ -163,7 +187,7 @@ def parse_lock(
             f"does not match BOTTLE.{driver['DRIVER_FORMULA']}.version ({mesa_bottle_ver})"
         )
 
-    return driver, bottles
+    return driver, bottles, toolchain
 
 
 def fetch_bottles(
@@ -570,9 +594,14 @@ def build_mesa_source(
     redownloaded: bool,
     jobs: int | None,
     patch_digest: str,
+    toolchain: dict[str, str],
 ) -> Path:
     version = driver["DRIVER_SOURCE_VERSION"]
-    build_dir = cache_dir / f"mesa-build-{version}-{patch_digest}"
+    # The key holds the toolchain pins. A pin change then runs a new meson setup
+    # and does not link static archives of the old Homebrew keg.
+    toolchain_text = "".join(f"{k}={toolchain[k]}\n" for k in sorted(toolchain))
+    toolchain_digest = hashlib.sha256(toolchain_text.encode()).hexdigest()[:12]
+    build_dir = cache_dir / f"mesa-build-{version}-{patch_digest}-{toolchain_digest}"
     if redownloaded and build_dir.exists():
         shutil.rmtree(build_dir)
 
@@ -654,9 +683,7 @@ def compute_mesa_source_closure(
                 keg_path = Path(keg_text)
                 if not keg_path.is_dir():
                     die(f"homebrew formula {dep_formula} is not installed (missing {keg_path})")
-                ver_line = run_cmd(["brew", "list", "--versions", dep_formula], capture=True).strip()
-                if not ver_line:
-                    die(f"homebrew formula {dep_formula} has no installed version")
+                _, ver_line = resolve_installed_brew_version(dep_formula)
                 dep_kegs[dep_formula] = keg_path
                 dep_versions[dep_formula] = ver_line
 
@@ -675,21 +702,53 @@ def compute_mesa_source_closure(
         keg_path = Path(keg_text)
         if not keg_path.is_dir():
             die(f"homebrew formula spirv-tools is not installed (missing {keg_path})")
-        ver_line = run_cmd(["brew", "list", "--versions", "spirv-tools"], capture=True).strip()
-        if not ver_line:
-            die("homebrew formula spirv-tools has no installed version")
+        _, ver_line = resolve_installed_brew_version("spirv-tools")
         dep_kegs["spirv-tools"] = keg_path
         dep_versions["spirv-tools"] = ver_line
 
     return staged, dep_kegs, dep_versions
 
 
-def collect_build_tool_versions() -> list[str]:
+def resolve_installed_brew_version(formula: str) -> tuple[str, str]:
+    ver_line = run_cmd(["brew", "list", "--versions", formula], capture=True).strip()
+    if not ver_line:
+        die(f"build tool formula {formula} has no installed Homebrew version")
+    parts = ver_line.split()
+    if len(parts) < 2 or parts[0] != formula:
+        die(f"unexpected brew list --versions output for {formula}: {ver_line}")
+    if len(parts) == 2:
+        active = parts[1]
+    else:
+        keg_text = run_cmd(["brew", "--prefix", formula], capture=True).strip()
+        keg_path = Path(keg_text)
+        if not keg_path.is_dir():
+            die(f"homebrew formula {formula} is not installed (missing {keg_path})")
+        active = keg_path.resolve().name
+        if active not in parts[1:]:
+            die(f"active keg version {active} for {formula} not in brew list --versions: {ver_line}")
+    return active, f"{formula} {active}"
+
+
+def verify_mesa_source_toolchain(toolchain: dict[str, str]) -> None:
+    for formula in MESA_SOURCE_TOOLCHAIN_FORMULAS:
+        want = toolchain[formula]
+        actual, _ = resolve_installed_brew_version(formula)
+        if actual != want:
+            die(
+                f"homebrew formula {formula} version is {actual}, want {want} "
+                "(pinned in gpurenderer/third_party.lock)"
+            )
+
+
+def collect_build_tool_versions(toolchain: dict[str, str]) -> list[str]:
     lines: list[str] = []
     for formula in MESA_SOURCE_BUILD_TOOLS:
-        ver_line = run_cmd(["brew", "list", "--versions", formula], capture=True).strip()
-        if not ver_line:
-            die(f"build tool formula {formula} has no installed Homebrew version")
+        actual, ver_line = resolve_installed_brew_version(formula)
+        if formula in toolchain and actual != toolchain[formula]:
+            die(
+                f"homebrew formula {formula} version is {actual}, want {toolchain[formula]} "
+                "(pinned in gpurenderer/third_party.lock)"
+            )
         lines.append(f"BUILD_TOOL {ver_line}")
     return lines
 
@@ -971,13 +1030,14 @@ def main(argv: list[str]) -> int:
         if args.source == "pinned":
             if args.cache is None or args.tag is None:
                 die("--verify-cache-only requires --cache and --tag when --source is pinned")
-            _, bottles = parse_lock(args.lock, args.tag, "pinned")
+            _, bottles, _ = parse_lock(args.lock, args.tag, "pinned")
             fetch_bottles(bottles, args.tag, args.cache / "bottles", offline=True)
             return 0
         if args.source == "mesa-source":
             if args.cache is None:
                 die("--verify-cache-only requires --cache when --source is mesa-source")
-            driver, _ = parse_lock(args.lock, None, "mesa-source")
+            driver, _, toolchain = parse_lock(args.lock, None, "mesa-source")
+            verify_mesa_source_toolchain(toolchain)
             fetch_mesa_source(driver, args.cache, offline=True)
             return 0
         die("--verify-cache-only requires --source pinned or mesa-source")
@@ -998,7 +1058,7 @@ def main(argv: list[str]) -> int:
         if args.cache is None:
             die("--cache is required when --source is mesa-source")
 
-    driver, bottles = parse_lock(args.lock, args.tag, args.source)
+    driver, bottles, toolchain = parse_lock(args.lock, args.tag, args.source)
 
     if args.source == "pinned":
         assert args.cache is not None and args.tag is not None
@@ -1017,6 +1077,7 @@ def main(argv: list[str]) -> int:
         )
     elif args.source == "mesa-source":
         assert args.cache is not None
+        verify_mesa_source_toolchain(toolchain)
         patches, patch_digest = collect_mesa_patches(args.patches_dir)
         archive, redownloaded = fetch_mesa_source(driver, args.cache, args.offline)
         src_dir = extract_mesa_source(
@@ -1027,9 +1088,9 @@ def main(argv: list[str]) -> int:
             patches,
             patch_digest,
         )
-        built_dylib = build_mesa_source(driver, src_dir, args.cache, redownloaded, args.jobs, patch_digest)
+        built_dylib = build_mesa_source(driver, src_dir, args.cache, redownloaded, args.jobs, patch_digest, toolchain)
         staged, dep_kegs, dep_versions = compute_mesa_source_closure(driver, built_dylib)
-        build_tools = collect_build_tool_versions()
+        build_tools = collect_build_tool_versions(toolchain)
         stage_and_check(
             staged,
             bottles,

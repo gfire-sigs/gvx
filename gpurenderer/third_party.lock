@@ -15,6 +15,10 @@ DRIVER_SOURCE_VERSION=26.3.0
 DRIVER_SOURCE_URL=https://archive.mesa3d.org/mesa-26.3.0.tar.xz
 DRIVER_SOURCE_SHA256=91d729aa68bb89e4ec857841300bbe922bcb3e52b1f97566ca83930d3b28343a
 DRIVER_SOURCE_PYTHON_REQUIREMENTS=packaging==26.3
+TOOLCHAIN.llvm.version=23.1.6
+TOOLCHAIN.libclc.version=23.1.6
+TOOLCHAIN.spirv-llvm-translator.version=23.1.3
+TOOLCHAIN.spirv-tools.version=1.4.363.0
 BOTTLE.mesa.version=26.3.0
 BOTTLE.mesa.arm64_golden_gate=50f68aeab7a2cb37e07bac0ba1227d27bcd156d6c52966d7f8e16fc2933517ee
 BOTTLE.mesa.arm64_tahoe=f774ca38347701f9861c1a080e3002b46fc4bbc937d2df73c066f3b68f31c72c

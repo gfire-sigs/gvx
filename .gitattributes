@@ -2,3 +2,5 @@
 # carriage return breaks them there. Keep LF line endings on every host.
 *.sh text eol=lf
 gpurenderer/gvx_gpu_protocol.h text eol=lf
+gpurenderer/licenses/*.txt text eol=lf
+gpurenderer/third_party.lock text eol=lf
