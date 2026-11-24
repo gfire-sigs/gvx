@@ -27,11 +27,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"z.gfire.dev/gvx/internal/testimage"
 	"z.gfire.dev/gvx/pkg/gvx/control"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 )
 
 const volumeCapGuestSource = `package main
@@ -53,7 +55,7 @@ func main() {
 	out("READY")
 	scanner := bufio.NewScanner(os.Stdin)
 	var held *os.File
-	chunk := make([]byte, 1<<20)
+	chunk := make([]byte, 4<<20)
 	for i := range chunk {
 		chunk[i] = byte(i)
 	}
@@ -158,10 +160,13 @@ func main() {
 				continue
 			}
 			var wErr error
-			for range mib {
-				if _, wErr = f.Write(chunk); wErr != nil {
+			remaining := mib << 20
+			for remaining > 0 {
+				step := min(remaining, len(chunk))
+				if _, wErr = f.Write(chunk[:step]); wErr != nil {
 					break
 				}
+				remaining -= step
 			}
 			if wErr == nil {
 				wErr = f.Sync()
@@ -205,35 +210,59 @@ func main() {
 }
 `
 
+var (
+	volcapBuildOnce sync.Once
+	volcapELFBytes  []byte
+	volcapLayerTar  []byte
+	volcapBuildErr  error
+)
+
 func buildVolumeCapGuestLayer(t *testing.T) ([]byte, []byte) {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module volcap\n\ngo 1.24\n"), 0o600); err != nil {
-		t.Fatal(err)
+	volcapBuildOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "gvx-volcap-build-*")
+		if err != nil {
+			volcapBuildErr = err
+			return
+		}
+		defer os.RemoveAll(dir)
+		if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module volcap\n\ngo 1.24\n"), 0o600); err != nil {
+			volcapBuildErr = err
+			return
+		}
+		if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(volumeCapGuestSource), 0o600); err != nil {
+			volcapBuildErr = err
+			return
+		}
+		outPath := filepath.Join(dir, "volcap")
+		cmd := exec.Command("go", "build", "-ldflags=-linkmode=internal", "-o", outPath, ".")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			volcapBuildErr = errors.New(err.Error() + "\n" + string(out))
+			return
+		}
+		elfBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			volcapBuildErr = err
+			return
+		}
+		layer, err := testimage.Tar(
+			testimage.File{Name: "bin/volcap", Data: elfBytes, Mode: 0o755},
+			testimage.File{Name: "mnt/", Type: tar.TypeDir, Mode: 0o755},
+			testimage.File{Name: "scratch/", Type: tar.TypeDir, Mode: 0o755},
+		)
+		if err != nil {
+			volcapBuildErr = err
+			return
+		}
+		volcapELFBytes = elfBytes
+		volcapLayerTar = layer
+	})
+	if volcapBuildErr != nil {
+		t.Fatalf("buildVolumeCapGuestLayer: %v", volcapBuildErr)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(volumeCapGuestSource), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	outPath := filepath.Join(dir, "volcap")
-	cmd := exec.Command("go", "build", "-ldflags=-linkmode=internal", "-o", outPath, ".")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build volcap guest ELF: %v\n%s", err, out)
-	}
-	elfBytes, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	layer, err := testimage.Tar(
-		testimage.File{Name: "bin/volcap", Data: elfBytes, Mode: 0o755},
-		testimage.File{Name: "mnt/", Type: tar.TypeDir, Mode: 0o755},
-		testimage.File{Name: "scratch/", Type: tar.TypeDir, Mode: 0o755},
-	)
-	if err != nil {
-		t.Fatalf("testimage.Tar: %v", err)
-	}
-	return elfBytes, layer
+	return volcapELFBytes, volcapLayerTar
 }
 
 func copyCheckpointBundleDir(t *testing.T, srcDir string) string {
@@ -414,41 +443,35 @@ func TestMountValidationLegacyHostfsSharedROAndOversizedImage(t *testing.T) {
 		})
 	}
 
-	// Grow an existing ext4lite image to 32 MiB and verify opening with a 16 MiB cap
-	// fails with ErrInvalidConfig without truncating the image.
-	requireCheckpointGuestBackend(t)
-	_, layer := buildVolumeCapGuestLayer(t)
+	// Format an ext4lite image extended to 32 MiB and verify opening with a 16 MiB
+	// cap fails with ErrInvalidConfig without truncating the image.
 	oversizedImg := filepath.Join(t.TempDir(), "oversized.ext4")
-
-	growCfg := newCheckpointTestConfig(t, cacheDir)
-	growCfg.OCILayerTars = [][]byte{layer}
-	growCfg.Mounts = []Mount{{Kind: MountVolume, ImagePath: oversizedImg, GuestPath: "/mnt"}}
-	growCfg.Argv = []string{"/bin/volcap"}
-	growCfg.Envv = []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"}
-	growCfg.Stdin = strings.NewReader("fill /mnt/big.bin 14\nquit\n")
-	var growOut bytes.Buffer
-	growCfg.Stdout = &growOut
-	growCfg.Stderr = io.Discard
-	growSB, err := New(context.Background(), growCfg)
+	ovF, err := os.OpenFile(oversizedImg, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		t.Fatalf("New(grow): %v", err)
+		t.Fatal(err)
 	}
-	code, runErr := growSB.Run(context.Background())
-	closeErr := growSB.Close()
-	if runErr != nil || closeErr != nil || code != 0 || !strings.Contains(growOut.String(), "FILLED\n") {
-		t.Fatalf("grow sandbox = (code=%d, runErr=%v, closeErr=%v, out=%q)", code, runErr, closeErr, growOut.String())
+	ovVol, err := ext4lite.OpenVolume(ovF, ext4lite.VolumeOptions{})
+	if err != nil {
+		t.Fatalf("ext4lite.OpenVolume(oversized seed): %v", err)
 	}
-	stBefore, err := os.Stat(oversizedImg)
-	if err != nil || stBefore.Size() != 32<<20 {
-		t.Fatalf("oversized.ext4 size before rejected open = (%v, %v), want 32 MiB", stBefore, err)
+	if err := ovVol.Close(); err != nil {
+		t.Fatalf("ovVol.Close: %v", err)
+	}
+	if err := os.Truncate(oversizedImg, 32<<20); err != nil {
+		t.Fatalf("Truncate(oversized.ext4, 32 MiB): %v", err)
 	}
 
-	rejectCfg := newCheckpointTestConfig(t, cacheDir)
-	rejectCfg.OCILayerTars = [][]byte{layer}
-	rejectCfg.Mounts = []Mount{{Kind: MountVolume, ImagePath: oversizedImg, GuestPath: "/mnt", SizeBytes: 16 << 20}}
-	rejectCfg.Argv = []string{"/bin/volcap"}
-	if _, err := New(context.Background(), rejectCfg); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("New(16 MiB cap on 32 MiB image) = %v, want ErrInvalidConfig", err)
+	rejectCfg := Config{
+		OCICacheDir: cacheDir,
+		Mounts:      []Mount{{Kind: MountVolume, ImagePath: oversizedImg, GuestPath: "/mnt", SizeBytes: 16 << 20}},
+	}
+	if err := rejectCfg.normalize(); err != nil {
+		t.Fatalf("rejectCfg.normalize(): %v", err)
+	}
+	sbReject := NewSandboxForMountTest(rejectCfg)
+	if err := OpenMountsForTest(sbReject); !errors.Is(err, ErrInvalidConfig) {
+		_ = CloseMountsForTest(sbReject)
+		t.Fatalf("OpenMountsForTest(16 MiB cap on 32 MiB image) = %v, want ErrInvalidConfig", err)
 	}
 	stAfter, err := os.Stat(oversizedImg)
 	if err != nil || stAfter.Size() != 32<<20 {
@@ -761,10 +784,13 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 		t.Fatalf("Restore(uncapped v2 with new SizeBytes) = %v, want ErrCheckpointManifest", err)
 	}
 
-	// 2. Verify lazy-detach guard on an isolated sandbox: while a detached capped
-	// volume still has an open guest descriptor, both Checkpoint and CheckpointStream
-	// fail before truncating existing checkpoint files.
+	// 2. Verify in-guest clean umount pruning and lazy-detach guard on one sandbox:
+	// - clean in-guest umount(2) prunes /mnt/umount from manifest.json;
+	// - while a detached capped volume (/mnt/cap) still has an open guest descriptor,
+	//   both Checkpoint and CheckpointStream fail before truncating checkpoint files;
+	// - once that open descriptor closes, Checkpoint succeeds and falls back to v1.
 	volDetach := filepath.Join(t.TempDir(), "detach.ext4")
+	volUmount := filepath.Join(t.TempDir(), "umount.ext4")
 	ckptDetach := t.TempDir()
 	rsDet := startControlTestSandbox(t, Config{
 		OCILayerTars:  [][]byte{layer},
@@ -772,6 +798,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 		CheckpointDir: ckptDetach,
 		Mounts: []Mount{
 			{Kind: MountVolume, ImagePath: volDetach, GuestPath: "/mnt/cap", SizeBytes: 32 << 20},
+			{Kind: MountVolume, ImagePath: volUmount, GuestPath: "/mnt/umount", SizeBytes: 16 << 20},
 		},
 		Argv: []string{"/bin/volcap"},
 		Envv: []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
@@ -781,12 +808,17 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
-	if _, err := io.WriteString(rsDet.stdinW, "create /mnt/cap/data.txt detach-test\nopen /mnt/cap/data.txt\n"); err != nil {
+	if _, err := io.WriteString(rsDet.stdinW, "umount /mnt/umount\ncreate /mnt/cap/data.txt detach-test\nopen /mnt/cap/data.txt\n"); err != nil {
 		t.Fatal(err)
 	}
+	rsDet.stdout.waitForSubstring(t, "UMOUNTED\n", 15*time.Second)
 	rsDet.stdout.waitForSubstring(t, "OPENED:detach-test\n", 15*time.Second)
 	if err := rsDet.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
 		t.Fatalf("baseline Checkpoint before detach: %v", err)
+	}
+	manBeforeDetach, err := readAndParseManifest(ckptDetach)
+	if err != nil || manBeforeDetach.Version != checkpointManifestVolumeLimitVersion || len(manBeforeDetach.Mounts) != 1 || manBeforeDetach.Mounts[0].GuestPath != "/mnt/cap" {
+		t.Fatalf("manifest after in-guest umount of /mnt/umount = (%+v, %v), want v3 with /mnt/cap only", manBeforeDetach, err)
 	}
 	stateInfoBefore, err := os.Stat(filepath.Join(ckptDetach, checkpointStateFileName))
 	if err != nil || stateInfoBefore.Size() == 0 {
@@ -808,9 +840,19 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	if err != nil || stateInfoAfter.Size() != stateInfoBefore.Size() {
 		t.Fatalf("failed detached Checkpoint mutated state.img size: got %v, want %d", stateInfoAfter, stateInfoBefore.Size())
 	}
-	_, _ = io.WriteString(rsDet.stdinW, "quit\n")
+	if _, err := io.WriteString(rsDet.stdinW, "close\n"); err != nil {
+		t.Fatal(err)
+	}
+	rsDet.stdout.waitForSubstring(t, "CLOSED\n", 15*time.Second)
+	if err := rsDet.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
+		t.Fatalf("Checkpoint after closing last descriptor on detached capped volume: %v", err)
+	}
 	<-rsDet.runDone
 	_ = rsDet.sb.Close()
+	manAllUnmounted, err := readAndParseManifest(ckptDetach)
+	if err != nil || manAllUnmounted.Version != CheckpointManifestVersion || len(manAllUnmounted.Mounts) != 0 {
+		t.Fatalf("manifest after all capped volumes unmounted = (%+v, %v), want v1 with 0 mounts", manAllUnmounted, err)
+	}
 
 	// 2b. Save a clean stop checkpoint (Manifest v3) of a capped persistent volume for Restore.
 	volCap := filepath.Join(t.TempDir(), "capped.ext4")
@@ -1146,34 +1188,5 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	manAfterRemove, err := readAndParseManifest(ckptAfterRemove)
 	if err != nil || manAfterRemove.Version != checkpointManifestVolumeLimitVersion || len(manAfterRemove.Mounts) != 1 || manAfterRemove.Mounts[0].GuestPath != "/mnt/ro1" {
 		t.Fatalf("manifest after secondary RO mount removal = (%+v, %v), want v3 with /mnt/ro1 only", manAfterRemove, err)
-	}
-
-	// 7. In-guest clean umount(2) of a capped volume prunes the stale mount entry
-	// instead of writing a phantom v3 volume_limit entry.
-	volUmount := filepath.Join(t.TempDir(), "umount.ext4")
-	ckptUmount := t.TempDir()
-	rsUmount := startControlTestSandbox(t, Config{
-		OCILayerTars:  [][]byte{layer},
-		OCICacheDir:   cacheDir,
-		CheckpointDir: ckptUmount,
-		Mounts: []Mount{
-			{Kind: MountVolume, ImagePath: volUmount, GuestPath: "/mnt/cap", SizeBytes: 16 << 20},
-		},
-		Argv: []string{"/bin/volcap"},
-		Envv: []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
-	})
-	rsUmount.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
-	if _, err := io.WriteString(rsUmount.stdinW, "umount /mnt/cap\n"); err != nil {
-		t.Fatal(err)
-	}
-	rsUmount.stdout.waitForSubstring(t, "UMOUNTED\n", 15*time.Second)
-	if err := rsUmount.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
-		t.Fatalf("Checkpoint after in-guest umount: %v", err)
-	}
-	<-rsUmount.runDone
-	_ = rsUmount.sb.Close()
-	manUmount, err := readAndParseManifest(ckptUmount)
-	if err != nil || manUmount.Version != CheckpointManifestVersion || len(manUmount.Mounts) != 0 {
-		t.Fatalf("manifest after in-guest umount = (%+v, %v), want v1 with 0 mounts", manUmount, err)
 	}
 }
