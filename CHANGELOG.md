@@ -2,6 +2,21 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.22.10002026111600] - 2026-11-24
+
+This release adds `size` and `ephemeral` options to `--mount type=volume` for `ext4lite` volumes (#247, #256). It also aligns Windows regular file modes in `hostfs` and `rungv mount serve` with Docker Desktop (#249, #251).
+
+### Features
+
+- **Per-mount `size` limits and `ephemeral` scratch volumes (`pkg/sentry/fsimpl/ext4lite`, `pkg/gvx`, `cmd/rungv`)** (#247, #256):
+  - `--mount type=volume` now accepts `size=SIZE` (`16m` to `64t` in `16 MiB` multiples) to cap `ext4lite` block, inode, `fallocate`, mapped write-back, and `statfs` capacity. `OpenVolume` refuses oversized host files, superblocks, and committed journal records before recovery writes.
+  - `--mount type=volume` now accepts bare `ephemeral` without `src` or `readonly` to create a private scratch image in `ephemeral-volumes/` before host lockdown. Linux uses `O_TMPFILE` with a locked staging fallback, macOS uses locked create-and-unlink, and Windows uses `FILE_FLAG_DELETE_ON_CLOSE`. Named volume commands ignore `ephemeral-volumes/`, and ephemeral sandboxes reject `-checkpoint-dir`, `Checkpoint`, and `CheckpointStream` with `ErrCheckpointEphemeralVolume` (`UNSUPPORTED`).
+  - Checkpoints with capped persistent `ext4lite` volumes now emit manifest version `3` with `volume_limit`, `backing_read_only`, and explicit `nat_policy_required`. `gvx.Restore` and `rungv restore` inherit omitted `size` limits from the bundle and reject detached live capped mounts before truncating output.
+
+### Bug Fixes
+
+- **Executable default mode for unrecorded Windows host files (`pkg/sentry/fsimpl/hostfs`, `cmd/rungv`)** (#249, #251): Unrecorded regular files on Windows `hostfs` mounts and `rungv mount serve` now report mode `0755` (`0555` when `FILE_ATTRIBUTE_READONLY` is set) instead of `0644`. Read-only single-file and directory bind mounts on Windows can now execute guest binaries directly, matching Docker Desktop while keeping `.gvx_meta` modes authoritative.
+
 ## [v0.21.10012026111600] - 2026-11-24
 
 This release fixes a `systrap` stub initialization panic on Linux and Android hosts with 16 KB pages and kernel-sealed mappings (`EPERM` on `munmap` or `mseal`), and hardens stub region placement and `seccomp` notification probing during startup.
