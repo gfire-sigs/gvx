@@ -700,7 +700,18 @@ func stablePathIno(rel string) uint64 {
 }
 
 func osModeToLinuxMode(m os.FileMode) uint32 {
+	return osModeToLinuxModeForOS(runtime.GOOS, m)
+}
+
+func osModeToLinuxModeForOS(goos string, m os.FileMode) uint32 {
 	perm := uint32(m.Perm())
+	if goos == "windows" && m&os.ModeSymlink == 0 {
+		if perm&0o200 != 0 {
+			perm = 0o755
+		} else {
+			perm = 0o555
+		}
+	}
 	if m&os.ModeSetuid != 0 {
 		perm |= 0o4000
 	}

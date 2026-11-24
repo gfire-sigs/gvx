@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"z.gfire.dev/gvx/internal/lockdownprobe"
@@ -126,6 +127,66 @@ func TestE2EFileBindMountExposesOnlyTheFile(t *testing.T) {
 			}
 			if want := []string{"data.txt", "sibling.txt"}; !slices.Equal(names, want) {
 				t.Errorf("host directory entries = %v, want %v (no metadata file, no new file)", names, want)
+			}
+		})
+	}
+}
+
+// TestE2EReadOnlySingleFileBindMountExec verifies that an executable bound
+// read-only from the host as a single-file mount or inside a read-only
+// directory mount can run directly as the container entrypoint without chmod.
+func TestE2EReadOnlySingleFileBindMountExec(t *testing.T) {
+	rungvBin := toolPath(t, rungvPkg)
+	archive := buildCheckpointProbeOCIArchive(t)
+	smokeELF, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "gvx-smoke-ok\n")
+	if err != nil {
+		t.Fatalf("BuildGuestELF64 failed: %v", err)
+	}
+
+	hostDir := t.TempDir()
+	hostBin := filepath.Join(hostDir, "smoke.elf")
+	if err := os.WriteFile(hostBin, smokeELF, 0o755); err != nil {
+		t.Fatalf("write host executable: %v", err)
+	}
+
+	for _, b := range gateBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireBackend(t, b)
+			cacheDir := t.TempDir()
+
+			for _, tc := range []struct {
+				name       string
+				volumeSpec string
+				entrypoint string
+			}{
+				{
+					name:       "single_file_ro",
+					volumeSpec: hostBin + ":/guest-smoke:ro",
+					entrypoint: "/guest-smoke",
+				},
+				{
+					name:       "directory_ro",
+					volumeSpec: hostDir + ":/mnt-ro:ro",
+					entrypoint: "/mnt-ro/smoke.elf",
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					stdout, stderr, code := runTool(t, rungvBin,
+						"run",
+						"-platform="+string(b.plat),
+						"-net=none",
+						"-cache-dir="+cacheDir,
+						"-v="+tc.volumeSpec,
+						"--entrypoint="+tc.entrypoint,
+						archive,
+					)
+					if code != 0 {
+						t.Fatalf("rungv run (%s) = (code %d, stdout %q, stderr %q)", tc.name, code, stdout, stderr)
+					}
+					if strings.TrimSpace(stdout) != "gvx-smoke-ok" {
+						t.Fatalf("rungv run (%s) stdout = %q, want gvx-smoke-ok", tc.name, stdout)
+					}
+				})
 			}
 		})
 	}

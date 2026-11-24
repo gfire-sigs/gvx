@@ -484,7 +484,7 @@ func TestWindowsHostErrnoMapping(t *testing.T) {
 }
 
 func TestWindowsHostBasicOperations(t *testing.T) {
-	h, _ := winTestHost(t)
+	h, rootDir := winTestHost(t)
 
 	if h.caseInsensitive() {
 		t.Errorf("caseInsensitive() = true, want false")
@@ -528,11 +528,29 @@ func TestWindowsHostBasicOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lstat(d/f.txt) = %v", err)
 	}
-	if info.kind != hostKindRegular || info.size != 5 || info.blocks != 1 || info.nlink != 1 || info.perm != 0o644 {
-		t.Errorf("lstat(d/f.txt) = %+v, want regular size 5 blocks 1 nlink 1 perm 0644", info)
+	if info.kind != hostKindRegular || info.size != 5 || info.blocks != 1 || info.nlink != 1 || info.perm != 0o755 {
+		t.Errorf("lstat(d/f.txt) = %+v, want regular size 5 blocks 1 nlink 1 perm 0755", info)
 	}
 	if info.mtime.IsZero() || info.btime.IsZero() || info.ctime.IsZero() || info.atime.IsZero() {
 		t.Errorf("lstat(d/f.txt) times = %v %v %v %v, want all set", info.atime, info.mtime, info.ctime, info.btime)
+	}
+
+	hostFilePtr, err := windows.UTF16PtrFromString(filepath.Join(rootDir, "d", "f.txt"))
+	if err != nil {
+		t.Fatalf("UTF16PtrFromString(d/f.txt): %v", err)
+	}
+	if err := windows.SetFileAttributes(hostFilePtr, windows.FILE_ATTRIBUTE_READONLY); err != nil {
+		t.Fatalf("SetFileAttributes(READONLY): %v", err)
+	}
+	roInfo, roErr := h.lstat("d/f.txt")
+	if err := windows.SetFileAttributes(hostFilePtr, windows.FILE_ATTRIBUTE_NORMAL); err != nil {
+		t.Fatalf("SetFileAttributes(NORMAL): %v", err)
+	}
+	if roErr != nil {
+		t.Fatalf("lstat(d/f.txt) read-only = %v", roErr)
+	}
+	if roInfo.perm != 0o555 {
+		t.Errorf("lstat(d/f.txt) read-only perm = %04o, want 0555", roInfo.perm)
 	}
 
 	// O_TRUNC truncates the open handle, and it works through fstat.

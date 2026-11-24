@@ -583,18 +583,20 @@ func statHandle(handle windows.Handle) (hostInfo, error) {
 	if err != nil {
 		return hostInfo{}, err
 	}
+	// NTFS stores no POSIX execute bit. Unrecorded host entries default to 0755
+	// (0555 when read-only) like Docker Desktop; .gvx_meta overrides this mode
+	// for entries that the guest creates or updates with chmod.
 	info := hostInfo{
 		kind:  kind,
 		id:    hostID{dev: uint64(bhfi.VolumeSerialNumber), ino: uint64(bhfi.FileIndexHigh)<<32 | uint64(bhfi.FileIndexLow)},
 		nlink: bhfi.NumberOfLinks,
-		perm:  0o644,
+		perm:  0o755,
 		atime: filetimeToTime(uint64(bhfi.LastAccessTime.HighDateTime)<<32 | uint64(bhfi.LastAccessTime.LowDateTime)),
 		mtime: filetimeToTime(uint64(bhfi.LastWriteTime.HighDateTime)<<32 | uint64(bhfi.LastWriteTime.LowDateTime)),
 		ctime: filetimeToTime(uint64(basic.ChangeTime)),
 		btime: filetimeToTime(uint64(bhfi.CreationTime.HighDateTime)<<32 | uint64(bhfi.CreationTime.LowDateTime)),
 	}
 	if kind == hostKindDir {
-		info.perm = 0o755
 		// Callers add the "." and ".." links themselves.
 		if info.nlink == 0 {
 			info.nlink = 1

@@ -256,7 +256,7 @@ A source without a path separator and without an absolute path names a volume. W
 
 A bind mount can target a single regular file, such as `-v /host/app.conf:/etc/app.conf:ro` (sockets, devices, and pipes are refused). The guest sees only that file; the host parent directory and sibling files remain inaccessible. The sandbox creates an empty `0644` mount point file and any missing guest parent directories. `-workspace` accepts directories only.
 
-Single-file mounts write no `.gvx_meta` file. Mode, owner, and xattr changes stay in memory for the run, while timestamp updates reach the host file. Guest `unlink` or `rename` on the mount point returns `EBUSY` (as in Docker), and `link` returns `EXDEV`.
+Single-file mounts write no `.gvx_meta` file. Mode, owner, and xattr changes stay in memory for the run, while timestamp updates reach the host file. On Windows, unrecorded host files default to mode `0755` (`0555` when read-only), matching Docker Desktop so read-only bind-mounted executables run without `chmod`. Guest `unlink` or `rename` on the mount point returns `EBUSY` (as in Docker), and `link` returns `EXDEV`.
 
 On macOS, on Windows, and with `-lockdown=false`, an atomic host rename replaces the mounted file for future guest opens. On Windows, the pre-lockdown `winMountBroker` pins the parent directory handle and authorizes opens for the exact leaf filename without modifying any NTFS ACL or integrity label. On Linux under Landlock, the ruleset binds the original file descriptor, so atomic host replacement requires a directory mount or `-lockdown=false`. Open file descriptors always keep reading the old file.
 
