@@ -424,6 +424,7 @@ func TestMountValidationLegacyHostfsSharedROAndOversizedImage(t *testing.T) {
 	growCfg.OCILayerTars = [][]byte{layer}
 	growCfg.Mounts = []Mount{{Kind: MountVolume, ImagePath: oversizedImg, GuestPath: "/mnt"}}
 	growCfg.Argv = []string{"/bin/volcap"}
+	growCfg.Envv = []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"}
 	growCfg.Stdin = strings.NewReader("fill /mnt/big.bin 14\nquit\n")
 	var growOut bytes.Buffer
 	growCfg.Stdout = &growOut
@@ -488,6 +489,7 @@ func TestEphemeralVolumeLifecycleIsolationAndOrphanCleanup(t *testing.T) {
 		{Kind: MountVolume, GuestPath: "/scratch", Ephemeral: true, SizeBytes: 32 << 20},
 	}
 	cfg.Argv = []string{"/bin/volcap"}
+	cfg.Envv = []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"}
 	cfg.Stdin = strings.NewReader("statfs /scratch\ncreate /scratch/note.txt ephemeral-ok\nfill /scratch/full.bin 40\nquit\n")
 	cfg.Stdout = &outBuf
 	cfg.Stderr = io.Discard
@@ -613,6 +615,7 @@ func TestEphemeralVolumeRejectsCheckpointWithoutMutatingStateOrOutput(t *testing
 		OCICacheDir:  cacheDir,
 		Mounts:       []Mount{{Kind: MountVolume, GuestPath: "/scratch", Ephemeral: true, SizeBytes: 16 << 20}},
 		Argv:         []string{"/bin/volcap"},
+		Envv:         []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
 	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 
@@ -621,6 +624,7 @@ func TestEphemeralVolumeRejectsCheckpointWithoutMutatingStateOrOutput(t *testing
 
 	execStream, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
 		Argv:  []string{"/bin/volcap"},
+		Env:   []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 		Stdin: true,
 	})
 	if err != nil {
@@ -726,6 +730,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 		NetworkMode:   NetModeNAT,
 		NetworkPolicy: &natPol,
 		Argv:          []string{"/bin/volcap"},
+		Envv:          []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
 	rsV2.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 	if err := rsV2.sb.Checkpoint(context.Background(), CheckpointOptions{LeaveRunning: false}); err != nil {
@@ -1103,6 +1108,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 			{Kind: MountVolume, ImagePath: volCap, GuestPath: "/mnt/ro2", ReadOnly: true, SizeBytes: 32 << 20},
 		},
 		Argv: []string{"/bin/volcap"},
+		Envv: []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
 	rsShared.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 	if err := rsShared.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
@@ -1154,6 +1160,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 			{Kind: MountVolume, ImagePath: volUmount, GuestPath: "/mnt/cap", SizeBytes: 16 << 20},
 		},
 		Argv: []string{"/bin/volcap"},
+		Envv: []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
 	rsUmount.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 	if _, err := io.WriteString(rsUmount.stdinW, "umount /mnt/cap\n"); err != nil {
