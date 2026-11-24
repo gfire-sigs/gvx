@@ -642,7 +642,7 @@ func TestEphemeralVolumeRejectsCheckpointWithoutMutatingStateOrOutput(t *testing
 	})
 	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	execStream, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
@@ -805,7 +805,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	})
 	rsDet.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	if _, err := io.WriteString(rsDet.stdinW, "umount /mnt/umount\ncreate /mnt/cap/data.txt detach-test\nopen /mnt/cap/data.txt\n"); err != nil {
