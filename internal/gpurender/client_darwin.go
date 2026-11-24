@@ -56,6 +56,8 @@ type Client struct {
 	mu            sync.Mutex
 	nextSeq       uint32             // guarded by mu
 	pending       map[uint32]*call   // guarded by mu; nil after loss
+	head, tail    *call              // guarded by mu; FIFO order of pending calls
+	headSince     time.Time          // guarded by mu; when the previous head reply promoted c.head
 	lost          error              // guarded by mu; set once
 	sink          gpuproto.EventSink // guarded by mu
 	lostDelivered bool               // guarded by mu: the reader finished with no sink, or called RendererLost
@@ -72,7 +74,10 @@ type call struct {
 	blob             gpuproto.BlobCreate     // for BLOB_CREATE validation and undo
 	res              gpuproto.ResourceCreate // for RES_CREATE validation and undo
 	timeout          time.Duration
-	deadline         time.Time
+	seq              uint32      // guarded by Client.mu; assigned by register
+	writtenAt        time.Time   // guarded by Client.mu; zero until frame write finishes
+	deadline         time.Time   // guarded by Client.mu; non-zero only for the written FIFO head
+	prev, next       *call       // guarded by Client.mu; intrusive FIFO queue links
 	done             chan result // nil for fire-and-forget; else capacity 1
 	abandoned        bool        // guarded by Client.mu; the caller left after cancellation
 }
@@ -544,9 +549,79 @@ func (c *Client) register(cl *call) (uint32, error) {
 			break
 		}
 	}
-	cl.deadline = time.Now().Add(cl.timeout)
+	cl.seq = seq
+	cl.writtenAt = time.Time{}
+	cl.deadline = time.Time{}
 	c.pending[seq] = cl
+	c.enqueueLocked(cl)
 	return seq, nil
+}
+
+// enqueueLocked appends cl to the FIFO queue while the caller holds c.mu.
+func (c *Client) enqueueLocked(cl *call) {
+	cl.prev = c.tail
+	cl.next = nil
+	if c.tail != nil {
+		c.tail.next = cl
+	} else {
+		c.head = cl
+		c.headSince = time.Time{}
+	}
+	c.tail = cl
+}
+
+// dequeueLocked unlinks cl from the FIFO queue while the caller holds c.mu.
+func (c *Client) dequeueLocked(cl *call) {
+	if cl.prev != nil {
+		cl.prev.next = cl.next
+	} else if c.head == cl {
+		c.head = cl.next
+	}
+	if cl.next != nil {
+		cl.next.prev = cl.prev
+	} else if c.tail == cl {
+		c.tail = cl.prev
+	}
+	cl.prev = nil
+	cl.next = nil
+}
+
+// armHeadDeadlineLocked sets the FIFO head deadline from max(writtenAt, headSince).
+// Callers hold c.mu with cl equal to c.head and a non-zero writtenAt.
+func (c *Client) armHeadDeadlineLocked(cl *call) {
+	start := cl.writtenAt
+	if c.headSince.After(start) {
+		start = c.headSince
+	}
+	cl.deadline = start.Add(cl.timeout)
+}
+
+// advanceHeadLocked promotes the next FIFO entry after a head reply arrives at now.
+// The caller holds c.mu.
+func (c *Client) advanceHeadLocked(now time.Time) {
+	if c.head == nil {
+		c.headSince = time.Time{}
+		return
+	}
+	c.headSince = now
+	if !c.head.writtenAt.IsZero() {
+		c.armHeadDeadlineLocked(c.head)
+	}
+}
+
+// markWritten records the frame write completion time and arms the deadline
+// when cl is the FIFO head. Callers hold writeSem across register,
+// writeFrameLocked, and markWritten so the queue matches wire order.
+func (c *Client) markWritten(cl *call) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lost != nil || c.pending[cl.seq] != cl {
+		return
+	}
+	cl.writtenAt = time.Now()
+	if c.head == cl {
+		c.armHeadDeadlineLocked(cl)
+	}
 }
 
 func buildFrame(op gpuproto.Op, seq, ctxID uint32, fixedPayload, tail []byte) net.Buffers {
@@ -566,9 +641,9 @@ func buildFrame(op gpuproto.Op, seq, ctxID uint32, fixedPayload, tail []byte) ne
 	return net.Buffers{head}
 }
 
-// roundTrip acquires writeSem, registers a call, writes its frame, and waits
-// for its reply or for ctx. Acquiring writeSem before register prevents
-// unwritten calls from entering c.pending and sends frames in sequence order.
+// roundTrip acquires writeSem, registers a call, writes its frame, records the
+// write completion time, and waits for its reply or for ctx. Holding writeSem
+// across register, write, and markWritten keeps c.head..c.tail in wire order.
 func (c *Client) roundTrip(ctx context.Context, cl *call, fixedPayload, tail []byte) (result, error) {
 	if err := c.acquireWriteSem(ctx); err != nil {
 		if ctx != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
@@ -583,6 +658,9 @@ func (c *Client) roundTrip(ctx context.Context, cl *call, fixedPayload, tail []b
 	}
 	frame := buildFrame(cl.op, seq, cl.ctxID, fixedPayload, tail)
 	err = c.writeFrameLocked(cl.op, frame, cl.timeout)
+	if err == nil {
+		c.markWritten(cl)
+	}
 	<-c.writeSem
 	if err != nil {
 		return result{}, err
@@ -604,7 +682,8 @@ func (c *Client) roundTrip(ctx context.Context, cl *call, fixedPayload, tail []b
 	}
 }
 
-// send acquires writeSem, registers a fire-and-forget call, and writes its frame.
+// send acquires writeSem, registers a fire-and-forget call, writes its frame,
+// and records its write completion time before releasing writeSem.
 func (c *Client) send(cl *call, fixedPayload, tail []byte) error {
 	if err := c.acquireWriteSem(nil); err != nil {
 		return err
@@ -615,7 +694,11 @@ func (c *Client) send(cl *call, fixedPayload, tail []byte) error {
 		return err
 	}
 	frame := buildFrame(cl.op, seq, cl.ctxID, fixedPayload, tail)
-	return c.writeFrameLocked(cl.op, frame, cl.timeout)
+	err = c.writeFrameLocked(cl.op, frame, cl.timeout)
+	if err == nil {
+		c.markWritten(cl)
+	}
+	return err
 }
 
 // lose marks the client lost with cause, closes the socket, fails every
@@ -631,6 +714,9 @@ func (c *Client) lose(cause error, kill bool) {
 	c.lost = lostErr
 	pend := c.pending
 	c.pending = nil
+	c.head = nil
+	c.tail = nil
+	c.headSince = time.Time{}
 	c.mu.Unlock()
 
 	// Deliver lost results to all pending callers before closing c.failed so
@@ -648,8 +734,9 @@ func (c *Client) lose(cause error, kill bool) {
 	_ = c.conn.Close()
 }
 
-// deadlineLoop checks pending calls every deadlineTick and loses the renderer
-// when one is past its deadline. It ends when c.done closes.
+// deadlineLoop inspects the FIFO head every deadlineTick and loses the
+// renderer when that head exceeds its budget. Queued calls behind the head do
+// not expire until earlier replies arrive. It exits when c.done closes.
 func (c *Client) deadlineLoop() {
 	defer c.wg.Done()
 	ticker := time.NewTicker(deadlineTick)
@@ -666,14 +753,11 @@ func (c *Client) deadlineLoop() {
 				expTO   time.Duration
 			)
 			c.mu.Lock()
-			for seq, cl := range c.pending {
-				if now.After(cl.deadline) {
-					expired = true
-					expSeq = seq
-					expOp = cl.op
-					expTO = cl.timeout
-					break
-				}
+			if cl := c.head; cl != nil && !cl.deadline.IsZero() && now.After(cl.deadline) {
+				expired = true
+				expSeq = cl.seq
+				expOp = cl.op
+				expTO = cl.timeout
 			}
 			c.mu.Unlock()
 			if expired {
@@ -881,6 +965,11 @@ func (c *Client) dispatchReply(hdr gpuproto.Header, payload []byte, shm *fd.Host
 		return false
 	}
 	delete(c.pending, hdr.Seq)
+	wasHead := c.head == cl
+	c.dequeueLocked(cl)
+	if wasHead {
+		c.advanceHeadLocked(time.Now())
+	}
 	abandoned := cl.abandoned
 	sink := c.sink
 	c.mu.Unlock()
