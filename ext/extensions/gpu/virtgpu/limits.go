@@ -31,7 +31,8 @@ type Limits struct {
 	// BlobBytes bounds the host bytes of all live blobs of the sandbox.
 	BlobBytes uint64
 	// SubmitBytes bounds the total bytes of copied EXECBUFFER and
-	// RESOURCE_CREATE_BLOB command buffers in flight on one device.
+	// RESOURCE_CREATE_BLOB command buffers in flight on one device. It also
+	// counts the BO handle arrays of EXECBUFFER.
 	// Tests set a short value.
 	SubmitBytes uint64
 	// FenceTimeout bounds how long a fence can stay pending before the device

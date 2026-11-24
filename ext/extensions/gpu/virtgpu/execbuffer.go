@@ -32,6 +32,11 @@ const (
 	// maxBoHandles bounds the guest BO handle array copy in EXECBUFFER (D-6b.4).
 	maxBoHandles = 65536
 
+	// boHandleBudgetBytes is the Sentry heap that one BO handle of an
+	// EXECBUFFER holds until submit returns: the copied 4-byte handle and the
+	// 8-byte object pointer.
+	boHandleBudgetBytes = 4 + 8
+
 	execbufFlagsKnown = virtgpuExecbufFenceFDIn | virtgpuExecbufFenceFDOut | virtgpuExecbufRingIdx
 )
 
@@ -133,6 +138,16 @@ func (fd *renderFD) execbuffer(ctx context.Context, uio usermem.IO, arg []byte) 
 	if req.NumBoHandles > maxBoHandles {
 		return linuxerr.EINVAL
 	}
+
+	// Reserve the command buffer and the handle arrays before the first
+	// allocation. A thread that waits behind a slow submit then holds no
+	// unaccounted copy, also when req.Size is 0.
+	budgetBytes := uint64(req.Size) + uint64(req.NumBoHandles)*boHandleBudgetBytes
+	if err := fd.dev.submitBudget.acquire(ctx, budgetBytes); err != nil {
+		return err
+	}
+	defer fd.dev.submitBudget.release(budgetBytes)
+
 	var objs []*gemObject
 	if req.NumBoHandles > 0 {
 		raw := make([]byte, int(req.NumBoHandles)*4)
@@ -175,12 +190,6 @@ func (fd *renderFD) execbuffer(ctx context.Context, uio usermem.IO, arg []byte) 
 
 	var cmd []byte
 	if req.Size > 0 {
-		cmdSize := uint64(req.Size)
-		if err := fd.dev.submitBudget.acquire(ctx, cmdSize); err != nil {
-			return err
-		}
-		defer fd.dev.submitBudget.release(cmdSize)
-
 		cmd = make([]byte, req.Size)
 		if _, err := uio.CopyIn(ctx, hostarch.Addr(req.Command), cmd, usermem.IOOpts{}); err != nil {
 			return linuxerr.EFAULT

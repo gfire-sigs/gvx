@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"z.gfire.dev/gvx/ext/extensions/gpu/gpuproto"
 	"z.gfire.dev/gvx/pkg/context"
@@ -700,5 +701,91 @@ func TestExecbufferSubmitByteBound(t *testing.T) {
 				t.Fatalf("first EXECBUFFER: %v", err)
 			}
 		})
+	})
+}
+
+// TestExecbufferHandleArrayByteBound verifies that an EXECBUFFER without a
+// command buffer still reserves its BO handle arrays, so threads that wait
+// behind one slow submit hold no copy. The waiters of the old code block on a
+// mutex, which synctest cannot observe, so the test uses real time.
+func TestExecbufferHandleArrayByteBound(t *testing.T) {
+	requireBlobHost(t)
+
+	const (
+		handles    = 64
+		workers    = 6
+		settle     = 300 * time.Millisecond
+		structAddr = hostarch.Addr(0x1000)
+		boAddr     = hostarch.Addr(0x2000)
+	)
+
+	t.Run("waiters behind one slow submit copy no handle array", func(t *testing.T) {
+		fake := newFakeVirglRenderer()
+		// Room for the handle arrays of one EXECBUFFER.
+		node := newTestNodeWithLimits(t, fake, Limits{SubmitBytes: handles * boHandleBudgetBytes})
+		fd := node.openVirgl(t)
+		defer fd.DecRef(node.ctx)
+
+		res := mustCreateResource(t, node, fd, virtgpuResourceCreate{Size: 4096})
+		raw := make([]byte, handles*4)
+		for i := range handles {
+			binary.LittleEndian.PutUint32(raw[i*4:], res.BoHandle)
+		}
+		fake.mu.Lock()
+		fake.submitGate = make(chan struct{})
+		fake.submitEntered = make(chan struct{}, 1)
+		fake.mu.Unlock()
+
+		var copied atomic.Int64
+		errCh := make(chan error, workers)
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mem := newGuestMem()
+				mem.writeBytes(boAddr, raw)
+				mem.put(t, structAddr, virtgpuExecbuffer{
+					BoHandles:    uint64(boAddr),
+					NumBoHandles: handles,
+				})
+				uio := &countingIO{IO: &mem.BytesIO, cmdAddr: boAddr, copied: &copied}
+				errCh <- ioctlWithIO(node.ctx, fd, cmdVirtgpuExecbuffer, uio, structAddr)
+			}()
+		}
+
+		<-fake.submitEntered
+		time.Sleep(settle)
+		got := copied.Load()
+		for range workers {
+			fake.submitGate <- struct{}{}
+		}
+		wg.Wait()
+		close(errCh)
+		if got != handles*4 {
+			t.Fatalf("in-flight copied handle bytes = %d, want %d", got, handles*4)
+		}
+		for err := range errCh {
+			if err != nil {
+				t.Fatalf("concurrent EXECBUFFER: %v", err)
+			}
+		}
+		node.dev.submitBudget.mu.Lock()
+		used := node.dev.submitBudget.used
+		node.dev.submitBudget.mu.Unlock()
+		if used != 0 {
+			t.Errorf("submit budget after all submits = %d bytes, want 0", used)
+		}
+	})
+
+	t.Run("handle arrays above the limit return ENOMEM", func(t *testing.T) {
+		node := newTestNodeWithLimits(t, newFakeVirglRenderer(), Limits{SubmitBytes: handles*boHandleBudgetBytes - 1})
+		fd := node.openVirgl(t)
+		defer fd.DecRef(node.ctx)
+		mem := newGuestMem()
+		mem.put(t, structAddr, virtgpuExecbuffer{BoHandles: uint64(boAddr), NumBoHandles: handles})
+		if err := node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr); !linuxerr.Equals(linuxerr.ENOMEM, err) {
+			t.Fatalf("EXECBUFFER above the submit budget: got %v, want ENOMEM", err)
+		}
 	})
 }
