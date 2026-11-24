@@ -65,6 +65,8 @@ func formatVolume(hf hostFile, now time.Time) error {
 	}
 	v := &volume{
 		hf:         hf,
+		maxGroups:  maxGroups,
+		maxBytes:   maxVolumeBytes,
 		now:        func() time.Time { return now },
 		nodes:      make(map[uint32]*node),
 		dirtyNodes: make(map[uint32]*node),

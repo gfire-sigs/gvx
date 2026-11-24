@@ -211,6 +211,9 @@ func (s *Sandbox) handleCheckpoint(ctx context.Context, stream *control.Stream, 
 	if err := decodeParams(raw, &req); err != nil {
 		return err
 	}
+	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return mapControlErr(err)
+	}
 	if err := s.validateCheckpointDir(req.Dir); err != nil {
 		return err
 	}

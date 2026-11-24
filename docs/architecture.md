@@ -659,7 +659,9 @@ Every attribute other than `system.data` lives in one xattr block for each inode
 
 #### Growth, Shrink, and Storage Tiers (Descriptive Module)
 
-The volume grows by one 16MiB group when no free block or inode remains. Three storage tiers allocate the host space for a new group without a sparse hole. Tier A calls `fallocate` on Linux and `fcntl(F_PREALLOCATE)` on macOS. Tier B sets `FileAllocationInfo` on Windows and never sets `FSCTL_SET_SPARSE`. Tier C calls `ftruncate` and grows the file as the allocator needs blocks. The probe at open selects the first tier that works, and a failed call moves the volume down one tier.
+The volume grows by one 16MiB group when no free block or inode remains. `VolumeOptions.MaxBytes` (`size=`) caps growth at a 16MiB multiple up to 64TiB, bounding `statfs` and returning `ENOSPC` above the cap. Passing `ephemeral` creates a private scratch image in `ephemeral-volumes/` before lockdown and forbids checkpointing for that sandbox run.
+
+Three storage tiers allocate the host space for a new group without a sparse hole. Tier A calls `fallocate` on Linux and `fcntl(F_PREALLOCATE)` on macOS. Tier B sets `FileAllocationInfo` on Windows and never sets `FSCTL_SET_SPARSE`. Tier C calls `ftruncate` and grows the file as the allocator needs blocks. The probe at open selects the first tier that works, and a failed call moves the volume down one tier.
 
 A freed block stays held until the next flush ends. Flush-capable operations return `errSpaceHeld`, flush once, and retry so sequential workloads reuse freed blocks before growing. If a concurrent writer claims those blocks before the retry, the retry appends a new group instead of failing with `ENOSPC`. Mapped page write-back cannot flush while holding cache locks, so it grows under held space and returns `errSpaceHeld` only if growth fails. When an automatic hole punch is active, allocations wait for the punch to finish before attempting group growth.
 
@@ -1018,7 +1020,7 @@ A checkpoint directory (`0700`) holds four `0600` files pre-opened before lockdo
 
 | Bundle File | Producer / Consumer | Format Specification |
 | :--- | :--- | :--- |
-| `manifest.json` | `pkg/gvx` (`CheckpointManifest` v1) | JSON object recording `version` (`1`), `goos`, `goarch`, `platform`, `arch`, `user_address_holes`, ordered `layer_digests`, ordered `mounts` (`type`, `guest_path`, `read_only`, `kind`), `net_mode`, the optional `eth0` object of the NAT mode (`addresses`, `mtu`, `routes`), the optional `memory_limit_bytes`, and `created_at`. `gvx.Restore` rejects a file above 1 MiB. |
+| `manifest.json` | `pkg/gvx` (`CheckpointManifest` v1..v3) | JSON object recording `version` (`1` default, `2` for NAT policy, `3` for capped `ext4lite` mounts), host and guest target fields, `layer_digests`, `mounts` (`volume_limit` and `backing_read_only` in v3), `net_mode`, explicit `nat_policy_required` in v3, optional `eth0` and `memory_limit_bytes`, and `created_at` (1 MiB ceiling). |
 | `state.img` | `pkg/state/statefile` & `pkg/sentry/state` | 8-byte `"gVisorSF"` magic, big-endian `uint64` JSON metadata length, 1 MiB chunked `compressio` stream holding `cpuid.FeatureSet` and the serialized `kernel.Kernel` object graph. |
 | `pages.meta` | `pkg/sentry/pgalloc` | Little-endian `uint64` length plus `MemoryFileMetadataProto` for the primary `MemoryFile`, followed by a `pkg/state` table of private `MemoryFile` metadata keyed by `checkpoint.ResourceID`. `MemoryFile.LoadFrom` rejects a length above 256 MiB. |
 | `pages.img` | `pkg/sentry/pgalloc` & `stateio` | Concatenated 4 KiB non-zero committed page ranges scanned with `SEEK_DATA`/`SEEK_HOLE` where supported and loaded asynchronously via `kernel.AsyncMFLoader`. |

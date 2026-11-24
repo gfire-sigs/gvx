@@ -119,11 +119,23 @@ type Mount struct {
 	// the Sentry tmpfs. A bind or volume mount must leave it zero.
 	TmpfsSizeBytes int64
 
+	// SizeBytes caps the image in bytes. Zero preserves the existing limit.
+	SizeBytes int64
+
+	// Ephemeral selects a new private image for this sandbox run.
+	Ephemeral bool
+
 	// CreateHostPathIfMissing creates the host directory of a bind mount when
 	// the path does not exist. New creates it before the host lockdown.
 	// Without it, a missing path is an error. It never creates a file, and it
 	// leaves an existing file or directory as it is.
 	CreateHostPathIfMissing bool
+}
+
+type cappedVolumeBinding struct {
+	guestPath string
+	volume    *ext4lite.Volume
+	maxBytes  int64
 }
 
 // workspaceGuestPath is the mount point of Config.WorkspacePath.
@@ -244,22 +256,28 @@ func isHostPathSource(src string) bool {
 
 // ParseMount parses the value of a --mount flag. The keys are type (bind,
 // volume, tmpfs, or overlay; volume when absent), src or source, dst,
-// destination, or target, upper, readonly or ro, tmpfs-size, and driver. A bind
-// source must already exist. A volume or overlay source with a path separator
-// sets ImagePath; any other volume or overlay source is a volume name.
+// destination, or target, upper, readonly or ro, size, ephemeral, tmpfs-size,
+// and driver. A bind source must already exist. A volume or overlay source
+// with a path separator sets ImagePath; any other volume or overlay source is
+// a volume name.
 func ParseMount(spec string) (Mount, error) {
 	fields, err := csv.NewReader(strings.NewReader(spec)).Read()
 	if err != nil {
 		return Mount{}, fmt.Errorf("gvx: invalid mount %q: %w", spec, err)
 	}
 	var (
-		kind     = MountVolume
-		src, dst string
-		upper    string
-		hasUpper bool
-		size     string
-		driver   string
-		readOnly bool
+		kind          = MountVolume
+		src, dst      string
+		hasSrc        bool
+		upper         string
+		hasUpper      bool
+		tmpfsSize     string
+		volSize       string
+		hasVolSize    bool
+		ephemeral     bool
+		seenEphemeral bool
+		driver        string
+		readOnly      bool
 	)
 	for _, field := range fields {
 		key, value, hasValue := strings.Cut(field, "=")
@@ -268,6 +286,7 @@ func ParseMount(spec string) (Mount, error) {
 		case "type":
 			kind = MountKind(strings.ToLower(strings.TrimSpace(value)))
 		case "src", "source":
+			hasSrc = true
 			src = value
 		case "dst", "destination", "target":
 			dst = value
@@ -281,8 +300,26 @@ func ParseMount(spec string) (Mount, error) {
 					return Mount{}, fmt.Errorf("gvx: invalid mount %q: bad value for %s: %w", spec, key, err)
 				}
 			}
+		case "size":
+			if hasVolSize {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: duplicate size option", spec)
+			}
+			if !hasValue || strings.TrimSpace(value) == "" {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: size requires a value", spec)
+			}
+			hasVolSize = true
+			volSize = value
+		case "ephemeral":
+			if seenEphemeral {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: duplicate ephemeral option", spec)
+			}
+			if hasValue {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: ephemeral takes no value", spec)
+			}
+			seenEphemeral = true
+			ephemeral = true
 		case "tmpfs-size":
-			size = value
+			tmpfsSize = value
 		case "driver":
 			driver = strings.ToLower(strings.TrimSpace(value))
 		default:
@@ -303,18 +340,46 @@ func ParseMount(spec string) (Mount, error) {
 	if hasUpper && kind != MountOverlay {
 		return Mount{}, fmt.Errorf("gvx: invalid mount %q: upper needs type=overlay", spec)
 	}
-	m := Mount{Kind: kind, GuestPath: dst, ReadOnly: readOnly, Driver: MountDriver(driver)}
+	if hasVolSize && kind != MountVolume {
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: size needs type=volume", spec)
+	}
+	if ephemeral && kind != MountVolume {
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: ephemeral needs type=volume", spec)
+	}
+	if (hasVolSize || ephemeral) && MountDriver(driver) == DriverHostfs {
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: size and ephemeral require driver=ext4lite", spec)
+	}
+	m := Mount{Kind: kind, GuestPath: dst, ReadOnly: readOnly, Driver: MountDriver(driver), Ephemeral: ephemeral}
+	if hasVolSize {
+		sz, sizeErr := parseVolumeSize(volSize)
+		if sizeErr != nil {
+			return Mount{}, fmt.Errorf("gvx: invalid mount %q: %w", spec, sizeErr)
+		}
+		m.SizeBytes = sz
+	}
 	switch kind {
 	case MountBind, MountVolume:
-		if src == "" {
-			return Mount{}, fmt.Errorf("gvx: invalid mount %q: src is required for type=%s", spec, kind)
-		}
-		if size != "" {
+		if tmpfsSize != "" {
 			return Mount{}, fmt.Errorf("gvx: invalid mount %q: tmpfs-size needs type=tmpfs or type=overlay", spec)
 		}
 		if kind == MountBind {
+			if src == "" {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: src is required for type=%s", spec, kind)
+			}
 			m.HostPath = src
 			return m, nil
+		}
+		if ephemeral {
+			if hasSrc || src != "" {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: ephemeral cannot be combined with src", spec)
+			}
+			if readOnly {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: ephemeral cannot be combined with readonly", spec)
+			}
+			return m, nil
+		}
+		if src == "" {
+			return Mount{}, fmt.Errorf("gvx: invalid mount %q: src is required for type=%s", spec, kind)
 		}
 		if isHostPathSource(src) {
 			if m.Driver == DriverHostfs {
@@ -352,7 +417,7 @@ func ParseMount(spec string) (Mount, error) {
 			if readOnly {
 				return Mount{}, fmt.Errorf("gvx: invalid mount %q: readonly cannot be combined with upper", spec)
 			}
-			if size != "" {
+			if tmpfsSize != "" {
 				return Mount{}, fmt.Errorf("gvx: invalid mount %q: tmpfs-size cannot be combined with upper", spec)
 			}
 			if isHostPathSource(upper) {
@@ -370,8 +435,8 @@ func ParseMount(spec string) (Mount, error) {
 				(m.ImagePath != "" && m.UpperImagePath != "" && filepath.Clean(m.ImagePath) == filepath.Clean(m.UpperImagePath)) {
 				return Mount{}, fmt.Errorf("gvx: invalid mount %q: overlay lower and upper volumes must differ", spec)
 			}
-		} else if size != "" {
-			if m.TmpfsSizeBytes, err = parseTmpfsSize(size); err != nil {
+		} else if tmpfsSize != "" {
+			if m.TmpfsSizeBytes, err = parseTmpfsSize(tmpfsSize); err != nil {
 				return Mount{}, fmt.Errorf("gvx: invalid mount %q: %w", spec, err)
 			}
 		}
@@ -379,8 +444,8 @@ func ParseMount(spec string) (Mount, error) {
 		if src != "" {
 			return Mount{}, fmt.Errorf("gvx: invalid mount %q: type=tmpfs takes no src", spec)
 		}
-		if size != "" {
-			if m.TmpfsSizeBytes, err = parseTmpfsSize(size); err != nil {
+		if tmpfsSize != "" {
+			if m.TmpfsSizeBytes, err = parseTmpfsSize(tmpfsSize); err != nil {
 				return Mount{}, fmt.Errorf("gvx: invalid mount %q: %w", spec, err)
 			}
 		}
@@ -449,6 +514,51 @@ func parseTmpfsSize(s string) (int64, error) {
 	return n * multiplier, nil
 }
 
+// parseVolumeSize parses an ext4lite volume size limit with an optional binary
+// unit suffix (b, k, kb, kib, m, mb, mib, g, gb, gib, t, tb, or tib) and
+// validates that it falls in [16 MiB, 64 TiB] as an exact 16 MiB multiple.
+func parseVolumeSize(s string) (int64, error) {
+	raw := strings.ToLower(strings.TrimSpace(s))
+	if raw == "" {
+		return 0, errors.New("volume size must not be empty")
+	}
+	split := strings.IndexFunc(raw, func(r rune) bool { return r < '0' || r > '9' })
+	num, unit := raw, ""
+	if split >= 0 {
+		num, unit = raw[:split], raw[split:]
+	}
+	var multiplier int64
+	switch unit {
+	case "", "b":
+		multiplier = 1
+	case "k", "kb", "kib":
+		multiplier = 1 << 10
+	case "m", "mb", "mib":
+		multiplier = 1 << 20
+	case "g", "gb", "gib":
+		multiplier = 1 << 30
+	case "t", "tb", "tib":
+		multiplier = 1 << 40
+	default:
+		return 0, fmt.Errorf("unknown unit %q in volume size %q (use b, k, m, g, or t)", unit, s)
+	}
+	if num == "" {
+		return 0, fmt.Errorf("invalid volume size %q", s)
+	}
+	n, err := strconv.ParseInt(num, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("volume size %q must be a positive integer", s)
+	}
+	if n > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("volume size %q is too large", s)
+	}
+	total := n * multiplier
+	if err := ext4lite.ValidateMaxBytes(total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
 // validateMounts rejects a bad Mounts entry, a duplicate guest path, and a
 // mount at /workspace together with WorkspacePath. Every rejection wraps
 // ErrInvalidConfig.
@@ -457,9 +567,13 @@ func (c *Config) validateMounts() error {
 	if c.WorkspacePath != "" {
 		guestPaths[workspaceGuestPath] = struct{}{}
 	}
+	hasCheckpointDir := strings.TrimSpace(c.CheckpointDir) != ""
 	for i, m := range c.Mounts {
 		if err := m.validate(); err != nil {
 			return fmt.Errorf("%w: mount %d (%s): %w", ErrInvalidConfig, i, m.GuestPath, err)
+		}
+		if hasCheckpointDir && m.Ephemeral {
+			return fmt.Errorf("%w: mount %d (%s): CheckpointDir cannot be combined with an ephemeral ext4lite volume: %w", ErrInvalidConfig, i, m.GuestPath, ErrCheckpointEphemeralVolume)
 		}
 		if _, dup := guestPaths[m.GuestPath]; dup {
 			if m.GuestPath == workspaceGuestPath && c.WorkspacePath != "" {
@@ -545,6 +659,8 @@ func (c *Config) validateRootVolumeDup(rootMount Mount) error {
 func (c *Config) validateVolumeConflicts(rootImg string) error {
 	rwImages := make(map[string]bool)
 	roImages := make(map[string]bool)
+	hasROLimit := make(map[string]bool)
+	roLimits := make(map[string]int64)
 	if rootImg != "" {
 		rwImages[rootImg] = true
 	}
@@ -555,19 +671,33 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 		rwImages[img] = true
 		return nil
 	}
-	checkRO := func(img, label string) error {
+	checkRO := func(img, label string, limit int64) error {
 		if rwImages[img] {
 			return fmt.Errorf("%w: volume %s is mounted twice", ErrInvalidConfig, label)
 		}
+		if hasROLimit[img] && roLimits[img] != limit {
+			return fmt.Errorf("%w: shared read-only volume %s has conflicting size limits (%d vs %d)", ErrInvalidConfig, label, roLimits[img], limit)
+		}
 		roImages[img] = true
+		hasROLimit[img] = true
+		roLimits[img] = limit
 		return nil
 	}
 
 	for _, m := range c.Mounts {
 		switch m.Kind {
 		case MountVolume:
+			if m.Ephemeral {
+				continue
+			}
 			driver, err := c.resolveVolumeDriver(m)
-			if err != nil || driver != DriverExt4lite {
+			if err != nil {
+				continue
+			}
+			if driver != DriverExt4lite {
+				if m.SizeBytes > 0 {
+					return fmt.Errorf("%w: volume %s uses driver %q, which does not support size", ErrInvalidConfig, m.volumeLabel(), driver)
+				}
 				continue
 			}
 			img, err := c.volumeImagePath(m)
@@ -575,7 +705,7 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 				continue
 			}
 			if m.ReadOnly {
-				if err := checkRO(img, m.volumeLabel()); err != nil {
+				if err := checkRO(img, m.volumeLabel(), m.SizeBytes); err != nil {
 					return err
 				}
 			} else {
@@ -601,7 +731,7 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 					return err
 				}
 			}
-			if err := checkRO(lowerImg, m.volumeLabel()); err != nil {
+			if err := checkRO(lowerImg, m.volumeLabel(), 0); err != nil {
 				return err
 			}
 		}
@@ -616,6 +746,34 @@ func (m Mount) validate() error {
 	}
 	if m.TmpfsSizeBytes < 0 || (m.TmpfsSizeBytes > 0 && m.Kind != MountTmpfs && (m.Kind != MountOverlay || m.hasOverlayUpper())) {
 		return errors.New("TmpfsSizeBytes must be zero or positive and applies to tmpfs or ephemeral overlay mounts only")
+	}
+	if m.SizeBytes < 0 {
+		return errors.New("SizeBytes must be zero or positive")
+	}
+	if m.SizeBytes > 0 {
+		if m.Kind != MountVolume {
+			return errors.New("SizeBytes applies to volume mounts only")
+		}
+		if m.Driver == DriverHostfs {
+			return errors.New("SizeBytes requires the ext4lite volume driver")
+		}
+		if err := ext4lite.ValidateMaxBytes(m.SizeBytes); err != nil {
+			return err
+		}
+	}
+	if m.Ephemeral {
+		if m.Kind != MountVolume {
+			return errors.New("Ephemeral applies to volume mounts only")
+		}
+		if m.Driver == DriverHostfs {
+			return errors.New("Ephemeral requires the ext4lite volume driver")
+		}
+		if m.HostPath != "" || m.VolumeName != "" || m.ImagePath != "" {
+			return errors.New("an ephemeral volume mount takes no HostPath, VolumeName, or ImagePath")
+		}
+		if m.ReadOnly {
+			return errors.New("an ephemeral volume mount cannot be read-only")
+		}
 	}
 	if m.CreateHostPathIfMissing && m.Kind != MountBind {
 		return errors.New("CreateHostPathIfMissing applies to bind mounts only")
@@ -635,6 +793,9 @@ func (m Mount) validate() error {
 	case MountVolume:
 		if m.HostPath != "" {
 			return errors.New("a volume mount takes no HostPath")
+		}
+		if m.Ephemeral {
+			return nil
 		}
 		if m.ImagePath != "" {
 			if m.VolumeName != "" {
@@ -886,6 +1047,8 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
 	rwVolumes := make(map[string]bool)
 	roVolumes := make(map[string]*ext4lite.Volume)
+	hasROLimit := make(map[string]bool)
+	roLimits := make(map[string]int64)
 
 	openRW := func(m Mount) (*ext4lite.Volume, string, error) {
 		image, err := s.cfg.volumeImagePath(m)
@@ -911,6 +1074,9 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 		if rwVolumes[image] {
 			return nil, fmt.Errorf("gvx: volume %s is mounted twice: %w", m.volumeLabel(), ErrInvalidConfig)
 		}
+		if hasROLimit[image] && roLimits[image] != m.SizeBytes {
+			return nil, fmt.Errorf("gvx: shared read-only volume %s has conflicting size limits (%d vs %d): %w", m.volumeLabel(), roLimits[image], m.SizeBytes, ErrInvalidConfig)
+		}
 		if vol, ok := roVolumes[image]; ok {
 			return vol, nil
 		}
@@ -919,6 +1085,8 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 			return nil, err
 		}
 		roVolumes[image] = vol
+		hasROLimit[image] = true
+		roLimits[image] = m.SizeBytes
 		s.volumes = append(s.volumes, vol)
 		return vol, nil
 	}
@@ -947,6 +1115,9 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 			driver, err := s.cfg.resolveVolumeDriver(m)
 			if err != nil {
 				return err
+			}
+			if (m.SizeBytes > 0 || m.Ephemeral) && driver != DriverExt4lite {
+				return fmt.Errorf("gvx: volume %s uses driver %q, which does not support size or ephemeral: %w", m.volumeLabel(), driver, ErrInvalidConfig)
 			}
 			m.Driver = driver
 		}
@@ -982,26 +1153,57 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 				s.volumes = append(s.volumes, upperVol)
 				sm.upperVolume = upperVol
 			}
-			lowerVol, err := openRO(m)
+			lowerMount := m
+			lowerMount.SizeBytes = 0
+			lowerVol, err := openRO(lowerMount)
 			if err != nil {
 				return err
 			}
 			sm.volume = lowerVol
 		case m.Kind == MountVolume && m.Driver == DriverExt4lite:
-			sm.backingReadOnly = m.ReadOnly
-			if m.ReadOnly {
-				vol, err := openRO(m)
-				if err != nil {
-					return err
+			if m.Ephemeral {
+				if forRestore {
+					return fmt.Errorf("%w: ephemeral ext4lite volume at %q cannot be restored", ErrInvalidConfig, m.GuestPath)
 				}
-				sm.volume = vol
-			} else {
-				vol, _, err := openRW(m)
+				s.hasEphemeralVolume = true
+				vol, err := s.openEphemeralVolume(m)
 				if err != nil {
 					return err
 				}
 				s.volumes = append(s.volumes, vol)
 				sm.volume = vol
+				sm.backingReadOnly = false
+			} else {
+				backingRO := m.ReadOnly
+				if forRestore && s.restoreBackingRO != nil {
+					if ro, ok := s.restoreBackingRO[m.GuestPath]; ok {
+						backingRO = ro
+					}
+				}
+				sm.backingReadOnly = backingRO
+				openMount := m
+				openMount.ReadOnly = backingRO
+				if backingRO {
+					vol, err := openRO(openMount)
+					if err != nil {
+						return err
+					}
+					sm.volume = vol
+				} else {
+					vol, _, err := openRW(openMount)
+					if err != nil {
+						return err
+					}
+					s.volumes = append(s.volumes, vol)
+					sm.volume = vol
+				}
+				if m.SizeBytes > 0 {
+					s.cappedVolumes = append(s.cappedVolumes, cappedVolumeBinding{
+						guestPath: m.GuestPath,
+						volume:    sm.volume,
+						maxBytes:  m.SizeBytes,
+					})
+				}
 			}
 		default:
 			hostPath, isFile, err := s.prepareHostPath(m)
@@ -1081,6 +1283,9 @@ func resolveSymlinkPrefix(p string) string {
 // volumeLabel names a volume mount in messages: the quoted name, or the
 // image path.
 func (m Mount) volumeLabel() string {
+	if m.Ephemeral {
+		return fmt.Sprintf("ephemeral volume at %q", m.GuestPath)
+	}
 	if m.ImagePath != "" {
 		return fmt.Sprintf("image %q", m.ImagePath)
 	}
@@ -1095,7 +1300,7 @@ func (c Config) resolveVolumeDriver(m Mount) (MountDriver, error) {
 	if m.Driver != "" {
 		return m.Driver, nil
 	}
-	if m.ImagePath != "" {
+	if m.Ephemeral || m.ImagePath != "" {
 		return DriverExt4lite, nil
 	}
 	image, err := c.volumeImagePath(m)
@@ -1140,10 +1345,14 @@ func (s *Sandbox) openVolumeImageWithMode(m Mount, image string, forRestore bool
 	}
 	vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{
 		ReadOnly:           m.ReadOnly,
-		DeferOrphanCleanup: forRestore,
+		DeferOrphanCleanup: forRestore && !m.ReadOnly,
+		MaxBytes:           m.SizeBytes,
 	})
 	if errors.Is(err, ext4lite.ErrVolumeInUse) {
 		return nil, fmt.Errorf("gvx: volume %s is in use by another sandbox: %w", m.volumeLabel(), err)
+	}
+	if errors.Is(err, ext4lite.ErrInvalidVolumeSize) || errors.Is(err, ext4lite.ErrVolumeExceedsMaxBytes) {
+		return nil, fmt.Errorf("gvx: mount volume %s from %q: %w: %w", m.volumeLabel(), image, ErrInvalidConfig, err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("gvx: mount volume %s from %q: %w", m.volumeLabel(), image, err)
@@ -1292,6 +1501,8 @@ func (s *Sandbox) closeMounts() error {
 	}
 	s.workspaces = nil
 	s.volumes = nil
+	s.cappedVolumes = nil
+	s.restoreBackingRO = nil
 	s.mounts = nil
 	s.workspace = nil
 	s.rootUpperExisting = false

@@ -292,3 +292,32 @@ func TestRunFlagsSetNATBandwidth(t *testing.T) {
 		t.Fatalf("parse rate above NAT bandwidth maximum: code=%d, done=%t, want usage error", code, done)
 	}
 }
+
+func TestRunFlagsMountVolumeSizeAndEphemeral(t *testing.T) {
+	rc, _, done, stderr := parse(t,
+		"--mount", "type=volume,src=data,dst=/data,size=64m",
+		"--mount", "type=volume,dst=/scratch,ephemeral,size=32m",
+		"-image=x",
+	)
+	if done {
+		t.Fatalf("parseRunArgs ended the command: %s", stderr)
+	}
+	want := []gvx.Mount{
+		{Kind: gvx.MountVolume, VolumeName: "data", GuestPath: "/data", SizeBytes: 64 << 20},
+		{Kind: gvx.MountVolume, GuestPath: "/scratch", Ephemeral: true, SizeBytes: 32 << 20},
+	}
+	if !reflect.DeepEqual(rc.cfg.Mounts, want) {
+		t.Fatalf("Mounts = %+v, want %+v", rc.cfg.Mounts, want)
+	}
+
+	for _, bad := range []string{
+		"type=volume,src=data,dst=/data,size=20m",
+		"type=volume,src=data,dst=/scratch,ephemeral",
+		"type=volume,dst=/scratch,ephemeral,readonly",
+	} {
+		_, code, badDone, badStderr := parse(t, "--mount", bad, "-image=x")
+		if !badDone || code != 2 || !strings.Contains(badStderr, "--mount") {
+			t.Fatalf("--mount %q = (code=%d, done=%v, stderr=%q), want usage error 2", bad, code, badDone, badStderr)
+		}
+	}
+}

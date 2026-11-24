@@ -159,7 +159,7 @@ Failed RPCs return a `ProtoError` object with a stable `code`, a diagnostic `mes
 | `FORBIDDEN_BY_POLICY` | `126` | Capability disabled by `--control-policy` or `--control-disable`. |
 | `LOCKDOWN_DENIED` | `126` | Operation violates active host lockdown constraints. |
 | `INVALID_ARGUMENT` | `1` | Invalid request parameter, immutable tunable, or directory mismatch. |
-| `UNSUPPORTED` | `1` | Operation unavailable on the active host OS or transport. |
+| `UNSUPPORTED` | `1` | Operation unavailable on the active host OS, transport, or sandbox configuration (for example, checkpointing an ephemeral `ext4lite` volume). |
 | `ALREADY_PAUSED` | `1` | Sandbox is already paused (also rejects `exec.start`). |
 | `NOT_PAUSED` | `1` | `lifecycle.unpause` called on a running sandbox. |
 | `NOT_FOUND` | `1` | Target PID, path, port rule, or mount does not exist. |

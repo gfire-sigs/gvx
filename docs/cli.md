@@ -85,7 +85,7 @@ The table below lists the `rungv run` flags that match the Docker CLI.
 | `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` (or `--auto-publish-addr`) while the sandbox runs. Static `-p` rules keep precedence (see Section 4.7). |
 | `--auto-publish-addr IP` | Override the host IP literal for `--auto-publish` (for example, `0.0.0.0` or a LAN IP). Requires `--auto-publish` and NAT mode. |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, a single host file, or a named volume. |
-| `--mount type=bind\|volume\|tmpfs\|overlay,src=...,dst=...,readonly[,driver=ext4lite\|hostfs][,upper=...][,tmpfs-size=...]` | Mount using Docker key-value syntax. `driver` applies to `type=volume` only; a volume `src` with a path separator names a host `.ext4` file. `type=overlay` mounts a copy-on-write branch over a read-only base volume. |
+| `--mount type=bind\|volume\|tmpfs\|overlay,src=...,dst=...,readonly[,driver=ext4lite\|hostfs][,size=...][,ephemeral][,upper=...][,tmpfs-size=...]` | Mount using Docker key-value syntax. `driver`, `size`, and `ephemeral` apply to `type=volume`; `size` and `ephemeral` require `ext4lite`. A volume `src` with a path separator names a host `.ext4` file. `type=overlay` mounts a copy-on-write branch over a read-only base volume. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
 | `--read-only` | Mount the guest root filesystem read-only (cannot combine with `-rootfs-volume`). |
 | `-m`, `--memory SIZE` | Limit guest memory (`b`, `k`, `m`, `g`, `t`; minimum `6m`). |
@@ -245,6 +245,8 @@ The `ext4lite` driver formats and mounts each `<name>.ext4` image as an ext4 fil
 Each volume carries a `jbd2` metadata journal. After a crash or kill, the next writable run replays the journal, preserving synced files and freeing unlinked open files. Clean images pass `e2fsck -fn` and mount directly on Linux with `mount -o loop -t ext4`.
 
 In `--mount type=volume`, a `src` containing a path separator targets an `.ext4` image file at that host path, such as `--mount type=volume,src=/disk/vols/pg.ext4,dst=/var/lib/postgresql`. Prefix relative paths with `./` so they are not treated as volume names. The sandbox creates a missing image file before lockdown (except for read-only mounts) but never creates parent directories. `-v` keeps its Docker meaning: `-v /disk/vols/pg.ext4:/data` bind-mounts the file itself.
+
+In `--mount type=volume`, `size=SIZE` (`16m` to `64t`, in `16 MiB` multiples) caps `ext4lite` growth without preallocating capacity. The bare `ephemeral` key creates a private scratch image in `ephemeral-volumes/` for one run and rejects `src` and `readonly`. Named volume commands ignore `ephemeral-volumes/`. Sandboxes with an ephemeral `ext4lite` volume reject `-checkpoint-dir` and `rungv checkpoint`. Checkpoints with capped persistent `ext4lite` volumes write manifest version `3`, and `rungv restore` inherits omitted `size` limits.
 
 To branch a read-only base volume without copying it, pass `--mount type=overlay,src=BASE,dst=PATH[,upper=BRANCH][,tmpfs-size=SIZE]`. With `upper=BRANCH`, mutations and whiteouts persist in the `BRANCH` volume while `BASE` stays untouched; without `upper`, writes stay in an ephemeral `tmpfs` layer.
 
