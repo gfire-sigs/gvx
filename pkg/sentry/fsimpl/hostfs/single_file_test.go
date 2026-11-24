@@ -114,8 +114,12 @@ func TestSingleFileReadWriteTruncateAppend(t *testing.T) {
 		t.Fatalf("read = %q", got)
 	}
 	st := s.mustStat("mp")
-	if st.Mode&linux.S_IFMT != linux.S_IFREG || st.Mode&0o7777 != 0o644 || st.Size != 11 || st.Nlink != 1 {
-		t.Fatalf("stat = (mode %o, size %d, nlink %d), want a regular file with mode 644, size 11, 1 link", st.Mode, st.Size, st.Nlink)
+	wantPerm := uint16(0o644)
+	if !runtimeHasUnixModes() {
+		wantPerm = 0o755
+	}
+	if st.Mode&linux.S_IFMT != linux.S_IFREG || st.Mode&0o7777 != wantPerm || st.Size != 11 || st.Nlink != 1 {
+		t.Fatalf("stat = (mode %o, size %d, nlink %d), want a regular file with mode %o, size 11, 1 link", st.Mode, st.Size, st.Nlink, wantPerm)
 	}
 
 	fd := s.mustOpen("mp", linux.O_RDWR)
@@ -268,6 +272,49 @@ func TestSingleFileReadOnly(t *testing.T) {
 		t.Fatalf("host file = %q", got)
 	}
 	s.wantHostNames("after a read-only session")
+}
+
+func TestSingleFileReadOnlyExec(t *testing.T) {
+	outer := newEnv(t)
+	hostDir := resolvedTempDir(t)
+	file := filepath.Join(hostDir, "entry.sh")
+	if err := os.WriteFile(file, []byte("#!/bin/sh\necho ran\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := openWorkspace(file, true, workspaceOptions{coalesce: defaultCoalesceWindow})
+	if err != nil {
+		t.Fatalf("openWorkspace of read-only executable file: %v", err)
+	}
+	outer.writeFile("mp", nil)
+	_, err = outer.vfsObj.MountAt(outer.ctx, outer.creds, "", outer.fpop("mp"), Name, &vfs.MountOptions{
+		ReadOnly:             true,
+		GetFilesystemOptions: vfs.GetFilesystemOptions{InternalData: InternalFilesystemOptions{Workspace: ws}},
+	})
+	if err != nil {
+		_ = ws.Close()
+		t.Fatalf("mount read-only executable file: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = outer.vfsObj.UmountAt(outer.ctx, outer.creds, outer.pop("mp"), &vfs.UmountOptions{})
+		_ = ws.Close()
+	})
+
+	st := outer.mustStat("mp")
+	if st.Mode&0o7777 != 0o755 {
+		t.Fatalf("stat mode = %04o, want 0755", st.Mode&0o7777)
+	}
+	if err := outer.vfsObj.AccessAt(outer.ctx, outer.creds, vfs.MayRead|vfs.MayExec, outer.fpop("mp")); err != nil {
+		t.Fatalf("AccessAt(MayRead|MayExec) = %v, want nil", err)
+	}
+	execFD, err := outer.vfsObj.OpenAt(outer.ctx, outer.creds, outer.fpop("mp"), &vfs.OpenOptions{
+		Flags:    linux.O_RDONLY,
+		FileExec: true,
+	})
+	if err != nil {
+		t.Fatalf("OpenAt(FileExec) = %v, want nil", err)
+	}
+	execFD.DecRef(outer.ctx)
+	wantErrno(t, "chmod on read-only executable file", outer.setStat("mp", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o644}), linuxerr.EROFS)
 }
 
 func TestSingleFileSyncAllocateAndMap(t *testing.T) {
