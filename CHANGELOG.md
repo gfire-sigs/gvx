@@ -2,6 +2,24 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.24.10002026112300] - 2026-11-25
+
+This release moves default named volumes out of host cache directories into user data directories with automatic legacy migration. It also adds `-volume-dir` and `GVX_VOLUME_DIR` controls across the CLI and Go SDK, and resolves relative guest executables against the working directory.
+
+### Storage and Volume Management
+
+- **Named volume storage outside cache directories (`pkg/gvx`, `pkg/rungvx`, `docs/cli.md`)** (#261):
+  - Moves default named volume storage to `~/Library/Application Support/gvx/volumes` on macOS and `$XDG_DATA_HOME/gvx/volumes` or `~/.local/share/gvx/volumes` on Linux and Android. This protects persistent volumes from host cache purges; Windows keeps `%LOCALAPPDATA%\gvx\cache\volumes`.
+  - Migrates any legacy cache-adjacent `volumes` directory on first default use and leaves a symbolic link at the legacy path for older binaries. Configuration normalization and restore pre-flight checks stay read-only.
+  - Adds `Config.VolumeDir`, `VolumeDirEnv` (`GVX_VOLUME_DIR`), `gvx.VolumeStore`, and `gvx.SystemInfoOptions` / `ProbeSystemInfoWithOptions` in `pkg/gvx`.
+  - Adds `-volume-dir` to `rungvx run`, `restore`, `volume`, `info`, `system`, `mount add`, and shell completions. Precedence is `-volume-dir`, then `-cache-dir` (`<dir>/volumes`), then `GVX_VOLUME_DIR`, then the platform default.
+
+### Runtime and Guest Execution
+
+- **Working-directory resolution for relative executables (`pkg/gvx`)** (#262):
+  - Resolves relative guest executables (`./app`, `bin/run`) and relative or empty `PATH` entries through VFS from the active working directory instead of `/`. Honors `-w`, image `WORKDIR`, and `control.ExecRequest.WorkDir`.
+  - Preserves symlink names (`AT_EXECFN`, shebang `$0`, task `comm`), rejects non-directory working directories and deleted targets, and normalizes relative initial working directories.
+
 ## [v0.23.10022026112300] - 2026-11-25
 
 This release reduces the Tier 3 upstream diff footprint from 4.25% to 4.01% by moving six upstream seams into Tier 2 siblings with unchanged runtime behavior, adds automated VFS security parity guards across custom filesystems, shards CI jobs for faster feedback, removes a stray tracked root binary, and streamlines user-facing documentation.
