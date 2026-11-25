@@ -159,6 +159,9 @@ These flags configure execution backends, volumes, host lockdown, networking lim
 | `--backend BACKEND` | Recommended flag for the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. |
 | `-platform BACKEND` | Legacy alias for `--backend` without a slash; values with a slash select image platform. |
 | `-allow-unconfined-systrap` | Allow Windows `--backend=auto` fallback to `systrap` when `whpx` is unavailable (trusted workloads only). |
+| `-gpu MODE` | Enable optional virtio-gpu (`off`, `venus`, or `virgl`; requires a `-tags ext_gpu` build on macOS 26+ `arm64`, Section 4.15). |
+| `-gpu-renderer PATH` | Select the `gvx-gpu-renderer` binary for `-gpu=venus` or `-gpu=virgl` (overrides `GVX_GPU_RENDERER`). |
+| `-gpu-memory-limit SIZE` | Cap imported GPU shared memory per sandbox (for example `512m` or `2g`; requires `-gpu`). |
 | `-arch ARCH` | Legacy alias for selecting guest architecture (defaults to host CPU architecture). |
 | `-workspace DIR`, `-ro` | Mount an existing host directory at `/workspace` (optionally read-only). Unlike `-v`, `DIR` must exist. |
 | `-rootfs-volume NAME\|PATH` | Mount a named `.ext4` volume or host `.ext4` file as the persistent root overlay. |
@@ -393,6 +396,19 @@ Rules evaluate first-match, unreadable fields fail closed, and `-isolate-lan` ov
   "ingress": {"default": "deny"}
 }
 ```
+
+### 4.15 GPU Extension (`-tags ext_gpu`)
+
+Build `ext/cmd/rungvx` with `-tags ext_gpu` (or `-tags ext_all`) to include `-gpu=venus` and `-gpu=virgl`. Both active modes require Apple Silicon (`darwin/arm64`), macOS 26 or later, the `hvf` backend, and `gvx-gpu-renderer`. Confirm support with `rungvx version -V`, which prints `extension gpu: modes=venus,virgl`.
+
+| Rule | Behavior |
+| :--- | :--- |
+| **Renderer search** | Checks `-gpu-renderer`, `GVX_GPU_RENDERER`, `gvx-gpu-renderer/bin/gvx-gpu-renderer` beside `rungvx`, then `../libexec/gvx-gpu-renderer/bin/gvx-gpu-renderer`. |
+| **Missing renderer** | Exits with an error listing searched paths or stderr output. Never falls back silently to software rendering. |
+| **Guest drivers** | `venus` requires guest `mesa-vulkan-drivers`; `virgl` requires guest `libgl1-mesa-dri` and `libegl-mesa0`. |
+| **Checkpointing** | Refuses `-checkpoint-dir`, `rungvx restore`, and control-socket checkpoints. Other control subcommands stay active. |
+| **Memory cap** | Defaults to the smaller of 4 GiB and 25% of host RAM; override with `-gpu-memory-limit`. |
+| **Renderer exit** | Returns I/O errors to guest GPU calls without restarting the worker. |
 
 ---
 
