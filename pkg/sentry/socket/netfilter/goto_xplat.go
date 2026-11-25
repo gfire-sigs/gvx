@@ -20,21 +20,60 @@ import "z.gfire.dev/gvx/pkg/tcpip/stack"
 // goto. ip6tables uses linux.IP6T_F_GOTO for the same flag.
 const iptFGoto = 0x02
 
-// markGoto makes the jump target a goto when the entry sets the goto flag.
-// A goto enters the chain without a return address, so the end of that chain
-// returns to the caller of the current chain. The flag has no effect on
-// any other target.
-func markGoto(target stack.Target, flags, gotoFlag uint8) {
+// GotoTarget implements stack.Target for "-g chain" rules without modifying
+// upstream JumpTarget or netfilter_state_autogen.go. Because it embeds
+// JumpTarget and promotes JumpTarget.id, wire marshaling must go through
+// marshalTargetForWire rather than marshalTarget directly.
+//
+// +stateify savable
+type GotoTarget struct {
+	JumpTarget
+}
+
+// Action implements stack.Target.Action.
+func (gt *GotoTarget) Action(*stack.PacketBuffer, stack.Hook, *stack.Route, stack.AddressableEndpoint) (stack.RuleVerdict, int) {
+	return stack.RuleGoto, gt.RuleNum
+}
+
+// applyGoto converts a JumpTarget into a GotoTarget when the entry sets the
+// goto flag. A goto enters the chain without a return address, so the end of
+// that chain returns to the caller of the current chain. The flag has no effect
+// on any other target.
+func applyGoto(target stack.Target, flags, gotoFlag uint8) stack.Target {
 	if jump, ok := target.(*JumpTarget); ok && flags&gotoFlag != 0 {
-		jump.Goto = true
+		return &GotoTarget{JumpTarget: *jump}
 	}
+	return target
 }
 
 // gotoFlags returns the goto flag of the entry for a rule, or 0 when the rule
 // is not a goto.
 func gotoFlags(target stack.Target, gotoFlag uint8) uint8 {
-	if jump, ok := target.(*JumpTarget); ok && jump.Goto {
+	if _, ok := target.(*GotoTarget); ok {
 		return gotoFlag
 	}
 	return 0
+}
+
+// asJumpTarget returns the underlying JumpTarget for either a jump or a goto
+// target so chain offset resolution and graph checks handle both uniformly.
+func asJumpTarget(target stack.Target) (*JumpTarget, bool) {
+	switch t := target.(type) {
+	case *JumpTarget:
+		return t, true
+	case *GotoTarget:
+		return &t.JumpTarget, true
+	default:
+		return nil, false
+	}
+}
+
+// marshalTargetForWire serializes target into an xtables target payload,
+// encoding GotoTarget as a standard jump target whose goto bit lives in the
+// enclosing entry flags.
+func marshalTargetForWire(target stack.Target) []byte {
+	if gt, ok := target.(*GotoTarget); ok {
+		return marshalTarget(&gt.JumpTarget)
+	}
+	return marshalTarget(target)
 }

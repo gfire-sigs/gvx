@@ -135,6 +135,31 @@ func (t *connmarkTarget) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.LoadUint8(7, &t.shiftBits)
 }
 
+func (gt *GotoTarget) StateTypeName() string {
+	return "pkg/sentry/socket/netfilter.GotoTarget"
+}
+
+func (gt *GotoTarget) StateFields() []string {
+	return []string{
+		"JumpTarget",
+	}
+}
+
+func (gt *GotoTarget) beforeSave() {}
+
+// +checklocksignore
+func (gt *GotoTarget) StateSave(stateSinkObject state.Sink) {
+	gt.beforeSave()
+	stateSinkObject.Save(0, &gt.JumpTarget)
+}
+
+func (gt *GotoTarget) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (gt *GotoTarget) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &gt.JumpTarget)
+}
+
 func (im *ICMPMatcher) StateTypeName() string {
 	return "pkg/sentry/socket/netfilter.ICMPMatcher"
 }
@@ -802,6 +827,7 @@ func init() {
 	state.RegisterStruct((*AddrtypeMatcher)(nil))
 	state.RegisterNoHooks((*ConnmarkMatcher)(nil))
 	state.RegisterNoHooks((*connmarkTarget)(nil))
+	state.RegisterNoHooks((*GotoTarget)(nil))
 	state.RegisterNoHooks((*ICMPMatcher)(nil))
 	state.RegisterStruct((*LimitMatcher)(nil))
 	state.RegisterStruct((*logTarget)(nil))

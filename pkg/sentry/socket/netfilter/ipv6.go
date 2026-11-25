@@ -113,7 +113,7 @@ func getEntries6(table stack.Table, tablename linux.TableName) (linux.KernelIP6T
 		}
 
 		// Serialize and append the target.
-		serialized := marshalTarget(rule.Target)
+		serialized := marshalTargetForWire(rule.Target)
 		if len(serialized)%8 != 0 {
 			panic(fmt.Sprintf("target %T is not 64-bit aligned", rule.Target))
 		}
@@ -195,8 +195,7 @@ func modifyEntries6(mapper IDMapper, stk *stack.Stack, optVal []byte, replace *l
 				nflog("failed to parse target: %v", err)
 				return nil, nil, err
 			}
-			markGoto(target, entry.IPv6.Flags, linux.IP6T_F_GOTO)
-			rule.Target = target
+			rule.Target = applyGoto(target, entry.IPv6.Flags, linux.IP6T_F_GOTO)
 		default:
 			targets[int(entryIdx)] = optVal[:targetSize]
 		}

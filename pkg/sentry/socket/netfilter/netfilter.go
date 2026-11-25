@@ -296,7 +296,7 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 	// Set each jump to point to the appropriate rule. Right now they hold byte
 	// offsets.
 	for ruleIdx, rule := range table.Rules {
-		jump, ok := rule.Target.(*JumpTarget)
+		jump, ok := asJumpTarget(rule.Target)
 		if !ok {
 			continue
 		}
@@ -321,8 +321,6 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 			return syserr.ErrInvalidArgument
 		}
 		jump.RuleNum = jumpTo
-		rule.Target = jump
-		table.Rules[ruleIdx] = rule
 	}
 
 	if err := checkLoopsAndChains(table, ipv6); err != nil {
@@ -520,7 +518,7 @@ func checkChainDFS(table stack.Table, ruleIdx int, state []visitState, ipv6 bool
 	state[ruleIdx] = visiting
 
 	rule := table.Rules[ruleIdx]
-	if jump, ok := rule.Target.(*JumpTarget); ok {
+	if jump, ok := asJumpTarget(rule.Target); ok {
 		jumpTo := jump.RuleNum
 		if jumpTo <= 0 || jumpTo >= len(table.Rules) {
 			nflog("jump to out-of-bounds rule %d", jumpTo)
@@ -654,7 +652,7 @@ func checkChainTargets(table stack.Table, ruleIdx int, hook stack.Hook, visited 
 			return syserr.ErrInvalidArgument
 		}
 
-		if jump, ok := rule.Target.(*JumpTarget); ok {
+		if jump, ok := asJumpTarget(rule.Target); ok {
 			if err := checkChainTargets(table, jump.RuleNum, hook, visited, ipv6); err != nil {
 				return err
 			}

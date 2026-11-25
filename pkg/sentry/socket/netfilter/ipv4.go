@@ -110,7 +110,7 @@ func getEntries4(table stack.Table, tablename linux.TableName) (linux.KernelIPTG
 		}
 
 		// Serialize and append the target.
-		serialized := marshalTarget(rule.Target)
+		serialized := marshalTargetForWire(rule.Target)
 		if len(serialized)%8 != 0 {
 			panic(fmt.Sprintf("target %T is not 64-bit aligned", rule.Target))
 		}
@@ -192,8 +192,7 @@ func modifyEntries4(mapper IDMapper, stk *stack.Stack, optVal []byte, replace *l
 				nflog("failed to parse target: %v", err)
 				return nil, nil, err
 			}
-			markGoto(target, entry.IP.Flags, iptFGoto)
-			rule.Target = target
+			rule.Target = applyGoto(target, entry.IP.Flags, iptFGoto)
 		default:
 			targets[int(entryIdx)] = optVal[:targetSize]
 		}

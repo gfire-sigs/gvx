@@ -278,7 +278,7 @@ func markHookMask(table stack.Table, ruleIdx int, bit uint32, masks []uint32, vi
 		masks[ruleIdx] |= bit
 
 		rule := table.Rules[ruleIdx]
-		if jump, ok := rule.Target.(*JumpTarget); ok {
+		if jump, ok := asJumpTarget(rule.Target); ok {
 			markHookMask(table, jump.RuleNum, bit, masks, visited, ipv6)
 		}
 		if isUnconditionalFinalRule(rule, ipv6) {
