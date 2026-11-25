@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -414,7 +415,7 @@ func (s *Sandbox) applyInitialKernelLimits(k *kernel.Kernel) error {
 // stdio descriptors, and limits, then creates the initial thread group in k.
 func (s *Sandbox) createInitialGuestProcess(ctx context.Context, sctx, sctxWithRoot gvcontext.Context, k *kernel.Kernel, creds *auth.Credentials, mntns *vfs.MountNamespace, root vfs.VirtualDentry, argv []string) (*kernel.ThreadGroup, func(), error) {
 	vfsObj := k.VFS()
-	execPath, err := resolveGuestExecutable(sctxWithRoot, vfsObj, creds, root, argv[0], s.cfg.Envv)
+	execPath, err := resolveGuestExecutable(sctxWithRoot, vfsObj, creds, root, argv[0], s.initialWorkingDir(), s.cfg.Envv)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -482,12 +483,17 @@ func (s *Sandbox) createInitialGuestProcess(ctx context.Context, sctx, sctxWithR
 }
 
 func (s *Sandbox) initialWorkingDir() string {
-	workDir := s.cfg.WorkDir
-	if (workDir == "" || workDir == "/") && s.resolvedImg != nil && s.resolvedImg.Config.WorkingDir != "" {
-		workDir = s.resolvedImg.Config.WorkingDir
+	workDir := strings.TrimSpace(s.cfg.WorkDir)
+	if (workDir == "" || workDir == "/") && s.resolvedImg != nil {
+		if imgDir := strings.TrimSpace(s.resolvedImg.Config.WorkingDir); imgDir != "" {
+			workDir = imgDir
+		}
 	}
 	if workDir == "" {
 		return "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return "/" + workDir
 	}
 	return workDir
 }

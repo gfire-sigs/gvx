@@ -208,6 +208,35 @@ func TestSandboxRegistryImageAppliesRuntimeConfig(t *testing.T) {
 	}
 }
 
+func TestSandboxRunsRelativeEntrypointFromImageWorkDir(t *testing.T) {
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64 failed: %v", err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "app/run-cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "app/note.txt", Data: []byte("relative-entrypoint-ok\n")},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar failed: %v", err)
+	}
+	baseURL := testimage.NewRegistry(t, "gvx/relentry", "v1", testimage.Image{
+		Arch:       runtime.GOARCH,
+		Layers:     [][]byte{layer},
+		Entrypoint: []string{"./run-cat"},
+		Cmd:        []string{"note.txt"},
+		WorkingDir: "/app",
+	})
+
+	cfg := hostTestConfig(t)
+	cfg.OCIImage = "gvx/relentry:v1"
+	cfg.RegistryBaseURL = baseURL
+	code, stdout, stderr := runConfig(t, cfg)
+	if code != 0 || stdout != "relative-entrypoint-ok\n" {
+		t.Fatalf("relative entrypoint image = (%d, %q, stderr=%q), want (0, %q)", code, stdout, stderr, "relative-entrypoint-ok\n")
+	}
+}
+
 func TestSandboxOverlayWhiteoutsOpaqueAndOrdering(t *testing.T) {
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {

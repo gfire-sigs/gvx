@@ -748,24 +748,95 @@ func vfsEnsureEmptyFile(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, c
 	return nil
 }
 
-func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, cmd string, envv []string) (string, error) {
-	isRegularFile := func(candidate string) bool {
-		pop := vfs.PathOperation{
+// resolveGuestExecutable returns the absolute guest path that execve(2) would
+// run for cmd. A cmd that contains a slash names a path. A relative path, a
+// relative PATH entry, and an empty PATH entry resolve through VFS from
+// workDir so symlinks, "..", and trailing slashes obey execve(2) semantics.
+func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, cmd, workDir string, envv []string) (string, error) {
+	wd := root
+	var wdErr error
+	if workDir != "" {
+		wdPop := vfs.PathOperation{
 			Root:               root,
 			Start:              root,
-			Path:               makeFPath(candidate),
+			Path:               makeFPath(workDir),
 			FollowFinalSymlink: true,
 		}
-		st, err := vfsObj.StatAt(sctx, creds, &pop, &vfs.StatOptions{Mask: linux.STATX_TYPE | linux.STATX_MODE})
+		resolvedWD, err := vfsObj.GetDentryAt(sctx, creds, &wdPop, &vfs.GetDentryOptions{})
 		if err != nil {
-			return false
+			wdErr = err
+		} else {
+			stPop := vfs.PathOperation{Root: root, Start: resolvedWD}
+			st, err := vfsObj.StatAt(sctx, creds, &stPop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+			switch {
+			case err != nil:
+				resolvedWD.DecRef(sctx)
+				wdErr = err
+			case (st.Mode & linux.S_IFMT) != linux.S_IFDIR:
+				resolvedWD.DecRef(sctx)
+				wdErr = linuxerr.ENOTDIR
+			default:
+				wd = resolvedWD
+				defer wd.DecRef(sctx)
+			}
 		}
-		return (st.Mode & linux.S_IFMT) == linux.S_IFREG
+	}
+
+	resolveCandidate := func(candidate string) (string, bool) {
+		if candidate == "" {
+			return "", false
+		}
+		fp := makeFPath(candidate)
+		start := root
+		if !fp.Absolute {
+			if wdErr != nil {
+				return "", false
+			}
+			start = wd
+		}
+		statPop := vfs.PathOperation{
+			Root:               root,
+			Start:              start,
+			Path:               fp,
+			FollowFinalSymlink: true,
+		}
+		st, err := vfsObj.StatAt(sctx, creds, &statPop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+		if err != nil || (st.Mode&linux.S_IFMT) != linux.S_IFREG {
+			return "", false
+		}
+		if fp.Absolute {
+			return candidate, true
+		}
+		// Keep the final symlink name intact so shebang $0, AT_EXECFN, and
+		// task comm reflect the invoked link path while returning an absolute
+		// path reachable from root.
+		dentryPop := vfs.PathOperation{
+			Root:               root,
+			Start:              start,
+			Path:               fp,
+			FollowFinalSymlink: false,
+		}
+		vd, err := vfsObj.GetDentryAt(sctx, creds, &dentryPop, &vfs.GetDentryOptions{})
+		if err != nil {
+			return "", false
+		}
+		defer vd.DecRef(sctx)
+		absPath, err := vfsObj.PathnameReachable(sctx, root, vd)
+		if err != nil || absPath == "" || vd.Dentry().IsDead() {
+			return "", false
+		}
+		return absPath, true
 	}
 
 	if strings.Contains(cmd, "/") {
-		if isRegularFile(cmd) {
-			return cmd, nil
+		if resolved, ok := resolveCandidate(cmd); ok {
+			return resolved, nil
+		}
+		if !path.IsAbs(cmd) {
+			if wdErr != nil {
+				return "", fmt.Errorf("gvx: executable %q not found in guest rootfs (working directory %q: %w)", cmd, workDir, wdErr)
+			}
+			return "", fmt.Errorf("gvx: executable %q not found in guest rootfs from working directory %q", cmd, cmp.Or(workDir, "/"))
 		}
 		return "", fmt.Errorf("gvx: executable %q not found in guest rootfs", cmd)
 	}
@@ -779,16 +850,26 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 	}
 
 	for _, dir := range strings.Split(pathEnv, ":") {
-		if dir == "" {
-			dir = "/"
-		}
-		candidate := path.Join(dir, cmd)
-		if isRegularFile(candidate) {
-			return candidate, nil
+		// An empty PATH entry searches the working directory directly.
+		candidate := joinPathCandidate(dir, cmd)
+		if resolved, ok := resolveCandidate(candidate); ok {
+			return resolved, nil
 		}
 	}
 
 	return "", fmt.Errorf("gvx: executable %q not found in PATH (%s)", cmd, pathEnv)
+}
+
+// joinPathCandidate joins a PATH directory entry and bare command name without
+// lexically collapsing ".." segments before VFS symlink traversal.
+func joinPathCandidate(dir, cmd string) string {
+	if dir == "" {
+		return cmd
+	}
+	if strings.HasSuffix(dir, "/") {
+		return dir + cmd
+	}
+	return dir + "/" + cmd
 }
 
 func makeFPath(p string) fspath.Path {
