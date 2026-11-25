@@ -1,6 +1,6 @@
 name: pjdfstest
 
-# Runs the POSIX file system conformance suite (pjdfstest) inside rungv guests
+# Runs the POSIX file system conformance suite (pjdfstest) inside rungvx guests
 # on linux/amd64, linux/arm64, windows/amd64, and windows/arm64. The select job
 # picks the drivers from the changed paths: ext4lite volumes for
 # pkg/sentry/fsimpl/ext4lite, hostfs volumes for pkg/sentry/fsimpl/hostfs, and
@@ -112,15 +112,15 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Build rungv
+      - name: Build rungvx
         env:
           CGO_ENABLED: "0"
-        run: go build -o rungv ./cmd/rungv
+        run: go build -o rungvx ./cmd/rungvx
       - name: Build pjdfstest bundle inside guest
         env:
           GOMAXPROCS: "1"
         run: |
-          ./scripts/pjdfstest/build-bundle.sh ./rungv "$PWD/cache" "$PWD/bundle"
+          ./scripts/pjdfstest/build-bundle.sh ./rungvx "$PWD/cache" "$PWD/bundle"
           e2fsck -fn "$PWD/cache/volumes/pjdfs_build.ext4"
       - name: Upload guest-built pjdfstest bundle
         uses: actions/upload-artifact@v7
@@ -151,10 +151,10 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Build rungv
+      - name: Build rungvx
         env:
           CGO_ENABLED: "0"
-        run: go build -o rungv ./cmd/rungv
+        run: go build -o rungvx ./cmd/rungvx
       - name: Download pjdfstest bundle
         uses: actions/download-artifact@v8
         with:
@@ -163,7 +163,7 @@ jobs:
       - name: Run pjdfstest inside guests
         env:
           GOMAXPROCS: "1"
-        run: ./scripts/pjdfstest/run.sh ./rungv "$PWD/cache" "$PWD/bundle" ${{ matrix.fs }} vol "$PWD/out"
+        run: ./scripts/pjdfstest/run.sh ./rungvx "$PWD/cache" "$PWD/bundle" ${{ matrix.fs }} vol "$PWD/out"
       - name: Compare with the known failures
         run: go run ./internal/pjdfsreport -fs ${{ matrix.fs }} -os linux -known scripts/pjdfstest/known-failures.txt out/worker_*.log
       - name: Check the ext4lite volumes
@@ -204,9 +204,9 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Build rungv
+      - name: Build rungvx
         shell: bash
-        run: go build -o rungv.exe ./cmd/rungv
+        run: go build -o rungvx.exe ./cmd/rungvx
       - name: Download pjdfstest bundle
         uses: actions/download-artifact@v8
         with:
@@ -214,7 +214,7 @@ jobs:
           path: bundle
       - name: Run pjdfstest inside guests
         shell: bash
-        run: ./scripts/pjdfstest/run.sh ./rungv.exe ./cache ./bundle ${{ matrix.fs }} tmp ./out
+        run: ./scripts/pjdfstest/run.sh ./rungvx.exe ./cache ./bundle ${{ matrix.fs }} tmp ./out
       - name: Compare with the known failures
         shell: bash
         run: go run ./internal/pjdfsreport -fs ${{ matrix.fs }} -os windows -known scripts/pjdfstest/known-failures.txt out/worker_*.log

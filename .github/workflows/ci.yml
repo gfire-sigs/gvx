@@ -6,9 +6,9 @@ name: ci
 on:
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**", ".github/workflows/benchmark.yml", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml", ".github/workflows/pjdfstest.yml"]
+    paths-ignore: ["**.md", "docs/**", "ext/**", ".github/workflows/benchmark.yml", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml", ".github/workflows/ext.yml", ".github/workflows/pjdfstest.yml"]
   pull_request:
-    paths-ignore: ["**.md", "docs/**", ".github/workflows/benchmark.yml", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml", ".github/workflows/pjdfstest.yml"]
+    paths-ignore: ["**.md", "docs/**", "ext/**", ".github/workflows/benchmark.yml", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml", ".github/workflows/ext.yml", ".github/workflows/pjdfstest.yml"]
   workflow_dispatch:
     inputs:
       only:
@@ -30,7 +30,7 @@ env:
   # tests, which the project does not run.
   OWNED: >-
     ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/... ./tools/gostateify/...
-    ./pkg/gvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
+    ./pkg/gvx/... ./pkg/rungvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
     ./pkg/abi/linux/... ./pkg/cpuid/... ./pkg/erofs/... ./pkg/fd/... ./pkg/fdnotifier/... ./pkg/fsutil/... ./pkg/hostarch/...
     ./pkg/memutil/... ./pkg/rawfile/... ./pkg/ring0/... ./pkg/sync/... ./pkg/syserr/...
     ./pkg/sentry/arch/... ./pkg/sentry/blockdev/... ./pkg/sentry/devices/memdev/...
@@ -46,7 +46,7 @@ env:
   # project does not fix.
   VET: >-
     ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/... ./tools/gostateify/...
-    ./pkg/gvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
+    ./pkg/gvx/... ./pkg/rungvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
     ./pkg/sentry/blockdev/... ./pkg/sentry/socket/netlink/genetlink/...
     ./pkg/sentry/platform/hvcommon/... ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
     ./pkg/sentry/fsimpl/chunkcache/... ./pkg/sentry/fsimpl/fsutilx/... ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/...
@@ -71,7 +71,7 @@ jobs:
       - name: Check Go formatting
         run: |
           unformatted=$(gofmt -l cmd e2e internal scripts tools/upstream tools/licenses tools/gvisorlint tools/androidprobe tools/gostateify \
-            pkg/gvx pkg/oci pkg/netbackend pkg/hostlockdown pkg/syserr pkg/ipset pkg/tcpip/link/vxlan pkg/tcpip/link/wgtun \
+            pkg/gvx pkg/rungvx pkg/oci pkg/netbackend pkg/hostlockdown pkg/syserr pkg/ipset pkg/tcpip/link/vxlan pkg/tcpip/link/wgtun \
             pkg/sentry/blockdev pkg/sentry/socket/netlink/genetlink pkg/sentry/platform/hvcommon \
             pkg/sentry/platform/hvf pkg/sentry/platform/whpx pkg/sentry/fsimpl/chunkcache \
             pkg/sentry/fsimpl/fsutilx pkg/sentry/fsimpl/hostfs pkg/sentry/fsimpl/ext4lite pkg/sentry/fsimpl/rpcfs)
@@ -199,18 +199,19 @@ jobs:
         run: |
           go test -count=1 ./pkg/sentry/platform/systrap/
           go test -count=1 -run 'TestE2ESystrap|TestE2EGateETExec|TestE2EGateM2' ./e2e/
-      - name: Build rungv and the smoke guest
+      - name: Build rungvx and the smoke guest
         env:
           CGO_ENABLED: "0"
         run: |
-          go build -o rungv ./cmd/rungv
+          go build -o rungvx ./cmd/rungvx
+          ./rungvx version -V
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
       - name: Run smoke guest without lockdown
         env:
           GVX_DEBUG_LOG: "1"
         run: |
-          ./rungv stub
-          ./rungv run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
+          ./rungvx stub
+          ./rungvx run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
       # A cgo build adds the thread start of the C library to the filter.
@@ -219,9 +220,9 @@ jobs:
           CGO_ENABLED: "1"
           GVX_DEBUG_LOG: "1"
         run: |
-          go build -o rungv-cgo ./cmd/rungv
+          go build -o rungvx-cgo ./cmd/rungvx
           mkdir -p workspace-cgo
-          ./rungv-cgo run -platform=auto -net=none -workspace=workspace-cgo -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
+          ./rungvx-cgo run -platform=auto -net=none -workspace=workspace-cgo -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
       - name: Run smoke guest with lockdown
@@ -229,7 +230,7 @@ jobs:
           GVX_DEBUG_LOG: "1"
         run: |
           mkdir -p workspace
-          ./rungv run -platform=auto -net=none -workspace=workspace -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
+          ./rungvx run -platform=auto -net=none -workspace=workspace -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
 
@@ -255,7 +256,7 @@ jobs:
       # macOS has no systrap engine and macos-26 offers no Hypervisor.framework,
       # so this step runs the host-level e2e gates that need no guest VM.
       - name: Test host-level end-to-end gates
-        run: go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" -run '^TestE2E(OtherOSHypervisorFailsExplicitly|SystrapPrerequisiteError|RungvConfigurationErrors)$' ./e2e/
+        run: go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" -run '^TestE2E(OtherOSHypervisorFailsExplicitly|SystrapPrerequisiteError|RungvxConfigurationErrors)$' ./e2e/
 
   windows-amd64:
     name: test windows/amd64
@@ -285,10 +286,11 @@ jobs:
           Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List FeatureName, State
           Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent
           Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
-      - name: Build rungv and the smoke guest
+      - name: Build rungvx and the smoke guest
         shell: bash
         run: |
-          go build -o rungv.exe ./cmd/rungv
+          go build -o rungvx.exe ./cmd/rungvx
+          ./rungvx.exe version -V
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
       # The runner has the Windows Hypervisor Platform, so whpx must start.
       # GVX_DEBUG_LOG prints the Sentry log, which names the reason of a guest
@@ -298,7 +300,7 @@ jobs:
         env:
           GVX_DEBUG_LOG: "1"
         run: |
-          ./rungv.exe run -platform=whpx -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
+          ./rungvx.exe run -platform=whpx -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
       # The suite runs each test on whpx and on systrap. The hypervisor tests
@@ -307,7 +309,7 @@ jobs:
         shell: bash
         env:
           GVX_E2E_OFFLINE: "1"
-        run: go test -count=1 -timeout 25m ./pkg/gvx/ ./cmd/rungv/ ./e2e/
+        run: go test -count=1 -timeout 25m ./pkg/gvx/ ./pkg/rungvx/ ./cmd/rungvx/ ./e2e/
 
   windows-arm64:
     name: test windows/arm64
@@ -333,24 +335,25 @@ jobs:
       - name: Test execution backends
         shell: bash
         run: go test -count=1 ./pkg/sentry/platform/whpx/ ./pkg/sentry/platform/systrap/
-      - name: Build rungv and the smoke guest
+      - name: Build rungvx and the smoke guest
         shell: bash
         run: |
-          go build -o rungv.exe ./cmd/rungv
+          go build -o rungvx.exe ./cmd/rungvx
+          ./rungvx.exe version -V
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
       - name: Run smoke guest on systrap
         shell: bash
         env:
           GVX_DEBUG_LOG: "1"
         run: |
-          ./rungv.exe run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
+          ./rungvx.exe run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
       - name: Test end-to-end suite
         shell: bash
         env:
           GVX_E2E_OFFLINE: "1"
-        run: go test -count=1 -timeout 25m ./pkg/gvx/ ./cmd/rungv/ ./e2e/
+        run: go test -count=1 -timeout 25m ./pkg/gvx/ ./pkg/rungvx/ ./cmd/rungvx/ ./e2e/
 
   repro:
     name: reproducible build in gvx
@@ -371,7 +374,7 @@ jobs:
         with:
           path: ~/.cache/gvx/repro-layers
           key: gvx-repro-golang-${{ hashFiles('go.mod') }}-${{ runner.arch }}
-      - name: Build rungv in gvx Go image and compare SHA-256
+      - name: Build rungvx in gvx Go image and compare SHA-256
         env:
           GVX_REPRO_PLATFORM: systrap
         run: GVX_REPRO_CACHE_DIR="$HOME/.cache/gvx/repro-layers" ./scripts/verify-repro-gvx.sh

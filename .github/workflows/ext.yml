@@ -1,0 +1,155 @@
+name: ext
+
+# Builds, vets, and tests the nested Go extension submodule (ext/go.mod) with
+# compile-time build tags (-tags ext_gpu and -tags ext_all), independently from
+# the pure-Go core CI pipeline.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ext/**"
+      - "pkg/gvx/**"
+      - "pkg/rungvx/**"
+      - "pkg/sentry/fsimpl/sys/**"
+      - "pkg/sentry/vfs/**"
+      - "pkg/sentry/memmap/**"
+      - "scripts/repro-build.sh"
+      - "UPSTREAM_COMMIT"
+      - ".github/workflows/ext.yml"
+  pull_request:
+    paths:
+      - "ext/**"
+      - "pkg/gvx/**"
+      - "pkg/rungvx/**"
+      - "pkg/sentry/fsimpl/sys/**"
+      - "pkg/sentry/vfs/**"
+      - "pkg/sentry/memmap/**"
+      - "scripts/repro-build.sh"
+      - "UPSTREAM_COMMIT"
+      - ".github/workflows/ext.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ext-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  build:
+    name: build, vet, and repro ext
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Check Go formatting in ext
+        run: |
+          unformatted=$(gofmt -l ext)
+          test -z "$unformatted" || { echo "$unformatted"; exit 1; }
+      - name: Cross-compile ext across all target platforms
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64 android/arm64; do
+            echo "::group::build ext $target"
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go -C ext build ./...
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go -C ext build -tags ext_gpu ./...
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go -C ext build -tags ext_all ./...
+            echo "::endgroup::"
+          done
+      - name: Vet ext across all target platforms
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "::group::vet ext $target"
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go -C ext vet -tags ext_all ./...
+            echo "::endgroup::"
+          done
+      - name: Verify deterministic ext repro build and nginx-style version output
+        run: |
+          GVX_BUILD_TAGS=ext_gpu ./scripts/repro-build.sh /tmp/rungvx-ext-1 ./ext/cmd/rungvx
+          GVX_BUILD_TAGS=ext_gpu ./scripts/repro-build.sh /tmp/rungvx-ext-2 ./ext/cmd/rungvx
+          sha1=$(sha256sum /tmp/rungvx-ext-1 | awk '{ print $1 }')
+          sha2=$(sha256sum /tmp/rungvx-ext-2 | awk '{ print $1 }')
+          echo "ext repro sha256: $sha1"
+          test "$sha1" = "$sha2"
+          /tmp/rungvx-ext-1 version -V | tee /tmp/ext-version.txt
+          grep -q "build options: cgo=0 tags=ext_gpu extensions=gpu" /tmp/ext-version.txt
+          grep -q "spi: 1" /tmp/ext-version.txt
+          grep -q "extension gpu: modes=venus,virgl" /tmp/ext-version.txt
+
+          ./scripts/repro-build.sh /tmp/rungvx-pure ./cmd/rungvx
+          /tmp/rungvx-pure version -V | tee /tmp/pure-version.txt
+          grep -q "build options: cgo=0 tags=none extensions=none" /tmp/pure-version.txt
+      - name: Audit boundaries including ext
+        run: go run ./tools/upstream -mode=audit -max-ratio=0.045
+
+  test-linux:
+    name: test ext linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test ext with race detector
+        run: go -C ext test -race -count=1 -tags ext_all ./...
+      - name: Test ext pure-Go (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: "0"
+        run: go -C ext test -count=1 -tags ext_all ./...
+
+  test-darwin:
+    name: test ext darwin/arm64
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test ext with race detector
+        run: go -C ext test -race -count=1 -tags ext_all -exec "$PWD/scripts/codesign-exec.sh" ./...
+
+  test-windows:
+    name: test ext windows/amd64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test ext with race detector
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: go -C ext test -race -count=1 -tags ext_all ./...
+      - name: Test ext pure-Go (CGO_ENABLED=0)
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: go -C ext test -count=1 -tags ext_all ./...
