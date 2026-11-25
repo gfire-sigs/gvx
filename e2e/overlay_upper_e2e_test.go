@@ -185,12 +185,12 @@ func TestE2EOverlayUpperPersistsAcrossSandboxes(t *testing.T) {
 	}
 }
 
-// TestE2EOverlayUpperSurvivesSigkill kills a child rungv after the guest
+// TestE2EOverlayUpperSurvivesSigkill kills a child rungvx after the guest
 // synced its overlay writes. A new sandbox on the same backing store then
 // sees the whiteouts, the opaque directories, and the copied-up files.
 func TestE2EOverlayUpperSurvivesSigkill(t *testing.T) {
 	bin := acceptprog.BuildParityProbe(t, runtime.GOARCH)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 	layouts := []struct {
 		name string
 		bind bool
@@ -219,16 +219,16 @@ func TestE2EOverlayUpperSurvivesSigkill(t *testing.T) {
 					"-cache-dir=" + cacheDir, "-bin=" + bin,
 					"-mount=type=" + kind + ",src=" + src + ",dst=/data",
 					"--", "overlay-write", "/data", "hold"}
-				cmd := exec.Command(rungv, args...)
+				cmd := exec.Command(rungvx, args...)
 				stdout, stderr := newOutputLog(), newOutputLog()
 				cmd.Stdout, cmd.Stderr = stdout, stderr
 				t.Cleanup(func() {
 					if t.Failed() {
-						t.Logf("rungv stderr:\n%s", stderr.String())
+						t.Logf("rungvx stderr:\n%s", stderr.String())
 					}
 				})
 				if err := cmd.Start(); err != nil {
-					t.Fatalf("start rungv: %v", err)
+					t.Fatalf("start rungvx: %v", err)
 				}
 				exited := make(chan struct{})
 				var waitErr error
@@ -249,12 +249,12 @@ func TestE2EOverlayUpperSurvivesSigkill(t *testing.T) {
 				}
 				stdout.waitFor(t, 0, "SYNCED\n", 3*time.Minute, exited)
 				if err := cmd.Process.Kill(); err != nil {
-					t.Fatalf("SIGKILL rungv: %v", err)
+					t.Fatalf("SIGKILL rungvx: %v", err)
 				}
 				<-exited
 				var exitErr *exec.ExitError
 				if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() == 0 {
-					t.Fatalf("rungv wait after kill = %v, want a non-zero exit", waitErr)
+					t.Fatalf("rungvx wait after kill = %v, want a non-zero exit", waitErr)
 				}
 				requireProbeSteps(t, "overlay-write before the kill", 0, stdout.String(), overlayUpperSteps)
 

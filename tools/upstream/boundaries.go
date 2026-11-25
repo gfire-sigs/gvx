@@ -116,6 +116,9 @@ const (
 // that runtime and library packages under pkg/ must never import.
 var runtimeOuterBans = []string{
 	"cmd/*",
+	"ext/*",
+	"pkg/rungvx/*",
+	"pkg/gvx/exttest",
 	"internal/gvxshim/*",
 	"e2e/*",
 	"tools/*",
@@ -177,19 +180,58 @@ var boundaryRules = []importRule{
 		forbidden: []string{"pkg/*", "runsc/*", "shim/*", "cmd/*", "e2e/*", "tools/*", "scripts/*"},
 	},
 
-	// Standalone CLI runner and SDK coordinator (Tier 1).
+	// Standalone CLI runner, shared CLI library, and SDK coordinator (Tier 1).
 	{
-		pkg:               "cmd/rungv",
+		pkg:               "cmd/rungvx",
+		tier:              Tier1Additive,
+		allowed:           []string{"pkg/rungvx"},
+		forbidden:         []string{pkgSentryAll, "pkg/gvx", "pkg/gvx/*", "pkg/oci/*", "pkg/hostlockdown/*", "pkg/netbackend/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*", "ext/*"},
+		forbiddenLiterals: []string{winHvDLL},
+	},
+	{
+		pkg:               "pkg/rungvx",
 		tier:              Tier1Additive,
 		allowed:           []string{"pkg/gvx", "pkg/gvx/control", "pkg/oci", "gopkg.in/yaml.v3"},
-		forbidden:         []string{pkgSentryAll, "pkg/hostlockdown/*", "pkg/netbackend/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
+		forbidden:         []string{pkgSentryAll, "pkg/gvx/exttest", "pkg/hostlockdown/*", "pkg/netbackend/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*", "cmd/*", "ext/*"},
 		forbiddenLiterals: []string{winHvDLL},
+	},
+	{
+		pkg:           "ext",
+		tier:          Tier1Additive,
+		subtree:       true,
+		allowed:       []string{"ext/*", "pkg/gvx", "pkg/gvx/shm", "pkg/gvx/exttest", "pkg/rungvx", "pkg/sentry/fsimpl/sys", "pkg/sentry/vfs", "pkg/sentry/memmap", "pkg/sentry/kernel/auth", "pkg/context", "pkg/errors/linuxerr", "pkg/abi/linux", "pkg/usermem"},
+		forbidden:     []string{"internal/*", "pkg/hostlockdown/*", "pkg/netbackend/*", "pkg/sentry/kernel", "pkg/sentry/platform/*", "cmd/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
+		forbiddenProd: []string{"pkg/gvx/exttest"},
 	},
 	{
 		pkg:       "pkg/gvx",
 		tier:      Tier1Additive,
-		allowed:   []string{"pkg/gvx/control", "pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/state", "pkg/tcpip/*"},
-		forbidden: []string{"cmd/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "shim/*"},
+		allowed:   []string{"pkg/gvx/control", "pkg/gvx/shm", "pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/state", "pkg/tcpip/*"},
+		forbidden: []string{"cmd/*", "ext/*", "pkg/rungvx/*", "pkg/gvx/exttest", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "shim/*"},
+	},
+	{
+		pkg:       "pkg/gvx/exttest",
+		tier:      Tier1Additive,
+		allowed:   []string{"pkg/gvx", "internal/hvtest", "internal/systraptest", "internal/testimage"},
+		forbidden: []string{"cmd/*", "ext/*", "pkg/rungvx/*", "internal/gvxshim/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
+	},
+	{
+		pkg:     "pkg/gvx/shm",
+		tier:    Tier1Additive,
+		allowed: []string{"pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/safemem", "pkg/sentry/memmap", xSysUnix, xSysWindows},
+		forbidden: append([]string{
+			"pkg/gvx",
+			"pkg/gvx/control/*",
+			"pkg/gvx/hostcerts/*",
+			"pkg/gvx/tuning/*",
+			"pkg/oci/*",
+			"pkg/netbackend/*",
+			"pkg/hostlockdown/*",
+			"pkg/tcpip/*",
+			"pkg/sentry/kernel/*",
+			"pkg/sentry/vfs/*",
+			"pkg/sentry/platform/*",
+		}, runtimeOuterBans...),
 	},
 	{
 		pkg:     "pkg/gvx/control",
@@ -950,7 +992,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/oci"}, "github.com/klauspost/compress/*", "OCI puller decompresses zstd image layers"},
 	{[]string{"pkg/oci"}, "github.com/cespare/xxhash/*", "layer cache computes xxhash digests for content addressing"},
 	{[]string{"pkg/oci"}, "golang.org/x/sys/*", "Windows and Darwin layer caches open files with POSIX rename semantics"},
-	{[]string{"cmd/rungv"}, "pkg/gvx/tuning", "CLI tune flags read and print the leaf tunable registry"},
+	{[]string{"pkg/rungvx"}, "pkg/gvx/tuning", "CLI tune flags read and print the leaf tunable registry"},
 	{[]string{"pkg/netbackend"}, "pkg/gvx/tuning", "leaf tunable registry supplies NAT, DNS, and forwarder defaults"},
 
 	// pkg/tcpip/link/vxlan: the bound on transmit nesting.
@@ -963,7 +1005,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"internal/gvxshim"}, "github.com/containerd/typeurl/v2", "interop tests marshal an OCI specification"},
 	{[]string{"internal/gvxshim"}, "github.com/containerd/errdefs", "interop tests assert unsupported-operation errors"},
 	{[]string{"internal/gvxshim"}, "github.com/opencontainers/runtime-spec/specs-go", "interop tests construct a minimal OCI specification"},
-	{[]string{"pkg/gvx", "cmd/rungv"}, "internal/*", "tests load guest ELF, DNS, hypervisor, and image fixtures"},
+	{[]string{"pkg/gvx", "pkg/rungvx"}, "internal/*", "tests load guest ELF, DNS, hypervisor, and image fixtures"},
 	{[]string{"pkg/gvx", "e2e"}, "github.com/creack/pty", "darwin PTY tests verify host terminal raw mode restoration"},
 	{[]string{"e2e"}, "pkg/gvx", "black-box suite boots sandboxes through the public SDK"},
 	{[]string{"e2e"}, "pkg/gvx/control", "black-box suite exercises the v2 control socket protocol"},

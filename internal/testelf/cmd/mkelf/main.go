@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Command mkelf writes a tiny position-independent Linux ELF64 guest. The CI
-// smoke steps run it with rungv, so they need no registry access.
+// smoke steps run it with rungvx, so they need no registry access.
 package main
 
 import (

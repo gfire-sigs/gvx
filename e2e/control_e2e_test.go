@@ -84,7 +84,7 @@ func httpGetWithRetry(t *testing.T, url string, timeout time.Duration) string {
 
 func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	requireAutoPlatform(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 
 	const guestHTTPPort uint16 = 18088
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
@@ -143,7 +143,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 
 	sbStdout := newCheckpointNotifyBuffer()
 	sbStderr := newCheckpointNotifyBuffer()
-	sbCmd := exec.CommandContext(ctx, rungv,
+	sbCmd := exec.CommandContext(ctx, rungvx,
 		"run",
 		"-platform="+string(resolvedAutoPlatform()),
 		"-net=nat",
@@ -162,7 +162,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	sbCmd.Stdout = sbStdout
 	sbCmd.Stderr = sbStderr
 	if err := sbCmd.Start(); err != nil {
-		t.Fatalf("start rungv sandbox: %v", err)
+		t.Fatalf("start rungvx sandbox: %v", err)
 	}
 	sbDone := make(chan error, 1)
 	go func() { sbDone <- sbCmd.Wait() }()
@@ -179,10 +179,10 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	sbStdout.waitForSubstring(t, "e2e-ready\n", 30*time.Second, sbStderr)
 
 	// 1. ping & status verify host lockdown is active.
-	if out, errS, code := runTool(t, rungv, "ping", "-S", sockPath, "--wait", "10s"); code != 0 {
+	if out, errS, code := runTool(t, rungvx, "ping", "-S", sockPath, "--wait", "10s"); code != 0 {
 		t.Fatalf("ping = (%d, %q, %q)", code, out, errS)
 	}
-	statusOut, statusErr, statusCode := runTool(t, rungv, "status", "-S", sockPath, "-f", "json")
+	statusOut, statusErr, statusCode := runTool(t, rungvx, "status", "-S", sockPath, "-f", "json")
 	if statusCode != 0 {
 		t.Fatalf("status = (%d, %q, %q)", statusCode, statusOut, statusErr)
 	}
@@ -195,26 +195,26 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	}
 
 	// 2. pause & unpause
-	if _, errS, code := runTool(t, rungv, "pause", "-S", sockPath); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "pause", "-S", sockPath); code != 0 {
 		t.Fatalf("pause = (%d, %q)", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "unpause", "-S", sockPath); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "unpause", "-S", sockPath); code != 0 {
 		t.Fatalf("unpause = (%d, %q)", code, errS)
 	}
 
 	// 3. Docker-style exec (closed stdin, -i piped stdin, exit code 42)
-	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/hello"); code != 0 || out != "e2e-hello\n" {
+	if out, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/hello"); code != 0 || out != "e2e-hello\n" {
 		t.Fatalf("exec hello = (%d, %q, %q)", code, out, errS)
 	}
 	{
-		cmd := exec.CommandContext(ctx, rungv, "exec", "-S", sockPath, "-i", "--", "/bin/cat", "/proc/self/fd/0")
+		cmd := exec.CommandContext(ctx, rungvx, "exec", "-S", sockPath, "-i", "--", "/bin/cat", "/proc/self/fd/0")
 		cmd.Stdin = strings.NewReader("locked-stdin\n")
 		out, err := cmd.CombinedOutput()
 		if err != nil || string(out) != "locked-stdin\n" {
 			t.Fatalf("exec -i = (%q, %v)", out, err)
 		}
 	}
-	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/exit42"); code != 42 {
+	if _, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/exit42"); code != 42 {
 		t.Fatalf("exec exit42 = (%d, %q), want 42", code, errS)
 	}
 
@@ -223,11 +223,11 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	if err := os.WriteFile(srcFile, []byte("e2e-cp-locked\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, errS, code := runTool(t, rungv, "cp", "-S", sockPath, "-z", srcFile, ":/tmp/src.txt"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "cp", "-S", sockPath, "-z", srcFile, ":/tmp/src.txt"); code != 0 {
 		t.Fatalf("cp host->guest = (%d, %q)", code, errS)
 	}
 	dstFile := filepath.Join(t.TempDir(), "dst.txt")
-	if _, errS, code := runTool(t, rungv, "cp", "-S", sockPath, "-z", ":/tmp/src.txt", dstFile); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "cp", "-S", sockPath, "-z", ":/tmp/src.txt", dstFile); code != 0 {
 		t.Fatalf("cp guest->host = (%d, %q)", code, errS)
 	}
 	gotCP, err := os.ReadFile(dstFile)
@@ -236,31 +236,31 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	}
 
 	// 5. update live limits under lockdown
-	if _, errS, code := runTool(t, rungv, "update", "-S", sockPath, "-m", "256m", "--cpus", "0.5", "--pids-limit", "64", "--isolate-lan=true"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "update", "-S", sockPath, "-m", "256m", "--cpus", "0.5", "--pids-limit", "64", "--isolate-lan=true"); code != 0 {
 		t.Fatalf("update = (%d, %q)", code, errS)
 	}
 
 	// 6. Lockdown denials return exit code 126.
-	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "127.0.0.1:0:80"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "127.0.0.1:0:80"); code != 126 {
 		t.Fatalf("port add without --dynamic-ports = (%d, %q), want exit 126", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "mount", "remount", "-S", sockPath, "--rw", "/workspace"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "mount", "remount", "-S", sockPath, "--rw", "/workspace"); code != 126 {
 		t.Fatalf("mount remount host-RO workspace rw = (%d, %q), want exit 126", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "mount", "add", "-S", sockPath, "--type", "bind", "--src", t.TempDir(), "--dst", "/mnt/bind"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "mount", "add", "-S", sockPath, "--type", "bind", "--src", t.TempDir(), "--dst", "/mnt/bind"); code != 126 {
 		t.Fatalf("mount add bind under lockdown = (%d, %q), want exit 126", code, errS)
 	}
 
 	// 6b. port-forward tunnels TCP into the locked-down sandbox WITHOUT --dynamic-ports!
 	{
-		if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
+		if _, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
 			t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
 		}
 		localPort := freeLoopbackPortForE2E(t)
 		pfCtx, pfCancel := context.WithCancel(ctx)
 		pfOut := newCheckpointNotifyBuffer()
 		pfErr := newCheckpointNotifyBuffer()
-		pfCmd := exec.CommandContext(pfCtx, rungv, "port-forward", "-S", sockPath,
+		pfCmd := exec.CommandContext(pfCtx, rungvx, "port-forward", "-S", sockPath,
 			"127.0.0.1:"+strconv.Itoa(int(localPort))+":"+strconv.Itoa(int(guestHTTPPort)))
 		pfCmd.Stdout = pfOut
 		pfCmd.Stderr = pfErr
@@ -293,7 +293,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	}
 
 	// 7. mount add tmpfs + mount serve (rpcfs) work under full lockdown!
-	if _, errS, code := runTool(t, rungv, "mount", "add", "-S", sockPath, "--type", "tmpfs", "--dst", "/mnt/tmp", "--size", "8m"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "mount", "add", "-S", sockPath, "--type", "tmpfs", "--dst", "/mnt/tmp", "--size", "8m"); code != 0 {
 		t.Fatalf("mount add tmpfs = (%d, %q)", code, errS)
 	}
 
@@ -308,7 +308,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	serveCtx, serveCancel := context.WithCancel(ctx)
 	serveOut := newCheckpointNotifyBuffer()
 	serveErr := newCheckpointNotifyBuffer()
-	serveCmd := exec.CommandContext(serveCtx, rungv, "mount", "serve", "-S", sockPath, serveDir+":/mnt/proxy")
+	serveCmd := exec.CommandContext(serveCtx, rungvx, "mount", "serve", "-S", sockPath, serveDir+":/mnt/proxy")
 	serveCmd.Stdout = serveOut
 	serveCmd.Stderr = serveErr
 	if err := serveCmd.Start(); err != nil {
@@ -327,13 +327,13 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	})
 	serveOut.waitForSubstring(t, "Serving ", 15*time.Second, serveErr)
 
-	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/proxy/host.txt"); code != 0 || out != "locked-rpcfs-read\n" {
+	if out, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/proxy/host.txt"); code != 0 || out != "locked-rpcfs-read\n" {
 		t.Fatalf("exec read rpcfs under lockdown = (%d, %q, %q)", code, out, errS)
 	}
-	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/proxy/large.bin"); code != 0 || len(out) != len(largePayload) || out != string(largePayload) {
+	if out, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/proxy/large.bin"); code != 0 || len(out) != len(largePayload) || out != string(largePayload) {
 		t.Fatalf("exec read 512KiB rpcfs under lockdown = (%d, len=%d want=%d, err=%q)", code, len(out), len(largePayload), errS)
 	}
-	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/writeproxy"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/writeproxy"); code != 0 {
 		t.Fatalf("exec write rpcfs under lockdown = (%d, %q)", code, errS)
 	}
 	written, err := os.ReadFile(filepath.Join(serveDir, "guest.txt"))
@@ -349,7 +349,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	singleCtx, singleCancel := context.WithCancel(ctx)
 	singleOut := newCheckpointNotifyBuffer()
 	singleErr := newCheckpointNotifyBuffer()
-	singleCmd := exec.CommandContext(singleCtx, rungv, "mount", "serve", "-S", sockPath, singleHostFile+":/mnt/single.txt")
+	singleCmd := exec.CommandContext(singleCtx, rungvx, "mount", "serve", "-S", sockPath, singleHostFile+":/mnt/single.txt")
 	singleCmd.Stdout = singleOut
 	singleCmd.Stderr = singleErr
 	if err := singleCmd.Start(); err != nil {
@@ -367,7 +367,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 		}
 	})
 	singleOut.waitForSubstring(t, "Serving ", 15*time.Second, singleErr)
-	if out, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/single.txt"); code != 0 || out != "single-file-rpcfs\n" {
+	if out, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/single.txt"); code != 0 || out != "single-file-rpcfs\n" {
 		t.Fatalf("exec read single-file rpcfs = (%d, %q, %q)", code, out, errS)
 	}
 	singleCancel()
@@ -388,7 +388,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 	unmounted := false
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if out, _, code := runTool(t, rungv, "mount", "ls", "-S", sockPath, "-q"); code == 0 && !strings.Contains(out, "/mnt/proxy") {
+		if out, _, code := runTool(t, rungvx, "mount", "ls", "-S", sockPath, "-q"); code == 0 && !strings.Contains(out, "/mnt/proxy") {
 			unmounted = true
 			break
 		}
@@ -400,14 +400,14 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 
 	// 8. Streaming checkpoint (-o without -checkpoint-dir) + restore under lockdown.
 	bundleDir := filepath.Join(t.TempDir(), "ckpt-stream")
-	if _, errS, code := runTool(t, rungv, "checkpoint", "-S", sockPath, "-z", "-o", bundleDir); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "checkpoint", "-S", sockPath, "-z", "-o", bundleDir); code != 0 {
 		t.Fatalf("checkpoint -o = (%d, %q)", code, errS)
 	}
 	if err := <-sbDone; err != nil {
 		t.Fatalf("sandbox exit after checkpoint -o: %v (stderr=%q)", err, sbStderr.String())
 	}
 
-	resCmd := exec.CommandContext(ctx, rungv,
+	resCmd := exec.CommandContext(ctx, rungvx,
 		"restore",
 		"-platform="+string(resolvedAutoPlatform()),
 		"-net=nat",
@@ -433,7 +433,7 @@ func TestE2EControlProtocolUnderLockdown(t *testing.T) {
 
 func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 	requireAutoPlatform(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 
 	const guestPort uint16 = 18089
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
@@ -465,7 +465,7 @@ func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 
 	sbStdout := newCheckpointNotifyBuffer()
 	sbStderr := newCheckpointNotifyBuffer()
-	sbCmd := exec.CommandContext(ctx, rungv,
+	sbCmd := exec.CommandContext(ctx, rungvx,
 		"run",
 		"-platform="+string(resolvedAutoPlatform()),
 		"-net=nat",
@@ -483,7 +483,7 @@ func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 	sbCmd.Stdout = sbStdout
 	sbCmd.Stderr = sbStderr
 	if err := sbCmd.Start(); err != nil {
-		t.Fatalf("start rungv: %v", err)
+		t.Fatalf("start rungvx: %v", err)
 	}
 	sbDone := make(chan error, 1)
 	go func() { sbDone <- sbCmd.Wait() }()
@@ -499,26 +499,26 @@ func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 
 	sbStdout.waitForSubstring(t, "dyn-port-ok\n", 30*time.Second, sbStderr)
 
-	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
 		t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
 	}
 	hostPort := freeLoopbackPortForE2E(t)
 	spec := "127.0.0.1:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
-	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, spec); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, spec); code != 0 {
 		t.Fatalf("port add = (%d, %q)", code, errS)
 	}
 	// Non-loopback bind must still be refused under host lockdown even with --dynamic-ports.
-	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "0.0.0.0:0:80"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "0.0.0.0:0:80"); code != 126 {
 		t.Fatalf("port add non-loopback = (%d, %q), want 126", code, errS)
 	}
 	gotBody := httpGetWithRetry(t, "http://127.0.0.1:"+strconv.Itoa(int(hostPort))+"/", 15*time.Second)
 	if gotBody != "dyn-port-ok\n" {
 		t.Fatalf("dynamic port HTTP body = %q, want dyn-port-ok", gotBody)
 	}
-	if _, errS, code := runTool(t, rungv, "port", "rm", "-S", sockPath, spec); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "port", "rm", "-S", sockPath, spec); code != 0 {
 		t.Fatalf("port rm = (%d, %q)", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "stop", "-S", sockPath, "-t", "0"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "stop", "-S", sockPath, "-t", "0"); code != 0 {
 		t.Fatalf("stop -t 0 = (%d, %q)", code, errS)
 	}
 	_ = <-sbDone
@@ -526,7 +526,7 @@ func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 
 func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 	requireAutoPlatform(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 
 	const guestPort uint16 = 18090
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
@@ -558,7 +558,7 @@ func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 
 	sbStdout := newCheckpointNotifyBuffer()
 	sbStderr := newCheckpointNotifyBuffer()
-	sbCmd := exec.CommandContext(ctx, rungv,
+	sbCmd := exec.CommandContext(ctx, rungvx,
 		"run",
 		"-platform="+string(resolvedAutoPlatform()),
 		"-net=nat",
@@ -576,7 +576,7 @@ func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 	sbCmd.Stdout = sbStdout
 	sbCmd.Stderr = sbStderr
 	if err := sbCmd.Start(); err != nil {
-		t.Fatalf("start rungv: %v", err)
+		t.Fatalf("start rungvx: %v", err)
 	}
 	sbDone := make(chan error, 1)
 	go func() { sbDone <- sbCmd.Wait() }()
@@ -592,11 +592,11 @@ func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 
 	sbStdout.waitForSubstring(t, "dyn-addr-ok\n", 30*time.Second, sbStderr)
 
-	pingOut, errS, code := runTool(t, rungv, "ping", "-S", sockPath, "-f", "json")
+	pingOut, errS, code := runTool(t, rungvx, "ping", "-S", sockPath, "-f", "json")
 	if code != 0 || !strings.Contains(pingOut, "port.dynamic_any") {
 		t.Fatalf("ping = (%d, %q, %q), want port.dynamic_any", code, pingOut, errS)
 	}
-	statusOut, errS, code := runTool(t, rungv, "status", "-S", sockPath, "-f", "json")
+	statusOut, errS, code := runTool(t, rungvx, "status", "-S", sockPath, "-f", "json")
 	if code != 0 {
 		t.Fatalf("status = (%d, %q, %q)", code, statusOut, errS)
 	}
@@ -607,13 +607,13 @@ func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 		t.Fatalf("status dynamic_bind_addrs = (%v, %v), want [0.0.0.0]\nraw=%s", statusResp.DynamicBindAddrs, err, statusOut)
 	}
 
-	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
 		t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
 	}
 
 	hostPort := freeLoopbackPortForE2E(t)
 	spec := "0.0.0.0:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
-	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, spec); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, spec); code != 0 {
 		t.Fatalf("port add 0.0.0.0 = (%d, %q)", code, errS)
 	}
 	gotBody := httpGetWithRetry(t, "http://127.0.0.1:"+strconv.Itoa(int(hostPort))+"/", 15*time.Second)
@@ -623,20 +623,20 @@ func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 
 	// Unlisted IP addresses (including 127.0.0.1 without --dynamic-ports) and
 	// Unix sockets must still fail with LOCKDOWN_DENIED (exit 126).
-	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "127.0.0.1:0:80"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "127.0.0.1:0:80"); code != 126 {
 		t.Fatalf("port add unlisted loopback = (%d, %q), want 126", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "192.0.2.1:0:80"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "192.0.2.1:0:80"); code != 126 {
 		t.Fatalf("port add unlisted IP = (%d, %q), want 126", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "port", "add", "-S", sockPath, "unix:"+filepath.Join(t.TempDir(), "deny.sock")+":80"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "unix:"+filepath.Join(t.TempDir(), "deny.sock")+":80"); code != 126 {
 		t.Fatalf("port add unix socket = (%d, %q), want 126", code, errS)
 	}
 
-	if _, errS, code := runTool(t, rungv, "port", "rm", "-S", sockPath, spec); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "port", "rm", "-S", sockPath, spec); code != 0 {
 		t.Fatalf("port rm = (%d, %q)", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "stop", "-S", sockPath, "-t", "0"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "stop", "-S", sockPath, "-t", "0"); code != 0 {
 		t.Fatalf("stop -t 0 = (%d, %q)", code, errS)
 	}
 	_ = <-sbDone
@@ -647,7 +647,7 @@ func TestE2ELiveBindAttachUnderLockdown(t *testing.T) {
 		t.Skip("live hostfs bind attach via SCM_RIGHTS is POSIX-only under lockdown")
 	}
 	requireAutoPlatform(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {
@@ -696,7 +696,7 @@ func TestE2ELiveBindAttachUnderLockdown(t *testing.T) {
 
 	sbStdout := newCheckpointNotifyBuffer()
 	sbStderr := newCheckpointNotifyBuffer()
-	sbCmd := exec.CommandContext(ctx, rungv,
+	sbCmd := exec.CommandContext(ctx, rungvx,
 		"run",
 		"-platform="+string(resolvedAutoPlatform()),
 		"-net=none",
@@ -714,7 +714,7 @@ func TestE2ELiveBindAttachUnderLockdown(t *testing.T) {
 	sbCmd.Stdout = sbStdout
 	sbCmd.Stderr = sbStderr
 	if err := sbCmd.Start(); err != nil {
-		t.Fatalf("start rungv: %v", err)
+		t.Fatalf("start rungvx: %v", err)
 	}
 	sbDone := make(chan error, 1)
 	go func() { sbDone <- sbCmd.Wait() }()
@@ -730,16 +730,16 @@ func TestE2ELiveBindAttachUnderLockdown(t *testing.T) {
 
 	sbStdout.waitForSubstring(t, "bind-attach-ready\n", 30*time.Second, sbStderr)
 
-	pingOut, errS, code := runTool(t, rungv, "ping", "-S", sockPath, "-f", "json")
+	pingOut, errS, code := runTool(t, rungvx, "ping", "-S", sockPath, "-f", "json")
 	if code != 0 || !strings.Contains(pingOut, "mount.bind_attach") {
 		t.Fatalf("ping = (%d, %q, %q), want mount.bind_attach", code, pingOut, errS)
 	}
 
 	// 1. Attach host directory as hostfs under full host lockdown.
-	if outS, errS, code := runTool(t, rungv, "mount", "add", "-S", sockPath, "--type=bind", "--src", hostDir, "--dst", "/mnt/live"); code != 0 {
+	if outS, errS, code := runTool(t, rungvx, "mount", "add", "-S", sockPath, "--type=bind", "--src", hostDir, "--dst", "/mnt/live"); code != 0 {
 		t.Fatalf("mount add bind dir = (%d, %q, %q)", code, outS, errS)
 	}
-	gotDir, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/live/hello.txt")
+	gotDir, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/live/hello.txt")
 	if code != 0 || gotDir != "live-hostfs-dir\n" {
 		t.Fatalf("exec cat /mnt/live/hello.txt = (%d, %q, %q)", code, gotDir, errS)
 	}
@@ -747,12 +747,12 @@ func TestE2ELiveBindAttachUnderLockdown(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(hostDir, "hello.txt"), []byte("updated-from-host\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile update: %v", err)
 	}
-	gotUpdated, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/live/hello.txt")
+	gotUpdated, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/live/hello.txt")
 	if code != 0 || gotUpdated != "updated-from-host\n" {
 		t.Fatalf("exec cat updated = (%d, %q, %q)", code, gotUpdated, errS)
 	}
 	// Guest-to-host write-back into the live attached directory.
-	if _, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/writeok"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/writeok"); code != 0 {
 		t.Fatalf("exec writeok = (%d, %q)", code, errS)
 	}
 	writtenHost, err := os.ReadFile(filepath.Join(hostDir, "from-guest.txt"))
@@ -761,30 +761,30 @@ func TestE2ELiveBindAttachUnderLockdown(t *testing.T) {
 	}
 
 	// 2. Attach single host file read-only under full host lockdown.
-	if outS, errS, code := runTool(t, rungv, "mount", "add", "-S", sockPath, "--type=bind", "--ro", "--src", singleFile, "--dst", "/mnt/one.txt"); code != 0 {
+	if outS, errS, code := runTool(t, rungvx, "mount", "add", "-S", sockPath, "--type=bind", "--ro", "--src", singleFile, "--dst", "/mnt/one.txt"); code != 0 {
 		t.Fatalf("mount add bind file = (%d, %q, %q)", code, outS, errS)
 	}
-	gotFile, errS, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/one.txt")
+	gotFile, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/cat", "/mnt/one.txt")
 	if code != 0 || gotFile != "live-hostfs-file\n" {
 		t.Fatalf("exec cat /mnt/one.txt = (%d, %q, %q)", code, gotFile, errS)
 	}
 	// Read-only enforcement: guest write fails and remount --rw returns LOCKDOWN_DENIED (126).
-	if _, _, code := runTool(t, rungv, "exec", "-S", sockPath, "--", "/bin/writero"); code == 0 {
+	if _, _, code := runTool(t, rungvx, "exec", "-S", sockPath, "--", "/bin/writero"); code == 0 {
 		t.Fatal("exec writero on read-only attached file succeeded, want non-zero exit")
 	}
-	if _, errS, code := runTool(t, rungv, "mount", "remount", "-S", sockPath, "--rw", "/mnt/one.txt"); code != 126 {
+	if _, errS, code := runTool(t, rungvx, "mount", "remount", "-S", sockPath, "--rw", "/mnt/one.txt"); code != 126 {
 		t.Fatalf("mount remount --rw on --ro attached file = (%d, %q), want 126", code, errS)
 	}
 
 	// 3. Unmount the directory normally and lazy-detach the single file.
-	if _, errS, code := runTool(t, rungv, "mount", "rm", "-S", sockPath, "/mnt/live"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "mount", "rm", "-S", sockPath, "/mnt/live"); code != 0 {
 		t.Fatalf("mount rm /mnt/live = (%d, %q)", code, errS)
 	}
-	if _, errS, code := runTool(t, rungv, "mount", "rm", "-S", sockPath, "--detach", "/mnt/one.txt"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "mount", "rm", "-S", sockPath, "--detach", "/mnt/one.txt"); code != 0 {
 		t.Fatalf("mount rm --detach /mnt/one.txt = (%d, %q)", code, errS)
 	}
 
-	if _, errS, code := runTool(t, rungv, "stop", "-S", sockPath, "-t", "0"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "stop", "-S", sockPath, "-t", "0"); code != 0 {
 		t.Fatalf("stop -t 0 = (%d, %q)", code, errS)
 	}
 	_ = <-sbDone

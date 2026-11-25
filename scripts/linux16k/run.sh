@@ -2,7 +2,7 @@
 # Boots a Linux arm64 kernel with 16 KB pages in QEMU and runs the host
 # facility report, the synthetic ELF guest probes, the systrap, hostfs, and
 # ext4lite package tests, and the offline e2e test suite in it (GVXIP-006 P5).
-# It builds rungv, the test binaries, the prebuilt guest probes, and the init
+# It builds rungvx, the test binaries, the prebuilt guest probes, and the init
 # program of scripts/linux16k/init.go for linux/arm64, packs them into an
 # initramfs, and fails unless init prints VMSMOKE-OK.
 #
@@ -22,11 +22,11 @@ build() { GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath "$@"; }
 testbuild() { GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -trimpath -ldflags="-s -w" "$@"; }
 mkdir -p "$work/root/guests"
 build -ldflags="-s -w" -o "$work/root/init" scripts/linux16k/init.go
-build -ldflags="-s -w" -o "$work/root/rungv" ./cmd/rungv
+build -ldflags="-s -w" -o "$work/root/rungvx" ./cmd/rungvx
 build -ldflags="-s -w" -o "$work/root/androidprobe" ./tools/androidprobe
 build -ldflags="-s -w" -o "$work/root/guests/lockdownprobe" ./internal/lockdownprobe/cmd/lockdownprobe
-ln -s /rungv "$work/root/guests/rungv"
-ln -s /rungv "$work/root/guests/rungv-static"
+ln -s /rungvx "$work/root/guests/rungvx"
+ln -s /rungvx "$work/root/guests/rungvx-static"
 testbuild -o "$work/root/systrap.test" ./pkg/sentry/platform/systrap
 testbuild -o "$work/root/hostfs.test" ./pkg/sentry/fsimpl/hostfs
 testbuild -o "$work/root/ext4lite.test" ./pkg/sentry/fsimpl/ext4lite

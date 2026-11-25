@@ -103,7 +103,7 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 	if !canBindUnixControlSocket(sockDir) {
 		t.Skipf("host cannot bind Unix domain sockets in %q", sockDir)
 	}
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 
 	// Start a host Unix echo server (simulating ssh-agent).
 	hostSock := filepath.Join(sockDir, "agent.sock")
@@ -156,7 +156,7 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 
 	sbStdout := newCheckpointNotifyBuffer()
 	sbStderr := newCheckpointNotifyBuffer()
-	sbCmd := exec.CommandContext(ctx, rungv,
+	sbCmd := exec.CommandContext(ctx, rungvx,
 		"run",
 		"-platform="+string(resolvedAutoPlatform()),
 		"-net=none",
@@ -174,7 +174,7 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 	sbCmd.Stdout = sbStdout
 	sbCmd.Stderr = sbStderr
 	if err := sbCmd.Start(); err != nil {
-		t.Fatalf("start rungv: %v", err)
+		t.Fatalf("start rungvx: %v", err)
 	}
 	sbDone := make(chan error, 1)
 	go func() { sbDone <- sbCmd.Wait() }()
@@ -191,7 +191,7 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 	sbStdout.waitForSubstring(t, "uf-e2e-ready\n", 30*time.Second, sbStderr)
 
 	// Confirm host lockdown is active.
-	statusOut, errS, code := runTool(t, rungv, "status", "-S", ctrlSock, "-f", "json")
+	statusOut, errS, code := runTool(t, rungvx, "status", "-S", ctrlSock, "-f", "json")
 	if code != 0 {
 		t.Fatalf("status = (%d, %q, %q)", code, statusOut, errS)
 	}
@@ -203,20 +203,20 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 	}
 
 	// 1. Test boot-time --unix-forward under full host lockdown.
-	outS, errS, code := runTool(t, rungv, "exec", "-S", ctrlSock, "--", "/bin/uclient", "/run/host-services/ssh-auth.sock", "hello-boot")
+	outS, errS, code := runTool(t, rungvx, "exec", "-S", ctrlSock, "--", "/bin/uclient", "/run/host-services/ssh-auth.sock", "hello-boot")
 	if code != 0 || !strings.Contains(outS, "STAT mode=0600 uid=1000 gid=1000") || !strings.Contains(outS, "REPLY locked-agent:hello-boot") {
 		t.Fatalf("boot unix-forward exec = (%d, %q, %q)", code, outS, errS)
 	}
 
-	// 2. Test runtime `rungv unix-forward` under full host lockdown.
+	// 2. Test runtime `rungvx unix-forward` under full host lockdown.
 	ufCtx, ufCancel := context.WithCancel(ctx)
 	ufStdout := newCheckpointNotifyBuffer()
 	ufStderr := newCheckpointNotifyBuffer()
-	ufCmd := exec.CommandContext(ufCtx, rungv, "unix-forward", "-S", ctrlSock, "/tmp/live-agent.sock="+hostSock+",mode=0660")
+	ufCmd := exec.CommandContext(ufCtx, rungvx, "unix-forward", "-S", ctrlSock, "/tmp/live-agent.sock="+hostSock+",mode=0660")
 	ufCmd.Stdout = ufStdout
 	ufCmd.Stderr = ufStderr
 	if err := ufCmd.Start(); err != nil {
-		t.Fatalf("start rungv unix-forward: %v", err)
+		t.Fatalf("start rungvx unix-forward: %v", err)
 	}
 	ufDone := make(chan error, 1)
 	go func() { ufDone <- ufCmd.Wait() }()
@@ -231,7 +231,7 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 
 	ufStdout.waitForSubstring(t, "forwarding guest /tmp/live-agent.sock", 15*time.Second, ufStderr)
 
-	outS, errS, code = runTool(t, rungv, "exec", "-S", ctrlSock, "--", "/bin/uclient", "/tmp/live-agent.sock", "hello-live")
+	outS, errS, code = runTool(t, rungvx, "exec", "-S", ctrlSock, "--", "/bin/uclient", "/tmp/live-agent.sock", "hello-live")
 	if code != 0 || !strings.Contains(outS, "STAT mode=0660") || !strings.Contains(outS, "REPLY locked-agent:hello-live") {
 		t.Fatalf("runtime unix-forward exec = (%d, %q, %q)", code, outS, errS)
 	}
@@ -239,7 +239,7 @@ func TestE2EReverseUnixForwardUnderLockdown(t *testing.T) {
 	ufCancel()
 	<-ufDone
 
-	if _, errS, code := runTool(t, rungv, "stop", "-S", ctrlSock, "-t", "0"); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "stop", "-S", ctrlSock, "-t", "0"); code != 0 {
 		t.Fatalf("stop -t 0 = (%d, %q)", code, errS)
 	}
 	_ = <-sbDone

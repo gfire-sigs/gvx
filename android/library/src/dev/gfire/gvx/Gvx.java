@@ -30,7 +30,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Starts {@code rungv} from the native library directory of the app.
+ * Starts {@code rungvx} from the native library directory of the app.
  *
  * <p>The package installer writes the native library directory, and the app
  * cannot change it, so the start resolves no path that the app can write
@@ -43,24 +43,24 @@ import java.util.Set;
  * {@code --host-dns}.
  */
 public final class Gvx {
-    /** The file name of rungv in the native library directory. */
-    public static final String EXECUTABLE = "librungv.so";
+    /** The file name of rungvx in the native library directory. */
+    public static final String EXECUTABLE = "librungvx.so";
 
-    /** The commands of rungv that resolve registry names. */
+    /** The commands of rungvx that resolve registry names. */
     private static final Set<String> PULLING_COMMANDS =
             new HashSet<>(Arrays.asList("run", "pull"));
 
     private Gvx() {}
 
     /**
-     * Starts rungv with args, such as {@code ["run", "alpine:3", "uname", "-a"]}.
+     * Starts rungvx with args, such as {@code ["run", "alpine:3", "uname", "-a"]}.
      *
      * <p>The child has {@code HOME} in the files directory of the app and the
      * OCI cache and temporary files in its cache directory.
      */
     public static Process start(Context ctx, List<String> args) throws IOException {
         if (args.isEmpty()) {
-            throw new IllegalArgumentException("rungv needs a command");
+            throw new IllegalArgumentException("rungvx needs a command");
         }
         List<String> cmd = new ArrayList<>();
         cmd.add(new File(ctx.getApplicationInfo().nativeLibraryDir, EXECUTABLE).getPath());

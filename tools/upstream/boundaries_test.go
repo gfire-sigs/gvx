@@ -55,17 +55,22 @@ func TestBoundaryAllowListsFollowSpecTable(t *testing.T) {
 		{
 			name: "shim control has no guest runtime dependency", file: "internal/gvxshim/service.go",
 			imports: []string{"context", "golang.org/x/sys/unix", "golang.org/x/sys/windows", "github.com/Microsoft/go-winio", "github.com/containerd/ttrpc", "github.com/containerd/containerd/api/runtime/task/v3", "github.com/containerd/containerd/v2/pkg/identifiers", "google.golang.org/grpc/status", "google.golang.org/protobuf/proto"},
-			bad:     []string{m + "pkg/gvx", m + "pkg/hostlockdown", m + "pkg/sentry/kernel", m + "runsc/boot", m + "cmd/rungv", m + "shim/v1/cli", "github.com/containerd/containerd/v2/pkg/shim", "github.com/containerd/containerd/v2/client"},
+			bad:     []string{m + "pkg/gvx", m + "pkg/hostlockdown", m + "pkg/sentry/kernel", m + "runsc/boot", m + "cmd/rungvx", m + "shim/v1/cli", "github.com/containerd/containerd/v2/pkg/shim", "github.com/containerd/containerd/v2/client"},
 		},
 		{
-			name: "cmd/rungv may import gvx and oci only", file: "cmd/rungv/main.go",
+			name: "cmd/rungvx only composes pkg/rungvx", file: "cmd/rungvx/main.go",
+			imports: []string{m + "pkg/rungvx", "os"},
+			bad:     []string{m + "pkg/gvx", m + "pkg/oci", m + "pkg/netbackend", m + "pkg/hostlockdown", m + "pkg/sentry/kernel"},
+		},
+		{
+			name: "pkg/rungvx may import gvx and oci only", file: "pkg/rungvx/main.go",
 			imports: []string{m + "pkg/gvx", m + "pkg/oci", "flag"},
-			bad:     []string{m + "pkg/netbackend", m + "pkg/hostlockdown", m + "pkg/sentry/kernel", m + "pkg/log"},
+			bad:     []string{m + "pkg/netbackend", m + "pkg/hostlockdown", m + "pkg/sentry/kernel", m + "pkg/log", m + "pkg/gvx/exttest"},
 		},
 		{
 			name: "pkg/gvx coordinates the subsystems", file: "pkg/gvx/sandbox.go",
 			imports: []string{m + "pkg/oci", m + "pkg/netbackend", m + "pkg/hostlockdown", m + "pkg/sentry/vfs", m + "pkg/sentry/kernel", m + "pkg/fd", m + "pkg/tcpip/stack", m + "pkg/context", m + "pkg/cpuid"},
-			bad:     []string{m + "cmd/rungv", m + "pkg/rand", m + "pkg/unet", m + "internal/gvxshim"},
+			bad:     []string{m + "cmd/rungvx", m + "pkg/rungvx", m + "pkg/gvx/exttest", m + "pkg/rand", m + "pkg/unet", m + "internal/gvxshim"},
 		},
 		{
 			name: "pkg/oci stays independent of the sentry", file: "pkg/oci/pull.go",
@@ -216,8 +221,8 @@ func TestBoundaryTestExceptionsApplyToTestFilesOnly(t *testing.T) {
 	if vs := boundaryCheck(t, "pkg/gvx/sandbox_test.go", fixture); len(vs) != 0 {
 		t.Errorf("fixture imports in pkg/gvx tests flagged: %v", vs)
 	}
-	if vs := boundaryCheck(t, "cmd/rungv/main_hw_test.go", fixture); len(vs) != 0 {
-		t.Errorf("fixture imports in cmd/rungv tests flagged: %v", vs)
+	if vs := boundaryCheck(t, "pkg/rungvx/main_hw_test.go", fixture); len(vs) != 0 {
+		t.Errorf("fixture imports in pkg/rungvx tests flagged: %v", vs)
 	}
 	if vs := boundaryCheck(t, "pkg/gvx/sandbox.go", fixture); len(vs) != 2 {
 		t.Errorf("fixture imports in pkg/gvx production code: %d violations, want 2", len(vs))
@@ -230,8 +235,8 @@ func TestBoundaryTestExceptionsApplyToTestFilesOnly(t *testing.T) {
 func TestBoundaryForbiddenWinsOverException(t *testing.T) {
 	t.Parallel()
 
-	// pkg/gvx lists pkg/sentry/* as allowed, but cmd/rungv forbids it even in tests.
-	vs := boundaryCheck(t, "cmd/rungv/main_test.go", importLines(modulePrefix+"pkg/sentry/vfs"))
+	// pkg/gvx lists pkg/sentry/* as allowed, but pkg/rungvx forbids it even in tests.
+	vs := boundaryCheck(t, "pkg/rungvx/main_test.go", importLines(modulePrefix+"pkg/sentry/vfs"))
 	if len(vs) != 1 || !strings.Contains(vs[0].Reason, "forbidden") {
 		t.Fatalf("violations = %v, want one forbidden-list violation", vs)
 	}
@@ -293,7 +298,7 @@ func TestBoundaryRejectsWinHvPlatformLiteral(t *testing.T) {
 	t.Parallel()
 
 	body := "package p\n\nvar dll = \"winhvplatform.DLL\"\n"
-	for _, file := range []string{"cmd/rungv/main.go", "pkg/netbackend/nat.go"} {
+	for _, file := range []string{"cmd/rungvx/main.go", "pkg/rungvx/main.go", "pkg/netbackend/nat.go"} {
 		if vs := boundaryCheck(t, file, body); len(vs) != 1 || !strings.Contains(vs[0].Reason, "literal") {
 			t.Errorf("%s: violations = %v, want one literal violation", file, vs)
 		}
@@ -594,7 +599,11 @@ func TestVerifyBoundariesEnforcesArchitecturalRules(t *testing.T) {
 		{"shim binary importing pkg/sentry", "cmd/containerd-shim-gvx-v2/main.go", m + "pkg/sentry/kernel"},
 		{"shim binary importing pkg/hostlockdown", "cmd/containerd-shim-gvx-v2/main.go", m + "pkg/hostlockdown"},
 		{"pkg/gvx importing internal/gvxshim", "pkg/gvx/sandbox.go", m + "internal/gvxshim"},
-		{"pkg/gvx importing cmd/rungv", "pkg/gvx/sandbox.go", m + "cmd/rungv"},
+		{"pkg/gvx importing cmd/rungvx", "pkg/gvx/sandbox.go", m + "cmd/rungvx"},
+		{"pkg/gvx importing pkg/rungvx", "pkg/gvx/sandbox.go", m + "pkg/rungvx"},
+		{"pkg/gvx importing pkg/gvx/exttest", "pkg/gvx/sandbox.go", m + "pkg/gvx/exttest"},
+		{"pkg/rungvx importing pkg/gvx/exttest", "pkg/rungvx/run.go", m + "pkg/gvx/exttest"},
+		{"ext production importing pkg/gvx/exttest", "ext/extensions/gpu/plugin.go", m + "pkg/gvx/exttest"},
 		{"pkg/hostlockdown importing pkg/gvx", "pkg/hostlockdown/lockdown.go", m + "pkg/gvx"},
 		{"pkg/hostlockdown importing pkg/sentry", "pkg/hostlockdown/lockdown.go", m + "pkg/sentry/kernel"},
 		{"pkg/hostlockdown importing pkg/tcpip", "pkg/hostlockdown/lockdown.go", m + "pkg/tcpip"},
@@ -602,7 +611,7 @@ func TestVerifyBoundariesEnforcesArchitecturalRules(t *testing.T) {
 		{"pkg/hostlockdown importing pkg/netbackend", "pkg/hostlockdown/lockdown.go", m + "pkg/netbackend"},
 		{"pkg/netbackend importing pkg/sentry/kernel", "pkg/netbackend/nat.go", m + "pkg/sentry/kernel"},
 		{"pkg/netbackend importing pkg/gvx", "pkg/netbackend/nat.go", m + "pkg/gvx"},
-		{"pkg/netbackend importing cmd/rungv", "pkg/netbackend/nat.go", m + "cmd/rungv"},
+		{"pkg/netbackend importing cmd/rungvx", "pkg/netbackend/nat.go", m + "cmd/rungvx"},
 		{"pkg/oci importing google.golang.org/grpc", "pkg/oci/pull.go", "google.golang.org/grpc"},
 		{"pkg/oci importing containerd", "pkg/oci/pull.go", "github.com/containerd/containerd/v2/client"},
 		{"pkg/oci importing go.opentelemetry.io", "pkg/oci/pull.go", "go.opentelemetry.io/otel"},
@@ -618,7 +627,7 @@ func TestVerifyBoundariesEnforcesArchitecturalRules(t *testing.T) {
 		{"whpx importing pkg/netbackend", "pkg/sentry/platform/whpx/whpx.go", m + "pkg/netbackend"},
 		{"runtime pkg importing tools", "pkg/sync/mutex.go", m + "tools/upstream"},
 		{"runtime pkg importing e2e", "pkg/sentry/vfs/vfs.go", m + "e2e"},
-		{"runtime pkg importing cmd", "pkg/sentry/vfs/vfs.go", m + "cmd/rungv"},
+		{"runtime pkg importing cmd", "pkg/sentry/vfs/vfs.go", m + "cmd/rungvx"},
 		{"pkg/sync xplat sibling importing pkg/sentry/kernel", "pkg/sync/futex_xplat.go", m + "pkg/sentry/kernel"},
 		{"pkg/ring0 windows sibling importing pkg/sentry/arch", "pkg/ring0/bluepill_windows.go", m + "pkg/sentry/arch"},
 		{"Tier 2 sibling importing pkg/gvx", "pkg/sentry/mm/mm_xplat.go", m + "pkg/gvx"},
@@ -626,7 +635,7 @@ func TestVerifyBoundariesEnforcesArchitecturalRules(t *testing.T) {
 		{"Tier 2 sibling importing pkg/netbackend", "pkg/sentry/mm/mm_xplat.go", m + "pkg/netbackend"},
 		{"Tier 2 sibling importing pkg/hostlockdown", "pkg/sentry/mm/mm_xplat.go", m + "pkg/hostlockdown"},
 		{"Tier 2 sibling importing internal/gvxshim", "pkg/sentry/mm/mm_xplat.go", m + "internal/gvxshim"},
-		{"Tier 2 sibling importing cmd", "pkg/sentry/mm/mm_xplat.go", m + "cmd/rungv"},
+		{"Tier 2 sibling importing cmd", "pkg/sentry/mm/mm_xplat.go", m + "cmd/rungvx"},
 	}
 
 	for _, tc := range forbiddenCases {

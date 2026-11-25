@@ -35,7 +35,7 @@ import (
 
 func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 	requireAutoPlatform(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {
@@ -89,7 +89,7 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 
 	sb1Out := newCheckpointNotifyBuffer()
 	sb1Err := newCheckpointNotifyBuffer()
-	sb1Cmd := exec.CommandContext(ctx, rungv, runArgs...)
+	sb1Cmd := exec.CommandContext(ctx, rungvx, runArgs...)
 	sb1In, err := sb1Cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("StdinPipe(sb1): %v", err)
@@ -97,7 +97,7 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 	sb1Cmd.Stdout = sb1Out
 	sb1Cmd.Stderr = sb1Err
 	if err := sb1Cmd.Start(); err != nil {
-		t.Fatalf("start rungv run: %v", err)
+		t.Fatalf("start rungvx run: %v", err)
 	}
 	sb1Done := make(chan struct{})
 	go func() {
@@ -116,18 +116,18 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 	})
 
 	sb1Out.waitForSubstring(t, "ckpt-live-ready\n", 30*time.Second, sb1Err)
-	if out, errS, code := runTool(t, rungv, "ping", "-S", sock1, "--wait", "10s"); code != 0 {
+	if out, errS, code := runTool(t, rungvx, "ping", "-S", sock1, "--wait", "10s"); code != 0 {
 		t.Fatalf("ping sb1 = (%d, %q, %q)", code, out, errS)
 	}
 
-	// Start rungv mount serve for /mnt/proj under default lockdown.
+	// Start rungvx mount serve for /mnt/proj under default lockdown.
 	serveOut := newCheckpointNotifyBuffer()
 	serveErr := newCheckpointNotifyBuffer()
-	serveCmd := exec.CommandContext(ctx, rungv, "mount", "serve", "-S", sock1, serveDir+":/mnt/proj")
+	serveCmd := exec.CommandContext(ctx, rungvx, "mount", "serve", "-S", sock1, serveDir+":/mnt/proj")
 	serveCmd.Stdout = serveOut
 	serveCmd.Stderr = serveErr
 	if err := serveCmd.Start(); err != nil {
-		t.Fatalf("start rungv mount serve: %v", err)
+		t.Fatalf("start rungvx mount serve: %v", err)
 	}
 	var serveWaitErr error
 	serveDone := make(chan struct{})
@@ -146,7 +146,7 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 	serveOut.waitForSubstring(t, "Serving ", 15*time.Second, serveErr)
 
 	// Checkpoint and stop; serving client must detach cleanly and exit 0.
-	if out, errS, code := runTool(t, rungv, "checkpoint", "-S", sock1, "-checkpoint-dir", ckptDir); code != 0 {
+	if out, errS, code := runTool(t, rungvx, "checkpoint", "-S", sock1, "-checkpoint-dir", ckptDir); code != 0 {
 		t.Fatalf("checkpoint = (%d, %q, %q)", code, out, errS)
 	}
 	select {
@@ -182,7 +182,7 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 	}
 	sb2Out := newCheckpointNotifyBuffer()
 	sb2Err := newCheckpointNotifyBuffer()
-	sb2Cmd := exec.CommandContext(ctx, rungv, restoreArgs...)
+	sb2Cmd := exec.CommandContext(ctx, rungvx, restoreArgs...)
 	sb2In, err := sb2Cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("StdinPipe(sb2): %v", err)
@@ -190,7 +190,7 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 	sb2Cmd.Stdout = sb2Out
 	sb2Cmd.Stderr = sb2Err
 	if err := sb2Cmd.Start(); err != nil {
-		t.Fatalf("start rungv restore: %v", err)
+		t.Fatalf("start rungvx restore: %v", err)
 	}
 	sb2Done := make(chan error, 1)
 	go func() { sb2Done <- sb2Cmd.Wait() }()
@@ -204,10 +204,10 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 		}
 	})
 
-	if out, errS, code := runTool(t, rungv, "ping", "-S", sock2, "--wait", "15s"); code != 0 {
+	if out, errS, code := runTool(t, rungvx, "ping", "-S", sock2, "--wait", "15s"); code != 0 {
 		t.Fatalf("ping sb2 = (%d, %q, %q) sb2Err=%q", code, out, errS, sb2Err.String())
 	}
-	statusOut, statusErr, statusCode := runTool(t, rungv, "status", "-S", sock2, "-f", "json")
+	statusOut, statusErr, statusCode := runTool(t, rungvx, "status", "-S", sock2, "-f", "json")
 	if statusCode != 0 {
 		t.Fatalf("status sb2 = (%d, %q, %q)", statusCode, statusOut, statusErr)
 	}
@@ -220,10 +220,10 @@ func TestE2ECheckpointRestoreServeUnderHostLockdown(t *testing.T) {
 	}
 
 	// Read and write /mnt/proj inside restored locked-down sandbox.
-	if out, errS, code := runTool(t, rungv, "exec", "-S", sock2, "--", "/bin/cat", "/mnt/proj/hello.txt"); code != 0 || out != "hello-under-lockdown\n" {
+	if out, errS, code := runTool(t, rungvx, "exec", "-S", sock2, "--", "/bin/cat", "/mnt/proj/hello.txt"); code != 0 || out != "hello-under-lockdown\n" {
 		t.Fatalf("exec cat /mnt/proj/hello.txt = (%d, %q, %q)", code, out, errS)
 	}
-	if out, errS, code := runTool(t, rungv, "exec", "-S", sock2, "--", "/bin/writeproj"); code != 0 {
+	if out, errS, code := runTool(t, rungvx, "exec", "-S", sock2, "--", "/bin/writeproj"); code != 0 {
 		t.Fatalf("exec writeproj = (%d, %q, %q)", code, out, errS)
 	}
 	gotHost, err := os.ReadFile(filepath.Join(serveDir, "from_restored.txt"))

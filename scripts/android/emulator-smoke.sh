@@ -30,14 +30,14 @@ arch=$android_arch
 
 cd "$root"
 mkdir -p "$work/bins"
-env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/rungv" ./cmd/rungv
+env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/rungvx" ./cmd/rungvx
 env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/lockdownprobe" ./internal/lockdownprobe/cmd/lockdownprobe
 env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/androidprobe" ./tools/androidprobe
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/systrap.test" ./pkg/sentry/platform/systrap
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/hostfs.test" ./pkg/sentry/fsimpl/hostfs
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/ext4lite.test" ./pkg/sentry/fsimpl/ext4lite
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/e2e.test" ./e2e
-GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$work/bins/rungv-static" ./cmd/rungv
+GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$work/bins/rungvx-static" ./cmd/rungvx
 for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow checkpointprobe; do
 	GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags=-linkmode=internal -o "$work/bins/$g" "./internal/acceptprog/$g"
 done
@@ -112,8 +112,8 @@ run_shell() {
 }
 
 if switch_adb_uid 0 root; then
-	run_shell voltree-write-hostfs "write ok" "./rungv run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- write /workspace"
-	run_shell voltree-verify-hostfs "verify ok" "./rungv run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- verify /workspace"
+	run_shell voltree-write-hostfs "write ok" "./rungvx run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- write /workspace"
+	run_shell voltree-verify-hostfs "verify ok" "./rungvx run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- verify /workspace"
 	run_test_suite "hostfs.test (root)" hostfs.test 10m
 	run_test_suite "e2e.test hostfs overlay (root)" e2e.test 10m 0 "'-test.run=^TestE2EOverlayUpper/.*/hostfs-(bind|volume)$'"
 	adb shell "rm -rf $dir/cache $dir/tmp $dir/vws && mkdir -p $dir/cache $dir/tmp && chown -R shell:shell $dir" || true
@@ -160,7 +160,7 @@ for g in "${app_elves[@]}"; do
 	if [ "$g" = guest-shared-page ]; then
 		want="shared-page-ok"
 	fi
-	out=$(scripts/android/run-probe.sh librungv.so run -platform=systrap -net=none -bin "@FILES@/guests/$g" | tr -d '\r') || true
+	out=$(scripts/android/run-probe.sh librungvx.so run -platform=systrap -net=none -bin "@FILES@/guests/$g" | tr -d '\r') || true
 	if grep -qF "$want" <<<"$out" && grep -qF "exit code 0" <<<"$out"; then
 		echo "PASS app-$g"
 	else

@@ -2,8 +2,8 @@
 # Builds the Android library of GVXIP-006 and its sample app for ANDROID_ABI
 # (default arm64-v8a).
 #
-# OUT/gvx-android.aar holds the Java class dev.gfire.gvx.Gvx and librungv.so.
-# OUT/gvx-sample.apk is the sample app, which runs one rungv command in a
+# OUT/gvx-android.aar holds the Java class dev.gfire.gvx.Gvx and librungvx.so.
+# OUT/gvx-sample.apk is the sample app, which runs one rungvx command in a
 # foreground service (android/sample).
 #
 # Usage: scripts/android/build-sdk.sh OUT_DIR
@@ -16,13 +16,13 @@ out=$(cd "$out" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-android_go_lib "$work" librungv.so ./cmd/rungv
+android_go_lib "$work" librungvx.so ./cmd/rungvx
 
 # The library archive: classes.jar, a library manifest, and jni/<abi>/*.so.
 android_javac "$work/lib-classes" "$android_root/android/library/src"
 mkdir -p "$work/aar/jni/$android_abi"
 "${android_java_bin}jar" --create --file "$work/aar/classes.jar" -C "$work/lib-classes" .
-cp "$work/lib/$android_abi/librungv.so" "$work/aar/jni/$android_abi/"
+cp "$work/lib/$android_abi/librungvx.so" "$work/aar/jni/$android_abi/"
 cat >"$work/aar/AndroidManifest.xml" <<'EOF'
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.gfire.gvx">

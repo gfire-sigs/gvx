@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command licenses collects the license notices of the rungv binary. It writes
-// them as one text file that cmd/rungv embeds. It also checks that the embedded
+// Command licenses collects the license notices of the rungvx binary. It writes
+// them as one text file that pkg/rungvx embeds. It also checks that the embedded
 // file and the README table are current.
 //
 // Run the command from the root of the repository. The command runs go list
 // for each shipped target, so the module cache must hold the dependencies.
-// The package cmd/rungv embeds the text file, so go list fails when the file is
+// The package pkg/rungvx embeds the text file, so go list fails when the file is
 // missing. Create an empty file at the default path once before the first run.
 package main
 
@@ -33,7 +33,7 @@ import (
 
 // Paths of the generated files, relative to the repository root.
 const (
-	defaultEmbedded = "cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt"
+	defaultEmbedded = "pkg/rungvx/licenses/THIRD_PARTY_LICENSES.txt"
 	defaultReadme   = "README.md"
 )
 

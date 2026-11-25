@@ -30,37 +30,37 @@ import (
 	"z.gfire.dev/gvx/internal/testelf"
 )
 
-// staticRungv builds a rungv binary without cgo. A guest has no dynamic
+// staticRungvx builds a rungvx binary without cgo. A guest has no dynamic
 // loader for the host libc, so only a static binary runs in it.
-func staticRungv(t *testing.T) string {
+func staticRungvx(t *testing.T) string {
 	t.Helper()
 	if dir := os.Getenv("GVX_PREBUILT_DIR"); dir != "" {
-		for _, name := range []string{"rungv-static", "rungv"} {
+		for _, name := range []string{"rungvx-static", "rungvx"} {
 			cand := filepath.Join(dir, name)
 			if info, err := os.Stat(cand); err == nil && info.Mode().IsRegular() {
 				return cand
 			}
 		}
-		t.Fatalf("GVX_PREBUILT_DIR=%s has no rungv-static or rungv binary", dir)
+		t.Fatalf("GVX_PREBUILT_DIR=%s has no rungvx-static or rungvx binary", dir)
 	}
-	out := filepath.Join(t.TempDir(), "rungv-static")
+	out := filepath.Join(t.TempDir(), "rungvx-static")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, rungvPkg)
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, rungvxPkg)
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
 	if combined, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("go build %s failed: %v\n%s", rungvPkg, err, combined)
+		t.Fatalf("go build %s failed: %v\n%s", rungvxPkg, err, combined)
 	}
 	return out
 }
 
-// TestE2ENestedRungvInRungv runs rungv with systrap inside a guest of rungv
+// TestE2ENestedRungvxInRungvx runs rungvx with systrap inside a guest of rungvx
 // with systrap. The inner Sentry needs ptrace, seccomp, shared memory, the
 // futex calls, and the signal frame of the architecture from the guest
 // kernel. docs/cli.md section 11 lists the limits.
-func TestE2ENestedRungvInRungv(t *testing.T) {
+func TestE2ENestedRungvxInRungvx(t *testing.T) {
 	systraptest.Require(t)
-	inner := staticRungv(t)
+	inner := staticRungvx(t)
 	elfData, err := testelf.BuildDynamicGuestELF64(runtime.GOARCH, 0, "nested-ok\n")
 	if err != nil {
 		t.Fatalf("BuildDynamicGuestELF64 failed: %v", err)
@@ -70,7 +70,7 @@ func TestE2ENestedRungvInRungv(t *testing.T) {
 		t.Fatalf("write the guest binary: %v", err)
 	}
 
-	outer := toolPath(t, rungvPkg)
+	outer := toolPath(t, rungvxPkg)
 	stdout, stderr, code := runTool(t, outer,
 		"run", "-platform=systrap", "-v", smoke+":/smoke:ro", "-bin", inner,
 		"--", "run", "-platform=systrap", "-bin", "/smoke")

@@ -31,7 +31,7 @@ while IFS= read -r dir; do
 	if ! grep -Fxq "$pkg" <<<"$covered"; then
 		missing+=("$pkg")
 	fi
-done < <(find . \( -path './.git' -o -path './tools/shiminterop' -o -name testdata \) -prune -o -name '*_test.go' -print | sed 's|/[^/]*$||' | sort -u)
+done < <(find . \( -path './.git' -o -path './ext' -o -path './tools/shiminterop' -o -name testdata \) -prune -o -name '*_test.go' -print | sed 's|/[^/]*$||' | sort -u)
 
 if [ "${#missing[@]}" -gt 0 ]; then
 	printf 'Packages with _test.go missing from OWNED in .github/workflows/ci.yml:\n' >&2

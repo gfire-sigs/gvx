@@ -31,11 +31,11 @@ import (
 	"z.gfire.dev/gvx/internal/testelf"
 )
 
-// TestE2EAutoPublishUnderHostLockdown verifies that rungv --auto-publish
+// TestE2EAutoPublishUnderHostLockdown verifies that rungvx --auto-publish
 // discovers a guest TCP listener and exposes it on host 127.0.0.1 with host
 // lockdown active, without any static -p flag.
 func TestE2EAutoPublishUnderHostLockdown(t *testing.T) {
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 
 	for _, b := range gateBackends() {
 		t.Run(b.name, func(t *testing.T) {
@@ -63,7 +63,7 @@ func TestE2EAutoPublishUnderHostLockdown(t *testing.T) {
 				t.Fatalf("write guest ELF: %v", err)
 			}
 
-			wait := startTool(t, rungv,
+			wait := startTool(t, rungvx,
 				"run",
 				"-backend="+b.name,
 				"--auto-publish",
@@ -104,7 +104,7 @@ func TestE2EAutoPublishUnderHostLockdown(t *testing.T) {
 				t.Fatalf("GET %s body = %q, want %q\nstderr=%q", targetURL, gotBody, wantBody, stderr)
 			}
 			if code != 0 {
-				t.Fatalf("rungv exit code = %d, want 0\nstdout=%q\nstderr=%q", code, stdout, stderr)
+				t.Fatalf("rungvx exit code = %d, want 0\nstdout=%q\nstderr=%q", code, stdout, stderr)
 			}
 			wantNotice := "auto-published 127.0.0.1:" + strconv.Itoa(int(port))
 			if !strings.Contains(stderr, wantNotice) {

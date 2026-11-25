@@ -542,7 +542,7 @@ func killPhase1Want() map[string]wsEntry {
 	return want
 }
 
-// TestE2EGateM4MetaSurvivesSigkill kills a child rungv in the middle of a
+// TestE2EGateM4MetaSurvivesSigkill kills a child rungvx in the middle of a
 // metadata-heavy run. The workspace then reopens in a fresh sandbox, and the
 // state that the guest synced before the kill is intact.
 func TestE2EGateM4MetaSurvivesSigkill(t *testing.T) {
@@ -550,22 +550,22 @@ func TestE2EGateM4MetaSurvivesSigkill(t *testing.T) {
 		t.Run(b.name, func(t *testing.T) {
 			requireBackend(t, b)
 			requireRegistry(t)
-			rungv := toolPath(t, rungvPkg)
+			rungvx := toolPath(t, rungvxPkg)
 			workspace := t.TempDir()
 
 			// The child runs with the default lockdown.
-			cmd := exec.Command(rungv, "run", "-platform="+b.name, "-net=none",
+			cmd := exec.Command(rungvx, "run", "-platform="+b.name, "-net=none",
 				"-cache-dir="+sharedCacheDir(t), "-workspace="+workspace,
 				"-image="+busyboxImage, "--", "sh", "-c", killScript)
 			stdout, stderr := newOutputLog(), newOutputLog()
 			cmd.Stdout, cmd.Stderr = stdout, stderr
 			t.Cleanup(func() {
 				if t.Failed() {
-					t.Logf("rungv stderr:\n%s", stderr.String())
+					t.Logf("rungvx stderr:\n%s", stderr.String())
 				}
 			})
 			if err := cmd.Start(); err != nil {
-				t.Fatalf("start rungv: %v", err)
+				t.Fatalf("start rungvx: %v", err)
 			}
 			exited := make(chan struct{})
 			var waitErr error
@@ -582,12 +582,12 @@ func TestE2EGateM4MetaSurvivesSigkill(t *testing.T) {
 			// Phase 2 is under way once the guest reports later iterations.
 			stdout.waitFor(t, 0, "iter 30\n", time.Minute, exited)
 			if err := cmd.Process.Kill(); err != nil {
-				t.Fatalf("SIGKILL rungv: %v", err)
+				t.Fatalf("SIGKILL rungvx: %v", err)
 			}
 			<-exited
 			var exitErr *exec.ExitError
 			if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() == 0 {
-				t.Fatalf("rungv wait after kill = %v, want a non-zero exit", waitErr)
+				t.Fatalf("rungvx wait after kill = %v, want a non-zero exit", waitErr)
 			}
 
 			// The table on disk is a complete earlier or later version, never
@@ -646,10 +646,10 @@ echo REOPEN-OK`},
 func TestE2EGateM4TortureUnderDefaultLockdown(t *testing.T) {
 	requireAutoPlatform(t)
 	requireRegistry(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 	workspace := t.TempDir()
 	caseInsensitive := hostCaseInsensitive(t, workspace)
-	stdout, stderr, code := runTool(t, rungv, "run", "-platform="+string(autoPlatform()), "-net=none",
+	stdout, stderr, code := runTool(t, rungvx, "run", "-platform="+string(autoPlatform()), "-net=none",
 		"-cache-dir="+sharedCacheDir(t), "-workspace="+workspace,
 		"-image="+busyboxImage, "--", "sh", "-c", tortureScript(caseInsensitive))
 	requireGuestMarkers(t, code, stdout, stderr, posixTortureMarkers...)

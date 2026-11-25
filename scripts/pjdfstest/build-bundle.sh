@@ -4,7 +4,7 @@
 set -euo pipefail
 
 readonly usage='usage: build-bundle.sh RUNGV CACHE_DIR BUNDLE_DIR'
-readonly rungv=${1:?$usage} cache=${2:?$usage} bundle=${3:?$usage}
+readonly rungvx=${1:?$usage} cache=${2:?$usage} bundle=${3:?$usage}
 readonly platform=${PJDFS_PLATFORM:-systrap}
 # The pinned commit keeps test numbers stable for known-failures.txt.
 readonly pjdfstest_commit=85a8aea9e685999ef0540392fd80535f873d7ff7
@@ -12,7 +12,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly script_dir
 
 mkdir -p -- "$bundle" "$cache"
-"$rungv" run -platform="$platform" -cache-dir="$cache" -workspace="$bundle" \
+"$rungvx" run -platform="$platform" -cache-dir="$cache" -workspace="$bundle" \
   -v pjdfs_build:/mnt/vol alpine:3.20 sh -c '
     set -e
     apk add --no-cache git build-base autoconf automake perl perl-utils >/dev/null

@@ -22,7 +22,7 @@ import (
 
 // componentListHeading starts the component index of the text file. The index
 // holds one line per component and ends at the first blank line. The command
-// rungv license reads the same layout.
+// rungvx license reads the same layout.
 const componentListHeading = "Components (name version SPDX-id):"
 
 // textBlock is one license text and the components that use it.
@@ -49,12 +49,12 @@ func dedupe(components []component) []textBlock {
 	return blocks
 }
 
-const introduction = `rungv license notices
-=====================
+const introduction = `rungvx license notices
+======================
 
-This file lists the licenses of the components in the rungv binary.
+This file lists the licenses of the components in the rungvx binary.
 The generator "go run ./tools/licenses" writes this file. Do not edit it by hand.
-"rungv license" prints this file. "rungv license -list" prints the component index.
+"rungvx license" prints this file. "rungvx license -list" prints the component index.
 `
 
 const noticeIntroduction = `The files below belong to this repository, or to the modules and the standard library that the binary links.
@@ -120,7 +120,7 @@ func (d document) text() string {
 		}
 	}
 
-	heading(&b, "Files embedded in the rungv binary")
+	heading(&b, "Files embedded in the rungvx binary")
 	b.WriteString(embeddedNote + "\n\n")
 	for _, e := range d.embeds {
 		fmt.Fprintf(&b, "%s %s: %s\n", e.importPath, e.file, e.owner)

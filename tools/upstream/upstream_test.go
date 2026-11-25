@@ -23,7 +23,9 @@ func TestClassifyFilePartitionsThreeIsolationTiers(t *testing.T) {
 		path string
 		want IsolationTier
 	}{
-		{name: "tier1 cli runner", path: "cmd/rungv/main.go", want: Tier1Additive},
+		{name: "tier1 cli runner", path: "cmd/rungvx/main.go", want: Tier1Additive},
+		{name: "tier1 cli library", path: "pkg/rungvx/main.go", want: Tier1Additive},
+		{name: "tier1 ext module", path: "ext/extensions/gpu/plugin.go", want: Tier1Additive},
 		{name: "tier1 shim command", path: "cmd/containerd-shim-gvx-v2/main.go", want: Tier1Additive},
 		{name: "tier1 shim control", path: "internal/gvxshim/lifecycle.go", want: Tier1Additive},
 		{name: "tier1 isolated shim interop", path: "tools/shiminterop/shim_manager_linux_test.go", want: Tier1Additive},

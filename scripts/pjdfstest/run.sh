@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run the pjdfstest suites in four parallel rungv guests on one file system
+# Run the pjdfstest suites in four parallel rungvx guests on one file system
 # driver, and write the guest output of each worker to OUT_DIR/worker_N.log.
 # Compare the logs with internal/pjdfsreport afterwards.
 set -euo pipefail
 
 readonly usage='usage: run.sh RUNGV CACHE_DIR BUNDLE_DIR ext4lite|hostfs vol|tmp OUT_DIR'
-readonly rungv=${1:?$usage} cache=${2:?$usage} bundle=${3:?$usage}
+readonly rungvx=${1:?$usage} cache=${2:?$usage} bundle=${3:?$usage}
 readonly fs=${4:?$usage} binmode=${5:?$usage} outdir=${6:?$usage}
 readonly platform=${PJDFS_PLATFORM:-systrap}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -17,10 +17,10 @@ if [[ $fs != ext4lite && $fs != hostfs ]]; then
 fi
 
 # Git Bash on Windows rewrites arguments that start with "/" into Windows
-# paths. The guest paths must reach rungv unchanged.
+# paths. The guest paths must reach rungvx unchanged.
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 mkdir -p -- "$outdir" "$cache"
-"$rungv" pull -cache-dir="$cache" alpine:3.20 >/dev/null
+"$rungvx" pull -cache-dir="$cache" alpine:3.20 >/dev/null
 
 run_worker() {
   local w=$1
@@ -33,7 +33,7 @@ run_worker() {
   if [[ $fs == hostfs ]]; then
     mount=(--mount "type=volume,src=pjdfs_host_$w,dst=/mnt/vol,driver=hostfs")
   fi
-  "$rungv" run -platform="$platform" -cache-dir="$cache" -workspace="$wdir" -ro "${mount[@]}" \
+  "$rungvx" run -platform="$platform" -cache-dir="$cache" -workspace="$wdir" -ro "${mount[@]}" \
     alpine:3.20 sh /workspace/guest-run.sh "$binmode" "$@" >"$outdir/worker_$w.log" 2>&1
 }
 

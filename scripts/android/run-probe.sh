@@ -2,9 +2,9 @@
 # Runs one executable of the probe app on the device that adb selects.
 #
 # Usage: scripts/android/run-probe.sh EXE [ARG...]
-#   EXE is libandroidprobe.so or librungv.so. An argument may contain
+#   EXE is libandroidprobe.so or librungvx.so. An argument may contain
 #   @FILES@, which the app replaces with its files directory.
-# Example: scripts/android/run-probe.sh librungv.so run -platform=systrap -bin @FILES@/guests/guest-pie
+# Example: scripts/android/run-probe.sh librungvx.so run -platform=systrap -bin @FILES@/guests/guest-pie
 set -euo pipefail
 
 exe=${1:?usage: run-probe.sh EXE [ARG...]}

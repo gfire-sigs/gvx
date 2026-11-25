@@ -284,15 +284,15 @@ func TestE2EGateM3NodeAlpine(t *testing.T) {
 func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 	requireAutoPlatform(t)
 	requireRegistry(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 	cacheDir := t.TempDir()
 	foreign := otherArch()
 	host := hostArch()
 
 	for _, arch := range []string{foreign, host} {
-		stdout, stderr, code := runTool(t, rungv, "pull", "-arch="+arch, "-cache-dir="+cacheDir, "alpine:3.20")
+		stdout, stderr, code := runTool(t, rungvx, "pull", "-arch="+arch, "-cache-dir="+cacheDir, "alpine:3.20")
 		if code != 0 || !strings.Contains(stdout, "Digest: sha256:") {
-			t.Fatalf("rungv pull -arch=%s alpine:3.20 = (code %d, stdout %q, stderr %q)", arch, code, stdout, stderr)
+			t.Fatalf("rungvx pull -arch=%s alpine:3.20 = (code %d, stdout %q, stderr %q)", arch, code, stdout, stderr)
 		}
 	}
 
@@ -331,14 +331,14 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 	// A foreign architecture is a usage error on the hardware backend,
 	// whether the user names the backend or leaves the choice to auto.
 	for _, plat := range []string{string(autoPlatform()), "auto"} {
-		_, stderr, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+plat, "-net=none",
+		_, stderr, code := runTool(t, rungvx, "run", "-lockdown=false", "-platform="+plat, "-net=none",
 			"-arch="+foreign, "-cache-dir="+cacheDir, "-image=alpine:3.20", "--", "/bin/true")
 		wantErr, wantTail := "guest architecture "+foreign+" needs -platform=systrap", "run only the host architecture"
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			wantErr, wantTail = "guest architecture "+foreign+" cannot run on a", "only the host architecture"
 		}
 		if code != 2 || !strings.Contains(stderr, wantErr) || !strings.Contains(stderr, wantTail) {
-			t.Errorf("rungv run -platform=%s -arch=%s = (code %d, stderr %q), want usage error %q", plat, foreign, code, stderr, wantErr)
+			t.Errorf("rungvx run -platform=%s -arch=%s = (code %d, stderr %q), want usage error %q", plat, foreign, code, stderr, wantErr)
 		}
 	}
 	_, err = gvx.New(context.Background(), gvx.Config{
@@ -354,10 +354,10 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 	}
 
 	// The host architecture runs from the same cache.
-	_, _, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+string(autoPlatform()), "-net=none",
+	_, _, code := runTool(t, rungvx, "run", "-lockdown=false", "-platform="+string(autoPlatform()), "-net=none",
 		"-cache-dir="+cacheDir, "-image=alpine:3.20", "--", "/bin/true")
 	if code != 0 {
-		t.Errorf("rungv run of the host architecture exit code = %d, want 0", code)
+		t.Errorf("rungvx run of the host architecture exit code = %d, want 0", code)
 	}
 }
 

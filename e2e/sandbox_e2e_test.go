@@ -55,7 +55,7 @@ import (
 
 const (
 	lockdownProbePkg = "z.gfire.dev/gvx/internal/lockdownprobe/cmd/lockdownprobe"
-	rungvPkg         = "z.gfire.dev/gvx/cmd/rungv"
+	rungvxPkg        = "z.gfire.dev/gvx/cmd/rungvx"
 )
 
 // autoPlatform returns the backend that -platform=auto selects: the hardware
@@ -351,8 +351,8 @@ func TestE2ESystrapPrerequisiteError(t *testing.T) {
 	}
 }
 
-func TestE2ERungvReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
-	rungv := toolPath(t, rungvPkg)
+func TestE2ERungvxReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
+	rungvx := toolPath(t, rungvxPkg)
 	guestELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/workspace/guest.txt", "written-under-lockdown\n")
 	if err != nil {
 		t.Fatalf("BuildGuestWriteFileELF64 failed: %v", err)
@@ -364,18 +364,18 @@ func TestE2ERungvReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
 	workspace := t.TempDir()
 
 	// No -lockdown flag: the CLI default applies the host lockdown.
-	stdout, stderr, code := runTool(t, rungv, "run",
+	stdout, stderr, code := runTool(t, rungvx, "run",
 		"-platform=auto", "-net=none",
 		"-cache-dir="+t.TempDir(), "-workspace="+workspace,
 		elfPath)
 	if code != 0 {
-		t.Fatalf("rungv run exit code = %d, want 0\nstdout=%s\nstderr=%s", code, stdout, stderr)
+		t.Fatalf("rungvx run exit code = %d, want 0\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
-	if want := "rungv: platform=" + string(resolvedAutoPlatform()); !strings.Contains(stderr, want) {
-		t.Fatalf("rungv run stderr = %q, want it to report %q", stderr, want)
+	if want := "rungvx: platform=" + string(resolvedAutoPlatform()); !strings.Contains(stderr, want) {
+		t.Fatalf("rungvx run stderr = %q, want it to report %q", stderr, want)
 	}
 	if strings.Contains(stderr, "lockdown disabled") {
-		t.Fatalf("rungv run reports a disabled lockdown without -lockdown=false: %q", stderr)
+		t.Fatalf("rungvx run reports a disabled lockdown without -lockdown=false: %q", stderr)
 	}
 	got, err := os.ReadFile(filepath.Join(workspace, "guest.txt"))
 	if err != nil || string(got) != "written-under-lockdown\n" {
@@ -383,23 +383,23 @@ func TestE2ERungvReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
 	}
 
 	// -lockdown=false is an explicit and loud opt-out.
-	_, stderr, code = runTool(t, rungv, "run",
+	_, stderr, code = runTool(t, rungvx, "run",
 		"-lockdown=false", "-platform="+string(resolvedAutoPlatform()), "-net=none",
 		"-cache-dir="+t.TempDir(), "-workspace="+workspace,
 		elfPath)
 	if code != 0 {
-		t.Fatalf("rungv run -lockdown=false exit code = %d, stderr=%s", code, stderr)
+		t.Fatalf("rungvx run -lockdown=false exit code = %d, stderr=%s", code, stderr)
 	}
 	if !strings.Contains(stderr, "lockdown disabled") {
-		t.Fatalf("rungv run -lockdown=false stderr = %q, want a lockdown warning", stderr)
+		t.Fatalf("rungvx run -lockdown=false stderr = %q, want a lockdown warning", stderr)
 	}
 	if strings.Contains(stderr, "platform=") {
-		t.Fatalf("rungv run with explicit backend printed a backend line: %q", stderr)
+		t.Fatalf("rungvx run with explicit backend printed a backend line: %q", stderr)
 	}
 }
 
-func TestE2ERungvConfigurationErrors(t *testing.T) {
-	rungv := toolPath(t, rungvPkg)
+func TestE2ERungvxConfigurationErrors(t *testing.T) {
+	rungvx := toolPath(t, rungvxPkg)
 	guestELF, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "x\n")
 	if err != nil {
 		t.Fatalf("BuildGuestELF64 failed: %v", err)
@@ -427,9 +427,9 @@ func TestE2ERungvConfigurationErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			args := append(append([]string{}, base...), tc.args...)
 			args = append(args, elfPath)
-			stdout, stderr, code := runTool(t, rungv, args...)
+			stdout, stderr, code := runTool(t, rungvx, args...)
 			if code != tc.wantCode || !strings.Contains(stderr, tc.wantStderr) {
-				t.Fatalf("rungv %v = (code %d, stderr %q), want (code %d, stderr containing %q); stdout=%q", tc.args, code, stderr, tc.wantCode, tc.wantStderr, stdout)
+				t.Fatalf("rungvx %v = (code %d, stderr %q), want (code %d, stderr containing %q); stdout=%q", tc.args, code, stderr, tc.wantCode, tc.wantStderr, stdout)
 			}
 		})
 	}
@@ -475,40 +475,40 @@ func overlayRegistry(t *testing.T) (baseURL string) {
 	)
 }
 
-func TestE2ERungvPullAndRunOverlayWhiteoutsAndCaseSensitivity(t *testing.T) {
-	rungv := toolPath(t, rungvPkg)
+func TestE2ERungvxPullAndRunOverlayWhiteoutsAndCaseSensitivity(t *testing.T) {
+	rungvx := toolPath(t, rungvxPkg)
 	baseURL := overlayRegistry(t)
 	cacheDir := t.TempDir()
 
 	// layers reports the number of layers that the store holds for the image
-	// of the test registry and an architecture, as `rungv inspect` shows it.
+	// of the test registry and an architecture, as `rungvx inspect` shows it.
 	layers := func(arch string) int {
 		t.Helper()
 		name := strings.TrimPrefix(baseURL, "http://") + "/gvx/e2e:1"
-		stdout, stderr, code := runTool(t, rungv, "inspect", "-arch="+arch, "-cache-dir="+cacheDir, name)
+		stdout, stderr, code := runTool(t, rungvx, "inspect", "-arch="+arch, "-cache-dir="+cacheDir, name)
 		if code != 0 {
-			t.Fatalf("rungv inspect %s = (code %d, stdout %q, stderr %q), want the pulled image", name, code, stdout, stderr)
+			t.Fatalf("rungvx inspect %s = (code %d, stdout %q, stderr %q), want the pulled image", name, code, stdout, stderr)
 		}
 		var out []struct {
 			RootFS struct{ Layers []string }
 		}
 		if err := json.Unmarshal([]byte(stdout), &out); err != nil || len(out) != 1 {
-			t.Fatalf("rungv inspect output = %q (%v), want one image", stdout, err)
+			t.Fatalf("rungvx inspect output = %q (%v), want one image", stdout, err)
 		}
 		return len(out[0].RootFS.Layers)
 	}
 
-	stdout, stderr, code := runTool(t, rungv, "pull", "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/e2e:1")
+	stdout, stderr, code := runTool(t, rungvx, "pull", "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/e2e:1")
 	if code != 0 || !strings.Contains(stdout, "Digest: sha256:") {
-		t.Fatalf("rungv pull = (code %d, stdout %q, stderr %q), want success with the digest", code, stdout, stderr)
+		t.Fatalf("rungvx pull = (code %d, stdout %q, stderr %q), want success with the digest", code, stdout, stderr)
 	}
 	if got := layers(runtime.GOARCH); got != 2 {
 		t.Fatalf("the pulled image has %d layers, want 2", got)
 	}
 	// -arch selects the other architecture's manifest: one layer.
-	stdout, stderr, code = runTool(t, rungv, "pull", "-arch="+otherArch(), "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/e2e:1")
+	stdout, stderr, code = runTool(t, rungvx, "pull", "-arch="+otherArch(), "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/e2e:1")
 	if code != 0 {
-		t.Fatalf("rungv pull -arch=%s = (code %d, stdout %q, stderr %q), want success", otherArch(), code, stdout, stderr)
+		t.Fatalf("rungvx pull -arch=%s = (code %d, stdout %q, stderr %q), want success", otherArch(), code, stdout, stderr)
 	}
 	if got := layers(otherArch()); got != 1 {
 		t.Fatalf("the image for %s has %d layers, want 1", otherArch(), got)
@@ -516,7 +516,7 @@ func TestE2ERungvPullAndRunOverlayWhiteoutsAndCaseSensitivity(t *testing.T) {
 
 	runCat := func(paths ...string) (stdout, stderr string, code int) {
 		args := []string{"run", "-platform=auto", "-net=none", "-cache-dir=" + cacheDir, "-registry-url=" + baseURL, "-image=gvx/e2e:1", "--", "/bin/cat"}
-		return runTool(t, rungv, append(args, paths...)...)
+		return runTool(t, rungvx, append(args, paths...)...)
 	}
 
 	// Visible files cover case sensitivity, Windows-reserved names, and the
@@ -538,10 +538,10 @@ func TestE2ERungvPullAndRunOverlayWhiteoutsAndCaseSensitivity(t *testing.T) {
 	}
 
 	// The other architecture needs systrap, so the hardware backend refuses it.
-	_, stderr, code = runTool(t, rungv, "run", "-platform=auto", "-net=none", "-arch="+otherArch(),
+	_, stderr, code = runTool(t, rungvx, "run", "-platform=auto", "-net=none", "-arch="+otherArch(),
 		"-cache-dir="+cacheDir, "-registry-url="+baseURL, "-image=gvx/e2e:1", "--", "/bin/cat", "/dev/null")
 	if code != 2 || !strings.Contains(stderr, "systrap") {
-		t.Fatalf("rungv run -arch=%s = (code %d, stderr %q), want usage error naming systrap", otherArch(), code, stderr)
+		t.Fatalf("rungvx run -arch=%s = (code %d, stderr %q), want usage error naming systrap", otherArch(), code, stderr)
 	}
 }
 
@@ -1307,9 +1307,9 @@ func TestE2ESystrapHostLockdownDefault(t *testing.T) {
 	}
 }
 
-func TestE2ERungvSystrapDefaultLockdown(t *testing.T) {
+func TestE2ERungvxSystrapDefaultLockdown(t *testing.T) {
 	systraptest.Require(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 	guestELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/workspace/cli.txt", "cli-systrap\n")
 	if err != nil {
 		t.Fatalf("BuildGuestWriteFileELF64 failed: %v", err)
@@ -1324,10 +1324,10 @@ func TestE2ERungvSystrapDefaultLockdown(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, "cli.txt"), []byte("old\n"), 0o600); err != nil {
 		t.Fatalf("seed workspace cli.txt: %v", err)
 	}
-	stdout, stderr, code := runTool(t, rungv, "run", "-platform=systrap", "-net=none",
+	stdout, stderr, code := runTool(t, rungvx, "run", "-platform=systrap", "-net=none",
 		"-cache-dir="+t.TempDir(), "-workspace="+workspace, elfPath)
 	if code != 0 {
-		t.Fatalf("rungv run -platform=systrap exit code = %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
+		t.Fatalf("rungvx run -platform=systrap exit code = %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
 	if runtime.GOOS == "windows" {
 		if !strings.Contains(stderr, "Windows systrap lacks hardware or kernel syscall isolation") {
@@ -1342,21 +1342,21 @@ func TestE2ERungvSystrapDefaultLockdown(t *testing.T) {
 
 	if runtime.GOOS == "windows" && !hvtest.Available() {
 		noHV := []string{hvtest.AllowNoHypervisorEnv + "=0"}
-		_, failStderr, failCode := runToolWithEnv(t, noHV, rungv, "run", "-platform=auto", "-net=none",
+		_, failStderr, failCode := runToolWithEnv(t, noHV, rungvx, "run", "-platform=auto", "-net=none",
 			"-cache-dir="+t.TempDir(), "-workspace="+workspace, elfPath)
 		if failCode != 1 || !strings.Contains(failStderr, "-allow-unconfined-systrap") {
 			t.Fatalf("Windows -platform=auto without whpx or opt-in = (code %d, stderr %q), want code 1 and -allow-unconfined-systrap", failCode, failStderr)
 		}
-		_, okStderr, okCode := runToolWithEnv(t, noHV, rungv, "run", "-platform=auto", "-allow-unconfined-systrap", "-net=none",
+		_, okStderr, okCode := runToolWithEnv(t, noHV, rungvx, "run", "-platform=auto", "-allow-unconfined-systrap", "-net=none",
 			"-cache-dir="+t.TempDir(), "-workspace="+workspace, elfPath)
-		if okCode != 0 || !strings.Contains(okStderr, "rungv: platform=systrap") || !strings.Contains(okStderr, "Windows systrap lacks hardware or kernel syscall isolation") {
+		if okCode != 0 || !strings.Contains(okStderr, "rungvx: platform=systrap") || !strings.Contains(okStderr, "Windows systrap lacks hardware or kernel syscall isolation") {
 			t.Fatalf("Windows -platform=auto -allow-unconfined-systrap = (code %d, stderr %q), want code 0, platform=systrap, and warning", okCode, okStderr)
 		}
 	}
 
-	stdout, stderr, code = runTool(t, rungv, "stub")
+	stdout, stderr, code = runTool(t, rungvx, "stub")
 	if code != 0 || !strings.HasPrefix(stdout, "systrap stub ok\n") {
-		t.Fatalf("rungv stub = (code %d, stdout %q, stderr %q), want a handshake report", code, stdout, stderr)
+		t.Fatalf("rungvx stub = (code %d, stdout %q, stderr %q), want a handshake report", code, stdout, stderr)
 	}
 }
 

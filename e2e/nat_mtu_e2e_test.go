@@ -34,7 +34,7 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
-// mustTune builds Values from key and value pairs, as rungv --tune does.
+// mustTune builds Values from key and value pairs, as rungvx --tune does.
 func mustTune(t *testing.T, pairs map[string]string) tuning.Values {
 	t.Helper()
 	v, err := tuning.Parse(pairs)
@@ -239,11 +239,11 @@ echo SENT
 	}
 }
 
-// TestE2ERungvTuneSetsTheMTUOfEth0 runs the real rungv binary with the flags
+// TestE2ERungvxTuneSetsTheMTUOfEth0 runs the real rungvx binary with the flags
 // --tune and --tune-file. The guest reads the MTU of eth0 in netlink and in
 // /sys/class/net/eth0/mtu. A --tune flag wins over the file.
-func TestE2ERungvTuneSetsTheMTUOfEth0(t *testing.T) {
-	rungv := toolPath(t, rungvPkg)
+func TestE2ERungvxTuneSetsTheMTUOfEth0(t *testing.T) {
+	rungvx := toolPath(t, rungvxPkg)
 	probe := acceptprog.BuildNodeProbe(t, runtime.GOARCH)
 	file := filepath.Join(t.TempDir(), "tune.json")
 	if err := os.WriteFile(file, []byte(`{"net.nat.mtu": 1400}`), 0o600); err != nil {
@@ -263,7 +263,7 @@ func TestE2ERungvTuneSetsTheMTUOfEth0(t *testing.T) {
 				requireFixedAddressBackend(t, b)
 				args := append([]string{"run", "-lockdown=false", "-platform=" + string(b.plat), "-net=nat", "-cache-dir=" + t.TempDir()}, tc.args...)
 				args = append(args, "-bin="+probe, "--", "/bin/app", "natmtu", tc.mtu)
-				stdout, stderr, code := runTool(t, rungv, args...)
+				stdout, stderr, code := runTool(t, rungvx, args...)
 				requireNodeChecks(t, code, stdout, "eth0-has-the-expected-mtu-and-lo-keeps-65536", "sysfs-shows-the-mtu-of-eth0")
 				if code != 0 {
 					t.Logf("stderr: %s", stderr)
@@ -272,28 +272,28 @@ func TestE2ERungvTuneSetsTheMTUOfEth0(t *testing.T) {
 		}
 	}
 	t.Run("a bad value is a usage error", func(t *testing.T) {
-		_, stderr, code := runTool(t, rungv, "run", "-lockdown=false", "-net=nat", "--tune", "net.nat.mtu=67", "-bin="+probe, "--", "/bin/app", "natmtu")
+		_, stderr, code := runTool(t, rungvx, "run", "-lockdown=false", "-net=nat", "--tune", "net.nat.mtu=67", "-bin="+probe, "--", "/bin/app", "natmtu")
 		if code != 2 || !strings.Contains(stderr, "net.nat.mtu") || !strings.Contains(stderr, "68 to 65535") {
-			t.Errorf("rungv run --tune net.nat.mtu=67 = (code %d, stderr %q), want code 2 and the key with its range", code, stderr)
+			t.Errorf("rungvx run --tune net.nat.mtu=67 = (code %d, stderr %q), want code 2 and the key with its range", code, stderr)
 		}
 	})
 	t.Run("tune list prints the registry", func(t *testing.T) {
-		stdout, _, code := runTool(t, rungv, "tune", "list")
+		stdout, _, code := runTool(t, rungvx, "tune", "list")
 		if code != 0 || !strings.Contains(stdout, "net.nat.mtu") || !strings.Contains(stdout, "memory.cgroup.idle_poll_interval") {
-			t.Errorf("rungv tune list = (code %d, stdout %q)", code, stdout)
+			t.Errorf("rungvx tune list = (code %d, stdout %q)", code, stdout)
 		}
 	})
 }
 
-// TestE2ERungvTuneMTUReadWithCat runs the Alpine image through rungv with
+// TestE2ERungvxTuneMTUReadWithCat runs the Alpine image through rungvx with
 // --tune net.nat.mtu=9000 and reads the MTU with cat.
-func TestE2ERungvTuneMTUReadWithCat(t *testing.T) {
+func TestE2ERungvxTuneMTUReadWithCat(t *testing.T) {
 	requireRegistry(t)
-	rungv := toolPath(t, rungvPkg)
+	rungvx := toolPath(t, rungvxPkg)
 	for _, b := range gateBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			requireFixedAddressBackend(t, b)
-			stdout, stderr, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+string(b.plat), "-net=nat",
+			stdout, stderr, code := runTool(t, rungvx, "run", "-lockdown=false", "-platform="+string(b.plat), "-net=nat",
 				"-cache-dir="+sharedCacheDir(t), "--tune", "net.nat.mtu=9000", "-image=alpine:3.20", "--", "cat", "/sys/class/net/eth0/mtu")
 			if code != 0 || stdout != "9000\n" {
 				t.Errorf("cat /sys/class/net/eth0/mtu = (code %d, stdout %q, stderr %q), want 9000", code, stdout, stderr)

@@ -46,7 +46,7 @@ import (
 )
 
 // buildCheckpointProbeOCIArchive writes a single-arch OCI layout tar archive
-// containing /bin/checkpointprobe and sample image files for offline rungv E2E
+// containing /bin/checkpointprobe and sample image files for offline rungvx E2E
 // tests.
 func buildCheckpointProbeOCIArchive(t *testing.T) string {
 	t.Helper()
@@ -193,7 +193,7 @@ func writeE2ETestHostCAPEM(t *testing.T) string {
 }
 
 func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
-	rungvBin := toolPath(t, rungvPkg)
+	rungvxBin := toolPath(t, rungvxPkg)
 	archive := buildCheckpointProbeOCIArchive(t)
 	t.Setenv("SSL_CERT_FILE", writeE2ETestHostCAPEM(t))
 
@@ -225,7 +225,7 @@ func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
 
 				runStep := func(mode, wantBanner string) {
 					t.Helper()
-					stdout, stderr, code := runTool(t, rungvBin,
+					stdout, stderr, code := runTool(t, rungvxBin,
 						"run",
 						"-platform="+string(b.plat),
 						"-net=none",
@@ -236,11 +236,11 @@ func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
 						"-mode="+mode,
 					)
 					if code != 0 {
-						skipWhenFixedAddressRefused(t, "rungv run rootfs-volume", fmt.Errorf("exit %d: %s", code, stderr))
-						t.Fatalf("rungv run (%s) = (code %d, stdout %q, stderr %q)", mode, code, stdout, stderr)
+						skipWhenFixedAddressRefused(t, "rungvx run rootfs-volume", fmt.Errorf("exit %d: %s", code, stderr))
+						t.Fatalf("rungvx run (%s) = (code %d, stdout %q, stderr %q)", mode, code, stdout, stderr)
 					}
 					if !strings.Contains(stdout, wantBanner) {
-						t.Fatalf("rungv run (%s) stdout = %q, want %q", mode, stdout, wantBanner)
+						t.Fatalf("rungvx run (%s) stdout = %q, want %q", mode, stdout, wantBanner)
 					}
 				}
 
@@ -248,21 +248,21 @@ func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
 				requireCleanImage(t, imgPath, "rootfs-write")
 
 				if layout.managed {
-					lsOut, lsErr, lsCode := runTool(t, rungvBin, "volume", "ls", "-q", "-cache-dir="+cacheDir)
+					lsOut, lsErr, lsCode := runTool(t, rungvxBin, "volume", "ls", "-q", "-cache-dir="+cacheDir)
 					if lsCode != 0 || strings.TrimSpace(lsOut) != "e2eroot" {
-						t.Fatalf("rungv volume ls -q = (%d, %q, %q), want e2eroot", lsCode, lsOut, lsErr)
+						t.Fatalf("rungvx volume ls -q = (%d, %q, %q), want e2eroot", lsCode, lsOut, lsErr)
 					}
-					inspOut, inspErr, inspCode := runTool(t, rungvBin, "volume", "inspect", "e2eroot", "-cache-dir="+cacheDir)
+					inspOut, inspErr, inspCode := runTool(t, rungvxBin, "volume", "inspect", "e2eroot", "-cache-dir="+cacheDir)
 					if inspCode != 0 {
-						t.Fatalf("rungv volume inspect = (%d, %q, %q)", inspCode, inspOut, inspErr)
+						t.Fatalf("rungvx volume inspect = (%d, %q, %q)", inspCode, inspOut, inspErr)
 					}
 					var infos []gvx.VolumeInfo
 					if err := json.Unmarshal([]byte(inspOut), &infos); err != nil || len(infos) != 1 || infos[0].Driver != gvx.DriverExt4lite || infos[0].InUse {
 						t.Fatalf("volume inspect parsed = (%+v, %v), want 1 unlocked ext4lite volume", infos, err)
 					}
-					dfOut, dfErr, dfCode := runTool(t, rungvBin, "system", "df", "-v", "-cache-dir="+cacheDir)
+					dfOut, dfErr, dfCode := runTool(t, rungvxBin, "system", "df", "-v", "-cache-dir="+cacheDir)
 					if dfCode != 0 || !strings.Contains(dfOut, "e2eroot") {
-						t.Fatalf("rungv system df -v = (%d, %q, %q), want e2eroot", dfCode, dfOut, dfErr)
+						t.Fatalf("rungvx system df -v = (%d, %q, %q), want e2eroot", dfCode, dfOut, dfErr)
 					}
 				}
 
@@ -277,9 +277,9 @@ func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
 				}
 
 				if layout.managed {
-					rmOut, rmErr, rmCode := runTool(t, rungvBin, "volume", "rm", "e2eroot", "-cache-dir="+cacheDir)
+					rmOut, rmErr, rmCode := runTool(t, rungvxBin, "volume", "rm", "e2eroot", "-cache-dir="+cacheDir)
 					if rmCode != 0 {
-						t.Fatalf("rungv volume rm = (%d, %q, %q), want 0", rmCode, rmOut, rmErr)
+						t.Fatalf("rungvx volume rm = (%d, %q, %q), want 0", rmCode, rmOut, rmErr)
 					}
 				}
 			})
@@ -344,7 +344,7 @@ func TestE2ERootfsVolumeLockdownUnboundBlocked(t *testing.T) {
 }
 
 func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
-	rungvBin := toolPath(t, rungvPkg)
+	rungvxBin := toolPath(t, rungvxPkg)
 	archive := buildCheckpointProbeOCIArchive(t)
 
 	for _, b := range fixedAddressBackends() {
@@ -366,7 +366,7 @@ func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
 			stdout1 := newCheckpointNotifyBuffer()
 			stderr1 := newCheckpointNotifyBuffer()
 
-			runCmd := exec.CommandContext(ctx, rungvBin,
+			runCmd := exec.CommandContext(ctx, rungvxBin,
 				"run",
 				"-platform="+string(b.plat),
 				"-net=none",
@@ -381,7 +381,7 @@ func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
 			runCmd.Stdout = stdout1
 			runCmd.Stderr = stderr1
 			if err := runCmd.Start(); err != nil {
-				t.Fatalf("start rungv run: %v", err)
+				t.Fatalf("start rungvx run: %v", err)
 			}
 			runWaitCh := make(chan error, 1)
 			go func() {
@@ -399,8 +399,8 @@ func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
 			for !strings.Contains(stdout1.String(), "READY:rootfs-ckpt\n") {
 				select {
 				case wErr := <-runWaitCh:
-					skipWhenFixedAddressRefused(t, "rungv run", fmt.Errorf("%w: %s", wErr, stderr1.String()))
-					t.Fatalf("rungv run exited before READY: %v (stdout=%q stderr=%q)", wErr, stdout1.String(), stderr1.String())
+					skipWhenFixedAddressRefused(t, "rungvx run", fmt.Errorf("%w: %s", wErr, stderr1.String()))
+					t.Fatalf("rungvx run exited before READY: %v (stdout=%q stderr=%q)", wErr, stdout1.String(), stderr1.String())
 				case <-stdout1.ch:
 				case <-stderr1.ch:
 				case <-readyTimer.C:
@@ -408,22 +408,22 @@ func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
 				}
 			}
 
-			ckptOut, ckptErr, ckptCode := runTool(t, rungvBin,
+			ckptOut, ckptErr, ckptCode := runTool(t, rungvxBin,
 				"checkpoint",
 				"-control-socket="+controlAddr,
 				"-checkpoint-dir="+ckptDir,
 			)
 			if ckptCode != 0 {
-				t.Fatalf("rungv checkpoint = (code %d, stdout %q, stderr %q), want 0", ckptCode, ckptOut, ckptErr)
+				t.Fatalf("rungvx checkpoint = (code %d, stdout %q, stderr %q), want 0", ckptCode, ckptOut, ckptErr)
 			}
 			_ = stdinW.Close()
 			if wErr := <-runWaitCh; wErr != nil {
-				t.Fatalf("rungv run exit after checkpoint: %v (stderr=%q)", wErr, stderr1.String())
+				t.Fatalf("rungvx run exit after checkpoint: %v (stderr=%q)", wErr, stderr1.String())
 			}
 			verifyCheckpointBundleFiles(t, ckptDir)
 
 			// Restoring without -rootfs-volume must fail manifest validation.
-			_, badErr, badCode := runTool(t, rungvBin,
+			_, badErr, badCode := runTool(t, rungvxBin,
 				"restore",
 				"-platform="+string(b.plat),
 				"-net=none",
@@ -431,12 +431,12 @@ func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
 				"-checkpoint-dir="+ckptDir,
 			)
 			if badCode == 0 || !strings.Contains(badErr, "root volume mismatch") {
-				t.Fatalf("rungv restore without -rootfs-volume = (code %d, stderr %q), want mismatch failure", badCode, badErr)
+				t.Fatalf("rungvx restore without -rootfs-volume = (code %d, stderr %q), want mismatch failure", badCode, badErr)
 			}
 
 			// Restore with -rootfs-volume and finish guest.
 			var restoreOut, restoreErr bytes.Buffer
-			restoreCmd := exec.CommandContext(ctx, rungvBin,
+			restoreCmd := exec.CommandContext(ctx, rungvxBin,
 				"restore",
 				"-platform="+string(b.plat),
 				"-net=none",
@@ -448,14 +448,14 @@ func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
 			restoreCmd.Stdout = &restoreOut
 			restoreCmd.Stderr = &restoreErr
 			if err := restoreCmd.Run(); err != nil {
-				t.Fatalf("rungv restore failed: %v (stdout=%q stderr=%q)", err, restoreOut.String(), restoreErr.String())
+				t.Fatalf("rungvx restore failed: %v (stdout=%q stderr=%q)", err, restoreOut.String(), restoreErr.String())
 			}
 			if !strings.Contains(restoreOut.String(), "VERIFIED:rootfs-ckpt\n") {
-				t.Fatalf("rungv restore stdout = %q, want VERIFIED:rootfs-ckpt", restoreOut.String())
+				t.Fatalf("rungvx restore stdout = %q, want VERIFIED:rootfs-ckpt", restoreOut.String())
 			}
 
 			// Boot a 3rd fresh sandbox to verify post-restore root writes persisted in .ext4.
-			verifyOut, verifyErr, verifyCode := runTool(t, rungvBin,
+			verifyOut, verifyErr, verifyCode := runTool(t, rungvxBin,
 				"run",
 				"-platform="+string(b.plat),
 				"-net=none",
@@ -465,7 +465,7 @@ func TestE2ERootfsVolumeCheckpointAndRestore(t *testing.T) {
 				"-mode=rootfs-ckpt-verify",
 			)
 			if verifyCode != 0 || !strings.Contains(verifyOut, "VERIFIED:rootfs-ckpt-persist\n") {
-				t.Fatalf("3rd rungv run = (code %d, stdout %q, stderr %q), want VERIFIED:rootfs-ckpt-persist", verifyCode, verifyOut, verifyErr)
+				t.Fatalf("3rd rungvx run = (code %d, stdout %q, stderr %q), want VERIFIED:rootfs-ckpt-persist", verifyCode, verifyOut, verifyErr)
 			}
 
 			imgPath := filepath.Join(cacheDir, "volumes", "e2eckpt.ext4")

@@ -25,9 +25,11 @@ PROTECT tools/androidprobe/**
 PROTECT tools/gostateify/**
 PROTECT internal/xsys/**
 PROTECT scripts/**
-PROTECT cmd/rungv/**
+PROTECT cmd/rungvx/**
 PROTECT cmd/containerd-shim-gvx-v2/**
+PROTECT ext/**
 PROTECT pkg/gvx/**
+PROTECT pkg/rungvx/**
 PROTECT pkg/oci/**
 PROTECT pkg/netbackend/**
 PROTECT pkg/hostlockdown/**

@@ -16,7 +16,7 @@
 
 // Command init is process 1 of the initramfs that scripts/linux16k/run.sh
 // boots in QEMU on a Linux kernel with 16 KB pages. It runs androidprobe
-// report, generates the synthetic ELF guests in /tmp/elfguests, runs rungv
+// report, generates the synthetic ELF guests in /tmp/elfguests, runs rungvx
 // with the synthetic ELF probes and hostfs voltree, runs the systrap, hostfs,
 // ext4lite, and offline e2e test suites, prints "PASS name" or "FAIL name" for
 // each, prints "VMSMOKE-OK" when all pass, and powers off the machine.
@@ -34,7 +34,7 @@ import (
 	"unsafe"
 )
 
-// step is one rungv invocation and the substrings that its output must contain.
+// step is one rungvx invocation and the substrings that its output must contain.
 // The offline e2e suite runs the remaining acceptprog guest probes.
 type step struct {
 	label string
@@ -175,7 +175,7 @@ func runStep(s step) bool {
 	defer cancel()
 	var out bytes.Buffer
 	args := append([]string{"run", "-platform=systrap", "-net=none"}, s.args...)
-	cmd := exec.CommandContext(ctx, "/rungv", args...)
+	cmd := exec.CommandContext(ctx, "/rungvx", args...)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	err := cmd.Run()

@@ -854,11 +854,11 @@ func TestE2ECheckpointRestoreHostLockdownInvariants(t *testing.T) {
 	}
 }
 
-// TestE2ECheckpointRestoreRungvCLIRoundTrip verifies end-to-end execution of
-// rungv run, rungv checkpoint, and rungv restore under default host lockdown
+// TestE2ECheckpointRestoreRungvxCLIRoundTrip verifies end-to-end execution of
+// rungvx run, rungvx checkpoint, and rungvx restore under default host lockdown
 // over both Unix and loopback TCP control sockets.
-func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
-	rungvBin := toolPath(t, rungvPkg)
+func TestE2ECheckpointRestoreRungvxCLIRoundTrip(t *testing.T) {
+	rungvxBin := toolPath(t, rungvxPkg)
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			requireFixedAddressBackend(t, b)
@@ -891,7 +891,7 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 					stdout1 := newCheckpointNotifyBuffer()
 					stderr1 := newCheckpointNotifyBuffer()
 
-					runCmd := exec.CommandContext(ctx, rungvBin,
+					runCmd := exec.CommandContext(ctx, rungvxBin,
 						"run",
 						"-platform="+string(b.plat),
 						"-net=none",
@@ -909,7 +909,7 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 					runCmd.Stderr = stderr1
 
 					if err := runCmd.Start(); err != nil {
-						t.Fatalf("start rungv run: %v", err)
+						t.Fatalf("start rungvx run: %v", err)
 					}
 
 					runWaitCh := make(chan error, 1)
@@ -923,41 +923,41 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 						}
 					}()
 
-					// Wait until the guest signals readiness or rungv exits on an unsupported ET_EXEC backend.
+					// Wait until the guest signals readiness or rungvx exits on an unsupported ET_EXEC backend.
 					readyTimer := time.NewTimer(30 * time.Second)
 					defer readyTimer.Stop()
 					for !strings.Contains(stdout1.String(), "READY:hostfs\n") {
 						select {
 						case wErr := <-runWaitCh:
-							skipWhenFixedAddressRefused(t, "rungv run", fmt.Errorf("%w: %s", wErr, stderr1.String()))
-							t.Fatalf("rungv run exited before READY: %v (stdout=%q stderr=%q)", wErr, stdout1.String(), stderr1.String())
+							skipWhenFixedAddressRefused(t, "rungvx run", fmt.Errorf("%w: %s", wErr, stderr1.String()))
+							t.Fatalf("rungvx run exited before READY: %v (stdout=%q stderr=%q)", wErr, stdout1.String(), stderr1.String())
 						case <-stdout1.ch:
 						case <-stderr1.ch:
-							if strings.Contains(stderr1.String(), "rungv run:") {
+							if strings.Contains(stderr1.String(), "rungvx run:") {
 								_ = stdinW1.Close()
 							}
 						case <-readyTimer.C:
-							t.Fatalf("timed out waiting for READY:hostfs from rungv run (stdout=%q stderr=%q)", stdout1.String(), stderr1.String())
+							t.Fatalf("timed out waiting for READY:hostfs from rungvx run (stdout=%q stderr=%q)", stdout1.String(), stderr1.String())
 						}
 					}
 
-					ckptOut, ckptStderr, ckptCode := runTool(t, rungvBin,
+					ckptOut, ckptStderr, ckptCode := runTool(t, rungvxBin,
 						"checkpoint",
 						"-control-socket="+controlAddr,
 						"-checkpoint-dir="+ckptDir,
 					)
 					if ckptCode != 0 {
-						t.Fatalf("rungv checkpoint = (code %d, stdout %q, stderr %q), want 0", ckptCode, ckptOut, ckptStderr)
+						t.Fatalf("rungvx checkpoint = (code %d, stdout %q, stderr %q), want 0", ckptCode, ckptOut, ckptStderr)
 					}
 					_ = stdinW1.Close()
 
 					if wErr := <-runWaitCh; wErr != nil {
-						t.Fatalf("rungv run exit after checkpoint: %v (stderr=%q)", wErr, stderr1.String())
+						t.Fatalf("rungvx run exit after checkpoint: %v (stderr=%q)", wErr, stderr1.String())
 					}
 					verifyCheckpointBundleFiles(t, ckptDir)
 
 					var restoreStdout, restoreStderr bytes.Buffer
-					restoreCmd := exec.CommandContext(ctx, rungvBin,
+					restoreCmd := exec.CommandContext(ctx, rungvxBin,
 						"restore",
 						"-platform="+string(b.plat),
 						"-net=none",
@@ -970,10 +970,10 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 					restoreCmd.Stderr = &restoreStderr
 
 					if err := restoreCmd.Run(); err != nil {
-						t.Fatalf("rungv restore failed: %v (stdout=%q stderr=%q)", err, restoreStdout.String(), restoreStderr.String())
+						t.Fatalf("rungvx restore failed: %v (stdout=%q stderr=%q)", err, restoreStdout.String(), restoreStderr.String())
 					}
 					if !strings.Contains(restoreStdout.String(), "VERIFIED:hostfs\n") {
-						t.Fatalf("rungv restore stdout = %q, want VERIFIED:hostfs (stderr=%q)", restoreStdout.String(), restoreStderr.String())
+						t.Fatalf("rungvx restore stdout = %q, want VERIFIED:hostfs (stderr=%q)", restoreStdout.String(), restoreStderr.String())
 					}
 					verifyHostfsWorkspaceArtifacts(t, wsDir)
 				})

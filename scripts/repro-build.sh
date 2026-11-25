@@ -2,14 +2,34 @@
 # Builds a deterministic Go executable from this repository.
 #
 # Usage: scripts/repro-build.sh OUTPUT [PACKAGE]
-# Reads GOOS, GOARCH, GOAMD64, and GOARM64 from the environment and selects
-# per-OS defaults when unset. Scrubs ambient environment variables and pins the
-# toolchain, module proxy, architecture level, and linker flags.
+# Reads GOOS, GOARCH, GOAMD64, GOARM64, and GVX_BUILD_TAGS from the environment
+# and selects per-OS defaults when unset. Scrubs ambient environment variables
+# and pins the toolchain, module proxy, architecture level, and linker flags.
+#
+# Building ./cmd/rungvx runs with GOWORK=off and CGO_ENABLED=0 from the root
+# module. Building a package under ./ext/... (for example ./ext/cmd/rungvx)
+# runs from ext/ using ext/go.work and applies GVX_BUILD_TAGS when set.
 set -eu
 
 out=${1:?usage: repro-build.sh OUTPUT [PACKAGE]}
-pkg=${2:-./cmd/rungv}
+pkg=${2:-./cmd/rungvx}
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+build_dir="$repo_root"
+build_pkg="$pkg"
+gowork="off"
+case "$pkg" in
+./ext/*)
+	build_dir="$repo_root/ext"
+	build_pkg="./${pkg#./ext/}"
+	gowork="$repo_root/ext/go.work"
+	;;
+ext/*)
+	build_dir="$repo_root/ext"
+	build_pkg="./${pkg#ext/}"
+	gowork="$repo_root/ext/go.work"
+	;;
+esac
 
 go_bin=${GO:-go}
 go_path=$(command -v "$go_bin")
@@ -24,6 +44,7 @@ tmp_dir=${TMPDIR:-/tmp}
 goproxy=${GVX_GOPROXY:-https://proxy.golang.org/}
 gosumdb=${GVX_GOSUMDB:-sum.golang.org}
 buildvcs=${GVX_BUILDVCS:-true}
+buildtags=${GVX_BUILD_TAGS:-}
 buildmode=exe
 if [ "$goos" = "android" ]; then
 	buildmode=pie
@@ -62,7 +83,7 @@ set -- \
 	GOMODCACHE="$gomodcache" \
 	GOCACHE="$gocache" \
 	GOENV=off \
-	GOWORK=off \
+	GOWORK="$gowork" \
 	GO111MODULE=on \
 	GOPROXY="$goproxy" \
 	GOSUMDB="$gosumdb" \
@@ -89,8 +110,23 @@ if [ -n "${LOCALAPPDATA:-}" ]; then
 	set -- "$@" LOCALAPPDATA="$LOCALAPPDATA"
 fi
 
+if [ -n "$buildtags" ]; then
+	exec env -i "$@" "$go_bin" build \
+		-C "$build_dir" \
+		-mod=readonly \
+		-pgo=off \
+		-trimpath \
+		"-buildmode=$buildmode" \
+		-compiler=gc \
+		"-buildvcs=$buildvcs" \
+		"-tags=$buildtags" \
+		-ldflags="-s -w -buildid=" \
+		-o "$out_abs" \
+		"$build_pkg"
+fi
+
 exec env -i "$@" "$go_bin" build \
-	-C "$repo_root" \
+	-C "$build_dir" \
 	-mod=readonly \
 	-pgo=off \
 	-trimpath \
@@ -99,4 +135,4 @@ exec env -i "$@" "$go_bin" build \
 	"-buildvcs=$buildvcs" \
 	-ldflags="-s -w -buildid=" \
 	-o "$out_abs" \
-	"$pkg"
+	"$build_pkg"

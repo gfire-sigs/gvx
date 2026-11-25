@@ -28,7 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx"
 )
 
-// The Docker run gates: the settings of `docker run` that rungv now accepts
+// The Docker run gates: the settings of `docker run` that rungvx now accepts
 // reach the guest. Each subtest runs on the hardware backend and on systrap.
 
 func TestE2EDockerRunUserEnvironmentAndHostname(t *testing.T) {

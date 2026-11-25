@@ -60,7 +60,7 @@ func main() {
 }
 
 // writeGuests writes the guest programs that the smoke runs of the probe app
-// start with rungv -bin. Each program prints its name and exits with 0.
+// start with rungvx -bin. Each program prints its name and exits with 0.
 func writeGuests(dir string) error {
 	guests := map[string]func() ([]byte, error){
 		// A position-independent executable.

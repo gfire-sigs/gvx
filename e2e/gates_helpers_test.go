@@ -201,7 +201,7 @@ type guestSpec struct {
 	hostCACerts bool
 	// tuning sets the host-side tunables of the sandbox.
 	tuning tuning.Values
-	// packetWrite and allowSUID are the other two privileges of rungv
+	// packetWrite and allowSUID are the other two privileges of rungvx
 	// --privileged. dockerd needs all three.
 	packetWrite bool
 	allowSUID   bool

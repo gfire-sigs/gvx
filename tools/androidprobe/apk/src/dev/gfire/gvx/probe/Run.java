@@ -32,7 +32,7 @@ import java.util.Map;
  * output and exit code.
  *
  * <p>Arguments of {@code am instrument}: {@code exe} names the library file,
- * such as {@code librungv.so}. {@code args64} holds the arguments, separated
+ * such as {@code librungvx.so}. {@code args64} holds the arguments, separated
  * by NUL bytes and encoded in base64. The working directory is the files
  * directory of the app. Each output line goes to the status stream, and the
  * file {@code last-run.log} of the files directory keeps the whole output.

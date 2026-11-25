@@ -136,7 +136,7 @@ func TestE2EFileBindMountExposesOnlyTheFile(t *testing.T) {
 // read-only from the host as a single-file mount or inside a read-only
 // directory mount can run directly as the container entrypoint without chmod.
 func TestE2EReadOnlySingleFileBindMountExec(t *testing.T) {
-	rungvBin := toolPath(t, rungvPkg)
+	rungvxBin := toolPath(t, rungvxPkg)
 	archive := buildCheckpointProbeOCIArchive(t)
 	smokeELF, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "gvx-smoke-ok\n")
 	if err != nil {
@@ -171,7 +171,7 @@ func TestE2EReadOnlySingleFileBindMountExec(t *testing.T) {
 				},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					stdout, stderr, code := runTool(t, rungvBin,
+					stdout, stderr, code := runTool(t, rungvxBin,
 						"run",
 						"-platform="+string(b.plat),
 						"-net=none",
@@ -181,10 +181,10 @@ func TestE2EReadOnlySingleFileBindMountExec(t *testing.T) {
 						archive,
 					)
 					if code != 0 {
-						t.Fatalf("rungv run (%s) = (code %d, stdout %q, stderr %q)", tc.name, code, stdout, stderr)
+						t.Fatalf("rungvx run (%s) = (code %d, stdout %q, stderr %q)", tc.name, code, stdout, stderr)
 					}
 					if strings.TrimSpace(stdout) != "gvx-smoke-ok" {
-						t.Fatalf("rungv run (%s) stdout = %q, want gvx-smoke-ok", tc.name, stdout)
+						t.Fatalf("rungvx run (%s) stdout = %q, want gvx-smoke-ok", tc.name, stdout)
 					}
 				})
 			}

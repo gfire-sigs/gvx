@@ -35,7 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Runs one rungv command in a foreground service.
+ * Runs one rungvx command in a foreground service.
  *
  * <p>Android kills the child processes of a background app that use much CPU
  * (GVXIP-006 F5). A foreground service keeps the app in the foreground state,
@@ -112,7 +112,7 @@ public final class RunService extends Service {
             }
             write(log, "exit " + p.waitFor());
         } catch (Exception e) {
-            Log.e(TAG, "rungv failed", e);
+            Log.e(TAG, "rungvx failed", e);
         }
     }
 

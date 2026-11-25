@@ -33,7 +33,7 @@ const (
 	gvisorName = "github.com/google/gvisor"
 )
 
-// shippedTargets are the platforms that ship rungv.
+// shippedTargets are the platforms that ship rungvx.
 var shippedTargets = []struct{ goos, goarch string }{
 	{"darwin", "arm64"},
 	{"windows", "amd64"},
@@ -53,7 +53,7 @@ const (
 	groupModule
 )
 
-// component is one licensed unit of the rungv binary.
+// component is one licensed unit of the rungvx binary.
 type component struct {
 	name, version string
 	group         group
@@ -241,9 +241,9 @@ func collectInventory(root string) (inventory, error) {
 	return inv, nil
 }
 
-// goList returns the packages that rungv links for one target.
+// goList returns the packages that rungvx links for one target.
 func goList(root, goos, goarch string) ([]listedPackage, error) {
-	cmd := exec.Command("go", "list", "-deps", "-json", "./cmd/rungv")
+	cmd := exec.Command("go", "list", "-deps", "-json", "./cmd/rungvx")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+goos, "GOARCH="+goarch)
 	var stdout, stderr bytes.Buffer
