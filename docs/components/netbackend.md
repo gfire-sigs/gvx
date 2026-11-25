@@ -13,7 +13,7 @@ Guest processes invoke standard Linux socket calls against gVisor's pure-Go `pkg
 | **Attachment layer** | L2 in-memory `pipe` link to a peer host-side Netstack (`tcp.NewForwarder`, `udp.NewForwarder`, `gonet`) | L3 `wgtun.Endpoint` directly attached to `wireguard-go` in memory |
 | **Host transport** | Unprivileged host Go `net` sockets (Windows IOCP, macOS `kqueue`, Linux `epoll`) | One pre-bound unprivileged host UDP socket (`:0`) |
 | **Host/LAN reachability** | Permitted by default (`10.0.2.2` / `host.docker.internal` maps to host `127.0.0.1`; optional `-isolate-lan`) | Cryptographically isolated; all egress exits via WireGuard |
-| **Inbound exposure** | Static `-p` (TCP, UDP, ranges up to 1,024, `unix:`), dynamic `--auto-publish`, `rungv port add`, and `port-forward` | Tunnel peers only |
+| **Inbound exposure** | Static `-p` (TCP, UDP, ranges up to 1,024, `unix:`), dynamic `--auto-publish`, `rungvx port add`, and `port-forward` | Tunnel peers only |
 
 ---
 

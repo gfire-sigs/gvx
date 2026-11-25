@@ -18,7 +18,7 @@ Extracting Linux container `.tar` layers onto Windows NTFS or case-insensitive m
 
 `oci.ParseReference` implements the Docker image reference grammar, splitting registry host, repository (`library/` prefix for single-component Docker Hub names), tag (default `latest`), and `@sha256:` digest while rejecting uppercase repository names. Registries default to HTTPS except `localhost`, `127.0.0.0/8`, and `[::1]`, which use HTTP.
 
-Credentials load from `$DOCKER_CONFIG/config.json` (or `~/.docker/config.json`) in the standard lookup order: `credHelpers`, `credsStore`, then `auths`. External `docker-credential-NAME` helpers run with a 30-second timeout and 1 MiB output cap. `rungv login` validates credentials against the target registry before persisting them. `LayerCache.SetDNSServers` routes registry lookups through `--host-dns` servers without modifying the process-wide Go resolver.
+Credentials load from `$DOCKER_CONFIG/config.json` (or `~/.docker/config.json`) in the standard lookup order: `credHelpers`, `credsStore`, then `auths`. External `docker-credential-NAME` helpers run with a 30-second timeout and 1 MiB output cap. `rungvx login` validates credentials against the target registry before persisting them. `LayerCache.SetDNSServers` routes registry lookups through `--host-dns` servers without modifying the process-wide Go resolver.
 
 ### 2.2 In-Memory Tar-to-EROFS Compilation
 
@@ -37,7 +37,7 @@ At mount time, `pkg/gvx` opens read-only `HostHandle` descriptors for all lower 
 ### 2.3 Cache Operations, Blob Retention, Push, Save, and Load
 
 - **Pull policies**: `missing` (default), `always` (falling back to cache with a warning on unreachable registry or HTTP 401/403/404 for locally loaded images), and `never` (strictly offline).
-- **Blob retention (`-keep-blobs` / `GVX_KEEP_BLOBS=1`)**: Retains original compressed layer blobs under `blobs/sha256/<hex>` so `rungv save` and `rungv push` operate offline without re-fetching from the origin registry.
+- **Blob retention (`-keep-blobs` / `GVX_KEEP_BLOBS=1`)**: Retains original compressed layer blobs under `blobs/sha256/<hex>` so `rungvx save` and `rungvx push` operate offline without re-fetching from the origin registry.
 - **OCI Distribution v1.1 push (`push.go`)**: Probes existing blobs with `HEAD`, attempts same-registry cross-repository mounts, and uploads exact manifest bytes.
 - **Archives (`save.go`, `load.go`)**: Read and write dual OCI layout and `docker save` tar archives.
 
@@ -51,7 +51,7 @@ When `--host-ca-certs` (`Config.HostCACerts`) is enabled, `hostcerts` gathers tr
 
 - **Docker manifest schema 1**: Rejected with an error (matching Docker 28+).
 - **Offline `save` / `push` without `-keep-blobs`**: Requires network access to the origin registry if original compressed blobs were not retained when pulling or loading.
-- **Ignored image directives**: `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, and image labels are ignored by `rungv run`.
+- **Ignored image directives**: `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, and image labels are ignored by `rungvx run`.
 - **Nested container CA roots**: `--host-ca-certs` injects roots into the direct guest rootfs only; nested containers started by `dockerd` require mounting `/etc/ssl/certs/ca-certificates.crt` explicitly.
 
 ---

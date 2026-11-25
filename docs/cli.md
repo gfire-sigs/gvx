@@ -1,22 +1,22 @@
-# The `rungv` Command Line
+# The `rungvx` Command Line
 
-`rungv` executes an OCI image or a Linux ELF64 binary in the foreground inside a self-confined sandbox. Its subcommands, flags, and output follow Docker CLI conventions wherever the single-process model applies. This reference documents every subcommand, flag, tunable, networking rule, checkpoint operation, nested-execution detail, and Android setting. Consult [`architecture.md`](architecture.md) for system internals, [`compatibility.md`](compatibility.md) for verified workloads, and [`troubleshooting.md`](troubleshooting.md) for failure diagnosis.
+`rungvx` executes an OCI image or a Linux ELF64 binary in the foreground inside a self-confined sandbox. Its subcommands, flags, and output follow Docker CLI conventions wherever the single-process model applies. This reference documents every subcommand, flag, tunable, networking rule, checkpoint operation, nested-execution detail, and Android setting. Consult [`architecture.md`](architecture.md) for system internals, [`compatibility.md`](compatibility.md) for verified workloads, and [`troubleshooting.md`](troubleshooting.md) for failure diagnosis.
 
 ---
 
 ## 1. Execution Model
 
-`rungv` operates without a background daemon. Each `rungv run` invocation starts a sandbox, executes the guest command, and tears down all resources upon exit, matching `docker run --rm`.
+`rungvx` operates without a background daemon. Each `rungvx run` invocation starts a sandbox, executes the guest command, and tears down all resources upon exit, matching `docker run --rm`.
 
 By default, guest writes land in an ephemeral memory-backed `tmpfs` upper layer above read-only EROFS image layers. Data persists across invocations only in a bind mount, a named volume, a `-rootfs-volume` image, or the host image cache.
 
-Before executing guest code, the host process enforces OS-native self-lockdown (`hostlockdown.Apply()`). Once locked down, the process cannot open unbound host paths, create child processes, or bind arbitrary sockets. Passing `--auto-publish` or `--dynamic-ports` relaxes socket lockdown strictly for host loopback (`127.0.0.1`) binds. Starting `rungv run` with `-S`, `--control-socket`, or `--control` exposes an authenticated `gvx-ctrl/2` control listener for live inspection, `exec`, file copy, pause, resource updates, port rules, mounts, signals, logs, and checkpoints. See [`control-protocol.md`](control-protocol.md) for the wire protocol and lockdown rules.
+Before executing guest code, the host process enforces OS-native self-lockdown (`hostlockdown.Apply()`). Once locked down, the process cannot open unbound host paths, create child processes, or bind arbitrary sockets. Passing `--auto-publish` or `--dynamic-ports` relaxes socket lockdown strictly for host loopback (`127.0.0.1`) binds. Starting `rungvx run` with `-S`, `--control-socket`, or `--control` exposes an authenticated `gvx-ctrl/2` control listener for live inspection, `exec`, file copy, pause, resource updates, port rules, mounts, signals, logs, and checkpoints. See [`control-protocol.md`](control-protocol.md) for the wire protocol and lockdown rules.
 
 ---
 
 ## 2. Subcommand Overview
 
-Run `rungv help` to display this command table.
+Run `rungvx help` to display this command table.
 
 | Command | Purpose |
 | :--- | :--- |
@@ -32,7 +32,7 @@ Run `rungv help` to display this command table.
 | `port-forward` | Tunnel host TCP or Unix connections into a running sandbox via the control socket (alias: `pf`). |
 | `unix-forward` | Forward guest Unix socket connections to a host Unix socket via the control socket (alias: `uf`). |
 | `mount` | Group command for `ls`, `add`, `remount`, `rm`, and `serve` on runtime mounts. |
-| `status` | Inspect a running sandbox over its control socket (also `rungv sandbox inspect`). |
+| `status` | Inspect a running sandbox over its control socket (also `rungvx sandbox inspect`). |
 | `stats` | Display live CPU, memory, network, block I/O, and PID counters. |
 | `top` | List running processes inside a sandbox. |
 | `kill` | Deliver a POSIX signal to PID 1, a specific guest PID, or all guest processes. |
@@ -42,7 +42,7 @@ Run `rungv help` to display this command table.
 | `ping` | Verify control socket readiness and advertised capabilities. |
 | `debug` | Adjust the active Sentry log level (`warning`, `info`, or `debug`). |
 | `pull` | Fetch an OCI image into the local layer cache (`--platform linux/ARCH`; `-keep-blobs`). |
-| `push` | Push a cached image to a registry using OCI Distribution v1.1 (`rungv push [flags] IMAGE [TARGET]`). |
+| `push` | Push a cached image to a registry using OCI Distribution v1.1 (`rungvx push [flags] IMAGE [TARGET]`). |
 | `images` | List cached images. |
 | `inspect` | Print cached image metadata as JSON or through a Go template. |
 | `tag` | Add a repository or tag alias to a cached image. |
@@ -59,17 +59,17 @@ Run `rungv help` to display this command table.
 | `logout` | Remove stored registry credentials. |
 | `completion` | Emit shell completion scripts for `bash`, `zsh`, `fish`, or `powershell`. |
 | `stub` | Probe `systrap` readiness on the active host. |
-| `tune` | List host-side tunables (`rungv tune list`; Section 3.3). |
+| `tune` | List host-side tunables (`rungvx tune list`; Section 3.3). |
 | `license` | Print embedded open-source license notices (Section 9). |
 | `version` | Print binary version, commit SHA, and Go build metadata (Section 10). |
 
-Inspect subcommand flags with `rungv COMMAND --help`. Every flag accepts single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image name, short flag clusters expand (`-itP`, `-itp 8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`), `-h` sets the hostname, and arguments after `--` or the image name pass verbatim to the guest. Non-execution commands accept flags before or after positional arguments.
+Inspect subcommand flags with `rungvx COMMAND --help`. Every flag accepts single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image name, short flag clusters expand (`-itP`, `-itp 8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`), `-h` sets the hostname, and arguments after `--` or the image name pass verbatim to the guest. Non-execution commands accept flags before or after positional arguments.
 
 ---
 
-## 3. `rungv run`
+## 3. `rungvx run`
 
-The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first positional argument names the OCI image; subsequent arguments replace image `Cmd` while preserving `Entrypoint`. To run a local Linux ELF64 binary directly, invoke `rungv run [flags] -bin=ELF [ARG...]`, where trailing arguments form its complete `argv`.
+The synopsis is `rungvx run [flags] IMAGE [COMMAND [ARG...]]`. The first positional argument names the OCI image; subsequent arguments replace image `Cmd` while preserving `Entrypoint`. To run a local Linux ELF64 binary directly, invoke `rungvx run [flags] -bin=ELF [ARG...]`, where trailing arguments form its complete `argv`.
 
 ### Recommended Flag Spellings for Engine vs. Architecture
 
@@ -92,7 +92,7 @@ Legacy aliases (`-platform ENGINE` without a slash, and `-arch ARCH`) remain sup
 | `-w`, `--workdir DIR` | Set guest working directory (also accepted on `restore`). |
 | `--name NAME` | Set kernel container ID and derive the default control socket path under `--control`. |
 | `--rm` | Accepted for compatibility; every sandbox cleans up upon exit. |
-| `-i` | Accepted for compatibility; `rungv` stdin always feeds guest stdin. |
+| `-i` | Accepted for compatibility; `rungvx` stdin always feeds guest stdin. |
 | `-t` | Allocate a guest pseudo-terminal. |
 | `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. Omitting `HOST` or passing `0` chooses a free `127.0.0.1` port. Equal-length ranges (`8000-8009:8000-8009`) publish each port. `unix:PATH:GUEST` exposes guest TCP over a host Unix socket (Section 4.7). |
 | `-P` | Publish every port declared by image `EXPOSE` to free `127.0.0.1` ports. |
@@ -109,7 +109,7 @@ Legacy aliases (`-platform ENGINE` without a slash, and `-arch ARCH`) remain sup
 | `--platform linux/ARCH` | Recommended flag for OCI image architecture (`linux/amd64` or `linux/arm64`). |
 | `--pull POLICY` | Registry resolution policy: `missing` (default), `always`, or `never` (Section 5.1). |
 
-The Docker detach flag `-d` is rejected with an error because `rungv` runs strictly in the foreground.
+The Docker detach flag `-d` is rejected with an error because `rungvx` runs strictly in the foreground.
 
 ### 3.2 `gvx`-Specific Flags
 
@@ -140,24 +140,24 @@ The Docker detach flag `-d` is rejected with an error because `rungv` runs stric
 | `--control-policy POLICY` | Baseline control capability profile: `default`, `readonly`, or `checkpoint-only`. |
 | `--control-disable CAPS` | Comma-separated control capabilities or groups to disable (for example, `exec,net.dial`). |
 | `--control-token-file PATH` | Write the per-run 256-bit token to `PATH` and require token auth even on POSIX Unix sockets. |
-| `--dynamic-ports` | Allow runtime `rungv port add` loopback (`127.0.0.1`, `[::1]`) binds under host lockdown. |
-| `--dynamic-ports-addr IP` | Allow runtime `rungv port add` binds on the given host IP literal (repeatable). |
+| `--dynamic-ports` | Allow runtime `rungvx port add` loopback (`127.0.0.1`, `[::1]`) binds under host lockdown. |
+| `--dynamic-ports-addr IP` | Allow runtime `rungvx port add` binds on the given host IP literal (repeatable). |
 | `--unix-forward SPEC` | Forward a guest Unix socket to a host Unix socket (`GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]`, repeatable) via a pre-lockdown helper. |
 | `--allow-volume-attach` | Enable Linux seccomp rules permitting runtime `ext4lite` volume attach over `SCM_RIGHTS`. |
-| `--allow-bind-attach` | Enable runtime `hostfs` bind attach over `SCM_RIGHTS` (skips Linux Landlock while keeping seccomp; Windows uses `rungv mount serve`). |
+| `--allow-bind-attach` | Enable runtime `hostfs` bind attach over `SCM_RIGHTS` (skips Linux Landlock while keeping seccomp; Windows uses `rungvx mount serve`). |
 | `-lockdown=false` | Disable host self-lockdown (debugging only). |
 | `--tune KEY=VALUE` | Set a host-side tunable (repeatable; Section 3.3). Accepted by `run`, `restore`, image commands, `system`, and `info`. |
 | `--tune-file FILE` | Load host-side tunables from a JSON object (`--tune` flags take precedence). |
 
 ### 3.3 Tunables
 
-Tunables configure host-side ceilings and timeouts for which Linux defines no guest `sysctl`. Guest kernel settings continue to use `sysctl`, `/sys/module`, and netlink. One central registry in `pkg/gvx/tuning` drives `gvx.Config.Tuning`, `--tune`, `--tune-file`, `rungv tune list`, and the reference table below.
+Tunables configure host-side ceilings and timeouts for which Linux defines no guest `sysctl`. Guest kernel settings continue to use `sysctl`, `/sys/module`, and netlink. One central registry in `pkg/gvx/tuning` drives `gvx.Config.Tuning`, `--tune`, `--tune-file`, `rungvx tune list`, and the reference table below.
 
 Durations follow Go syntax (`250ms`, `30s`); sizes accept byte counts or binary suffixes (`64MiB`). Invalid keys, malformed values, or out-of-range settings fail immediately with the valid range.
 
-1. Run `rungv tune list` to list every key, default, and range.
+1. Run `rungvx tune list` to list every key, default, and range.
 2. Pass `--tune net.nat.mtu=9000` (repeatable) or `--tune-file FILE` with JSON (`{"net.nat.mtu": 9000, "net.dns.timeout": "8s"}`).
-3. Supply `--tune` to image commands (`rungv pull`, `rungv load`) when adjusting `oci.*` limits.
+3. Supply `--tune` to image commands (`rungvx pull`, `rungvx load`) when adjusting `oci.*` limits.
 
 `TestDocsMatchRegistry` in `pkg/gvx/tuning` enforces synchronization between the registry and the table below. After editing `pkg/gvx/tuning`, regenerate the table with `go test ./pkg/gvx/tuning -run TestDocsMatchRegistry -update`.
 
@@ -216,7 +216,7 @@ Durations follow Go syntax (`250ms`, `30s`); sizes accept byte counts or binary 
 
 ## 4. Operational Semantics of `run`
 
-This section summarizes how `rungv run` resolves commands, users, mounts, resource limits, networking, certificates, checkpoints, and control operations.
+This section summarizes how `rungvx run` resolves commands, users, mounts, resource limits, networking, certificates, checkpoints, and control operations.
 
 ### 4.1 Command and Environment
 
@@ -232,7 +232,7 @@ The runtime writes the guest hostname to `/etc/hostname` and ensures `/etc/hosts
 
 ### 4.4 Mounts and Volumes
 
-`rungv` supports four mount classes:
+`rungvx` supports four mount classes:
 
 - **Named `ext4lite` volumes (`-v NAME:DST[:ro]`, default driver)**: Stored as `<NAME>.ext4` under `<cacheDir>/volumes/` (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). Images grow in 16 MiB steps up to 64 TiB, maintain an ordered JBD2 journal, acquire `LOCK_EX` (read-write) or `LOCK_SH` (read-only), compact unused tail blocks on clean exit, and require zero post-lockdown host path rules. In `--mount type=volume`, a `src` containing a path separator targets a host `.ext4` file directly; `size=SIZE` caps growth; `ephemeral` creates a one-run scratch image in `ephemeral-volumes/` and disables checkpointing.
 - **Copy-on-write volume overlays (`--mount type=overlay,src=BASE,dst=PATH[,upper=BRANCH][,tmpfs-size=SIZE]`)**: Branches a shared read-only base volume into either a persistent upper volume or an ephemeral `tmpfs` upper layer.
@@ -255,13 +255,13 @@ Guest destinations must be clean absolute paths and may not overwrite `/`, `/pro
 
 ### 4.6 Guest Kernel Environment
 
-Guests receive `/proc`, `/sys`, `/sys/fs/cgroup` (`cgroup2`), `/dev`, `/dev/pts`, `/dev/shm`, `/dev/mqueue`, `/dev/fuse`, `/dev/net/tun`, and network interfaces `lo` and `eth0`. Because the root filesystem mounts over a hidden read-only root, `pivot_root(2)` works for nested `runc` containers. Calling `reboot(2)` as guest root terminates `rungv` with exit code `0` (halt/poweroff) or `129` (restart).
+Guests receive `/proc`, `/sys`, `/sys/fs/cgroup` (`cgroup2`), `/dev`, `/dev/pts`, `/dev/shm`, `/dev/mqueue`, `/dev/fuse`, `/dev/net/tun`, and network interfaces `lo` and `eth0`. Because the root filesystem mounts over a hidden read-only root, `pivot_root(2)` works for nested `runc` containers. Calling `reboot(2)` as guest root terminates `rungvx` with exit code `0` (halt/poweroff) or `129` (restart).
 
 ### 4.7 Published Ports
 
-Static `-p` ports bind before lockdown and print one stderr line each (`rungv: publishing 127.0.0.1:49493 -> 8080/tcp`). Equal-length ranges support up to `net.forward.max_port_range` (default `1,024`) ports. `-p unix:PATH:GUEST` binds an owner-only host Unix socket (expanding leading `~/`, replacing stale socket files on subsequent runs, and refusing commas in `PATH`).
+Static `-p` ports bind before lockdown and print one stderr line each (`rungvx: publishing 127.0.0.1:49493 -> 8080/tcp`). Equal-length ranges support up to `net.forward.max_port_range` (default `1,024`) ports. `-p unix:PATH:GUEST` binds an owner-only host Unix socket (expanding leading `~/`, replacing stale socket files on subsequent runs, and refusing commas in `PATH`).
 
-With `--auto-publish`, `rungv` polls guest TCP listeners and `iptables` NAT `DNAT` rules every `net.forward.dynamic_poll_interval` (default `200 ms`) and binds matching host `127.0.0.1` ports up to `net.forward.max_dynamic_ports` (default `64`). Static `-p` bindings always keep precedence.
+With `--auto-publish`, `rungvx` polls guest TCP listeners and `iptables` NAT `DNAT` rules every `net.forward.dynamic_poll_interval` (default `200 ms`) and binds matching host `127.0.0.1` ports up to `net.forward.max_dynamic_ports` (default `64`). Static `-p` bindings always keep precedence.
 
 ### 4.8 Raw Sockets, Netfilter, and `conntrack`
 
@@ -271,23 +271,23 @@ With `--auto-publish`, `rungv` polls guest TCP listeners and `iptables` NAT `DNA
 
 `--backend=auto` chooses `hvf` on macOS, `systrap` on Linux and Android, and `whpx` on Windows (failing closed if WHP is absent unless `-allow-unconfined-systrap` opts into `systrap`, which emits a stderr warning and records `Sandbox.FallbackReason`).
 
-`rungv` distinguishes two causes of exit code `137`: exceeding `--memory` prints a memory-limit message, whereas an underlying engine failure prints `the execution engine stopped the guest` with the cause (`ErrEngineFault` in the SDK). Set `GVX_DEBUG_LOG=1` (or `2`), `GVX_STRACE=1`, or `GVX_SYSTRAP_TRACE=1..4` for detailed traces (see [`troubleshooting.md`](troubleshooting.md)).
+`rungvx` distinguishes two causes of exit code `137`: exceeding `--memory` prints a memory-limit message, whereas an underlying engine failure prints `the execution engine stopped the guest` with the cause (`ErrEngineFault` in the SDK). Set `GVX_DEBUG_LOG=1` (or `2`), `GVX_STRACE=1`, or `GVX_SYSTRAP_TRACE=1..4` for detailed traces (see [`troubleshooting.md`](troubleshooting.md)).
 
 ### 4.10 Host Root Certificates
 
-Pass `--host-ca-certs` (`Config.HostCACerts`) behind a TLS-inspecting proxy or private CA. Before lockdown, `rungv` reads host roots from `SSL_CERT_FILE`/`SSL_CERT_DIR` and system trust stores: `/etc/ssl/certs` and `/etc/pki/tls/certs` on Linux; `System.keychain`, `SystemRootCertificates.keychain`, and `login.keychain-db` on macOS (honoring denials); and the `ROOT` store on Windows. At startup, missing roots append to existing image PEM bundles in the writable upper layer (or create `/etc/ssl/certs/ca-certificates.crt`) and drop anchor files in `/usr/local/share/ca-certificates` and `/etc/pki/ca-trust/source/anchors`.
+Pass `--host-ca-certs` (`Config.HostCACerts`) behind a TLS-inspecting proxy or private CA. Before lockdown, `rungvx` reads host roots from `SSL_CERT_FILE`/`SSL_CERT_DIR` and system trust stores: `/etc/ssl/certs` and `/etc/pki/tls/certs` on Linux; `System.keychain`, `SystemRootCertificates.keychain`, and `login.keychain-db` on macOS (honoring denials); and the `ROOT` store on Windows. At startup, missing roots append to existing image PEM bundles in the writable upper layer (or create `/etc/ssl/certs/ca-certificates.crt`) and drop anchor files in `/usr/local/share/ca-certificates` and `/etc/pki/ca-trust/source/anchors`.
 
 > [!WARNING]
 > `--host-ca-certs` affects direct sandbox processes only. Nested containers run by `dockerd` have separate root filesystems; see [`recipes/docker-engine.md`](recipes/docker-engine.md#6-operating-behind-a-tls-inspecting-proxy).
 
 ```sh
-rungv run --host-ca-certs alpine:3.20 wget -qO- https://example.com/
-SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO- https://registry.corp.example/
+rungvx run --host-ca-certs alpine:3.20 wget -qO- https://example.com/
+SSL_CERT_FILE=$PWD/corp-root.pem rungvx run --host-ca-certs alpine:3.20 wget -qO- https://registry.corp.example/
 ```
 
 ### 4.11 Checkpoint and Restore
 
-A checkpoint directory holds four files (`manifest.json`, `state.img`, `pages.meta`, `pages.img`). Because lockdown blocks new opens, pre-open `-checkpoint-dir` and `-control-socket` at start (or stream directly with `rungv checkpoint -o`). `rungv restore` validates host OS, architecture, backend, address holes, layer digests, mounts, `root_volume`, and network mode before re-applying lockdown.
+A checkpoint directory holds four files (`manifest.json`, `state.img`, `pages.meta`, `pages.img`). Because lockdown blocks new opens, pre-open `-checkpoint-dir` and `-control-socket` at start (or stream directly with `rungvx checkpoint -o`). `rungvx restore` validates host OS, architecture, backend, address holes, layer digests, mounts, `root_volume`, and network mode before re-applying lockdown.
 
 Bundles omit NAT bandwidth limits and NAT firewall rules: pass `--net-tx-bps`/`--net-rx-bps` or `--nat-policy-file` explicitly on restore. Checkpointing a sandbox with a protected NAT policy requires supplying a policy file on restore.
 
@@ -300,10 +300,10 @@ Bundles omit NAT bandwidth limits and NAT firewall rules: pass `--net-tx-bps`/`-
 
 ```sh
 mkdir -p ./work ./ckpt
-rungv run -checkpoint-dir=./ckpt -control-socket=./ckpt.sock -workspace=./work alpine:3.20 sh -c "sleep 30" &
+rungvx run -checkpoint-dir=./ckpt -control-socket=./ckpt.sock -workspace=./work alpine:3.20 sh -c "sleep 30" &
 sleep 1
-rungv checkpoint -control-socket=./ckpt.sock -checkpoint-dir=./ckpt
-rungv restore -checkpoint-dir=./ckpt -workspace=./work
+rungvx checkpoint -control-socket=./ckpt.sock -checkpoint-dir=./ckpt
+rungvx restore -checkpoint-dir=./ckpt -workspace=./work
 ```
 
 ### 4.12 Control Socket Subcommands
@@ -312,14 +312,14 @@ Control commands accept `-S`/`--control-socket SPEC` (`GVX_CONTROL_SOCKET`), `-n
 
 | Command | Synopsis and Notes |
 | :--- | :--- |
-| `exec` | `rungv exec [-i] [-t] [-d] [-e K=V] [--env-file F] [-w DIR] [-u USER] [--privileged=BOOL] [--detach-keys K] [--pid-file F] [--] CMD [ARG...]` |
-| `pause` / `unpause` | `rungv pause [--quiesce-net=true\|false]` and `rungv unpause`. |
-| `cp` / `export` | `rungv cp [-a] [-L] [-q] [-z] [--no-overwrite-dir] [--user U:G] SRC DST` and `rungv export [--upper-only] [-z] [-o FILE\|-] [PATH]`. Host disk I/O runs in the unlocked client. |
-| `update` | `rungv update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota US] [--cpu-period US] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps N] [--net-rx-bps N] [--tune K=V]...` |
-| `net-policy` | `rungv net-policy get` and `rungv net-policy replace --file FILE`. |
-| `port` / `port-forward` | `rungv port <ls\|add\|rm>` (requires `--dynamic-ports` or `--auto-publish`) and `rungv port-forward` (`pf`, tunnels over `net.dial` without relaxing lockdown). |
-| `unix-forward` | `rungv unix-forward [--replace] GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]` (`uf`). |
-| `mount` | `rungv mount <ls\|add\|remount\|rm\|serve>`. `mount serve HOST:GUEST` serves a pinned host directory or file via `rpcfs` with `inotify`. |
+| `exec` | `rungvx exec [-i] [-t] [-d] [-e K=V] [--env-file F] [-w DIR] [-u USER] [--privileged=BOOL] [--detach-keys K] [--pid-file F] [--] CMD [ARG...]` |
+| `pause` / `unpause` | `rungvx pause [--quiesce-net=true\|false]` and `rungvx unpause`. |
+| `cp` / `export` | `rungvx cp [-a] [-L] [-q] [-z] [--no-overwrite-dir] [--user U:G] SRC DST` and `rungvx export [--upper-only] [-z] [-o FILE\|-] [PATH]`. Host disk I/O runs in the unlocked client. |
+| `update` | `rungvx update [-m SIZE] [--force-memory] [--cpus N] [--cpu-quota US] [--cpu-period US] [--pids-limit N] [--isolate-lan=BOOL] [--net-tx-bps N] [--net-rx-bps N] [--tune K=V]...` |
+| `net-policy` | `rungvx net-policy get` and `rungvx net-policy replace --file FILE`. |
+| `port` / `port-forward` | `rungvx port <ls\|add\|rm>` (requires `--dynamic-ports` or `--auto-publish`) and `rungvx port-forward` (`pf`, tunnels over `net.dial` without relaxing lockdown). |
+| `unix-forward` | `rungvx unix-forward [--replace] GUEST_PATH=HOST_SOCKET[,uid=N,gid=N,mode=0600]` (`uf`). |
+| `mount` | `rungvx mount <ls\|add\|remount\|rm\|serve>`. `mount serve HOST:GUEST` serves a pinned host directory or file via `rpcfs` with `inotify`. |
 | `status`, `stats`, `top`, `dmesg`, `events`, `kill`, `stop`, `ping`, `debug` | Inspect state, stream counters or kernel logs, deliver signals, stop PID 1 cleanly, or set Sentry verbosity. |
 
 ### 4.13 NAT Bandwidth Limits
@@ -327,16 +327,16 @@ Control commands accept `-S`/`--control-socket SPEC` (`GVX_CONTROL_SOCKET`), `-n
 `--net-tx-bps` (guest egress) and `--net-rx-bps` (guest ingress) share one token bucket per direction across NAT relays, DNS, published ports, and `port-forward` tunnels (`0` is unlimited; NAT mode only; 256 KiB burst per direction). Stream relays throttle; full packet queues drop. The Go SDK does not combine bandwidth limits with `Config.StreamInterceptor`.
 
 ```sh
-rungv run --net=nat --net-tx-bps 2000000 --net-rx-bps 8000000 --name app --control alpine:3.20 sleep 600
-rungv update -n app --net-tx-bps 4000000
-rungv update -n app --net-rx-bps 0
+rungvx run --net=nat --net-tx-bps 2000000 --net-rx-bps 8000000 --name app --control alpine:3.20 sleep 600
+rungvx update -n app --net-tx-bps 4000000
+rungvx update -n app --net-rx-bps 0
 ```
 
 ### 4.14 Host NAT Policy
 
 `--nat-policy-file` enforces an IPv4/IPv6 firewall at the host NAT boundary, outside guest `iptables`. Policy files (`.json`, `.yaml`, or `.yml`; 64 KiB maximum; single YAML document without aliases or merge keys; quote numeric port strings such as `ports: "443"`) define `egress` and `ingress` chains, each with `default` (`allow` or `deny`) and up to 1,024 ordered rules matching optional `cidr`, `guest_cidr`, `protocol` (`tcp`, `udp`, `icmp`, `icmpv6`, or `1`..`255`), and `ports` (single port or inclusive range).
 
-Rules are evaluated first-match; unreadable fields fail closed; `-isolate-lan` overrides `allow`; NAT dials to the sandbox's own TCP control listener are blocked; active IP policies refuse Unix socket publications. Replacing a policy via `rungv net-policy replace` cancels active relays denied by the new policy without mutating bandwidth settings.
+Rules are evaluated first-match; unreadable fields fail closed; `-isolate-lan` overrides `allow`; NAT dials to the sandbox's own TCP control listener are blocked; active IP policies refuse Unix socket publications. Replacing a policy via `rungvx net-policy replace` cancels active relays denied by the new policy without mutating bandwidth settings.
 
 ```json
 {
@@ -352,7 +352,7 @@ Rules are evaluated first-match; unreadable fields fail closed; `-isolate-lan` o
 
 ## 5. Images, Registries, and Host DNS
 
-Image references obey the Docker grammar (host with `.` or `:` or `localhost`; otherwise Docker Hub with `library/` for single-segment names; default tag `latest`; `@sha256:` digests; lowercase repositories only). Registries use HTTPS except loopback (`localhost`, `127.0.0.0/8`, `[::1]`). Credentials resolve from `$DOCKER_CONFIG/config.json` (`credHelpers`, `credsStore`, `auths`), with 30 s / 1 MiB helper bounds. `rungv login` verifies credentials before saving.
+Image references obey the Docker grammar (host with `.` or `:` or `localhost`; otherwise Docker Hub with `library/` for single-segment names; default tag `latest`; `@sha256:` digests; lowercase repositories only). Registries use HTTPS except loopback (`localhost`, `127.0.0.0/8`, `[::1]`). Credentials resolve from `$DOCKER_CONFIG/config.json` (`credHelpers`, `credsStore`, `auths`), with 30 s / 1 MiB helper bounds. `rungvx login` verifies credentials before saving.
 
 ### 5.1 Pull Policy
 
@@ -367,7 +367,7 @@ Image references obey the Docker grammar (host with `.` or `:` or `localhost`; o
 Hosts lacking `/etc/resolv.conf` (such as Android apps) fail default Go DNS lookups against `[::1]:53`. Pass `--host-dns IP[:PORT]` (repeatable or comma-separated) to `run`, `pull`, `push`, or `save` (`Config.HostDNSServers` and `LayerCache.SetDNSServers` in Go) to supply explicit resolvers for both the guest DNS relay (`10.0.2.3`) and registry pulls without altering global process state.
 
 ```sh
-rungv run --host-dns 10.0.2.3 alpine:3.20 nslookup example.com
+rungvx run --host-dns 10.0.2.3 alpine:3.20 nslookup example.com
 ```
 
 ---
@@ -376,58 +376,58 @@ rungv run --host-dns 10.0.2.3 alpine:3.20 nslookup example.com
 
 Docker-style noun-verb groups administer local images, named volumes, diagnostics, and completions. Top-level aliases (`images`, `pull`, `push`, `rmi`, `inspect`, `tag`, `save`, `load`, `info`) remain available.
 
-### 6.1 Image Store (`rungv image`)
+### 6.1 Image Store (`rungvx image`)
 
 The layer cache lives under `%LOCALAPPDATA%\gvx\cache\layers` (Windows), `~/Library/Caches/gvx/layers` (macOS), or `~/.cache/gvx/layers` (Linux). Passing `-keep-blobs` (or `GVX_KEEP_BLOBS=1`) retains compressed blobs under `blobs/sha256/<hex>`.
 
 | Command | Behavior |
 | :--- | :--- |
-| `rungv image ls` (`images`) | List cached images (`-a`, `-q`, `--no-trunc`, `--digests`, `--format`). |
-| `rungv image pull` (`pull`) | Download an image (`--platform linux/ARCH`, `-registry-url`, `-keep-blobs`, `--host-dns`). |
-| `rungv image push` (`push`) | Upload a cached image (`IMAGE [TARGET]`) with `HEAD` checks, cross-repo mounts, and stdin/FD auth flags. |
-| `rungv image inspect` (`inspect`) | Print JSON metadata array or evaluate `-f`/`--format`. |
-| `rungv image rm` (`rmi`) | Untag or delete unreferenced layers and kept blobs (`-f` for multi-tagged IDs). |
-| `rungv image tag` (`tag`) | Add a second reference to a cached image. |
-| `rungv image save` (`save`) | Write an OCI and `docker save` tar archive (offline when `-keep-blobs` retained all layers). |
-| `rungv image load` (`load`) | Import images for the target architecture from a tar archive (`-keep-blobs` supported). |
-| `rungv image prune [-a] [-f]` | Remove dangling (or all `-a`) images and orphan layers; report reclaimed bytes. |
+| `rungvx image ls` (`images`) | List cached images (`-a`, `-q`, `--no-trunc`, `--digests`, `--format`). |
+| `rungvx image pull` (`pull`) | Download an image (`--platform linux/ARCH`, `-registry-url`, `-keep-blobs`, `--host-dns`). |
+| `rungvx image push` (`push`) | Upload a cached image (`IMAGE [TARGET]`) with `HEAD` checks, cross-repo mounts, and stdin/FD auth flags. |
+| `rungvx image inspect` (`inspect`) | Print JSON metadata array or evaluate `-f`/`--format`. |
+| `rungvx image rm` (`rmi`) | Untag or delete unreferenced layers and kept blobs (`-f` for multi-tagged IDs). |
+| `rungvx image tag` (`tag`) | Add a second reference to a cached image. |
+| `rungvx image save` (`save`) | Write an OCI and `docker save` tar archive (offline when `-keep-blobs` retained all layers). |
+| `rungvx image load` (`load`) | Import images for the target architecture from a tar archive (`-keep-blobs` supported). |
+| `rungvx image prune [-a] [-f]` | Remove dangling (or all `-a`) images and orphan layers; report reclaimed bytes. |
 
-### 6.2 Named Volumes (`rungv volume`)
+### 6.2 Named Volumes (`rungvx volume`)
 
-`rungv volume` inspects `ext4lite` host file locks (`ProbeVolumeLock`) and refuses to compact or delete any mounted volume.
+`rungvx volume` inspects `ext4lite` host file locks (`ProbeVolumeLock`) and refuses to compact or delete any mounted volume.
 
 | Command | Behavior |
 | :--- | :--- |
-| `rungv volume create [-d ext4lite\|hostfs] [NAME]` | Format an `ext4lite` volume (default) or `hostfs` directory (random 64-hex name if omitted). |
-| `rungv volume ls [-q] [--format SPEC]` | List local volumes sorted by name. |
-| `rungv volume inspect [-f SPEC] NAME...` | Print volume metadata (`SizeBytes`, `AllocatedBytes`, `InUse`, `LockMode`, etc.). |
-| `rungv volume compact NAME...` | Replay pending journals, punch freed blocks, and shrink tail groups on unlocked `ext4lite` volumes. |
-| `rungv volume rm [-f] NAME...` | Delete unlocked volumes (`-f` ignores missing names; mounted volumes still fail). |
-| `rungv volume prune [-f]` | Remove all unlocked local volumes and print reclaimed bytes. |
+| `rungvx volume create [-d ext4lite\|hostfs] [NAME]` | Format an `ext4lite` volume (default) or `hostfs` directory (random 64-hex name if omitted). |
+| `rungvx volume ls [-q] [--format SPEC]` | List local volumes sorted by name. |
+| `rungvx volume inspect [-f SPEC] NAME...` | Print volume metadata (`SizeBytes`, `AllocatedBytes`, `InUse`, `LockMode`, etc.). |
+| `rungvx volume compact NAME...` | Replay pending journals, punch freed blocks, and shrink tail groups on unlocked `ext4lite` volumes. |
+| `rungvx volume rm [-f] NAME...` | Delete unlocked volumes (`-f` ignores missing names; mounted volumes still fail). |
+| `rungvx volume prune [-f]` | Remove all unlocked local volumes and print reclaimed bytes. |
 
-### 6.3 System Diagnostics (`rungv system`) and Templates
+### 6.3 System Diagnostics (`rungvx system`) and Templates
 
 | Command or Format | Behavior |
 | :--- | :--- |
-| `rungv system info` (`info`) | Probe `whpx`, `hvf`, and `systrap`, report lockdown profile, and list cache/volume counts. |
-| `rungv system df [-v] [--format SPEC]` | Report total, active, and reclaimable space for images and volumes (`-v` adds detail tables). |
-| `rungv system prune [-a] [--volumes] [-f]` | Prune unused images and optionally unlocked volumes. |
+| `rungvx system info` (`info`) | Probe `whpx`, `hvf`, and `systrap`, report lockdown profile, and list cache/volume counts. |
+| `rungvx system df [-v] [--format SPEC]` | Report total, active, and reclaimable space for images and volumes (`-v` adds detail tables). |
+| `rungvx system prune [-a] [--volumes] [-f]` | Prune unused images and optionally unlocked volumes. |
 | `--format json` / `'{{.Field}}'` / `'table ...'` | Emit NDJSON or evaluate Go `text/template` with helpers `json`, `lower`, `upper`, `join`, `split`, `truncate`. |
 
 ### 6.4 Shell Completion
 
 | Shell | Activation Command |
 | :--- | :--- |
-| Bash | `source <(rungv completion bash)` |
-| Zsh | `source <(rungv completion zsh)` (after `compinit`) |
-| Fish | `rungv completion fish \| source` |
-| PowerShell | `rungv completion powershell \| Out-String \| Invoke-Expression` |
+| Bash | `source <(rungvx completion bash)` |
+| Zsh | `source <(rungvx completion zsh)` (after `compinit`) |
+| Fish | `rungvx completion fish \| source` |
+| PowerShell | `rungvx completion powershell \| Out-String \| Invoke-Expression` |
 
 ---
 
 ## 7. Summary of Differences from Docker
 
-| Docker Feature | `rungv` Behavior |
+| Docker Feature | `rungvx` Behavior |
 | :--- | :--- |
 | `-d`, `ps`, `logs`, `rm`, `restart` | Unavailable (no daemon); live commands require `-S`/`--control-socket` or `--control`. |
 | `docker build`, `compose`, `network` | Unavailable directly; run `docker:dind` inside `gvx` (see [`recipes/docker-engine.md`](recipes/docker-engine.md)). |
@@ -446,55 +446,55 @@ The layer cache lives under `%LOCALAPPDATA%\gvx\cache\layers` (Windows), `~/Libr
 
 ```sh
 # Run as UID 1000 with an environment variable and read-only bind mount
-rungv run -u 1000 -e MODE=test -v "$PWD":/src:ro -w /src alpine:3.20 sh -c 'ls; id'
+rungvx run -u 1000 -e MODE=test -v "$PWD":/src:ro -w /src alpine:3.20 sh -c 'ls; id'
 
 # Publish all EXPOSE ports to ephemeral host loopback ports
-rungv run -P nginx:alpine
+rungvx run -P nginx:alpine
 
 # Create an ext4lite volume, run with memory limit, and inspect disk usage
-rungv volume create appdata
-rungv run -m512m -v appdata:/var/lib/app alpine:3.20 sh -c "date > /var/lib/app/stamp"
-rungv run -rootfs-volume rootstate alpine:3.20 sh -c "echo saved > /etc/custom"
-rungv system df -v
+rungvx volume create appdata
+rungvx run -m512m -v appdata:/var/lib/app alpine:3.20 sh -c "date > /var/lib/app/stamp"
+rungvx run -rootfs-volume rootstate alpine:3.20 sh -c "echo saved > /etc/custom"
+rungvx system df -v
 
 # Export and re-import an image archive
-rungv save -o alpine.tar alpine:3.20
-rungv load -i alpine.tar
+rungvx save -o alpine.tar alpine:3.20
+rungvx load -i alpine.tar
 ```
 
 ---
 
-## 9. `rungv license`
+## 9. `rungvx license`
 
-`rungv license [-list]` prints the embedded notice file (`cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt`) covering `gvx`, upstream gVisor, the Go standard library, and every linked third-party module. Passing `-list` prints one summary line per module with version and SPDX identifier. Regenerate notices with `go run ./tools/licenses -o cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt` and verify both the file and `README.md` with `go run ./tools/licenses -check`.
+`rungvx license [-list]` prints the embedded notice file (`pkg/rungvx/licenses/THIRD_PARTY_LICENSES.txt`) covering `gvx`, upstream gVisor, the Go standard library, and every linked third-party module. Passing `-list` prints one summary line per module with version and SPDX identifier. Regenerate notices with `go run ./tools/licenses -o pkg/rungvx/licenses/THIRD_PARTY_LICENSES.txt` and verify both the file and `README.md` with `go run ./tools/licenses -check`.
 
 ---
 
-## 10. `rungv version`
+## 10. `rungvx version`
 
-`rungv version` (or `rungv --version`) prints module version, Git commit SHA and timestamp (`modified` if dirty), and Go toolchain/target architecture level (`GOAMD64` or `GOARM64`). Include its full output in every bug or security report.
+`rungvx version` (or `rungvx --version`) prints the module version, Git commit SHA and timestamp (`modified` if dirty), Go toolchain and target architecture level (`GOAMD64` or `GOARM64`), and the nginx-style `build options:` line (`cgo`, sorted Go build tags, and compiled extensions). Pass `-V` (`rungvx version -V` or `rungvx -V`) to append compiler, build mode, `trimpath`, SPI version, and per-extension capability lines. Include the full `rungvx -V` output in every bug or security report.
 
 ---
 
 ## 11. Nested Execution
 
-Running `rungv` inside an outer sandbox exercises `ptrace`, `seccomp`, shared memory, futexes, and architecture signal frames provided by the outer kernel.
+Running `rungvx` inside an outer sandbox exercises `ptrace`, `seccomp`, shared memory, futexes, and architecture signal frames provided by the outer kernel.
 
 > [!IMPORTANT]
-> Place a statically linked Linux `rungv` binary inside the outer guest (`CGO_ENABLED=0 go build -o rungv-static ./cmd/rungv`), as minimal guests lack the host C library loader.
+> Place a statically linked Linux `rungvx` binary inside the outer guest (`CGO_ENABLED=0 go build -o rungvx-static ./cmd/rungvx`), as minimal guests lack the host C library loader.
 
-### 11.1 `rungv` Inside `rungv`
+### 11.1 `rungvx` Inside `rungvx`
 
-An inner `rungv --backend=systrap` executes inside an outer `rungv` running on Linux `systrap` (`amd64` and `arm64`, including KVM-less cloud VMs) or macOS `hvf` (slower). The inner sandbox prints a benign warning (`seccomp user-space notification mechanism isn't supported`) and uses its futex wake loop.
+An inner `rungvx --backend=systrap` executes inside an outer `rungvx` running on Linux `systrap` (`amd64` and `arm64`, including KVM-less cloud VMs) or macOS `hvf` (slower). The inner sandbox prints a benign warning (`seccomp user-space notification mechanism isn't supported`) and uses its futex wake loop.
 
-1. Compile a static Linux binary: `CGO_ENABLED=0 go build -o rungv-static ./cmd/rungv`.
+1. Compile a static Linux binary: `CGO_ENABLED=0 go build -o rungvx-static ./cmd/rungvx`.
 2. Build the smoke ELF binary: `go run ./internal/testelf/cmd/mkelf -o smoke`.
-3. Run nested execution: `rungv run --backend=systrap -v "$PWD/smoke:/smoke:ro" -bin ./rungv-static -- run --backend=systrap -bin /smoke`.
+3. Run nested execution: `rungvx run --backend=systrap -v "$PWD/smoke:/smoke:ro" -bin ./rungvx-static -- run --backend=systrap -bin /smoke`.
 4. Confirm the output prints `gvx-smoke-ok`.
 
-### 11.2 `rungv` Inside Docker with Upstream `runsc`
+### 11.2 `rungvx` Inside Docker with Upstream `runsc`
 
-Under upstream `runsc` (`release-20261102.0`, both `--platform=kvm` and `--platform=systrap`), `linux/amd64` nested runs succeed with `--backend=systrap -net=none -lockdown=false` because inner `rungv` adapts to four `runsc` divergences (fixed-map alignment order, zero fault error codes, `ARCH_SET_GS` clearing outer patches, and per-mapping unmap around sealed outer patch tables). On `linux/arm64`, upstream `runsc` omits `fpsimd_context` from signal frames, causing stub exit code `137`.
+Under upstream `runsc` (`release-20261102.0`, both `--platform=kvm` and `--platform=systrap`), `linux/amd64` nested runs succeed with `--backend=systrap -net=none -lockdown=false` because inner `rungvx` adapts to four `runsc` divergences (fixed-map alignment order, zero fault error codes, `ARCH_SET_GS` clearing outer patches, and per-mapping unmap around sealed outer patch tables). On `linux/arm64`, upstream `runsc` omits `fpsimd_context` from signal frames, causing stub exit code `137`.
 
 ### 11.3 Nested Limits
 
@@ -508,7 +508,7 @@ On `android/arm64`, `--backend=auto` selects `systrap` because unprivileged Andr
 
 ### 12.1 Process Model and Phantom Process Ceiling
 
-`dev.gfire.gvx.Gvx` starts `librungv.so` from the application's native library directory and passes active network resolvers via `--host-dns`. Because Android SELinux denies `linkat` hard links on app-data files (`EACCES`), use `ext4lite` volumes for workloads needing hard links.
+`dev.gfire.gvx.Gvx` starts `librungvx.so` from the application's native library directory and passes active network resolvers via `--host-dns`. Because Android SELinux denies `linkat` hard links on app-data files (`EACCES`), use `ext4lite` volumes for workloads needing hard links.
 
 Each live guest address space holds one stub process and at most two `sysmsg` processes on Android. Android 12+ counts all app child processes system-wide and terminates the oldest once the total exceeds 32, causing `the execution engine stopped the guest`. Android also terminates CPU-intensive background child processes.
 
@@ -520,6 +520,6 @@ Each live guest address space holds one stub process and at most two `sysmsg` pr
 
 ### 12.2 Sustaining Long-Running Android Workloads
 
-1. Launch `librungv.so` from an Android foreground service (as `android/sample` does).
+1. Launch `librungvx.so` from an Android foreground service (as `android/sample` does).
 2. Keep concurrent guest processes below 10 when operating under default system limits.
 3. Disable child-process restrictions using the table above if builds require higher concurrency.

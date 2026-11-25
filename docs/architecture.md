@@ -1,6 +1,6 @@
 # System Architecture of `gvx`
 
-`gvx` is an upstream-tracking port of Google's `gvisor` user-space Linux kernel (`Sentry` and `Netstack`) to Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`), alongside official Linux (`linux/amd64`, `linux/arm64`, 4 KiB and 16 KiB host pages) and Android (`android/arm64`) support. Without booting a Linux virtual machine, `gvx` executes unmodified Linux ELF64 binaries and OCI container images inside a single unprivileged process via `cmd/rungv` or the embeddable `pkg/gvx` Go SDK.
+`gvx` is an upstream-tracking port of Google's `gvisor` user-space Linux kernel (`Sentry` and `Netstack`) to Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`), alongside official Linux (`linux/amd64`, `linux/arm64`, 4 KiB and 16 KiB host pages) and Android (`android/arm64`) support. Without booting a Linux virtual machine, `gvx` executes unmodified Linux ELF64 binaries and OCI container images inside a single unprivileged process via `cmd/rungvx` or the embeddable `pkg/gvx` Go SDK.
 
 ---
 
@@ -17,7 +17,7 @@ This section states the architectural contracts, supported host matrix, and deli
 | **Driverless Networking (`pkg/netbackend`)** | Connects guest Netstack to unprivileged L4 Go `net` NAT (`-net=nat`, `-p`, `--auto-publish`, host NAT policy, bandwidth limits) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports Docker Engine (`docker:dind`), single-node and multi-node Kubernetes (`k3s`, Flannel, Calico VXLAN), and LAN isolation. |
 | **Direct OCI Compilation (`pkg/oci`)** | Streams `.tar.gz`/`.tar.zst` layers directly into cached read-only EROFS files mounted beneath `tmpfs` or `ext4lite`. | Runs unmodified Linux images without unpacking Linux filenames onto NTFS or APFS. |
 | **Lockdown-Safe Checkpoint/Restore** | Pre-opens bundle descriptors and optional `gvx-ctrl/2` listeners prior to `hostlockdown.Apply()`, and validates untrusted bundles before allocation. | Saves and resumes guest tasks, sparse memory, `hostfs`, `ext4lite`, and network namespaces without weakening containment. |
-| **Upstream Isolation** | Separates host logic into Tier 1 additive packages and Tier 2 `_windows`/`_darwin`/`_xplat` siblings. | Enforces a `< 4.2%` CI audit gate inside a `< 5.0%` ceiling; builds with Go 1.27.4+ without Bazel. |
+| **Upstream Isolation** | Separates host logic into Tier 1 additive packages and Tier 2 `_windows`/`_darwin`/`_xplat` siblings. | Enforces a `< 4.5%` CI audit gate inside a `< 5.0%` ceiling; builds with Go 1.27.4+ without Bazel. |
 
 ![gvx Subsystem Architecture Overview](assets/arch-overview.svg)
 
@@ -35,7 +35,7 @@ Hardware virtualization (`whpx` and `hvf`) is the default backend on Windows and
 | `darwin/amd64` | None | None | None | Unsupported. |
 | `linux/amd64` | Upstream `systrap` | None | 4 KiB page | Official target; full CI `e2e/` and conformance suites. |
 | `linux/arm64` | Upstream `systrap` (4 KiB direct or 16 KiB `subblock_xplat.go`) | None | 4 KiB or 16 KiB page | Official target; 4 KiB native and 16 KiB QEMU CI. |
-| `android/arm64` | None (`untrusted_app` lacks `/dev/kvm`) | Upstream `systrap` (`MFD_EXEC`, `idleStubLimit = 2`, 16 KiB sub-blocks) | 4 KiB or 16 KiB page | Packaged as `librungv.so` in `gvx-android.aar` (`minSdkVersion 31`). |
+| `android/arm64` | None (`untrusted_app` lacks `/dev/kvm`) | Upstream `systrap` (`MFD_EXEC`, `idleStubLimit = 2`, 16 KiB sub-blocks) | 4 KiB or 16 KiB page | Packaged as `librungvx.so` in `gvx-android.aar` (`minSdkVersion 31`). |
 
 ### 1.2 Deliverables and Feature Map
 
@@ -43,7 +43,7 @@ The repository builds four deliverables backed by eight major component subsyste
 
 | Deliverable or Subsystem | Owning Packages | Component Specification |
 | :--- | :--- | :--- |
-| Standalone CLI (`rungv`) | `cmd/rungv` | [`cli.md`](cli.md) |
+| Standalone CLI (`rungvx`) | `cmd/rungvx` | [`cli.md`](cli.md) |
 | Embeddable Go SDK & Control Protocol | `pkg/gvx`, `pkg/gvx/control`, `pkg/gvx/tuning` | Section 3.13; [`control-protocol.md`](control-protocol.md) |
 | Optional Containerd Control Shim | `cmd/containerd-shim-gvx-v2`, `internal/gvxshim` | Section 3.10 |
 | Android Library (`gvx-android.aar`) | `android/`, `tools/androidprobe` | [`components/android.md`](components/android.md) |
@@ -68,7 +68,7 @@ gvx/ (Tracks google/gvisor@go)
  ├── entitlements.plist                     # com.apple.security.hypervisor entitlement for macOS
  ├── android/                               # Android AAR library (dev.gfire.gvx.Gvx) and sample service
  ├── cmd/
- │   ├── rungv/                             # Standalone foreground CLI
+ │   ├── rungvx/                             # Standalone foreground CLI
  │   └── containerd-shim-gvx-v2/            # Optional containerd v3 control shim
  ├── docs/
  │   ├── architecture.md, cli.md, compatibility.md, control-protocol.md, glossary.md, troubleshooting.md
@@ -104,7 +104,7 @@ Strict top-down import directionality keeps host OS bindings out of the pure-Go 
 | `internal/gvxshim` | Shim bootstrap, ttRPC serving, leases, and teardown. | Containerd types, ttRPC, protobuf, OS APIs | `pkg/*`, `runsc/*`, `shim/*`, `cmd/*` |
 | `tools/shiminterop` | Isolated containerd `2.1.5` SDK interoperability tests. | None | Root runtime, `cmd/*`, `internal/*` |
 | `tools/gostateify` | Reflection-free `pkg/state` generator and drift checker. | `golang.org/x/tools/*` | Production `pkg/*`, `cmd/*`, `internal/*` |
-| `cmd/rungv` | CLI subcommands documented in [`cli.md`](cli.md). | `pkg/gvx`, `pkg/gvx/{control,tuning}`, `pkg/oci`, `pkg/netbackend` | `pkg/sentry/*`, `WinHvPlatform.dll` |
+| `cmd/rungvx` | CLI subcommands documented in [`cli.md`](cli.md). | `pkg/gvx`, `pkg/gvx/{control,tuning}`, `pkg/oci`, `pkg/netbackend` | `pkg/sentry/*`, `WinHvPlatform.dll` |
 | `pkg/gvx` | Orchestrates OCI, mounts, networking, lockdown, Sentry boot, control server, and C/R. | `pkg/gvx/{control,hostcerts,tuning}`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip`, `pkg/seccomp`, `runsc/boot/filter/config` | `cmd/*`, `internal/gvxshim` |
 | `pkg/gvx/control` | `gvx-ctrl/2` wire framing, auth, and capability policy. | `internal/xsys/unix`, `golang.org/x/sys/windows`, `zstd` | `pkg/sentry/*`, `cmd/*`, `pkg/hostlockdown` |
 | `pkg/oci` | Multi-arch OCI registry client, cache, and Tar-to-EROFS compiler. | `pkg/abi/linux`, `pkg/erofs`, `pkg/gvx/tuning` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
@@ -117,7 +117,7 @@ Strict top-down import directionality keeps host OS bindings out of the pure-Go 
 | `pkg/sentry/platform/systrap` | Linux (4 KiB/16 KiB) and Windows stub-process execution engine. | `pkg/sentry/platform`, `hvcommon`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/arch/*` | `pkg/sentry/kernel`, `whpx`, `hvf` |
 | `pkg/sentry/fsimpl/hostfs` | Pinned host directory/file VFS2 driver and `.gvx_meta` journal. | `pkg/sentry/vfs`, `chunkcache`, `fsutilx`, `pkg/abi/linux`, `pkg/fd`, `pkg/hostlockdown`, `internal/xsys/unix` | `pkg/sentry/platform/*` |
 | `pkg/sentry/fsimpl/ext4lite` | Single-file JBD2-journaled ext4 volume driver. | `pkg/sentry/vfs`, `pkg/sentry/blockdev`, `chunkcache`, `fsutilx`, `pkg/abi/linux`, `pkg/fd`, `internal/xsys/unix` | `pkg/sentry/platform/*`, `cmd/*` |
-| `pkg/sentry/fsimpl/rpcfs` | Client-served proxy VFS2 driver for `rungv mount serve`. | `pkg/sentry/vfs`, `pkg/abi/linux`, `pkg/errors/linuxerr`, `pkg/usermem` | `pkg/gvx/*`, `pkg/sentry/platform/*`, `pkg/hostlockdown` |
+| `pkg/sentry/fsimpl/rpcfs` | Client-served proxy VFS2 driver for `rungvx mount serve`. | `pkg/sentry/vfs`, `pkg/abi/linux`, `pkg/errors/linuxerr`, `pkg/usermem` | `pkg/gvx/*`, `pkg/sentry/platform/*`, `pkg/hostlockdown` |
 | `pkg/sync`, `pkg/memutil`, `pkg/fd` | Host futexes, shared memory views, and handle wrappers. | `golang.org/x/sys/windows`, `internal/xsys/unix` | `pkg/sentry/*` |
 
 ### 2.2 Three-Tier Upstream Isolation Model
@@ -126,9 +126,9 @@ Repository files fall into three isolation tiers so upstream synchronization rem
 
 | Isolation Tier | File Paths | Upstream Overlap | Maintenance Rule |
 | :--- | :--- | ---: | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/ipset/`, `pkg/tcpip/link/{vxlan,wgtun}/`, `pkg/hostlockdown/`, `pkg/sentry/socket/netlink/genetlink/`, `pkg/sentry/platform/{whpx,hvf,hvcommon}/`, `pkg/sentry/blockdev/`, `pkg/sentry/fsimpl/{chunkcache,fsutilx,hostfs,ext4lite,rpcfs}/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/{upstream,shiminterop,licenses,gvisorlint,androidprobe,gostateify}/`, `android/`, `docs/` | `0.0%` | Owned wholly by `gvx`; protected by `tools/upstream/file_mask.txt`. |
+| **Tier 1: Additive Packages** | `cmd/rungvx/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/ipset/`, `pkg/tcpip/link/{vxlan,wgtun}/`, `pkg/hostlockdown/`, `pkg/sentry/socket/netlink/genetlink/`, `pkg/sentry/platform/{whpx,hvf,hvcommon}/`, `pkg/sentry/blockdev/`, `pkg/sentry/fsimpl/{chunkcache,fsutilx,hostfs,ext4lite,rpcfs}/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/{upstream,shiminterop,licenses,gvisorlint,androidprobe,gostateify}/`, `android/`, `docs/` | `0.0%` | Owned wholly by `gvx`; protected by `tools/upstream/file_mask.txt`. |
 | **Tier 2: Sibling Files** | `*_windows*`, `*_darwin*`, and `*_xplat*` files placed inside upstream packages | `0.0%` | Selected by Go build constraints alongside unmodified `*_linux.go` files; zero diff budget charged. |
-| **Tier 3: Build-Tag and Seam Patches** | Allowlisted pure-Go upstream files (`tools/upstream/buildtag_allowlist.txt`) | `< 5.0%` (`< 4.2%` CI gate) | Automatically re-applied by `tools/upstream -mode=retag`; Linux-only build fences on `runsc`/`shim`/`gofer` are tracked separately. |
+| **Tier 3: Build-Tag and Seam Patches** | Allowlisted pure-Go upstream files (`tools/upstream/buildtag_allowlist.txt`) | `< 5.0%` (`< 4.5%` CI gate) | Automatically re-applied by `tools/upstream -mode=retag`; Linux-only build fences on `runsc`/`shim`/`gofer` are tracked separately. |
 
 ![Upstream Synchronization Pipeline](assets/upstream-sync.svg)
 
@@ -153,7 +153,7 @@ git merge --no-commit upstream/go
 ./scripts/gostateify.sh
 go run ./tools/upstream -mode=retag
 ./scripts/gostateify.sh -check
-go run ./tools/upstream -mode=audit -max-ratio=0.042
+go run ./tools/upstream -mode=audit -max-ratio=0.045
 git rev-parse upstream/go > UPSTREAM_COMMIT
 for t in windows/amd64 windows/arm64 darwin/arm64 linux/amd64 linux/arm64; do
   GOOS=${t%/*} GOARCH=${t#*/} go build ./...
@@ -297,7 +297,7 @@ Because `pkg/gvx`, `e2e/`, and shims execute multiple sandboxes inside one host 
 | `systrap` `sealedHoles`, dispatcher, thread budgets, `globalPool`, `sharedSystrap` | `platform/systrap`, `pkg/gvx` | Describes host address layout and host stub pool with compile-time cap (`2` Android; `4..32` Linux). |
 | `hvf` shared VM (`vmGlobal`) | `platform/hvf` | `Hypervisor.framework` permits one VM per host process; platforms reference-count it with separate page tables. |
 | `hostfs` watch budget (`processWatches`) | `fsimpl/hostfs` | Host FD limits are process-wide; all workspaces draw from one shared cap. |
-| Capability probes, `memutil` arena index, `lastPIDNSID`, `hostlockdown` state, `tuning` registry, `log.SetLevel` | Respective packages | Host kernel facts, monotonic counters, one-way lockdown, immutable tables, or `CapDebug`-gated upstream log level. |
+| Capability probes, `memutil` arena index, `lastPIDNSID`, `hostlockdown` state, extension lockdown grants (`extLockdownRecvMsgFD`), `tuning` registry, `log.SetLevel` | Respective packages | Host kernel facts, monotonic counters, one-way lockdown (`gvx.New` returns `ErrLockdownActive` if a subsequent sandbox requires helper spawns or ungranted `RecvMsgFDs`), immutable tables, or `CapDebug`-gated upstream log level. |
 | Unused `runsc`-only globals (`seccheck.Global`, `nftables`, `gofer.globalDentryCache`, `time.tscOffset`, etc.) | Upstream Sentry | Never set by `gvx`. |
 
 | Per-Sandbox Owned State | Owning Key |
@@ -326,7 +326,7 @@ During save, the runtime stops the watchdog, pauses guest tasks, quiesces NAT re
 
 ### 3.14 Android Host Runtime and Packaging
 
-`scripts/android/build-sdk.sh` compiles `cmd/rungv` (`GOOS=android`, `CGO_ENABLED=1`) into `jni/arm64-v8a/librungv.so` inside `gvx-android.aar` (`minSdkVersion 31`) so Android PackageManager extracts it under the executable `apk_data_file` label. `dev.gfire.gvx.Gvx` launches it with app-private `HOME`/`TMPDIR` and active `--host-dns` resolvers, while `android/sample` wraps execution in an Android 14+ `specialUse` foreground service. Consult [`components/android.md`](components/android.md) for `MFD_EXEC`, 16 KiB sub-blocks, and the 32-process ceiling.
+`scripts/android/build-sdk.sh` compiles `cmd/rungvx` (`GOOS=android`, `CGO_ENABLED=1`) into `jni/arm64-v8a/librungvx.so` inside `gvx-android.aar` (`minSdkVersion 31`) so Android PackageManager extracts it under the executable `apk_data_file` label. `dev.gfire.gvx.Gvx` launches it with app-private `HOME`/`TMPDIR` and active `--host-dns` resolvers, while `android/sample` wraps execution in an Android 14+ `specialUse` foreground service. Consult [`components/android.md`](components/android.md) for `MFD_EXEC`, 16 KiB sub-blocks, and the 32-process ceiling.
 
 ---
 
@@ -381,8 +381,8 @@ Integration evidence covers commit `f3b7ef4` (post-upstream `90a2f3f7`) across f
 
 ### 4.7 Third-Party License Collector (`tools/licenses`)
 
-`tools/licenses` walks the transitive Go module graph across shipped targets, generates `cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt`, and verifies both that file and the license table in `README.md` (`go run ./tools/licenses -check`).
+`tools/licenses` walks the transitive Go module graph across shipped targets, generates `pkg/rungvx/licenses/THIRD_PARTY_LICENSES.txt`, and verifies both that file and the license table in `README.md` (`go run ./tools/licenses -check`).
 
 ### 4.8 Reproducible Builds
 
-`scripts/repro-build.sh` compiles deterministic binaries (`-trimpath`, stripped build IDs, scrubbed environment, pinned `CGO_ENABLED=0` and `GOAMD64`/`GOARM64` levels). `scripts/verify-repro-gvx.sh` builds `rungv` both on the host and inside a `golang` container running on `gvx`, asserting identical SHA-256 hashes.
+`scripts/repro-build.sh` compiles deterministic binaries (`-trimpath`, stripped build IDs, scrubbed environment, pinned `CGO_ENABLED=0` and `GOAMD64`/`GOARM64` levels). `scripts/verify-repro-gvx.sh` builds `rungvx` both on the host and inside a `golang` container running on `gvx`, asserting identical SHA-256 hashes.

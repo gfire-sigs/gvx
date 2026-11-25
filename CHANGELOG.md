@@ -2,6 +2,32 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This release renames the CLI binary and build artifacts from `rungv` to `rungvx`, extends `rungvx version` with nginx-style compile-time build options, and adds the Sandbox Extension SPI with a nested `ext/` Go submodule and separated extension CI.
+
+### Breaking Changes
+
+- **CLI binary, Go package, release archive, and Android library rename (`cmd/rungvx`, `pkg/rungvx`, `android/`)** (#250):
+  - The standalone CLI executable is now `rungvx` (`rungvx.exe` on Windows) instead of `rungv` (`rungv.exe`).
+  - The Go CLI entrypoint package moved from `./cmd/rungv` to `./cmd/rungvx`, with shared CLI internals extracted into `pkg/rungvx`.
+  - Release archives use the `rungvx-<tag>-<os>-<arch>` prefix instead of `rungv-<tag>-<os>-<arch>`, and the embedded third-party license notice file moved to `pkg/rungvx/licenses/THIRD_PARTY_LICENSES.txt`.
+  - The Android native library inside `gvx-android.aar` (`dev.gfire.gvx.Gvx.EXECUTABLE`) is now `librungvx.so` instead of `librungv.so`. Update scripts, shell completions, containerd configs, and Android launch commands accordingly.
+- **`rungvx version` output format (`pkg/rungvx`)** (#250):
+  - `rungvx version` (and `rungvx --version`) now prints `rungvx <version>` on the first line and appends a fourth line: `build options: cgo=<0|1> tags=<list|none> extensions=<list|none>`.
+  - `rungvx version -V` (and top-level `rungvx -V`) appends deterministic `compiler:`, `buildmode:`, `trimpath:`, `spi:`, and per-extension `extension <name>:` metadata lines. Update scripts or parsers that expect the previous three-line `rungv version` format.
+
+### Features
+
+- **Sandbox Extension SPI, shared-memory importer, and declarative `sysfs` topology (`pkg/gvx`, `pkg/gvx/shm`, `pkg/sentry/fsimpl/sys`)** (#250):
+  - Adds `gvx.SPIVersion`, `gvx.Extension`, `gvx.BoundExtension`, `gvx.PreLockdownEnv`, `gvx.KernelEnv`, and `Config.Extensions` with process-wide lockdown grant enforcement (`ErrLockdownActive`), three-outcome teardown, `PreLockdownEnv.SpawnHelper` supervision, FD-pinned receive-only `SYS_RECVMSG` Linux seccomp rules, and `gvx-ctrl/2` `Inspect`/`Stats` extension telemetry.
+  - Adds `pkg/gvx/shm` zero-copy shared-memory importer enforcing alignment, `PROT_EXEC` refusal, per-sandbox byte quotas, and reference-counted unmapping with a verified `hvf` backend.
+  - Adds declarative `sysfs` topology additions (`pkg/sentry/fsimpl/sys/ext_xplat.go`) with binary PCI config space payloads, directory merge rules, collision validation in `gvx.New`, and dynamic PCI/virtio slot allocation.
+- **Nested extension Go submodule (`ext/go.mod`), CLI plugin registry, and separated CI pipelines (`pkg/rungvx`, `pkg/gvx/exttest`, `ext/`, `.github/workflows/ext.yml`)** (#250):
+  - Keeps root `z.gfire.dev/gvx` builds pure Go (`CGO_ENABLED=0`) with zero extension dependencies in root `go.mod`.
+  - Adds `pkg/rungvx.CLIPlugin`, `MainWithPlugins`, `pkg/gvx/exttest`, and `ext/cmd/rungvx` supporting compile-time Go build tags (`-tags ext_gpu`, `-tags ext_all`) with `GVX_BUILD_TAGS` support in `scripts/repro-build.sh`.
+  - Separates extension CI into path-filtered `.github/workflows/ext.yml` and adds `ext/**` to `paths-ignore` in `.github/workflows/ci.yml`.
+
 ## [v0.22.10002026111600] - 2026-11-24
 
 This release adds `size` and `ephemeral` options to `--mount type=volume` for `ext4lite` volumes (#247, #256). It also aligns Windows regular file modes in `hostfs` and `rungv mount serve` with Docker Desktop (#249, #251).

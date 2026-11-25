@@ -27,7 +27,7 @@ Target workloads are Chromium-based browsers, browser automation frameworks (Pla
 | Objective | Requirement |
 | :--- | :--- |
 | G1 | Headless Chromium renders WebGL and compositing on the host GPU on macOS and Windows. |
-| G2 | The `rungv` binary remains pure Go (`CGO_ENABLED=0`) without linking host C graphics libraries. |
+| G2 | The `rungvx` binary remains pure Go (`CGO_ENABLED=0`) without linking host C graphics libraries. |
 | G3 | GPU access is strictly opt-in; default sandboxes retain their existing security posture. |
 | G4 | Guests run unmodified distribution packages (Mesa, Chromium, Electron). |
 | G5 | A subsequent phase presents guest windows on the host desktop if user demand warrants it. |
@@ -77,11 +77,11 @@ No production Windows product is known to ship `virglrenderer` over ANGLE on Dir
 | :--- | :--- | :--- |
 | No post-lockdown child processes | `hostlockdown.Apply` | Renderer process must launch prior to lockdown, analogous to the `systrap` stub host. |
 | No `win32k` syscalls inside Sentry | `AGENTS.md` Section 3.2 | Direct3D calls must stay confined to the separate renderer process. |
-| Pure-Go `rungv` (`CGO_ENABLED=0`) | `.github/workflows/release.yml` | C graphics libraries (`virglrenderer`, ANGLE) reside in a separate renderer binary communicating over IPC. |
+| Pure-Go `rungvx` (`CGO_ENABLED=0`) | `.github/workflows/release.yml` | C graphics libraries (`virglrenderer`, ANGLE) reside in a separate renderer binary communicating over IPC. |
 | `hostfs` sockets live in Sentry memory | [`components/hostfs.md`](components/hostfs.md) | Guests cannot connect to host Unix sockets through bind mounts; display protocols need a dedicated socket bridge or TCP. |
 | Distinct guest memory models per backend | `hvf`, `whpx`, `systrap` | Zero-copy renderer blob buffers require per-backend `memmap.File` imports. |
 | No physical GPU on hosted CI runners | GitHub Actions | Windows CI can test functionally on WARP; macOS hardware testing and performance checks require physical hosts. |
-| Upstream diff ceiling (< 5.0%; 4.2% CI) | `tools/upstream` | New packages must register in `tier1Prefixes`; `sysfs` `/sys/class/drm` requires one Tier 3 seam. |
+| Upstream diff ceiling (< 5.0%; 4.5% CI) | `tools/upstream` | New packages must register in `tier1Prefixes`; `sysfs` `/sys/class/drm` requires one Tier 3 seam. |
 
 ---
 

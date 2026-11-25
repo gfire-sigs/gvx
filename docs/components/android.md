@@ -6,7 +6,7 @@ This specification describes the Android runtime deliverable (`gvx-android.aar`)
 
 ## 1. Purpose and Scope
 
-Unprivileged Android applications (`untrusted_app` SELinux domain) cannot open `/dev/kvm`, cannot execute binaries downloaded into writable app directories (`app_data_file`, enforced by Android 10+ SELinux W^X), and lack `/etc/resolv.conf`. Packaging `cmd/rungv` as a native shared library (`librungv.so`) inside an Android archive (`gvx-android.aar`) allows Android applications to launch isolated Linux containers and ELF64 binaries without root access.
+Unprivileged Android applications (`untrusted_app` SELinux domain) cannot open `/dev/kvm`, cannot execute binaries downloaded into writable app directories (`app_data_file`, enforced by Android 10+ SELinux W^X), and lack `/etc/resolv.conf`. Packaging `cmd/rungvx` as a native shared library (`librungvx.so`) inside an Android archive (`gvx-android.aar`) allows Android applications to launch isolated Linux containers and ELF64 binaries without root access.
 
 ---
 
@@ -16,14 +16,14 @@ Android packaging spans three layers: NDK compilation into a native library, Jav
 
 ### 2.1 Library Packaging (`scripts/android/build-sdk.sh`)
 
-`scripts/android/build-sdk.sh` cross-compiles `cmd/rungv` with the Android NDK (`GOOS=android`, `CGO_ENABLED=1`, `GOARM64=v8.0`, PIE mode) and packages two artifacts:
+`scripts/android/build-sdk.sh` cross-compiles `cmd/rungvx` with the Android NDK (`GOOS=android`, `CGO_ENABLED=1`, `GOARM64=v8.0`, PIE mode) and packages two artifacts:
 
-1. **`gvx-android.aar`** (`minSdkVersion 31`): Contains `AndroidManifest.xml` (requesting `INTERNET` and `ACCESS_NETWORK_STATE`), `classes.jar` (`dev.gfire.gvx.Gvx`), and `jni/arm64-v8a/librungv.so`.
-2. **`gvx-sample.apk`**: A debug-signed sample application demonstrating foreground-service execution (`dev.gfire.gvx.sample.RunService`), aligned with `zipalign -P 16` and setting `android:extractNativeLibs="true"` so PackageManager extracts `librungv.so` into the immutable, executable `ApplicationInfo.nativeLibraryDir` (`apk_data_file` SELinux label).
+1. **`gvx-android.aar`** (`minSdkVersion 31`): Contains `AndroidManifest.xml` (requesting `INTERNET` and `ACCESS_NETWORK_STATE`), `classes.jar` (`dev.gfire.gvx.Gvx`), and `jni/arm64-v8a/librungvx.so`.
+2. **`gvx-sample.apk`**: A debug-signed sample application demonstrating foreground-service execution (`dev.gfire.gvx.sample.RunService`), aligned with `zipalign -P 16` and setting `android:extractNativeLibs="true"` so PackageManager extracts `librungvx.so` into the immutable, executable `ApplicationInfo.nativeLibraryDir` (`apk_data_file` SELinux label).
 
 ### 2.2 Java Launcher and DNS Injection (`dev.gfire.gvx.Gvx`)
 
-`Gvx.start(Context ctx, List<String> args)` constructs a `ProcessBuilder` targeting `<nativeLibraryDir>/librungv.so`:
+`Gvx.start(Context ctx, List<String> args)` constructs a `ProcessBuilder` targeting `<nativeLibraryDir>/librungvx.so`:
 
 - Sets `HOME` to `ctx.getFilesDir()` and both `XDG_CACHE_HOME` and `TMPDIR` to `ctx.getCacheDir()`.
 - For commands that resolve remote names (`run`, `pull`), queries `ConnectivityManager.getActiveNetwork()` and `LinkProperties.getDnsServers()`, skips link-local IPv6 addresses requiring zone IDs, and prepends `--host-dns <ip>` flags before passing remaining arguments.
@@ -33,7 +33,7 @@ Android packaging spans three layers: NDK compilation into a native library, Jav
 
 ### 2.3 Kernel and `systrap` Adaptations on Android
 
-Inside `librungv.so`, four runtime adaptations accommodate Android kernel policies:
+Inside `librungvx.so`, four runtime adaptations accommodate Android kernel policies:
 
 - **Executable stub memory**: Allocates stub memory with `memfd_create(MFD_EXEC)` and probes `vm.mmap_min_addr` (`0x8000`) via `MAP_FIXED_NOREPLACE`.
 - **16 KiB page support**: Activates `platform/systrap/subblock_xplat.go` automatically on 16 KiB ARM64 kernels, preserving 4 KiB Linux guest pages across 16 KiB host mappings.
@@ -61,7 +61,7 @@ Inside `librungv.so`, four runtime adaptations accommodate Android kernel polici
 
 | Files | Role |
 | :--- | :--- |
-| `android/library/src/dev/gfire/gvx/Gvx.java` | Java launcher locating `librungv.so`, configuring app storage env vars, and injecting `--host-dns`. |
+| `android/library/src/dev/gfire/gvx/Gvx.java` | Java launcher locating `librungvx.so`, configuring app storage env vars, and injecting `--host-dns`. |
 | `android/sample/AndroidManifest.xml`, `android/sample/src/dev/gfire/gvx/sample/RunService.java` | Sample `specialUse` foreground service invoking `Gvx.start` and logging to `files/run.log` and logcat. |
 | `scripts/android/build-sdk.sh`, `scripts/android/lib.sh`, `scripts/android/emulator-smoke.sh` | NDK build scripts for `gvx-android.aar` and `gvx-sample.apk`, plus the CI emulator smoke runner. |
 | `tools/androidprobe/` | Standalone Android kernel page-size, `memfd`, seccomp, and `systrap` probe tool. |

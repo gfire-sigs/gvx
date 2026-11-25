@@ -38,7 +38,7 @@ To avoid host sparse-write fragmentation during group growth, `ext4lite` probes 
 Space reclamation operates in two modes:
 
 1. **Online hole punching**: After each journal commit and home-block flush (and on guest `FITRIM` / `fstrim`), `ext4lite` punches free runs outside `heldBlocks` using `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` on Linux and Android, 16 KiB-aligned `fcntl(F_PUNCHHOLE)` on macOS, or `FSCTL_SET_ZERO_DATA` on Windows. Unsupported host filesystems treat hole punching as a clean no-op.
-2. **Clean-unmount and offline compaction**: On clean unmount or `rungv volume compact`, `ext4lite` relocates data blocks from trailing groups into free holes in lower groups (keeping inode numbers invariant), removes empty trailing groups, empties the journal, and truncates the host file.
+2. **Clean-unmount and offline compaction**: On clean unmount or `rungvx volume compact`, `ext4lite` relocates data blocks from trailing groups into free holes in lower groups (keeping inode numbers invariant), removes empty trailing groups, empties the journal, and truncates the host file.
 
 ### 2.3 Ordered JBD2 Journaling and Crash Safety
 
@@ -73,7 +73,7 @@ Single-run overlay pulls inside `docker:dind` on an Apple M1 host (`hvf`) showed
 - **No directory hash tree (`dir_index`) or metadata checksums**: Directory lookups read the directory once into an in-memory map rather than walking an HTree index.
 - **Extended attribute ceiling**: One 4 KiB xattr block per inode; sets exceeding 4 KiB return `ENOSPC`.
 - **Unmovable inodes during shrink**: Compaction relocates data extents only; trailing groups containing allocated inodes cannot be truncated away until those inodes are freed.
-- **Ephemeral volumes and checkpointing**: Sandboxes mounting an `ephemeral` volume forbid `rungv checkpoint`.
+- **Ephemeral volumes and checkpointing**: Sandboxes mounting an `ephemeral` volume forbid `rungvx checkpoint`.
 - **Database suites unverified in `e2e/`**: Although JBD2 ordering and `fsync` are implemented and unit-tested, no automated test under `e2e/` executes PostgreSQL or SQLite.
 
 ---

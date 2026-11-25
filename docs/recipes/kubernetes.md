@@ -8,7 +8,7 @@ The commands below pin `rancher/k3s:v1.31.4-k3s1` and Calico `v3.28.2` because t
 
 ## 1. Architecture of a Node
 
-`rungv` executes the official `rancher/k3s` image. The table below summarizes the key arguments.
+`rungvx` executes the official `rancher/k3s` image. The table below summarizes the key arguments.
 
 | Argument | Purpose |
 | :--- | :--- |
@@ -28,7 +28,7 @@ Because host self-lockdown seals socket binds at startup, publish static ports s
 These steps start a single-node `k3s` server and connect the host `kubectl` on macOS, Windows, or Linux.
 
 > [!IMPORTANT]
-> Confirm that host ports `6443` and `30000` through `30019` are unused. `rungv` exits with `address already in use` if any static `-p` port is occupied.
+> Confirm that host ports `6443` and `30000` through `30019` are unused. `rungvx` exits with `address already in use` if any static `-p` port is occupied.
 
 1. Create a host directory to receive `kubeconfig.yaml`.
 
@@ -39,7 +39,7 @@ These steps start a single-node `k3s` server and connect the host `kubectl` on m
 2. Start the `k3s` server in the foreground.
 
    ```sh
-   rungv run \
+   rungvx run \
      -e IPTABLES_MODE=legacy \
      -p 127.0.0.1:6443:6443 \
      -p 127.0.0.1:30000-30019:30000-30019 \
@@ -85,7 +85,7 @@ These steps run a `k3s` server and a `k3s` agent in two separate sandboxes on on
 2. Start the server sandbox (replace `my-token` with a chosen secret).
 
    ```sh
-   rungv run \
+   rungvx run \
      -e IPTABLES_MODE=legacy \
      --hostname server \
      -p 127.0.0.1:6443:6443 \
@@ -110,7 +110,7 @@ These steps run a `k3s` server and a `k3s` agent in two separate sandboxes on on
 4. Start the agent sandbox in a second terminal using the same token.
 
    ```sh
-   rungv run \
+   rungvx run \
      -e IPTABLES_MODE=legacy \
      --hostname agent \
      -v k3s-agent:/var/lib/rancher \
@@ -169,7 +169,7 @@ Calico replaces Flannel and enforces Kubernetes `NetworkPolicy` using VXLAN enca
 3. Start the server; the shell wrapper marks `/` recursively shared and installs `calico.yaml` into `k3s`'s auto-deploy manifest directory.
 
    ```sh
-   rungv run \
+   rungvx run \
      -e IPTABLES_MODE=legacy \
      -p 127.0.0.1:6443:6443 \
      -v k3s-calico:/var/lib/rancher \
@@ -265,4 +265,4 @@ The tables below summarize automated test coverage and architectural limits for 
 
 ## 6. Troubleshooting
 
-If a node remains `NotReady`, Calico pods crash, or ports conflict, consult [`../troubleshooting.md`](../troubleshooting.md#5-kubernetes-k3s-failures). Re-run `rungv` with `GVX_DEBUG_LOG=1` to inspect Sentry kernel diagnostics alongside `k3s` logs.
+If a node remains `NotReady`, Calico pods crash, or ports conflict, consult [`../troubleshooting.md`](../troubleshooting.md#5-kubernetes-k3s-failures). Re-run `rungvx` with `GVX_DEBUG_LOG=1` to inspect Sentry kernel diagnostics alongside `k3s` logs.

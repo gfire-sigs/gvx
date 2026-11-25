@@ -10,7 +10,7 @@ Contributions to `gvx` are welcome across host bindings, filesystem drivers, net
 
 | Deliverable | Entry Package | Primary Tests | Primary Specification |
 | :--- | :--- | :--- | :--- |
-| Standalone CLI (`rungv`) | `cmd/rungv` | `cmd/rungv/*_test.go`, `e2e/` | [`docs/cli.md`](docs/cli.md) |
+| Standalone CLI (`rungvx`) | `cmd/rungvx` | `cmd/rungvx/*_test.go`, `e2e/` | [`docs/cli.md`](docs/cli.md) |
 | Embeddable Go SDK | `pkg/gvx` | `pkg/gvx/*_test.go`, `e2e/` | [`docs/architecture.md`](docs/architecture.md) |
 | Control protocol (`gvx-ctrl/2`) | `pkg/gvx/control` | `pkg/gvx/control/*_test.go`, `e2e/control_e2e_test.go` | [`docs/control-protocol.md`](docs/control-protocol.md) |
 | Containerd control shim | `cmd/containerd-shim-gvx-v2`, `internal/gvxshim` | `internal/gvxshim/*_test.go`, `tools/shiminterop` | [`docs/architecture.md`](docs/architecture.md#310-optional-containerd-control-adapter) |
@@ -29,7 +29,7 @@ Contributions to `gvx` are welcome across host bindings, filesystem drivers, net
 
 `gvx` keeps its diff against upstream gVisor below 5.0% (enforced at 4.2% in CI) so upstream merges proceed cleanly. Place new code in the highest isolation tier that fits:
 
-1. **Tier 1 (Additive Packages)**: New `gvx`-owned packages (`pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/{whpx,hvf,hvcommon}`, `pkg/sentry/fsimpl/{ext4lite,hostfs,rpcfs}`, `cmd/rungv`, `e2e/`, `docs/`). These files never conflict with upstream.
+1. **Tier 1 (Additive Packages)**: New `gvx`-owned packages (`pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/{whpx,hvf,hvcommon}`, `pkg/sentry/fsimpl/{ext4lite,hostfs,rpcfs}`, `cmd/rungvx`, `e2e/`, `docs/`). These files never conflict with upstream.
 2. **Tier 2 (Sibling Files)**: OS-specific or cross-platform helpers placed inside an upstream package with `_windows`, `_darwin`, or `_xplat` in the file name. These files cost zero upstream diff budget.
 3. **Tier 3 (Upstream Patches)**: Minimal build-tag expansions or hook seams in upstream pure-Go files. Register every Tier 3 edit in `tools/upstream/buildtag_allowlist.txt` and keep each Tier 3 pull request focused on one behavior (under roughly 400 changed lines excluding tests and generated files).
 

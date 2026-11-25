@@ -27,9 +27,9 @@ Before executing a downloaded release archive, verify its Sigstore provenance bu
 
 ```sh
 VERSION=v0.22.10002026111600
-ARCHIVE="rungv-${VERSION}-darwin-arm64.tar.gz"
+ARCHIVE="rungvx-${VERSION}-darwin-arm64.tar.gz"
 gh attestation verify "${ARCHIVE}" \
-  --bundle "rungv-${VERSION}.sigstore.json" \
+  --bundle "rungvx-${VERSION}.sigstore.json" \
   --repo gfire-sigs/gvx \
   --signer-workflow gfire-sigs/gvx/.github/workflows/release.yml \
   --source-ref "refs/tags/${VERSION}" \
@@ -68,7 +68,7 @@ Report suspected vulnerabilities privately through GitHub Security Advisories.
 > Do not disclose a vulnerability in a public issue, pull request, or discussion. Public disclosure exposes users before a remediation exists.
 
 1. Open <https://github.com/gfire-sigs/gvx/security/advisories/new>.
-2. Include the complete output of `rungv version`.
+2. Include the complete output of `rungvx version`.
 3. State the host operating system, CPU architecture, and execution backend (`hvf`, `whpx`, or `systrap`).
 4. Attach the minimal guest binary, OCI image reference, or volume file that reproduces the defect.
 5. Identify which boundary from Section 1 the defect violates.

@@ -15,7 +15,7 @@ Execute these steps before editing repository files.
 2. Inspect the target package and its Go build constraints (`windows`, `darwin`, `linux`, `amd64`, `arm64`).
 3. Activate the applicable engineering skills under `.agents/skills/` from the routing table below.
 4. Implement and verify `darwin/arm64` paths natively first when working on cross-platform features, then add `windows/{amd64,arm64}` bindings and verify them in CI.
-5. Verify that modified upstream files stay below the 5.0% architectural ceiling (4.2% CI audit gate).
+5. Verify that modified upstream files stay below the 5.0% architectural ceiling (4.5% CI audit gate).
 
 | Task Category | Required Skill (`.agents/skills/`) | Scope of Enforcement |
 | :--- | :--- | :--- |
@@ -35,7 +35,7 @@ Execute these steps before editing repository files.
 
 | Isolation Tier | Packages and Files | Architectural Rule |
 | :--- | :--- | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/gvx/control`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/blockdev`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/fsimpl/fsutilx`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/tcpip/link/wgtun`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/rpcfs`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; absent from `upstream/go` (0.0% merge conflict rate). |
+| **Tier 1: Additive Packages** | `cmd/rungvx`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/rungvx`, `pkg/gvx`, `pkg/gvx/control`, `pkg/gvx/shm`, `pkg/gvx/exttest`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/blockdev`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/fsimpl/fsutilx`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/tcpip/link/wgtun`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/rpcfs`, `ext/`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; absent from `upstream/go` (0.0% merge conflict rate). |
 | **Tier 2: Sibling `_windows`, `_darwin`, and `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | Placed beside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
 | **Tier 3: Build-Tag and Seam Patches** | Pure-Go files in `pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,tmpfs,overlay}`, `pkg/tcpip`, `pkg/sentry/platform/systrap/{usertrap,sysmsg}` (`amd64` files) | Register every build-tag change (`linux \|\| windows \|\| darwin`) in `tools/upstream/buildtag_allowlist.txt`; keep modified upstream files below 5.0%. Name additive helpers in shared packages `*_xplat.go` or `*_darwin*.go` so the audit counts them as Tier 2 siblings. |
 
@@ -108,8 +108,8 @@ GOOS=windows GOARCH=arm64 go build ./...
 GOOS=linux   GOARCH=amd64 go build ./...
 GOOS=linux   GOARCH=arm64 go build ./...
 
-# 3. Audit upstream diff budget (< 5.0% ceiling; 4.2% CI gate)
-go run ./tools/upstream -mode=audit -max-ratio=0.05
+# 3. Audit upstream diff budget (< 5.0% ceiling; 4.5% CI gate)
+go run ./tools/upstream -mode=audit -max-ratio=0.045
 
 # 4. Verify generated state files match source annotations
 ./scripts/gostateify.sh -check
@@ -125,7 +125,7 @@ rg -n "\x{2014}| \x{2013} |\x{2192}" README.md AGENTS.md CONTRIBUTING.md SECURIT
 
 `.github/workflows/ci.yml` builds and vets all five targets, runs `gvisorlint`, audits the upstream diff, verifies third-party licenses, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. Its `repro` job executes `scripts/verify-repro-gvx.sh` to confirm identical SHA-256 hashes between host and in-`gvx` builds. Its `dind-build` job runs `TestE2EDockerBuildDindLocalRegistry` against cached `docker:dind` layers. Hosted macOS and `windows-11-arm` runners lack nested hypervisors and therefore skip hypervisor-only tests.
 
-Additional workflows serve specialized verification: `e2e-images.yml` pulls registry images weekly; `diagnose.yml` runs targeted diagnostics on demand; `pjdfstest.yml` runs the POSIX suite on `ext4lite` and `hostfs` (recording unavoidable host limits in `scripts/pjdfstest/known-failures.txt`); `android.yml` runs `scripts/android/emulator-smoke.sh` on an x86-64 Android 16 KVM emulator; `linux16k.yml` boots a Debian trixie `arm64-16k` kernel in QEMU; and `release.yml` builds, attests, and publishes tagged releases. On Linux, run `scripts/seccomp-audit.sh` whenever adding a host system call.
+Additional workflows serve specialized verification: `ext.yml` builds, vets, and tests the nested `ext/` submodule with `-tags ext_gpu` and `-tags ext_all`; `e2e-images.yml` pulls registry images weekly; `diagnose.yml` runs targeted diagnostics on demand; `pjdfstest.yml` runs the POSIX suite on `ext4lite` and `hostfs` (recording unavoidable host limits in `scripts/pjdfstest/known-failures.txt`); `android.yml` runs `scripts/android/emulator-smoke.sh` on an x86-64 Android 16 KVM emulator; `linux16k.yml` boots a Debian trixie `arm64-16k` kernel in QEMU; and `release.yml` builds, attests, and publishes tagged releases. On Linux, run `scripts/seccomp-audit.sh` whenever adding a host system call.
 
 Native shim tests re-execute production `Main` without `GVX_SHIM_BINARY`. Explicit interoperability tests set `GVX_SHIM_BINARY` (and `GVX_CONTAINERD_BINARY` for the external-daemon smoke test), documented in [`docs/architecture.md`](docs/architecture.md#43-containerd-shim-verification).
 

@@ -6,7 +6,7 @@ This guide explains how to operate Docker Engine (`dockerd`) inside a `gvx` sand
 
 ## 1. Architecture of the Setup
 
-`rungv` runs the unmodified `docker:dind` image, whose entrypoint launches `dockerd` inside the sandbox. The Sentry guest kernel provides legacy `iptables` (including `addrtype`), Linux bridges, network namespaces, `pivot_root`, `cgroup2`, and overlay mounts.
+`rungvx` runs the unmodified `docker:dind` image, whose entrypoint launches `dockerd` inside the sandbox. The Sentry guest kernel provides legacy `iptables` (including `addrtype`), Linux bridges, network namespaces, `pivot_root`, `cgroup2`, and overlay mounts.
 
 | Component | Role |
 | :--- | :--- |
@@ -25,12 +25,12 @@ By default, host self-lockdown prevents new host socket binds after startup. Pas
 
 ## 2. Starting Docker Engine
 
-This procedure starts `dockerd` inside `gvx` and attaches the host `docker` CLI without any local Docker daemon. It requires `rungv` (see [`../../README.md`](../../README.md#2-installation-and-first-run)) and the `docker` CLI. The commands work on macOS, Linux, and Windows.
+This procedure starts `dockerd` inside `gvx` and attaches the host `docker` CLI without any local Docker daemon. It requires `rungvx` (see [`../../README.md`](../../README.md#2-installation-and-first-run)) and the `docker` CLI. The commands work on macOS, Linux, and Windows.
 
 **Windows PowerShell notes**: Create the socket directory with `mkdir $HOME\.gvx -Force`, and create the context with `docker context create gvx --docker "host=unix://$($HOME -replace '\\','/')/.gvx/docker.sock"`. Using `unix://` on Windows requires Docker CLI 29 or newer; with an earlier CLI, publish `-p 127.0.0.1:2375:2375` and configure `host=tcp://127.0.0.1:2375`.
 
 > [!IMPORTANT]
-> Choose unused host ports when using static `-p` ranges. `rungv` exits immediately with `address already in use` if any port in the range is occupied.
+> Choose unused host ports when using static `-p` ranges. `rungvx` exits immediately with `address already in use` if any port in the range is occupied.
 
 1. Create the directory for the forwarded Unix socket.
 
@@ -41,7 +41,7 @@ This procedure starts `dockerd` inside `gvx` and attaches the host `docker` CLI 
 2. Start `docker:dind` in the foreground.
 
    ```sh
-   rungv run \
+   rungvx run \
      --auto-publish \
      -p unix:~/.gvx/docker.sock:2375 \
      -v gvx-docker:/var/lib/docker \
@@ -112,10 +112,10 @@ Once the `gvx` context is active, standard `docker` commands execute against `do
 
 ## 4. Stopping and Restarting the Engine
 
-Stopping `rungv` cleanly flushes `gvx-docker.ext4` and compacts unused tail groups while preserving images, volumes, and stopped containers.
+Stopping `rungvx` cleanly flushes `gvx-docker.ext4` and compacts unused tail groups while preserving images, volumes, and stopped containers.
 
-1. Press `Ctrl-C` in the `rungv` terminal to stop `dockerd`.
-2. Re-run the `rungv run` command from Section 2 whenever you wish to resume with existing state.
+1. Press `Ctrl-C` in the `rungvx` terminal to stop `dockerd`.
+2. Re-run the `rungvx run` command from Section 2 whenever you wish to resume with existing state.
 3. Restore your default Docker context when finished.
 
    ```sh
@@ -126,9 +126,9 @@ Stopping `rungv` cleanly flushes `gvx-docker.ext4` and compacts unused tail grou
 
 ## 5. Sharing Host Directories with Nested Containers
 
-Paths supplied to `docker run -v` refer to paths inside the `gvx` sandbox rather than directly on the host machine. Expose the host directory to `rungv` first, then mount that sandbox path into the container.
+Paths supplied to `docker run -v` refer to paths inside the `gvx` sandbox rather than directly on the host machine. Expose the host directory to `rungvx` first, then mount that sandbox path into the container.
 
-1. Add a host bind mount (for example, `-v ~/src:/src`) to the `rungv run` command in Section 2.
+1. Add a host bind mount (for example, `-v ~/src:/src`) to the `rungvx run` command in Section 2.
 2. Mount the sandbox path into the nested container.
 
    ```sh
@@ -139,12 +139,12 @@ Paths supplied to `docker run -v` refer to paths inside the `gvx` sandbox rather
 
 ## 6. Operating Behind a TLS-Inspecting Proxy
 
-When the host operates behind a corporate TLS-inspecting proxy or private registry CA, add `--host-ca-certs` to the `rungv run` command in Section 2. `dockerd` then trusts host root certificates for `docker pull` and `docker build`. See [`../cli.md`](../cli.md#410-host-root-certificates) for platform certificate sources.
+When the host operates behind a corporate TLS-inspecting proxy or private registry CA, add `--host-ca-certs` to the `rungvx run` command in Section 2. `dockerd` then trusts host root certificates for `docker pull` and `docker build`. See [`../cli.md`](../cli.md#410-host-root-certificates) for platform certificate sources.
 
 > [!IMPORTANT]
 > `--host-ca-certs` injects roots into the sandbox root filesystem used by `dockerd` only. Nested containers launched by `dockerd` carry their own root filesystems and do not inherit host roots automatically.
 
-1. Add `--host-ca-certs` to the `rungv run` invocation in Section 2.
+1. Add `--host-ca-certs` to the `rungvx run` invocation in Section 2.
 2. For nested containers that need the host roots, mount the sandbox bundle read-only.
 
    ```sh
@@ -173,20 +173,20 @@ This section documents storage options, known limits, security properties, and m
 
 `dockerd` supports three backing stores under `gvx`, all compatible with Docker's `overlayfs` driver. Times below reflect single runs on an Apple M1 host using `hvf`.
 
-| Storage Backend | `rungv` Flag | Persists Across Restarts | `docker pull nginx:alpine` |
+| Storage Backend | `rungvx` Flag | Persists Across Restarts | `docker pull nginx:alpine` |
 | :--- | :--- | :--- | ---: |
 | Named `ext4lite` volume | `-v gvx-docker:/var/lib/docker` | Yes | 9 s |
 | Host-path `ext4lite` image | `--mount type=volume,src=/disk/gvx-docker.ext4,dst=/var/lib/docker` | Yes | 9 s |
 | Host directory (`hostfs`) | `-v /disk/gvx-docker:/var/lib/docker` | Yes, as host files | 32 to 54 s |
 | Memory (`tmpfs`) | `--tmpfs /var/lib/docker:size=6g` | No | 5 s |
 
-Prefer an `ext4lite` volume unless direct inspection of individual files on the host is needed. To reset engine state completely, run `rungv volume rm gvx-docker`.
+Prefer an `ext4lite` volume unless direct inspection of individual files on the host is needed. To reset engine state completely, run `rungvx volume rm gvx-docker`.
 
 ### 7.2 Known Limits
 
 | Limit | Observed Effect |
 | :--- | :--- |
-| Published host ports | Without `--auto-publish`, static `-p` rules fix exposed ports at startup. With `--auto-publish`, `rungv` binds dynamic ports on `127.0.0.1` only (up to `net.forward.max_dynamic_ports`, default 64). |
+| Published host ports | Without `--auto-publish`, static `-p` rules fix exposed ports at startup. With `--auto-publish`, `rungvx` binds dynamic ports on `127.0.0.1` only (up to `net.forward.max_dynamic_ports`, default 64). |
 | Guest architecture | Matches the host CPU architecture (`linux/arm64` on Apple Silicon and Windows ARM64; `linux/amd64` on x86-64). |
 | Reaching `10.0.2.15` from a container | A container on the `bridge` network cannot connect to the sandbox's `eth0` IP. Use the container IP or a user-defined bridge network. |
 | `docker stats` | Reports memory (`memory.current`, including page cache and mapped pages), CPU usage, and network counters. A container writing 64 MiB reported 64 MiB on `hvf` and 101 MiB on Linux `systrap`. `BLOCK I/O` remains `0B / 0B` because no `cgroup2` `io` controller exists. |
@@ -248,4 +248,4 @@ Because a Go program demands slightly over 1.0 CPU, a quota of exactly one CPU t
 
 ## 8. Troubleshooting
 
-If `docker info` fails, ports collide, or builds fail behind a corporate TLS proxy, consult [`../troubleshooting.md`](../troubleshooting.md#4-docker-engine-dockerdind-failures). For opaque daemon crashes, re-run `rungv` with `GVX_DEBUG_LOG=1` to inspect Sentry kernel diagnostics.
+If `docker info` fails, ports collide, or builds fail behind a corporate TLS proxy, consult [`../troubleshooting.md`](../troubleshooting.md#4-docker-engine-dockerdind-failures). For opaque daemon crashes, re-run `rungvx` with `GVX_DEBUG_LOG=1` to inspect Sentry kernel diagnostics.

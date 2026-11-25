@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a defect in rungv, pkg/gvx, a platform backend, or documentation
+about: Report a defect in rungvx, pkg/gvx, a platform backend, or documentation
 title: ""
 labels: bug
 ---
@@ -11,7 +11,7 @@ State the expected behavior and the observed behavior in two or three sentences.
 
 ## Environment
 
-- Output of `rungv version`:
+- Output of `rungvx version`:
 - Host OS and version (for example, macOS 15.4, Windows 11 24H2, Ubuntu 24.04):
 - Host CPU architecture (`amd64` or `arm64`):
 - Execution backend (`hvf`, `whpx`, or `systrap`):

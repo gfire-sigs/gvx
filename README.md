@@ -12,7 +12,7 @@ Different classes of users adopt `gvx` for different operational settings. The r
 
 | Deliverable | Audience | Entry Point |
 | :--- | :--- | :--- |
-| `rungv` | Developers running Linux containers, Docker Engine, or local Kubernetes without a virtual machine. | Section 2 below; [`docs/cli.md`](docs/cli.md) |
+| `rungvx` | Developers running Linux containers, Docker Engine, or local Kubernetes without a virtual machine. | Section 2 below; [`docs/cli.md`](docs/cli.md) |
 | `pkg/gvx` | Go programmers embedding isolated Linux execution inside a host application. | Section 2.4 below; `go get z.gfire.dev/gvx` |
 | `gvx-android.aar` | Android developers packaging Linux execution inside an application (`android/arm64`). | [`docs/components/android.md`](docs/components/android.md) |
 | `containerd-shim-gvx-v2` | Runtime integrators testing the optional containerd v3 control-plane adapter. | [`docs/architecture.md`](docs/architecture.md#310-optional-containerd-control-adapter) |
@@ -31,7 +31,7 @@ Each supported host operating system imposes a small set of prerequisites. Consu
 
 1. Verify that the machine uses an Apple Silicon processor (`arm64`); Intel Macs (`darwin/amd64`) are not supported.
 2. Prebuilt release binaries carry an ad-hoc `com.apple.security.hypervisor` signature rather than Apple notarization.
-3. If Gatekeeper blocks a downloaded binary, clear its quarantine attribute with `xattr -d com.apple.quarantine ./rungv`.
+3. If Gatekeeper blocks a downloaded binary, clear its quarantine attribute with `xattr -d com.apple.quarantine ./rungvx`.
 4. If you build from source or run `go install`, sign the binary with `entitlements.plist` (Section 2.3).
 
 #### Windows (`amd64` and `arm64`)
@@ -45,7 +45,7 @@ Hardware-assisted execution (`whpx`) requires Windows 10 (version 2004 or later)
 Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
 ```
 
-Release binaries for Windows are not Authenticode-signed. Windows SmartScreen may present a warning on first execution; remove the download mark with `Unblock-File .\rungv.exe` or choose "More info" and "Run anyway". On hosts without hardware virtualization, trusted workloads may opt into the user-mode fallback with `--backend=systrap` or `-allow-unconfined-systrap`.
+Release binaries for Windows are not Authenticode-signed. Windows SmartScreen may present a warning on first execution; remove the download mark with `Unblock-File .\rungvx.exe` or choose "More info" and "Run anyway". On hosts without hardware virtualization, trusted workloads may opt into the user-mode fallback with `--backend=systrap` or `-allow-unconfined-systrap`.
 
 #### Linux (`amd64` and `arm64`)
 
@@ -57,13 +57,13 @@ Each tagged release on the [Releases](https://github.com/gfire-sigs/gvx/releases
 
 | Host Target | Release Archive Name |
 | :--- | :--- |
-| macOS Apple Silicon (`arm64`) | `rungv-VERSION-darwin-arm64.tar.gz` |
-| Windows x86-64 (`amd64`) | `rungv-VERSION-windows-amd64.zip` |
-| Windows ARM64 (`arm64`) | `rungv-VERSION-windows-arm64.zip` |
-| Linux x86-64 (`amd64`) | `rungv-VERSION-linux-amd64.tar.gz` |
-| Linux ARM64 (`arm64`, v8.0) | `rungv-VERSION-linux-arm64.tar.gz` |
-| Linux ARM64 (`arm64`, v8.2 LSE) | `rungv-VERSION-linux-arm64v8.2.tar.gz` |
-| Android ARM64 (`gvx-android.aar`) | `rungv-VERSION-android-arm64.tar.gz` |
+| macOS Apple Silicon (`arm64`) | `rungvx-VERSION-darwin-arm64.tar.gz` |
+| Windows x86-64 (`amd64`) | `rungvx-VERSION-windows-amd64.zip` |
+| Windows ARM64 (`arm64`) | `rungvx-VERSION-windows-arm64.zip` |
+| Linux x86-64 (`amd64`) | `rungvx-VERSION-linux-amd64.tar.gz` |
+| Linux ARM64 (`arm64`, v8.0) | `rungvx-VERSION-linux-arm64.tar.gz` |
+| Linux ARM64 (`arm64`, v8.2 LSE) | `rungvx-VERSION-linux-arm64v8.2.tar.gz` |
+| Android ARM64 (`gvx-android.aar`) | `rungvx-VERSION-android-arm64.tar.gz` |
 
 #### Install on macOS or Linux
 
@@ -71,34 +71,34 @@ Each tagged release on the [Releases](https://github.com/gfire-sigs/gvx/releases
 2. Download the archive, `SHA256SUMS`, and the provenance bundle from GitHub Releases.
 3. Verify the SHA-256 digest before extracting the archive.
 4. Optionally verify the SLSA build provenance with the GitHub CLI (`gh`).
-5. Extract the archive and place `rungv` on your `PATH`.
+5. Extract the archive and place `rungvx` on your `PATH`.
 
 ```sh
 VERSION=v0.22.10002026111600
 TARGET=darwin-arm64
-ARCHIVE="rungv-${VERSION}-${TARGET}.tar.gz"
+ARCHIVE="rungvx-${VERSION}-${TARGET}.tar.gz"
 BASE="https://github.com/gfire-sigs/gvx/releases/download/${VERSION}"
 
 curl -fsSLO "${BASE}/${ARCHIVE}"
 curl -fsSLO "${BASE}/SHA256SUMS"
-curl -fsSLO "${BASE}/rungv-${VERSION}.sigstore.json"
+curl -fsSLO "${BASE}/rungvx-${VERSION}.sigstore.json"
 
 # Verify SHA-256 checksum (use sha256sum -c on Linux)
 grep " ${ARCHIVE}\$" SHA256SUMS | shasum -a 256 -c -
 
 # Verify SLSA v1 build provenance
 gh attestation verify "${ARCHIVE}" \
-  --bundle "rungv-${VERSION}.sigstore.json" \
+  --bundle "rungvx-${VERSION}.sigstore.json" \
   --repo gfire-sigs/gvx \
   --signer-workflow gfire-sigs/gvx/.github/workflows/release.yml \
   --source-ref "refs/tags/${VERSION}" \
   --deny-self-hosted-runners
 
 tar -xzf "${ARCHIVE}"
-mv "rungv-${VERSION}-${TARGET}/rungv" /usr/local/bin/rungv
+mv "rungvx-${VERSION}-${TARGET}/rungvx" /usr/local/bin/rungvx
 # On macOS, clear Gatekeeper quarantine if prompted:
-xattr -d com.apple.quarantine /usr/local/bin/rungv 2>/dev/null || true
-rungv version
+xattr -d com.apple.quarantine /usr/local/bin/rungvx 2>/dev/null || true
+rungvx version
 ```
 
 #### Install on Windows (PowerShell)
@@ -106,12 +106,12 @@ rungv version
 1. Set `$Version` and `$Target` (`windows-amd64` or `windows-arm64`).
 2. Download the archive and `SHA256SUMS`.
 3. Compare the computed SHA-256 hash against the entry in `SHA256SUMS`.
-4. Extract `rungv.exe`, unblock the file, and add its directory to `PATH`.
+4. Extract `rungvx.exe`, unblock the file, and add its directory to `PATH`.
 
 ```powershell
 $Version = "v0.22.10002026111600"
 $Target = "windows-amd64"
-$Archive = "rungv-$Version-$Target.zip"
+$Archive = "rungvx-$Version-$Target.zip"
 $Base = "https://github.com/gfire-sigs/gvx/releases/download/$Version"
 
 Invoke-WebRequest "$Base/$Archive" -OutFile $Archive
@@ -122,8 +122,8 @@ $Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLower()
 if ($Actual -ne $Expected) { throw "SHA-256 mismatch: $Actual != $Expected" }
 
 Expand-Archive -Path $Archive -DestinationPath . -Force
-Unblock-File ".\rungv-$Version-$Target\rungv.exe"
-.\rungv-$Version-$Target\rungv.exe version
+Unblock-File ".\rungvx-$Version-$Target\rungvx.exe"
+.\rungvx-$Version-$Target\rungvx.exe version
 ```
 
 ### 2.3 Install with Go or Build from Source
@@ -139,20 +139,20 @@ The project does not yet publish packages for Homebrew, Winget, APT, or similar 
 
 ```sh
 # Option A: install from the Go module proxy (Linux and Windows; sign on macOS below)
-CGO_ENABLED=0 go install z.gfire.dev/gvx/cmd/rungv@latest
+CGO_ENABLED=0 go install z.gfire.dev/gvx/cmd/rungvx@latest
 
 # Option B: reproducible build from a source checkout
-./scripts/repro-build.sh ./rungv ./cmd/rungv
+./scripts/repro-build.sh ./rungvx ./cmd/rungvx
 
 # Required on macOS after either Option A or Option B
-codesign --sign - --entitlements entitlements.plist --force ./rungv
+codesign --sign - --entitlements entitlements.plist --force ./rungvx
 ```
 
 ### 2.4 First Examples
 
 The commands below verify container execution, port forwarding, volumes, checkpointing, and Go embedding. Copy any block into a fresh directory.
 
-#### Command-Line Examples (`rungv`)
+#### Command-Line Examples (`rungvx`)
 
 1. Run a command inside an unmodified Alpine Linux image.
 2. Create a local web directory and serve it through nginx on host port `8080`.
@@ -160,18 +160,18 @@ The commands below verify container execution, port forwarding, volumes, checkpo
 
 ```sh
 # 1. Execute a one-shot Linux container (no daemon, no sudo)
-rungv run alpine:3.20 uname -a
+rungvx run alpine:3.20 uname -a
 
 # 2. Serve a local host directory with nginx and a persistent ext4lite volume
 mkdir -p ./my-site
 printf '<h1>Served from gvx</h1>\n' > ./my-site/index.html
-rungv run -p 8080:80 -v appdata:/var/lib/nginx -v "$PWD/my-site:/usr/share/nginx/html:ro" nginx:alpine
+rungvx run -p 8080:80 -v appdata:/var/lib/nginx -v "$PWD/my-site:/usr/share/nginx/html:ro" nginx:alpine
 
 # 3. Checkpoint a running container to disk and restore it later
-rungv run -control-socket ./ctrl.sock -checkpoint-dir ./snap alpine:3.20 sh -c "sleep 300" &
+rungvx run -control-socket ./ctrl.sock -checkpoint-dir ./snap alpine:3.20 sh -c "sleep 300" &
 sleep 1
-rungv checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
-rungv restore -checkpoint-dir ./snap
+rungvx checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
+rungvx restore -checkpoint-dir ./snap
 ```
 
 Notice that `-v SRC:DST` creates a missing host directory before lockdown, whereas `-workspace DIR` requires that `DIR` already exist. See [`docs/cli.md`](docs/cli.md) for the complete command reference.
@@ -313,7 +313,7 @@ Documentation is organized by audience so new users can evaluate and operate `gv
 
 | Document | Contents |
 | :--- | :--- |
-| [`docs/cli.md`](docs/cli.md) | Complete `rungv` command reference, flags, tunables, mounts, checkpointing, nested use, and Android operation. |
+| [`docs/cli.md`](docs/cli.md) | Complete `rungvx` command reference, flags, tunables, mounts, checkpointing, nested use, and Android operation. |
 | [`docs/compatibility.md`](docs/compatibility.md) | Verified workloads from `e2e/`, unverified workloads, and consolidated platform limitations. |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptom-to-remedy guide covering installation, signing, exit code 137, Docker, Kubernetes, DNS, and tracing. |
 | [`docs/glossary.md`](docs/glossary.md) | Concise definitions of subsystems, backends, filesystems, and deliverables. |
@@ -350,7 +350,7 @@ Documentation is organized by audience so new users can evaluate and operate `gv
 
 The repository tracks the pre-generated `go` branch of [google/gvisor](https://github.com/google/gvisor) (Apache License 2.0, Copyright The gVisor Authors) and pins the synced commit in [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT). To prevent merge conflicts across upstream releases, host bindings live in standalone Tier 1 packages and OS-suffixed Tier 2 sibling files (`*_windows.go`, `*_darwin.go`, `*_xplat.go`). Fewer than 5.0% of upstream gVisor files carry Tier 3 build-tag expansions or seams. Every CI run audits this ceiling with `go run ./tools/upstream -mode=audit`.
 
-Run `rungv license` to print embedded notices for `gvx`, upstream gVisor, Go, and linked third-party modules. Pass `-list` for a summary table.
+Run `rungvx license` to print embedded notices for `gvx`, upstream gVisor, Go, and linked third-party modules. Pass `-list` for a summary table.
 
 | SPDX identifier | Third-party modules |
 | :--- | :--- |

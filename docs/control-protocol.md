@@ -151,17 +151,17 @@ Follow these steps to launch a named sandbox and control it from a second termin
 > Never bind a control socket on a non-loopback address or inside a world-writable directory. Keep Unix sockets inside a mode `0700` owner-only directory.
 
 1. Start a named sandbox with `--control` (and optional `--dynamic-ports`).
-2. Confirm connectivity with `rungv ping -n <name>`.
+2. Confirm connectivity with `rungvx ping -n <name>`.
 3. Execute commands, adjust limits, forward ports, serve host paths, or stream checkpoints.
-4. Terminate cleanly with `rungv stop -n <name>`.
+4. Terminate cleanly with `rungvx stop -n <name>`.
 
 ```sh
-rungv run --name app --control --dynamic-ports alpine:3.20 sleep 600
-rungv ping -n app
-rungv exec -n app -it -- /bin/sh
-rungv update -n app -m 512m --cpus 1.0 --pids-limit 128
-rungv port-forward -n app 18080:80
-rungv mount serve -n app "$PWD":/mnt/host
-rungv checkpoint -n app -z -o ./app-ckpt --leave-running
-rungv stop -n app
+rungvx run --name app --control --dynamic-ports alpine:3.20 sleep 600
+rungvx ping -n app
+rungvx exec -n app -it -- /bin/sh
+rungvx update -n app -m 512m --cpus 1.0 --pids-limit 128
+rungvx port-forward -n app 18080:80
+rungvx mount serve -n app "$PWD":/mnt/host
+rungvx checkpoint -n app -z -o ./app-ckpt --leave-running
+rungvx stop -n app
 ```

@@ -64,7 +64,7 @@ classes: {
   }
 }
 
-save_init: "1. Pre-Lockdown Sandbox Boot (gvx.New / rungv run)\nPre-open CheckpointDir descriptors and bind -control-socket (Unix 0600 or loopback TCP)" {
+save_init: "1. Pre-Lockdown Sandbox Boot (gvx.New / rungvx run)\nPre-open CheckpointDir descriptors and bind -control-socket (Unix 0600 or loopback TCP)" {
   class: phase
   style.fill: "#1E293B"
   style.font-color: "#F8FAFC"
@@ -97,7 +97,7 @@ bundle: "4. Checkpoint Bundle Directory (-checkpoint-dir)" {
   }
 }
 
-restore_open: "5. Pre-Lockdown Restore Setup (gvx.Restore / rungv restore)\nValidate manifest.json, pre-open bundle FDs, engine, verified EROFS layers, os.Root, ext4lite, and sockets" {
+restore_open: "5. Pre-Lockdown Restore Setup (gvx.Restore / rungvx restore)\nValidate manifest.json, pre-open bundle FDs, engine, verified EROFS layers, os.Root, ext4lite, and sockets" {
   class: phase
 }
 

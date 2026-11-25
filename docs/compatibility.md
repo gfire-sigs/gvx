@@ -6,7 +6,7 @@ This document answers a direct practical question: which Linux workloads are ver
 
 ## 1. Verified Workloads (`e2e/`)
 
-The `e2e/` test suite exercises `pkg/gvx` and `cmd/rungv` as black-box binaries across Linux (`amd64`, `arm64`, 4 KiB and 16 KiB host pages), Windows (`amd64` `whpx` and `systrap`; `arm64` `systrap`), macOS (`arm64` `hvf`), and Android (`arm64` emulator smoke).
+The `e2e/` test suite exercises `pkg/gvx` and `cmd/rungvx` as black-box binaries across Linux (`amd64`, `arm64`, 4 KiB and 16 KiB host pages), Windows (`amd64` `whpx` and `systrap`; `arm64` `systrap`), macOS (`arm64` `hvf`), and Android (`arm64` emulator smoke).
 
 | Workload Category | Verified Images or Binaries | Representative `e2e/` Tests |
 | :--- | :--- | :--- |
@@ -22,9 +22,9 @@ The `e2e/` test suite exercises `pkg/gvx` and `cmd/rungv` as black-box binaries 
 | **Networking, netfilter, and overlays** | `iptables-legacy`, `conntrack`, `ipset`, policy routing, `rp_filter`, proxy ARP, VXLAN, WireGuard (`wg0` and `-net=wg`), NAT throughput, MTU changes | `TestE2EIPSetNetfilter`, `TestE2EPolicyRouting`, `TestE2EVxlanA13TwoSandboxesOverWireGuard`, `TestE2EWireGuardFullTunnel`, `TestE2ENATThroughput` |
 | **Persistent volumes and overlays** | `ext4lite` named, capped, ephemeral, shared read-only, and copy-on-write overlay mounts; `-rootfs-volume`; single-file bind mounts | `TestE2EVolumePersistsAcrossSandboxes`, `TestE2EEphemeralAndCappedVolumeUnderLockdown`, `TestE2EOverlayUpperPersistsAcrossSandboxes`, `TestE2ERootfsVolumePersistenceAndCLI`, `TestE2EFileBindMountExposesOnlyTheFile` |
 | **Resource controls (`cgroup2`)** | `memory.max` OOM killer, `cpu.max` CFS quota enforcement, per-sandbox accounting, `pids.max` | `TestE2ECPUMaxEnforcement`, `TestE2EMemoryCgroupLimits`, `TestE2EMemoryAccountingIsPerSandbox` |
-| **Checkpoint and restore** | Live and stop-mode save/restore of memory, `hostfs`, `ext4lite`, `-rootfs-volume`, `rpcfs`, network namespaces, `ipset`, port forwards | `TestE2ECheckpointRestoreMemoryState`, `TestE2ECheckpointRestoreExt4liteState`, `TestE2ECheckpointRestoreNetnsIPSetPortForwarding`, `TestE2ECheckpointRestoreRungvCLIRoundTrip` |
+| **Checkpoint and restore** | Live and stop-mode save/restore of memory, `hostfs`, `ext4lite`, `-rootfs-volume`, `rpcfs`, network namespaces, `ipset`, port forwards | `TestE2ECheckpointRestoreMemoryState`, `TestE2ECheckpointRestoreExt4liteState`, `TestE2ECheckpointRestoreNetnsIPSetPortForwarding`, `TestE2ECheckpointRestoreRungvxCLIRoundTrip` |
 | **Control protocol (`gvx-ctrl/2`)** | `exec`, `cp`, `export`, `update`, dynamic ports, `unix-forward`, `mount serve` (`rpcfs`), `net-policy` under host lockdown | `TestE2EControlProtocolUnderLockdown`, `TestE2EDynamicPortsUnderLockdown`, `TestE2EReverseUnixForwardUnderLockdown` |
-| **Nested sandboxing** | Linux `rungv` inside `rungv` (`systrap` in `systrap` or `hvf`) | `TestE2ENestedRungvInRungv` |
+| **Nested sandboxing** | Linux `rungvx` inside `rungvx` (`systrap` in `systrap` or `hvf`) | `TestE2ENestedRungvxInRungvx` |
 
 In addition to `e2e/`, the POSIX filesystem conformance suite `pjdfstest` runs continuously in CI against both `ext4lite` and `hostfs`, with unavoidable host-filesystem exceptions recorded in `scripts/pjdfstest/known-failures.txt`.
 
