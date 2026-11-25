@@ -2,9 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.23.10002026111600] - 2026-11-25
 
-This release renames the CLI binary and build artifacts from `rungv` to `rungvx`, extends `rungvx version` with nginx-style compile-time build options, and adds the Sandbox Extension SPI with a nested `ext/` Go submodule and separated extension CI.
+This release renames the CLI binary and build artifacts from `rungv` to `rungvx`, extends `rungvx version` with nginx-style compile-time build options, adds the Sandbox Extension SPI with a nested `ext/` Go submodule and separated extension CI, ships the optional macOS GPU extension (`-tags ext_gpu`), and overhauls user-facing documentation.
 
 ### Breaking Changes
 
@@ -32,6 +32,11 @@ This release renames the CLI binary and build artifacts from `rungv` to `rungvx`
   - Adds the virtio-gpu render node (`/dev/dri/renderD128`) under `ext/extensions/gpu/virtgpu`, backed by `pkg/gvx/shm.Importer` (non-executable shared-memory views) and declarative `sysfs` discovery (`sys.VirtioPCIDeviceTopology`), wired into `rungvx` (`-gpu=venus`, `-gpu=virgl`, `-gpu-renderer`, `-gpu-memory-limit`) via `gvx.Extension` and `rungvx.CLIPlugin`.
   - Adds opt-in browser SwiftShader gates (`ext/e2e/gate_browser_test.go`, `internal/acceptprog`), GPU gates (`GVX_E2E_GPU=1`), and Khronos WebGL conformance gates (`ext/e2e/`, `GVX_E2E_WEBGL_CTS=subset|full|full-deqp`).
   - Adds the `gpu-renderer` build job to `.github/workflows/ext.yml` and `.github/workflows/release.yml`, and checks renderer license manifests in `tools/licenses`.
+
+### Documentation
+
+- **User-facing README and guide overhaul (`README.md`, `docs/`)** (#257, #258):
+  - Reorganizes `README.md` around quickstart install and first-run flows with dedicated setup guides (`docs/getting-started.md`, `docs/guides/common-tasks.md`, `docs/troubleshooting.md`, `docs/security.md`) and trims inline prose across subsystem docs.
 
 ## [v0.22.10002026111600] - 2026-11-24
 
