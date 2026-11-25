@@ -89,6 +89,10 @@ gh attestation verify "${ARCHIVE}" \
 
 </details>
 
+### Desktop GUI (Community)
+
+For a graphical interface on macOS or Windows, see [GVX Desktop](https://github.com/ironpark/gvx-desktop), an independently maintained community desktop app built on `gvx`.
+
 ## Quick Start
 
 Run any example below from an empty directory (`-v SRC:DST` creates missing host directories before lockdown; `-workspace DIR` requires `DIR` to exist beforehand).
