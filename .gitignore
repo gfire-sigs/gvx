@@ -28,6 +28,7 @@ profile.cov
 # Go workspace file
 go.work
 go.work.sum
+!/ext/go.work
 
 # env file
 .env

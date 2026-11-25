@@ -63,45 +63,102 @@ func TestExtensionLockdownSecondSandboxHelper(t *testing.T) {
 	if os.Getenv("GVX_EXT_LOCKDOWN_HELPER") != "1" {
 		return
 	}
-	if _, err := hostlockdown.Apply(hostlockdown.Options{
-		AllowOutboundNet:     false,
-		InstallSyscallFilter: func() error { return nil },
-	}); err != nil {
-		if errors.Is(err, hostlockdown.ErrUnsupported) {
-			t.Skip("hostlockdown unsupported on this OS")
-		}
-		t.Fatalf("hostlockdown.Apply: %v", err)
-	}
-	recordProcessExtensionLockdown([]int{42})
-
 	ctx := context.Background()
+	initialExt := &conformanceExtension{
+		name:             "initial-grant",
+		needsHelperSpawn: false,
+		recvMsgFDs:       []int{42},
+	}
+
+	// Open a real first sandbox with lockdown enabled so Linux installs its real
+	// Landlock + seccomp filter (including granted RecvMsgFD 42) and macOS
+	// applies Seatbelt. On hosted macOS runners without nested HVF, fall back to
+	// applying Seatbelt directly.
+	sb1, err := New(ctx, Config{
+		Platform:            PlatformAuto,
+		NetworkMode:         NetModeNone,
+		DisableHostLockdown: false,
+		Extensions:          []Extension{initialExt},
+	})
+	if err != nil {
+		if runtime.GOOS == "darwin" && os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1" {
+			if _, lerr := hostlockdown.Apply(hostlockdown.Options{
+				AllowOutboundNet: false,
+			}); lerr != nil {
+				if errors.Is(lerr, hostlockdown.ErrUnsupported) {
+					t.Skip("hostlockdown unsupported on this OS")
+				}
+				t.Fatalf("hostlockdown.Apply: %v", lerr)
+			}
+			recordProcessExtensionLockdown([]int{42})
+		} else if errors.Is(err, hostlockdown.ErrUnsupported) {
+			t.Skip("hostlockdown unsupported on this OS")
+		} else {
+			t.Fatalf("first Sandbox New with lockdown: %v", err)
+		}
+	} else {
+		defer func() { _ = sb1.Close() }()
+	}
+	if !hostlockdown.IsLockedDown() {
+		t.Fatal("hostlockdown.IsLockedDown() = false after lockdown")
+	}
+
+	platName := "hvf"
+	if sb1 != nil {
+		platName = sb1.platName
+	}
+
+	// Direct helper spawning must fail closed with ErrLockdownActive.
+	if _, err := spawnHelperProcess(ctx, HelperSpec{Name: "blocked", Path: "/bin/true"}); !errors.Is(err, ErrLockdownActive) {
+		t.Fatalf("spawnHelperProcess after lockdown err = %v, want ErrLockdownActive", err)
+	}
+
 	spawningExt := &conformanceExtension{
 		name:             "spawner",
 		needsHelperSpawn: true,
 		spawnRealHelper:  false,
 	}
-	if _, err := New(ctx, Config{
-		Platform:               PlatformAuto,
-		AllowUnconfinedSystrap: runtime.GOOS == "windows",
-		NetworkMode:            NetModeNone,
-		DisableHostLockdown:    true,
-		Extensions:             []Extension{spawningExt},
-	}); !errors.Is(err, ErrLockdownActive) {
-		t.Fatalf("New(spawning ext after lockdown) err = %v, want ErrLockdownActive", err)
+	sbSpawn := &Sandbox{
+		cfg:      Config{Extensions: []Extension{spawningExt}},
+		platName: platName,
 	}
+	if err := sbSpawn.openExtensions(ctx); !errors.Is(err, ErrLockdownActive) {
+		t.Fatalf("openExtensions(spawning ext after lockdown) err = %v, want ErrLockdownActive", err)
+	}
+	_ = sbSpawn.Close()
 
 	ungrantedFDExt := &conformanceExtension{
 		name:       "ungranted-fd",
 		recvMsgFDs: []int{99},
 	}
-	if _, err := New(ctx, Config{
-		Platform:               PlatformAuto,
-		AllowUnconfinedSystrap: runtime.GOOS == "windows",
-		NetworkMode:            NetModeNone,
-		DisableHostLockdown:    true,
-		Extensions:             []Extension{ungrantedFDExt},
-	}); !errors.Is(err, ErrLockdownActive) {
-		t.Fatalf("New(ungranted RecvMsgFDs after lockdown) err = %v, want ErrLockdownActive", err)
+	sbFD := &Sandbox{
+		cfg:      Config{Extensions: []Extension{ungrantedFDExt}},
+		platName: platName,
+	}
+	if err := sbFD.openExtensions(ctx); !errors.Is(err, ErrLockdownActive) {
+		t.Fatalf("openExtensions(ungranted RecvMsgFDs after lockdown) err = %v, want ErrLockdownActive", err)
+	}
+	_ = sbFD.Close()
+
+	// On macOS with HVF available, also verify the full New() path rejects both
+	// second-sandbox extension cases with ErrLockdownActive.
+	if sb1 != nil && runtime.GOOS == "darwin" {
+		if _, err := New(ctx, Config{
+			Platform:            PlatformAuto,
+			NetworkMode:         NetModeNone,
+			DisableHostLockdown: true,
+			Extensions:          []Extension{spawningExt},
+		}); !errors.Is(err, ErrLockdownActive) {
+			t.Fatalf("New(spawning ext after lockdown) err = %v, want ErrLockdownActive", err)
+		}
+		if _, err := New(ctx, Config{
+			Platform:            PlatformAuto,
+			NetworkMode:         NetModeNone,
+			DisableHostLockdown: true,
+			Extensions:          []Extension{ungrantedFDExt},
+		}); !errors.Is(err, ErrLockdownActive) {
+			t.Fatalf("New(ungranted RecvMsgFDs after lockdown) err = %v, want ErrLockdownActive", err)
+		}
 	}
 
 	// Non-spawning extension whose requested RecvMsgFD is already in the recorded
@@ -113,7 +170,7 @@ func TestExtensionLockdownSecondSandboxHelper(t *testing.T) {
 	}
 	sb := &Sandbox{
 		cfg:      Config{Extensions: []Extension{pureExt}},
-		platName: "hvf",
+		platName: platName,
 	}
 	if err := sb.openExtensions(ctx); err != nil {
 		t.Fatalf("openExtensions(non-spawning ext with satisfied grant) err = %v, want nil", err)
