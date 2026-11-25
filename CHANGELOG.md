@@ -2,6 +2,24 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.23.10022026112300] - 2026-11-25
+
+This release reduces the Tier 3 upstream diff footprint from 4.25% to 4.01% by moving six upstream seams into Tier 2 siblings with unchanged runtime behavior, adds automated VFS security parity guards across custom filesystems, shards CI jobs for faster feedback, removes a stray tracked root binary, and streamlines user-facing documentation.
+
+### Internal Architecture and Upstream Isolation
+
+- **Tier 3 diff reduction (`pkg/tcpip`, `pkg/tcpip/transport/tcp`, `pkg/tcpip/network/ipv4`, `pkg/sentry/socket/netfilter`)**:
+  - Moves the high-resolution Windows host clock into Tier 2 `hostClock` (`pkg/tcpip/stdclock_xplat.go`), restoring `pkg/tcpip/stdclock.go` and `pkg/tcpip/stdclock_state.go` to pristine upstream while preserving cross-OS checkpoint and restore compatibility.
+  - Moves TCP keepalive defaults and per-NIC IPv4 `route_localnet` state into per-stack extension state (`pkg/tcpip/stack/ext_state_xplat.go`), restoring `pkg/tcpip/transport/tcp/tcp_state_autogen.go` and `pkg/tcpip/network/ipv4/ipv4_state_autogen.go` to pristine upstream and clearing `route_localnet` on NIC recreation and `ResetConfig`.
+  - Replaces `JumpTarget.Goto` with Tier 2 `GotoTarget` (`pkg/sentry/socket/netfilter/goto_xplat.go`), restoring `pkg/sentry/socket/netfilter/targets.go` and `pkg/sentry/socket/netfilter/netfilter_state_autogen.go` to pristine upstream.
+- **VFS security parity guards (`pkg/sentry/fsimpl/fsutilx`, `pkg/sentry/fsimpl/erofs`, `pkg/gvx`, `tools/upstream`)**:
+  - Adds a reflection test over 18 exported `pkg/sentry/vfs` option structs (`vfs_parity_test.go`), shares `fsutilx.FinishGetXattr` from `erofs/xattr_xplat.go`, adds a `tmpfs`-oracle security conformance matrix across `hostfs` and `ext4lite`, and reports changed `vfs`, `auth`, `tmpfs`, and `memxattr` files during `tools/upstream -mode=sync`.
+
+### CI, Packaging, and Documentation
+
+- **Sharded CI pipeline (`.github/workflows/ci.yml`, `scripts/check-ci-owned.sh`)**: Splits the monolithic build, vet, and analyzer job into parallel per-target shards, shards Linux, macOS, and Windows test jobs into disjoint `OWNED_STORAGE`, `OWNED_RUNTIME`, and `OWNED_CORE` groups, and eliminates duplicate non-race runs on `windows/arm64`.
+- **Repository hygiene and documentation (`README.md`, `docs/`, `.gitignore`)**: Removes the accidentally tracked root `licenses` binary, ignores `/licenses` and `/licenses.exe`, trims redundant horizontal rules across user guides, and links the community GVX Desktop app under `Install` in `README.md`.
+
 ## [v0.23.10012026112300] - 2026-11-25
 
 This release syncs the embedded gVisor Sentry kernel and netstack to upstream `release-20261123.0` (`83df8eae069e`) and aligns `hostfs`, `ext4lite`, and `erofs` extended attribute capability reads with upstream user-namespace security rules.
