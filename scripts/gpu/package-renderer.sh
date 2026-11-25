@@ -110,9 +110,9 @@ if ((lib_count == 0)); then
 fi
 
 cat >"$bundle_dir/README.txt" <<'EOF'
-gvx-gpu-renderer: the GPU renderer process of rungv -gpu=venus (macOS 26 or later, Apple silicon).
-Extract this archive in the directory that holds rungv, so that rungv finds gvx-gpu-renderer/bin/gvx-gpu-renderer.
-To use another location, set GVX_GPU_RENDERER or the rungv flag -gpu-renderer to the path of bin/gvx-gpu-renderer.
+gvx-gpu-renderer: the GPU renderer process of rungvx -gpu=venus (macOS 26 or later, Apple silicon).
+Extract this archive in the directory that holds rungvx, so that rungvx finds gvx-gpu-renderer/bin/gvx-gpu-renderer.
+To use another location, set GVX_GPU_RENDERER or the rungvx flag -gpu-renderer to the path of bin/gvx-gpu-renderer.
 EOF
 
 find "$bundle_dir" -exec touch -h -t 202601010000.00 {} +

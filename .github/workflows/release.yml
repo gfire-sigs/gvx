@@ -173,7 +173,9 @@ jobs:
       # against TOOLCHAIN.*.version in ext/workers/gpu-renderer/third_party.lock
       # and records them in BUILDINFO.
       - name: Install the driver build tools
-        run: brew install meson ninja cmake pkgconf llvm libclc spirv-llvm-translator spirv-tools
+        run: |
+          brew update
+          brew install meson ninja cmake pkgconf llvm libclc spirv-llvm-translator spirv-tools
       - name: Build the renderer bundle
         run: scripts/gpu/build-renderer.sh --driver-source mesa-source --out "$RUNNER_TEMP/gpu"
       - name: Run the renderer self-test
