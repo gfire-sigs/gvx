@@ -28,7 +28,6 @@ import (
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/hostlockdown"
-	"z.gfire.dev/gvx/pkg/oci"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
 )
@@ -942,20 +941,6 @@ func (c Config) hasHostDirs() bool {
 		}
 	}
 	return false
-}
-
-// volumeRoot returns the directory that holds the named volumes. It lies next
-// to the default layer cache directory. When OCICacheDir overrides the layer
-// cache, it lies below that directory.
-func (c Config) volumeRoot() (string, error) {
-	if c.OCICacheDir != "" {
-		return filepath.Join(c.OCICacheDir, "volumes"), nil
-	}
-	layers, err := oci.DefaultCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(filepath.Dir(layers), "volumes"), nil
 }
 
 // sandboxMount is a Mount that New has prepared. A bind mount or a hostfs
