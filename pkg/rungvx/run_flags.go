@@ -141,6 +141,7 @@ type sandboxFlagValues struct {
 	readOnly               bool
 	workDir                string
 	cacheDir               string
+	volumeDir              string
 	keepBlobs              bool
 	registryURL            string
 	hostDNS                *multiStringFlag
@@ -241,7 +242,8 @@ func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
 		fs.StringVar(&f.workDir, n, "", "Initial guest working directory")
 	})
 	fs.BoolVar(&f.readOnly, "ro", false, "Mount /workspace read-only")
-	fs.StringVar(&f.cacheDir, "cache-dir", "", "EROFS layer cache directory")
+	fs.StringVar(&f.cacheDir, "cache-dir", "", "EROFS layer cache directory (also sets named volumes to DIR/volumes unless -volume-dir is set)")
+	fs.StringVar(&f.volumeDir, "volume-dir", "", "Named volume directory (overrides -cache-dir and GVX_VOLUME_DIR)")
 	fs.BoolVar(&f.keepBlobs, "keep-blobs", defaultKeepBlobs(), keepBlobsUsage)
 	fs.StringVar(&f.registryURL, "registry-url", "", "OCI registry base URL")
 	fs.StringVar(&f.pull, "pull", string(gvx.PullMissing), "Pull the image: missing (use the cache first, the default), always (ask the registry first), or never (cache only)")
@@ -539,6 +541,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		WireGuardConfigPath:    f.wireGuardPath(),
 		OCIImage:               strings.TrimSpace(f.image),
 		OCICacheDir:            strings.TrimSpace(f.cacheDir),
+		VolumeDir:              strings.TrimSpace(f.volumeDir),
 		OCIKeepBlobs:           f.keepBlobs,
 		RegistryBaseURL:        strings.TrimSpace(f.registryURL),
 		PullPolicy:             pullPolicy,

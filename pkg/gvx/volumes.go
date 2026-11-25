@@ -66,7 +66,11 @@ type VolumeDiskUsage struct {
 	ReclaimableBytes int64
 }
 
-// VolumeDir returns the host directory storing named volumes for cacheDir.
+// VolumeDir returns the host directory storing named volumes. A non-empty
+// cacheDir selects <cacheDir>/volumes. When cacheDir is empty, VolumeDirEnv
+// (GVX_VOLUME_DIR) overrides the platform user data directory, and first
+// resolution of the default migrates any legacy cache-adjacent volumes
+// directory.
 func VolumeDir(cacheDir string) (string, error) {
 	return (Config{OCICacheDir: strings.TrimSpace(cacheDir)}).volumeRoot()
 }

@@ -648,7 +648,7 @@ func (c *Config) validateRootVolume(hasManifestLayers bool) error {
 // validateRootVolumeDup rejects configurations that pass the same ext4lite
 // image as both Config.RootVolume and a volume or overlay entry in Config.Mounts.
 func (c *Config) validateRootVolumeDup(rootMount Mount) error {
-	rootImg, err := c.volumeImagePath(rootMount)
+	rootImg, err := c.volumeImagePathWithMigrate(rootMount, false)
 	if err != nil {
 		return err
 	}
@@ -689,7 +689,7 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 			if m.Ephemeral {
 				continue
 			}
-			driver, err := c.resolveVolumeDriver(m)
+			driver, err := c.resolveVolumeDriverWithMigrate(m, false)
 			if err != nil {
 				continue
 			}
@@ -699,7 +699,7 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 				}
 				continue
 			}
-			img, err := c.volumeImagePath(m)
+			img, err := c.volumeImagePathWithMigrate(m, false)
 			if err != nil {
 				continue
 			}
@@ -713,13 +713,13 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 				}
 			}
 		case MountOverlay:
-			lowerImg, err := c.volumeImagePath(m)
+			lowerImg, err := c.volumeImagePathWithMigrate(m, false)
 			if err != nil {
 				continue
 			}
 			if m.hasOverlayUpper() {
 				upperMount := m.overlayUpperMount()
-				upperImg, err := c.volumeImagePath(upperMount)
+				upperImg, err := c.volumeImagePathWithMigrate(upperMount, false)
 				if err != nil {
 					continue
 				}
@@ -1230,6 +1230,10 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 // volume. Two mounts of one image get the same path, so openMounts can refuse
 // the second one.
 func (c Config) volumeImagePath(m Mount) (string, error) {
+	return c.volumeImagePathWithMigrate(m, true)
+}
+
+func (c Config) volumeImagePathWithMigrate(m Mount, migrate bool) (string, error) {
 	if m.ImagePath != "" {
 		abs, err := filepath.Abs(m.ImagePath)
 		if err != nil {
@@ -1237,7 +1241,7 @@ func (c Config) volumeImagePath(m Mount) (string, error) {
 		}
 		return resolveSymlinkPrefix(abs), nil
 	}
-	root, err := c.volumeRoot()
+	root, err := c.volumeRootWithMigrate(migrate)
 	if err != nil {
 		return "", fmt.Errorf("gvx: locate the volume directory: %w", err)
 	}
@@ -1282,13 +1286,17 @@ func (m Mount) volumeLabel() string {
 // name exists and no image exists. A volume from an older release lives in
 // that directory, and the mount must not hide its files.
 func (c Config) resolveVolumeDriver(m Mount) (MountDriver, error) {
+	return c.resolveVolumeDriverWithMigrate(m, true)
+}
+
+func (c Config) resolveVolumeDriverWithMigrate(m Mount, migrate bool) (MountDriver, error) {
 	if m.Driver != "" {
 		return m.Driver, nil
 	}
 	if m.Ephemeral || m.ImagePath != "" {
 		return DriverExt4lite, nil
 	}
-	image, err := c.volumeImagePath(m)
+	image, err := c.volumeImagePathWithMigrate(m, migrate)
 	if err != nil {
 		return "", err
 	}

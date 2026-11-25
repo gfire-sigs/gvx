@@ -79,7 +79,7 @@ func printVolumeGroupUsage(w io.Writer) {
 func volumeCreateSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	const cmdName = "volume create"
 	fs := newImageFlagSet(cmdName, stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS cache parent directory")
+	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
 	var driver string
 	registerAlias([]string{"d", "driver"}, func(n string) {
 		fs.StringVar(&driver, n, string(gvx.DriverExt4lite), "Volume driver (ext4lite or hostfs)")
@@ -121,7 +121,7 @@ type volumeFormatRow struct {
 func volumeListSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	const cmdName = "volume ls"
 	fs := newImageFlagSet(cmdName, stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS cache parent directory")
+	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
 	var quiet bool
 	fs.BoolVar(&quiet, "q", false, "Print only volume names")
 	fs.BoolVar(&quiet, "quiet", false, "Print only volume names")
@@ -184,7 +184,7 @@ func volumeListSubcommand(_ context.Context, args []string, stdout, stderr io.Wr
 func volumeInspectSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	const cmdName = "volume inspect"
 	fs := newImageFlagSet(cmdName, stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS cache parent directory")
+	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
 	var format string
 	registerAlias([]string{"f", "format"}, func(n string) {
 		fs.StringVar(&format, n, "", "Format output using json (default) or a Go template")
@@ -235,7 +235,7 @@ func volumeInspectSubcommand(_ context.Context, args []string, stdout, stderr io
 func volumeCompactSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	const cmdName = "volume compact"
 	fs := newImageFlagSet(cmdName, stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS cache parent directory")
+	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
 	}
@@ -262,7 +262,7 @@ func volumeCompactSubcommand(_ context.Context, args []string, stdout, stderr io
 func volumeRemoveSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	const cmdName = "volume rm"
 	fs := newImageFlagSet(cmdName, stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS cache parent directory")
+	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
 	var force bool
 	fs.BoolVar(&force, "f", false, "Ignore nonexistent volumes")
 	fs.BoolVar(&force, "force", false, "Ignore nonexistent volumes")
@@ -295,7 +295,7 @@ func volumeRemoveSubcommand(_ context.Context, args []string, stdout, stderr io.
 func volumePruneSubcommand(_ context.Context, args []string, streams cliIO) int {
 	const cmdName = "volume prune"
 	fs := newImageFlagSet(cmdName, streams.stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS cache parent directory")
+	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
 	var force bool
 	fs.BoolVar(&force, "f", false, "Do not prompt for confirmation")
 	fs.BoolVar(&force, "force", false, "Do not prompt for confirmation")

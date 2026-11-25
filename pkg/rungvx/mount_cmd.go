@@ -148,7 +148,7 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 	registerAlias([]string{"size", "tmpfs-size"}, func(n string) {
 		fs.StringVar(&sizeStr, n, "", "Maximum tmpfs size (e.g. 64m)")
 	})
-	fs.StringVar(&cacheDir, "cache-dir", "", "EROFS cache parent directory for resolving named volumes")
+	fs.StringVar(&cacheDir, "cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
 
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code

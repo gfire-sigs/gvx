@@ -80,6 +80,7 @@ func TestRunFlagsForAnELFBinaryUseArgv(t *testing.T) {
 func TestRunFlagsDockerShortAndLongNames(t *testing.T) {
 	rc, _, done, stderr := parse(t,
 		"-u", "bob:staff", "-h", "box", "--name", "web-1", "-w", "/srv", "-m", "256m", "--cpus", "1",
+		"-cache-dir", "/tmp/cache", "-volume-dir", "/tmp/vols",
 		"--network", "bridge", "--publish", "8080:80", "-P", "--rm", "-image=x")
 	if done {
 		t.Fatalf("parseRunArgs ended the command: %s", stderr)
@@ -87,6 +88,9 @@ func TestRunFlagsDockerShortAndLongNames(t *testing.T) {
 	cfg := rc.cfg
 	if cfg.User != "bob:staff" || cfg.Hostname != "box" || cfg.Name != "web-1" || cfg.WorkDir != "/srv" {
 		t.Errorf("identity settings = user %q hostname %q name %q workdir %q", cfg.User, cfg.Hostname, cfg.Name, cfg.WorkDir)
+	}
+	if cfg.OCICacheDir != "/tmp/cache" || cfg.VolumeDir != "/tmp/vols" {
+		t.Errorf("storage dirs = cache %q volume %q, want /tmp/cache and /tmp/vols", cfg.OCICacheDir, cfg.VolumeDir)
 	}
 	if cfg.Resources != (gvx.Resources{MemoryBytes: 256 << 20, CPUMillis: 1000}) {
 		t.Errorf("Resources = %+v, want 256 MiB and 1000 milli-CPUs", cfg.Resources)

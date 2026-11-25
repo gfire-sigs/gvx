@@ -17,7 +17,6 @@ package gvx
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,24 +25,43 @@ import (
 	"z.gfire.dev/gvx/pkg/oci"
 )
 
-// VolumeDirEnv names the environment variable that sets the directory of the
-// named volumes. It takes precedence over Config.OCICacheDir.
+// VolumeDirEnv names the environment variable that overrides the default
+// directory of named volumes when neither Config.VolumeDir nor
+// Config.OCICacheDir is set.
 const VolumeDirEnv = "GVX_VOLUME_DIR"
 
-// volumeRoot returns the directory that holds the named volumes. VolumeDirEnv
-// sets it first. When OCICacheDir overrides the layer cache, it lies below
-// that directory. Otherwise it is the platform data directory of
-// defaultVolumeDirFor.
+// volumeRoot returns the directory that holds named volumes, migrating a
+// legacy cache-adjacent directory on first default resolution. Precedence is
+// Config.VolumeDir, Config.OCICacheDir ("<dir>/volumes"), VolumeDirEnv, and
+// finally the platform user data directory of defaultVolumeDirFor.
 func (c Config) volumeRoot() (string, error) {
+	return c.volumeRootWithMigrate(true)
+}
+
+// volumeRootReadOnly resolves the directory that holds named volumes without
+// moving or creating host directories. Config.normalize uses it so validation
+// never mutates the host filesystem.
+func (c Config) volumeRootReadOnly() (string, error) {
+	return c.volumeRootWithMigrate(false)
+}
+
+func (c Config) volumeRootWithMigrate(migrate bool) (string, error) {
+	if dir := strings.TrimSpace(c.VolumeDir); dir != "" {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", fmt.Errorf("gvx: resolve VolumeDir %q: %w", dir, err)
+		}
+		return abs, nil
+	}
+	if dir := strings.TrimSpace(c.OCICacheDir); dir != "" {
+		return filepath.Join(dir, "volumes"), nil
+	}
 	if dir := strings.TrimSpace(os.Getenv(VolumeDirEnv)); dir != "" {
 		abs, err := filepath.Abs(dir)
 		if err != nil {
 			return "", fmt.Errorf("gvx: resolve %s %q: %w", VolumeDirEnv, dir, err)
 		}
 		return abs, nil
-	}
-	if c.OCICacheDir != "" {
-		return filepath.Join(c.OCICacheDir, "volumes"), nil
 	}
 	root, err := defaultVolumeDirFor(runtime.GOOS, os.Getenv, os.UserHomeDir)
 	if err != nil {
@@ -53,12 +71,16 @@ func (c Config) volumeRoot() (string, error) {
 	if err != nil {
 		return root, nil
 	}
-	return migrateVolumeRoot(filepath.Join(filepath.Dir(layers), "volumes"), root), nil
+	legacy := filepath.Join(filepath.Dir(layers), "volumes")
+	if !migrate {
+		return existingVolumeRoot(legacy, root), nil
+	}
+	return migrateVolumeRoot(legacy, root), nil
 }
 
 // defaultVolumeDirFor returns the default directory of the named volumes on
 // goos. On macOS and Linux it lies in the user data directory and not in the
-// user cache directory, because a host may purge the cache directory. macOS
+// user cache directory, because a host can purge the cache directory. macOS
 // deletes the content of ~/Library/Caches when the disk runs low on space.
 // Windows does not purge %LOCALAPPDATA%, so the directory there stays beside
 // the layer cache.
@@ -85,6 +107,21 @@ func defaultVolumeDirFor(goos string, getenv func(string) string, userHomeDir fu
 	return filepath.Join(home, ".local", "share", "gvx", "volumes"), nil
 }
 
+// existingVolumeRoot reports where default named volumes currently reside
+// without migrating legacy to root.
+func existingVolumeRoot(legacy, root string) string {
+	if legacy == root {
+		return root
+	}
+	if _, err := os.Lstat(root); err == nil {
+		return root
+	}
+	if st, err := os.Lstat(legacy); err == nil && st.IsDir() {
+		return legacy
+	}
+	return root
+}
+
 // migrateVolumeRoot moves the volume directory of an earlier release, legacy,
 // to root when root does not exist yet. It then leaves a symbolic link at
 // legacy, so an earlier release that runs beside this one finds the same
@@ -96,7 +133,7 @@ func migrateVolumeRoot(legacy, root string) string {
 	if legacy == root {
 		return root
 	}
-	if _, err := os.Lstat(root); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Lstat(root); err == nil {
 		return root
 	}
 	if st, err := os.Lstat(legacy); err != nil || !st.IsDir() {

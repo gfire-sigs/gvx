@@ -38,7 +38,7 @@ const (
 var forceEphemeralStagingFallback atomic.Bool
 
 // ephemeralVolumeRoot returns the directory holding private ephemeral ext4lite
-// images beside volumes/ under the configured cache base.
+// scratch images under the configured cache base.
 func (c Config) ephemeralVolumeRoot() (string, error) {
 	if c.OCICacheDir != "" {
 		return filepath.Join(c.OCICacheDir, ephemeralVolumesDirName), nil

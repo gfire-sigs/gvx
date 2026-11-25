@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/oci"
@@ -85,19 +86,93 @@ func TestVolumeRootPrecedence(t *testing.T) {
 		t.Fatalf("volumeRoot() = (%q, %v), want the default %q", got, err, def)
 	}
 
-	cacheDir := t.TempDir()
-	want := filepath.Join(cacheDir, "volumes")
-	if got, err := (Config{OCICacheDir: cacheDir}).volumeRoot(); err != nil || got != want {
-		t.Fatalf("volumeRoot() with OCICacheDir = (%q, %v), want %q", got, err, want)
-	}
-
 	envDir := t.TempDir()
 	t.Setenv(VolumeDirEnv, envDir)
-	if got, err := (Config{OCICacheDir: cacheDir}).volumeRoot(); err != nil || got != envDir {
+	if got, err := (Config{}).volumeRoot(); err != nil || got != envDir {
 		t.Fatalf("volumeRoot() with %s = (%q, %v), want %q", VolumeDirEnv, got, err, envDir)
 	}
-	if got, err := VolumeDir(cacheDir); err != nil || got != envDir {
-		t.Fatalf("VolumeDir() with %s = (%q, %v), want %q", VolumeDirEnv, got, err, envDir)
+	if got, err := VolumeDir(""); err != nil || got != envDir {
+		t.Fatalf("VolumeDir(\"\") with %s = (%q, %v), want %q", VolumeDirEnv, got, err, envDir)
+	}
+
+	// An explicit OCICacheDir / cacheDir stays isolated from ambient GVX_VOLUME_DIR
+	// so targeted commands (including volume prune) and tests never touch user volumes.
+	cacheDir := t.TempDir()
+	wantCache := filepath.Join(cacheDir, "volumes")
+	if got, err := (Config{OCICacheDir: cacheDir}).volumeRoot(); err != nil || got != wantCache {
+		t.Fatalf("volumeRoot() with OCICacheDir = (%q, %v), want %q", got, err, wantCache)
+	}
+	if got, err := VolumeDir(cacheDir); err != nil || got != wantCache {
+		t.Fatalf("VolumeDir(cacheDir) with %s = (%q, %v), want %q", VolumeDirEnv, got, err, wantCache)
+	}
+
+	// Config.VolumeDir takes highest precedence over both OCICacheDir and GVX_VOLUME_DIR.
+	volDir := t.TempDir()
+	if got, err := (Config{OCICacheDir: cacheDir, VolumeDir: volDir}).volumeRoot(); err != nil || got != volDir {
+		t.Fatalf("volumeRoot() with VolumeDir = (%q, %v), want %q", got, err, volDir)
+	}
+}
+
+func TestPruneVolumesWithExplicitCacheDirDoesNotTouchVolumeDirEnv(t *testing.T) {
+	isolateUserDirs(t)
+	envDir := t.TempDir()
+	t.Setenv(VolumeDirEnv, envDir)
+	if _, err := CreateVolume("", "keep-me", DriverExt4lite); err != nil {
+		t.Fatalf("CreateVolume in %s: %v", VolumeDirEnv, err)
+	}
+
+	scratchCache := t.TempDir()
+	if _, err := CreateVolume(scratchCache, "throwaway", DriverExt4lite); err != nil {
+		t.Fatalf("CreateVolume in scratch cache: %v", err)
+	}
+	report, err := PruneVolumes(scratchCache)
+	if err != nil {
+		t.Fatalf("PruneVolumes(scratchCache): %v", err)
+	}
+	if len(report.Deleted) != 1 || report.Deleted[0] != "throwaway" {
+		t.Fatalf("PruneVolumes(scratchCache).Deleted = %v, want [throwaway]", report.Deleted)
+	}
+	if _, err := InspectVolume("", "keep-me"); err != nil {
+		t.Fatalf("volume in %s was affected by PruneVolumes(scratchCache): %v", VolumeDirEnv, err)
+	}
+}
+
+func TestConfigNormalizeDoesNotMigrateLegacyVolumeDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows default stays beside the layer cache")
+	}
+	isolateUserDirs(t)
+	layers, err := oci.DefaultCacheDir()
+	if err != nil {
+		t.Fatalf("oci.DefaultCacheDir: %v", err)
+	}
+	legacy := filepath.Join(filepath.Dir(layers), "volumes")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "keep.ext4"), []byte("volume"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg := Config{
+		Mounts: []Mount{{Kind: MountVolume, VolumeName: "keep", GuestPath: "/data"}},
+	}
+	if err := cfg.normalize(); err != nil {
+		t.Fatalf("normalize(): %v", err)
+	}
+	st, err := os.Lstat(legacy)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", legacy, err)
+	}
+	if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("normalize() migrated legacy directory %q: mode %v", legacy, st.Mode())
+	}
+	root, err := defaultVolumeDirFor(runtime.GOOS, os.Getenv, os.UserHomeDir)
+	if err != nil {
+		t.Fatalf("defaultVolumeDirFor: %v", err)
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("normalize() created %q: %v", root, err)
 	}
 }
 
@@ -136,8 +211,12 @@ func TestVolumeRootMovesTheLegacyDirectory(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(legacy, "data.ext4")); err != nil || string(got) != "volume" {
 		t.Fatalf("volume through the legacy path = (%q, %v), want %q", got, err, "volume")
 	}
-	if st, err := os.Lstat(legacy); err != nil || st.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("legacy path is not a symbolic link: mode %v, err %v", st.Mode(), err)
+	st, err := os.Lstat(legacy)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", legacy, err)
+	}
+	if st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("legacy path is not a symbolic link: mode %v", st.Mode())
 	}
 	if again, err := (Config{}).volumeRoot(); err != nil || again != root {
 		t.Fatalf("second volumeRoot() = (%q, %v), want %q", again, err, root)
@@ -210,6 +289,71 @@ func TestMigrateVolumeRoot(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
 		if got := migrateVolumeRoot(legacy, filepath.Join(parent, "root")); got != legacy {
 			t.Fatalf("migrateVolumeRoot() = %q, want the legacy directory %q", got, legacy)
+		}
+	})
+	t.Run("keeps the legacy directory when root parent is unsearchable", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("needs a directory that the test user cannot traverse")
+		}
+		dir := t.TempDir()
+		legacy := filepath.Join(dir, "legacy")
+		parent := filepath.Join(dir, "parent")
+		for _, d := range []string{legacy, parent} {
+			if err := os.Mkdir(d, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(parent, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+		if got := migrateVolumeRoot(legacy, filepath.Join(parent, "root")); got != legacy {
+			t.Fatalf("migrateVolumeRoot() = %q, want the legacy directory %q", got, legacy)
+		}
+	})
+	t.Run("concurrent callers all observe root after migration", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows default stays beside the layer cache and symlinks may require privilege")
+		}
+		dir := t.TempDir()
+		legacy := filepath.Join(dir, "legacy")
+		root := filepath.Join(dir, "data", "volumes")
+		if err := os.Mkdir(legacy, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(legacy, "shared.ext4"), []byte("ok"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		const workers = 8
+		start := make(chan struct{})
+		results := make([]string, workers)
+		var wg sync.WaitGroup
+		for i := range workers {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-start
+				results[idx] = migrateVolumeRoot(legacy, root)
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		for i, got := range results {
+			if got != root {
+				t.Errorf("worker %d got %q, want %q", i, got, root)
+			}
+		}
+		if data, err := os.ReadFile(filepath.Join(root, "shared.ext4")); err != nil || string(data) != "ok" {
+			t.Fatalf("migrated file = (%q, %v), want \"ok\"", data, err)
+		}
+		st, err := os.Lstat(legacy)
+		if err != nil {
+			t.Fatalf("Lstat(%q): %v", legacy, err)
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("legacy path is not a symlink after concurrent migration: mode %v", st.Mode())
 		}
 	})
 }
