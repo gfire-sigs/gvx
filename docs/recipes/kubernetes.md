@@ -6,8 +6,6 @@ This guide shows how to boot an unmodified `rancher/k3s` node inside a `gvx` san
 
 The commands below pin `rancher/k3s:v1.31.4-k3s1` and Calico `v3.28.2` matching CI verification; consult [`../troubleshooting.md`](../troubleshooting.md#5-kubernetes-k3s-failures) if a node stays `NotReady`.
 
----
-
 ## 1. Architecture of a Node
 
 `rungvx` executes the official `rancher/k3s` image. The table below summarizes the key arguments.
@@ -22,8 +20,6 @@ The commands below pin `rancher/k3s:v1.31.4-k3s1` and Calico `v3.28.2` matching 
 | `-m` and `--cpus` | Set reported node capacity (`MemTotal` and online CPU count). |
 
 Because host self-lockdown seals socket binds at startup, publish static ports such as `6443`, UDP `51820`, or a NodePort range with `-p`. For dynamic local TCP NodePorts, pass `--auto-publish`.
-
----
 
 ## 2. Starting a Single-Node Cluster
 
@@ -68,8 +64,6 @@ These steps start a single-node `k3s` server and attach host `kubectl` on macOS,
    ```
 
    Expected status: `Ready`. Any `NodePort` Service on ports `30000` to `30019` answers on host `127.0.0.1:<port>`.
-
----
 
 ## 3. Starting a Two-Node Cluster
 
@@ -133,8 +127,6 @@ These steps run a `k3s` server and a `k3s` agent in two sandboxes on one host. T
 
 The agent publishes no host ports; it initiates the WireGuard handshake so the server learns its endpoint. Because `k3s agent` rejects `--flannel-external-ip`, `--node-external-ip 192.0.2.1` provides a placeholder. `kubectl logs` and `kubectl exec` reach the agent through the `k3s` tunnel.
 
----
-
 ## 4. Using Calico VXLAN Instead of Flannel
 
 Calico replaces Flannel and enforces `NetworkPolicy` using VXLAN encapsulation and legacy `iptables`. The guest kernel implements the policy routing tables, route types, proxy ARP, `rpfilter` match, and `ipset` tables required by Felix.
@@ -195,8 +187,6 @@ Calico replaces Flannel and enforces `NetworkPolicy` using VXLAN encapsulation a
 
 `TestE2EK3sCalico` automates this flow and verifies pods, `coredns`, direct and ClusterIP traffic, and deny/allow `NetworkPolicy` rules.
 
----
-
 ## 5. Reference: Verified Behavior and Known Limits
 
 These tables summarize automated Kubernetes verification and platform boundaries on `gvx`.
@@ -247,8 +237,6 @@ Consult [`../compatibility.md`](../compatibility.md) for host-wide limits; the i
 | Neighbor and VXLAN tables | Static entries are unbounded unless `maxaddr` is set. Dynamic neighbors follow `gc_thresh1..3` (`128`, `512`, `1024`). |
 | `xt_recent` parameters | Write `ip_list_tot` and `ip_pkt_list_tot` before creating `recent` rules; later writes return `EINVAL`. |
 | Connection tracking | `/proc/sys/net/netfilter` configures timeouts and `nf_conntrack_max` (default `262144`). Full tables evict expired entries before dropping flows. |
-
----
 
 ## 6. Troubleshooting
 

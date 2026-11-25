@@ -6,8 +6,6 @@ The Sentry guest kernel implements legacy `iptables`, Linux bridges, network nam
 
 Follow the steps below to start `docker:dind`, or consult [`../cli.md`](../cli.md) and [`../troubleshooting.md`](../troubleshooting.md#4-docker-engine-dockerdind-failures) for reference and recovery.
 
----
-
 ## 1. Architecture of the Setup
 
 `rungvx` launches the unmodified `docker:dind` image, whose entrypoint starts `dockerd` inside the sandbox using the host options below.
@@ -25,11 +23,9 @@ Follow the steps below to start `docker:dind`, or consult [`../cli.md`](../cli.m
 
 By default, host self-lockdown blocks new socket binds after startup. `--auto-publish` permits post-boot loopback (`127.0.0.1`) binds only; omitting it requires static `-p` port ranges.
 
----
-
 ## 2. Starting Docker Engine
 
-This procedure starts `dockerd` inside `gvx` and attaches the host `docker` CLI without a local Docker daemon. It requires `rungvx` (see [`../../README.md`](../../README.md#1-quickstart-install-and-first-run)) and the `docker` CLI on macOS, Linux, or Windows.
+This procedure starts `dockerd` inside `gvx` and attaches the host `docker` CLI without a local Docker daemon. It requires `rungvx` (see [`../../README.md`](../../README.md#install)) and the `docker` CLI on macOS, Linux, or Windows.
 
 **Windows PowerShell notes**: Create the socket directory with `mkdir $HOME\.gvx -Force`. Create the context with `docker context create gvx --docker "host=unix://$($HOME -replace '\\','/')/.gvx/docker.sock"`. Using `unix://` on Windows requires Docker CLI 29 or newer; earlier releases require `-p 127.0.0.1:2375:2375` and `host=tcp://127.0.0.1:2375`.
 
@@ -75,8 +71,6 @@ This procedure starts `dockerd` inside `gvx` and attaches the host `docker` CLI 
 
    Expected output: `overlayfs Alpine Linux ... (containerized)`.
 
----
-
 ## 3. Running Workloads
 
 Once the `gvx` context is active, standard `docker` commands run against `dockerd` inside the sandbox.
@@ -112,8 +106,6 @@ Once the `gvx` context is active, standard `docker` commands run against `docker
    docker compose up -d
    ```
 
----
-
 ## 4. Stopping and Restarting the Engine
 
 Stopping `rungvx` flushes `gvx-docker.ext4` and compacts unused tail groups while preserving images, volumes, and stopped containers.
@@ -126,8 +118,6 @@ Stopping `rungvx` flushes `gvx-docker.ext4` and compacts unused tail groups whil
    docker context use default
    ```
 
----
-
 ## 5. Sharing Host Directories with Nested Containers
 
 Paths supplied to `docker run -v` resolve inside the `gvx` sandbox rather than directly on the host machine. Expose the host directory to `rungvx` first, then mount that sandbox path into the container.
@@ -138,8 +128,6 @@ Paths supplied to `docker run -v` resolve inside the `gvx` sandbox rather than d
    ```sh
    docker run --rm -v /src/data:/data alpine ls /data
    ```
-
----
 
 ## 6. Operating Behind a TLS-Inspecting Proxy
 
@@ -166,8 +154,6 @@ Add `--host-ca-certs` to the `rungvx run` command in Section 2 behind a corporat
 4. Run `docker build -t app .` so subsequent `RUN` stages trust the root certificate.
 
 If only `dockerd` pulls from a private registry, steps 2 through 4 are unnecessary.
-
----
 
 ## 7. Reference and Known Limits
 
@@ -249,8 +235,6 @@ Measured results from `TestE2ECPUMaxEnforcement` appear below. The `max` and `13
 | `100000 100000`, `nr_throttled` | 14 in 3 s | 18 in 3 s | not measured |
 
 Because a Go program demands slightly above 1.0 CPU, a 1-CPU quota throttles it as on Linux. Clock-loop checks measure running gaps of 2 ms or more rather than iteration counts, which vary with CPU frequency scaling.
-
----
 
 ## 8. Troubleshooting
 

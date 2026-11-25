@@ -6,8 +6,6 @@ Contributions to `gvx` are welcome across host bindings, filesystem drivers, net
 
 Read [`docs/architecture.md`](docs/architecture.md) to verify owning packages and import boundaries before modifying source files, and follow [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
----
-
 ## 1. Repository Orientation and Deliverables
 
 This table maps each deliverable and core subsystem to its owning packages, test suites, and primary specification.
@@ -28,8 +26,6 @@ This table maps each deliverable and core subsystem to its owning packages, test
 | OCI compiler and host CAs | `pkg/oci`, `pkg/gvx/hostcerts` | `pkg/oci/*_test.go`, `e2e/gate_m3_test.go` | [`docs/components/oci.md`](docs/components/oci.md) |
 | Host self-lockdown | `pkg/hostlockdown` | `pkg/hostlockdown/*_test.go`, `e2e/gate_m4_test.go` | [`docs/components/hostlockdown.md`](docs/components/hostlockdown.md) |
 
----
-
 ## 2. Three-Tier Upstream Isolation Rule
 
 `gvx` keeps its diff against upstream gVisor below 5.0% (enforced at 4.5% in CI) so upstream merges remain mechanical. Separating host code from upstream packages also keeps root `go.mod` dependencies minimal for SDK consumers.
@@ -41,8 +37,6 @@ Place new code in the highest isolation tier from the list below that fits its p
 1. **Tier 1 (Additive Packages)**: New `gvx`-owned packages (`cmd/rungvx`, `pkg/rungvx`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `ext/`, `e2e/`, `docs/`). These files never conflict with upstream.
 2. **Tier 2 (Sibling Files)**: OS-specific or cross-platform helpers placed beside upstream files with `_windows`, `_darwin`, or `_xplat` filenames. These files cost zero upstream diff budget.
 3. **Tier 3 (Upstream Patches)**: Minimal build-tag expansions or hook seams in upstream pure-Go files. Register each edit in `tools/upstream/buildtag_allowlist.txt` and keep PRs under ~400 changed lines.
-
----
 
 ## 3. Preparing a First Contribution
 
@@ -76,8 +70,6 @@ go run ./tools/licenses -check
 ```
 
 If you modify tunables in `pkg/gvx/tuning`, regenerate the table in [`docs/cli.md`](docs/cli.md) with `go test ./pkg/gvx/tuning -run TestDocsMatchRegistry -update`. If you modify `// +stateify savable` structs, run `./scripts/gostateify.sh`.
-
----
 
 ## 4. Commit, Documentation, and Review Standards
 

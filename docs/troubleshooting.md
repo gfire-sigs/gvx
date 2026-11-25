@@ -6,8 +6,6 @@ Most failures stem from four boundaries: missing host signing, pre-lockdown moun
 
 Start with Section 1 to capture environment metadata and traces, then locate your symptom in the sections below.
 
----
-
 ## 1. Collecting Diagnostic Information
 
 Collect backend capabilities, build options, and Sentry logs before filing an issue or debugging a guest crash.
@@ -30,8 +28,6 @@ GVX_DEBUG_LOG=1 rungvx run alpine:3.20 uname -a
 | `GVX_STRACE=1` | Logs guest Linux system calls and return values to standard error. |
 | `GVX_SYSTRAP_TRACE=1` | Prints Windows `systrap` exceptions (`2` every stop; `3` counts and patches; `4` hot PCs). |
 
----
-
 ## 2. Installation, Signing, and Backend Startup
 
 Consult this table when `rungvx` fails Gatekeeper, SmartScreen, entitlement checks, or hypervisor creation at startup.
@@ -45,8 +41,6 @@ Consult this table when `rungvx` fails Gatekeeper, SmartScreen, entitlement chec
 | `--backend=auto` fails on Windows with WHP unavailable | Windows Hypervisor Platform is disabled, and `auto` fails closed. | Enable `HypervisorPlatform` in elevated PowerShell and restart. For trusted guests without WHP, pass `-allow-unconfined-systrap`. |
 | `whpx` fails on Windows ARM64 | ARM64 `whpx` requires Windows 11 24H2 (Build 26100.3915 or later). | Update Windows or pass `--backend=systrap` for trusted workloads only. |
 | Guest architecture mismatch error | Requested `--platform linux/ARCH` differs from the host CPU architecture. | Pull and run the matching architecture (`linux/arm64` or `linux/amd64`). |
-
----
 
 ## 3. Mounts, Ports, Flags, and Exit Code 137
 
@@ -63,8 +57,6 @@ Consult this table when CLI flags are rejected, host binds fail under lockdown, 
 | `ext4lite` mount fails with `in use` or dirty journal | Another sandbox holds `LOCK_EX`, or a `:ro` mount found an unrecovered journal. | Wait for the writer to exit, or run `rungvx volume compact NAME` first. |
 | `rungvx` reports `lockdown` error or `LOCKDOWN_DENIED` | The requested host path or bind address violates pre-execution lockdown. | Pre-open directories with `-v`, enable `--dynamic-ports`, or use `rungvx mount serve`. |
 
----
-
 ## 4. Docker Engine (`docker:dind`) Failures
 
 See [`recipes/docker-engine.md`](recipes/docker-engine.md) for the setup procedure.
@@ -77,8 +69,6 @@ See [`recipes/docker-engine.md`](recipes/docker-engine.md) for the setup procedu
 | Container on Docker `bridge` cannot reach `10.0.2.15` | Guest bridge containers route replies via `eth0` and cannot connect to `eth0` directly. | Connect via the container bridge IP or a user-defined Docker bridge network. |
 | `docker run -v /host/path:/data` mounts an empty directory | Docker `-v` paths resolve inside the `gvx` sandbox filesystem, not the host OS. | Bind-mount into `rungvx` first (`-v ~/src:/src`), then pass `-v /src:/data`. |
 
----
-
 ## 5. Kubernetes (`k3s`) Failures
 
 See [`recipes/kubernetes.md`](recipes/kubernetes.md) for the single-node, two-node, and Calico procedures.
@@ -90,8 +80,6 @@ See [`recipes/kubernetes.md`](recipes/kubernetes.md) for the single-node, two-no
 | `calico-node` stays `CrashLoopBackOff` | `/` was not marked shared (`mount --make-rshared /`), or Felix used `nftables` or wrong CIDR. | Run `mount --make-rshared /` at startup, and set `CALICO_IPV4POOL_CIDR=10.42.0.0/16` plus `FELIX_IPTABLESBACKEND=Legacy`. |
 | `kubectl` logs `Skipping network policy controller start` | Legacy iptables or `ipset` support was turned off (`--net-raw=false`). | Keep default `--privileged` (enables `--net-raw`) and `-e IPTABLES_MODE=legacy`. |
 | Agent node fails to join server on the same host | Both sandboxes bound port `6443`, or the agent dialed `127.0.0.1`. | Publish `6443` and `51820/udp` on the server only; dial `--server https://10.0.2.2:6443`. |
-
----
 
 ## 6. Networking, DNS, and Android Issues
 

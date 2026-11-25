@@ -6,8 +6,6 @@ Black-box integration suites exercise `pkg/gvx` and `rungvx` across Windows, mac
 
 Review the verified workloads, unverified targets, and canonical platform limits below before deploying specialized software.
 
----
-
 ## 1. Verified Workloads (`e2e/`)
 
 The `e2e/` suite tests `pkg/gvx` and `rungvx` end-to-end across `linux/{amd64,arm64}`, `windows/{amd64,arm64}`, `darwin/arm64`, and `android/arm64` smoke environments.
@@ -32,20 +30,16 @@ The `e2e/` suite tests `pkg/gvx` and `rungvx` end-to-end across `linux/{amd64,ar
 
 `pjdfstest` also runs in CI on Linux and Windows for `ext4lite` and `hostfs`. Unavoidable host filesystem exceptions appear in `scripts/pjdfstest/known-failures.txt`.
 
----
-
 ## 2. Unverified Workloads
 
-Absence of an automated test means runtime behavior is not established by CI. Validate any workload below on your target host and backend before relying on it.
+Absence of an automated default-CI test means runtime behavior is not established on every host. Validate any workload below on your target host and backend before relying on it.
 
 | Workload | Current Evidence State |
 | :--- | :--- |
 | **Relational and embedded databases (PostgreSQL, SQLite, MySQL, Redis)** | No `e2e/` test runs a database engine. `ext4lite` implements ordered JBD2 journaling and `fsync`, yet database durability remains untested in CI. |
-| **Browsers and GUI automation (Chromium, Playwright, Puppeteer, Electron)** | No `e2e/` test runs a browser or Electron process. Software rendering and browser sandboxing remain untested, and host GPU acceleration is unimplemented (see [`moonshots.md`](moonshots.md)). |
+| **Browsers and GUI automation on Windows, Linux, and default builds** | Opt-in SwiftShader browser gates (`GVX_E2E_BROWSER=1`), macOS GPU gates (`GVX_E2E_GPU=1`), and Khronos WebGL CTS gates (`GVX_E2E_WEBGL_CTS`) live in `ext/e2e/` and run on physical Apple Silicon `hvf` hosts. Windows and Linux browser runs remain unverified in CI. |
 | **Calico eBPF and BIRD BGP modes** | Calico is verified only in VXLAN mode with legacy iptables (`FELIX_IPTABLESBACKEND=Legacy`). BGP and eBPF datapaths are untested. |
 | **Additional JVM releases** | Automated tests verify Eclipse Temurin 21 only. Other JVM builds and versions are untested. |
-
----
 
 ## 3. Unsupported Features and Platform Limits
 
@@ -65,6 +59,6 @@ This table is the canonical reference for omitted Linux interfaces, architecture
 | **Windows `systrap` and Defender** | Stub hosts, debug objects, and patched views remain untested under Microsoft Defender. | Antivirus software can kill stub processes, causing guest exit code 137 (`ErrEngineFault`). |
 | **Windows `systrap` self-reads and `arm64` exclusives** | Self-reading code pages observe patched bytes; `arm64` `stxr`/`stlxr` on executing pages raise `SIGSEGV`. | Ordinary ELF binaries and JITs run normally; self-modifying code differs from Linux. |
 | **macOS `membarrier` scope** | macOS provides no process-wide cross-thread memory barrier primitive. | `membarrier` orders guest vCPU threads only and not concurrent Sentry syscalls. |
-| **Host GPU acceleration** | No `/dev/dri/*` render device or host GPU worker ships in default builds. | Guests use CPU rendering; see [`moonshots.md`](moonshots.md) and [`extensions-plan.md`](extensions-plan.md). |
+| **Host GPU acceleration** | Default pure-Go builds omit `/dev/dri/*`; optional macOS headless rendering (`-gpu=venus`, `-gpu=virgl`) requires building `ext/cmd/rungvx` with `-tags ext_gpu` and `gvx-gpu-renderer`. | Windows and Linux host GPU paths remain unimplemented; see [`extensions-plan.md`](extensions-plan.md) and [`moonshots.md`](moonshots.md). |
 | **Android 32-process ceiling and SELinux** | Android 12+ caps total app children at 32; SELinux blocks app-data hard links. | Keep guest concurrency under 10 in a foreground service, and use `ext4lite` for hard links. |
 | **Containerd shim scope** | `containerd-shim-gvx-v2` implements only Task v3 bootstrap and shutdown. | It returns `Unimplemented` on `CreateSandbox` and launches no guest workloads yet. |

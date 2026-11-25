@@ -52,7 +52,7 @@ This release renames the CLI binary and build artifacts from `rungv` to `rungvx`
 ### Documentation
 
 - **User-facing README and guide overhaul (`README.md`, `docs/`)** (#257, #258):
-  - Reorganizes `README.md` around quickstart install and first-run flows with dedicated setup guides (`docs/getting-started.md`, `docs/guides/common-tasks.md`, `docs/troubleshooting.md`, `docs/security.md`) and trims inline prose across subsystem docs.
+  - Reorganizes `README.md` around quickstart install and first-run flows, adds [`docs/compatibility.md`](docs/compatibility.md), [`docs/troubleshooting.md`](docs/troubleshooting.md), [`docs/glossary.md`](docs/glossary.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), and `docs/components/*`, and trims inline prose across subsystem docs.
 
 ## [v0.22.10002026111600] - 2026-11-24
 

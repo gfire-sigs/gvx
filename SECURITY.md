@@ -6,8 +6,6 @@ Hardware page tables, a memory-safe Go kernel, pinned directory handles, and OS-
 
 This policy defines the enforced boundaries, supported versions, provenance checks, and private disclosure procedure.
 
----
-
 ## 1. Security Boundaries
 
 A security vulnerability is any defect enabling a guest program, image, volume, or control peer to cross one boundary below. See [`docs/components/hostlockdown.md`](docs/components/hostlockdown.md) and [`docs/architecture.md`](docs/architecture.md#39-host-self-lockdown-and-security-model) for containment details.
@@ -54,8 +52,6 @@ The following behaviors are deliberate design limits rather than security defect
 - The host kernel does not bound GPU renderer memory. An internal watchdog exits above the configured limit, though a compromised renderer can bypass it.
 - A guest sending malformed GPU commands stops its own renderer permanently without automatic restart.
 
----
-
 ## 2. Supported Versions
 
 `gvx` is under active pre-release development. Security fixes land on `main` and ship in the next tagged release only.
@@ -65,8 +61,6 @@ The following behaviors are deliberate design limits rather than security defect
 | `main` branch | Yes |
 | Latest tagged release | Yes |
 | Earlier releases | No |
-
----
 
 ## 3. Reporting a Vulnerability
 
