@@ -25,7 +25,6 @@ import (
 
 	"z.gfire.dev/gvx/pkg/gvx"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
-	"z.gfire.dev/gvx/pkg/oci"
 )
 
 func TestParseVolume(t *testing.T) {
@@ -216,6 +215,8 @@ func TestConfigNormalizeRejectsBindSourceOfOtherFileType(t *testing.T) {
 }
 
 func TestConfigNormalizeAcceptsMounts(t *testing.T) {
+	// normalize resolves the volume directory, and the default one belongs to the user.
+	t.Setenv(gvx.VolumeDirEnv, t.TempDir())
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing")
 	file := filepath.Join(dir, "file.txt")
@@ -693,26 +694,6 @@ func TestOpenMountsFailsForMissingBindSourceAndReleasesHandles(t *testing.T) {
 	}
 }
 
-func TestVolumeRootLiesBelowTheCacheDirectoryOverride(t *testing.T) {
-	override := t.TempDir()
-	got, err := gvx.VolumeRootForTest(gvx.Config{OCICacheDir: override})
-	if err != nil || got != filepath.Join(override, "volumes") {
-		t.Fatalf("volumeRoot() with OCICacheDir = (%q, %v), want %q", got, err, filepath.Join(override, "volumes"))
-	}
-
-	layers, layersErr := oci.DefaultCacheDir()
-	got, err = gvx.VolumeRootForTest(gvx.Config{})
-	if layersErr != nil {
-		if err == nil {
-			t.Fatalf("volumeRoot() succeeded although DefaultCacheDir failed: %v", layersErr)
-		}
-		return
-	}
-	if want := filepath.Join(filepath.Dir(layers), "volumes"); err != nil || got != want {
-		t.Fatalf("volumeRoot() = (%q, %v), want %q next to the layer cache", got, err, want)
-	}
-}
-
 func TestConfigHasHostDirsIgnoresTmpfs(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -770,6 +751,8 @@ func TestParseMountDriver(t *testing.T) {
 }
 
 func TestConfigNormalizeRootVolumeValidation(t *testing.T) {
+	// normalize resolves the volume directory, and the default one belongs to the user.
+	t.Setenv(gvx.VolumeDirEnv, t.TempDir())
 	dir := t.TempDir()
 	for _, tc := range []struct {
 		name string

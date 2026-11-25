@@ -332,8 +332,14 @@ type Config struct {
 	// compile into cached <sha256>.erofs layers and mount in lower-to-upper order.
 	OCILayerTars [][]byte
 
-	// OCICacheDir overrides the default host EROFS layer cache directory.
+	// OCICacheDir overrides the default host EROFS layer cache directory. When
+	// set and VolumeDir is empty, named volumes also live in
+	// <OCICacheDir>/volumes.
 	OCICacheDir string
+
+	// VolumeDir overrides the host directory storing named volumes. It takes
+	// precedence over OCICacheDir and VolumeDirEnv (GVX_VOLUME_DIR).
+	VolumeDir string
 
 	// OCIKeepBlobs retains original image blobs in the layer cache when pulling
 	// or loading OCIImage, so SaveImages works offline and PushImage needs no
@@ -388,8 +394,8 @@ type Config struct {
 
 	// RootVolume names a persistent ext4lite volume or a host .ext4 image
 	// path for the writable upper layer of the container root filesystem. A
-	// value without a path separator names <cacheDir>/volumes/<name>.ext4; a
-	// value with a path separator names an image file at that host path. When
+	// value without a path separator names <name>.ext4 in the volume directory;
+	// a value with a path separator names an image file at that host path. When
 	// empty, writes to the root filesystem stay in memory and end at exit.
 	// RootVolume requires OCI image layers and cannot be combined with
 	// ReadOnlyRoot.

@@ -100,11 +100,6 @@ func HasRootVolumeForTest(sb *Sandbox) bool {
 	return sb.rootVolume != nil
 }
 
-// VolumeRootForTest returns the directory that stores named volume images for cfg.
-func VolumeRootForTest(cfg Config) (string, error) {
-	return cfg.volumeRoot()
-}
-
 // HasHostDirsForTest reports whether cfg configures any host directory or file mount.
 func HasHostDirsForTest(cfg Config) bool {
 	return cfg.hasHostDirs()

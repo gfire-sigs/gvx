@@ -155,7 +155,7 @@ _rungvx_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr --unix-forward -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --nat-policy-file --backend --platform --pull --keep-blobs --entrypoint --rm -cache-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --allow-bind-attach --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish --auto-publish-addr --dynamic-ports --dynamic-ports-addr --unix-forward -e --env-file -u --user -m --memory --cpus --pids-limit --net --net-tx-bps --net-rx-bps --nat-policy-file --backend --platform --pull --keep-blobs --entrypoint --rm -cache-dir -volume-dir -S --control-socket --control --control-policy --control-disable --control-token-file --allow-volume-attach --allow-bind-attach --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -175,7 +175,7 @@ _rungvx_completions() {
             if [[ "${prev}" == --nat-policy-file || "${prev}" == -nat-policy-file ]]; then
                 COMPREPLY=( $(compgen -f -- "${cur}") )
             elif [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--net-tx-bps --net-rx-bps --nat-policy-file" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "--net-tx-bps --net-rx-bps --nat-policy-file -cache-dir -volume-dir" -- "${cur}") )
             fi
             ;;
     esac
@@ -323,13 +323,17 @@ _rungv() {
                 '--backend[Execution backend]:backend:(auto whpx hvf systrap)' \
                 '--platform[Target image platform]:platform:(linux/amd64 linux/arm64)' \
                 '--pull[Image pull policy]:policy:(missing always never)' \
-                '--keep-blobs[Keep original image blobs in the cache]'
+                '--keep-blobs[Keep original image blobs in the cache]' \
+                '-cache-dir[EROFS layer cache directory]:dir:_files -/' \
+                '-volume-dir[Named volume directory]:dir:_files -/'
             ;;
         restore|resume)
             _arguments \
                 '--net-tx-bps[Limit NAT traffic from guest to host]:bps:' \
                 '--net-rx-bps[Limit NAT traffic from host to guest]:bps:' \
-                '--nat-policy-file[Read host NAT firewall policy]:file:_files'
+                '--nat-policy-file[Read host NAT firewall policy]:file:_files' \
+                '-cache-dir[EROFS layer cache directory]:dir:_files -/' \
+                '-volume-dir[Named volume directory]:dir:_files -/'
             ;;
         update)
             _arguments \
@@ -403,6 +407,7 @@ complete -c rungvx -n "__fish_seen_subcommand_from completion" -a "bash zsh fish
 complete -c rungvx -n "__fish_seen_subcommand_from run restore resume update" -l net-tx-bps -r -d "Limit NAT traffic from guest to host"
 complete -c rungvx -n "__fish_seen_subcommand_from run restore resume update" -l net-rx-bps -r -d "Limit NAT traffic from host to guest"
 complete -c rungvx -n "__fish_seen_subcommand_from run restore resume" -l nat-policy-file -rF -d "Read host NAT firewall policy"
+complete -c rungvx -n "__fish_seen_subcommand_from run restore resume volume system info mount" -o volume-dir -r -a "(__fish_complete_directories)" -d "Named volume directory"
 `
 
 const powershellCompletionScript = `# PowerShell completion for rungvx
@@ -422,7 +427,7 @@ Register-ArgumentCompleter -Native -CommandName rungvx -ScriptBlock {
     $sub = $tokens[1]
     if ($sub -in @('run','restore','resume','update') -and $wordToComplete -like '-*') {
         $flags = @('--net-tx-bps','--net-rx-bps')
-        if ($sub -ne 'update') { $flags += '--nat-policy-file' }
+        if ($sub -ne 'update') { $flags += '--nat-policy-file'; $flags += '-cache-dir'; $flags += '-volume-dir' }
         $flags | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
             [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
         }

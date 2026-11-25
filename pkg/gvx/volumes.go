@@ -66,9 +66,31 @@ type VolumeDiskUsage struct {
 	ReclaimableBytes int64
 }
 
-// VolumeDir returns the host directory storing named volumes for cacheDir.
+// VolumeStore selects the host directory backing named volume operations.
+// Resolution precedence matches Config: VolumeDir, then OCICacheDir
+// (<OCICacheDir>/volumes), then VolumeDirEnv (GVX_VOLUME_DIR), then the
+// platform user data directory.
+type VolumeStore struct {
+	OCICacheDir string
+	VolumeDir   string
+}
+
+// Dir returns the host directory storing named volumes for s. First resolution
+// of the platform default migrates any legacy cache-adjacent volumes directory.
+func (s VolumeStore) Dir() (string, error) {
+	return (Config{
+		OCICacheDir: strings.TrimSpace(s.OCICacheDir),
+		VolumeDir:   strings.TrimSpace(s.VolumeDir),
+	}).volumeRoot()
+}
+
+// VolumeDir returns the host directory storing named volumes. A non-empty
+// cacheDir selects <cacheDir>/volumes. When cacheDir is empty, VolumeDirEnv
+// (GVX_VOLUME_DIR) overrides the platform user data directory, and first
+// resolution of the default migrates any legacy cache-adjacent volumes
+// directory.
 func VolumeDir(cacheDir string) (string, error) {
-	return (Config{OCICacheDir: strings.TrimSpace(cacheDir)}).volumeRoot()
+	return VolumeStore{OCICacheDir: cacheDir}.Dir()
 }
 
 func randomVolumeName() (string, error) {
@@ -83,6 +105,11 @@ func randomVolumeName() (string, error) {
 // An empty name generates a 64-character hexadecimal identifier. An empty
 // driver defaults to DriverExt4lite.
 func CreateVolume(cacheDir, name string, driver MountDriver) (VolumeInfo, error) {
+	return VolumeStore{OCICacheDir: cacheDir}.Create(name, driver)
+}
+
+// Create creates or opens an idempotent named volume in s.
+func (s VolumeStore) Create(name string, driver MountDriver) (VolumeInfo, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		var err error
@@ -101,7 +128,7 @@ func CreateVolume(cacheDir, name string, driver MountDriver) (VolumeInfo, error)
 		return VolumeInfo{}, fmt.Errorf("%w: unsupported volume driver %q (want ext4lite or hostfs)", ErrInvalidConfig, driver)
 	}
 
-	root, err := VolumeDir(cacheDir)
+	root, err := s.Dir()
 	if err != nil {
 		return VolumeInfo{}, err
 	}
@@ -121,12 +148,12 @@ func CreateVolume(cacheDir, name string, driver MountDriver) (VolumeInfo, error)
 			if !info.Mode().IsRegular() {
 				return VolumeInfo{}, fmt.Errorf("gvx: volume %q path %q is not a regular file", name, imgPath)
 			}
-			return InspectVolume(cacheDir, name)
+			return s.Inspect(name)
 		}
 		f, err := os.OpenFile(imgPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			if errors.Is(err, os.ErrExist) {
-				return InspectVolume(cacheDir, name)
+				return s.Inspect(name)
 			}
 			return VolumeInfo{}, fmt.Errorf("gvx: create volume %q: %w", name, err)
 		}
@@ -138,7 +165,7 @@ func CreateVolume(cacheDir, name string, driver MountDriver) (VolumeInfo, error)
 		if closeErr := vol.Close(); closeErr != nil {
 			return VolumeInfo{}, fmt.Errorf("gvx: close formatted volume %q: %w", name, closeErr)
 		}
-		return InspectVolume(cacheDir, name)
+		return s.Inspect(name)
 
 	case DriverHostfs:
 		if _, err := os.Stat(imgPath); err == nil {
@@ -147,18 +174,23 @@ func CreateVolume(cacheDir, name string, driver MountDriver) (VolumeInfo, error)
 		if err := os.MkdirAll(dirPath, 0o700); err != nil {
 			return VolumeInfo{}, fmt.Errorf("gvx: create hostfs volume %q: %w", name, err)
 		}
-		return InspectVolume(cacheDir, name)
+		return s.Inspect(name)
 	}
 	return VolumeInfo{}, fmt.Errorf("%w: unsupported volume driver %q", ErrInvalidConfig, driver)
 }
 
 // InspectVolume returns metadata and lock state for one named volume.
 func InspectVolume(cacheDir, name string) (VolumeInfo, error) {
+	return VolumeStore{OCICacheDir: cacheDir}.Inspect(name)
+}
+
+// Inspect returns metadata and lock state for one named volume in s.
+func (s VolumeStore) Inspect(name string) (VolumeInfo, error) {
 	name = strings.TrimSpace(name)
 	if !volumeNamePattern.MatchString(name) {
 		return VolumeInfo{}, fmt.Errorf("%w: %s", ErrVolumeNotFound, name)
 	}
-	root, err := VolumeDir(cacheDir)
+	root, err := s.Dir()
 	if err != nil {
 		return VolumeInfo{}, err
 	}
@@ -176,7 +208,12 @@ func InspectVolume(cacheDir, name string) (VolumeInfo, error) {
 // ListVolumes returns all named volumes under cacheDir sorted by name.
 // Read-only calls on a non-existent store directory return an empty slice.
 func ListVolumes(cacheDir string) ([]VolumeInfo, error) {
-	root, err := VolumeDir(cacheDir)
+	return VolumeStore{OCICacheDir: cacheDir}.List()
+}
+
+// List returns all named volumes in s sorted by name.
+func (s VolumeStore) List() ([]VolumeInfo, error) {
+	root, err := s.Dir()
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +268,12 @@ func ListVolumes(cacheDir string) ([]VolumeInfo, error) {
 
 // RemoveVolume deletes one named volume when it is not locked by a running sandbox.
 func RemoveVolume(cacheDir, name string) error {
-	vi, err := InspectVolume(cacheDir, name)
+	return VolumeStore{OCICacheDir: cacheDir}.Remove(name)
+}
+
+// Remove deletes one named volume in s when it is not locked by a running sandbox.
+func (s VolumeStore) Remove(name string) error {
+	vi, err := s.Inspect(name)
 	if err != nil {
 		return err
 	}
@@ -261,7 +303,13 @@ func RemoveVolume(cacheDir, name string) error {
 // any uncommitted journal state, punches interior free blocks when supported,
 // compacts and truncates trailing groups on Close, and returns updated metadata.
 func CompactVolume(cacheDir, name string) (VolumeInfo, error) {
-	vi, err := InspectVolume(cacheDir, name)
+	return VolumeStore{OCICacheDir: cacheDir}.Compact(name)
+}
+
+// Compact replays pending journals, punches free blocks, and shrinks trailing
+// groups on an unlocked ext4lite volume in s.
+func (s VolumeStore) Compact(name string) (VolumeInfo, error) {
+	vi, err := s.Inspect(name)
 	if err != nil {
 		return VolumeInfo{}, err
 	}
@@ -294,13 +342,18 @@ func CompactVolume(cacheDir, name string) (VolumeInfo, error) {
 	if err := errors.Join(syncErr, trimErr, closeErr); err != nil {
 		return VolumeInfo{}, fmt.Errorf("gvx: compact volume %q: %w", vi.Name, err)
 	}
-	return InspectVolume(cacheDir, vi.Name)
+	return s.Inspect(vi.Name)
 }
 
 // PruneVolumes removes all local volumes that are not currently locked by a
 // running sandbox.
 func PruneVolumes(cacheDir string) (VolumePruneReport, error) {
-	vols, err := ListVolumes(cacheDir)
+	return VolumeStore{OCICacheDir: cacheDir}.Prune()
+}
+
+// Prune removes all unlocked local volumes in s.
+func (s VolumeStore) Prune() (VolumePruneReport, error) {
+	vols, err := s.List()
 	if err != nil {
 		return VolumePruneReport{}, err
 	}
@@ -310,7 +363,7 @@ func PruneVolumes(cacheDir string) (VolumePruneReport, error) {
 		if v.InUse {
 			continue
 		}
-		if err := RemoveVolume(cacheDir, v.Name); err != nil {
+		if err := s.Remove(v.Name); err != nil {
 			if errors.Is(err, ErrVolumeInUse) || errors.Is(err, ErrVolumeNotFound) {
 				continue
 			}
@@ -325,7 +378,12 @@ func PruneVolumes(cacheDir string) (VolumePruneReport, error) {
 
 // ComputeVolumeDiskUsage summarizes local volume counts and physical allocated bytes.
 func ComputeVolumeDiskUsage(cacheDir string) (VolumeDiskUsage, error) {
-	vols, err := ListVolumes(cacheDir)
+	return VolumeStore{OCICacheDir: cacheDir}.DiskUsage()
+}
+
+// DiskUsage summarizes volume counts and physical allocated bytes in s.
+func (s VolumeStore) DiskUsage() (VolumeDiskUsage, error) {
+	vols, err := s.List()
 	if err != nil {
 		return VolumeDiskUsage{}, err
 	}

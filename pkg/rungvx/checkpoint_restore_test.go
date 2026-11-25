@@ -135,6 +135,19 @@ func TestParseRunAndRestoreRootfsVolumeFlags(t *testing.T) {
 	if !resEmptyDone || resEmptyCode != 2 || !strings.Contains(restoreEmptyErr.String(), "--rootfs-volume") {
 		t.Fatalf("parseRestoreArgs(empty -rootfs-volume) = (code=%d done=%v stderr=%q), want exit 2", resEmptyCode, resEmptyDone, restoreEmptyErr.String())
 	}
+
+	rcVol, codeVol, doneVol, stderrVol := parse(t, "-volume-dir=/tmp/custom-vols", "alpine:3.20")
+	if doneVol || codeVol != 0 || rcVol.cfg.VolumeDir != "/tmp/custom-vols" {
+		t.Fatalf("parse(-volume-dir) = (code=%d done=%v volDir=%q stderr=%q)", codeVol, doneVol, rcVol.cfg.VolumeDir, stderrVol)
+	}
+	var restoreVolErr bytes.Buffer
+	resVolCfg, resVolCode, resVolDone := parseRestoreArgs([]string{
+		"-checkpoint-dir=/tmp/bundle",
+		"--volume-dir=/tmp/restore-vols",
+	}, nil, &bytes.Buffer{}, &restoreVolErr)
+	if resVolDone || resVolCode != 0 || resVolCfg.cfg.VolumeDir != "/tmp/restore-vols" {
+		t.Fatalf("parseRestoreArgs(--volume-dir) = (code=%d done=%v volDir=%q stderr=%q)", resVolCode, resVolDone, resVolCfg.cfg.VolumeDir, restoreVolErr.String())
+	}
 }
 
 func TestParseCheckpointArgs(t *testing.T) {

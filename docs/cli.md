@@ -175,7 +175,8 @@ These flags configure execution backends, volumes, host lockdown, networking lim
 | `--host-ca-certs` | Inject host root CA certificates into the guest upper layer (Section 4.10). |
 | `-registry-url URL` | Override the registry base URL for an image reference. |
 | `--host-dns IP[:PORT]` | Explicit host DNS server (repeatable; accepted by `run`, `pull`, `push`, and `save`). |
-| `-cache-dir DIR` | Override the layer cache directory. |
+| `-cache-dir DIR` | Override the layer cache directory. Named volumes then live in `DIR/volumes` unless `-volume-dir` is set. |
+| `-volume-dir DIR` | Override the named volume directory (takes precedence over `-cache-dir` and `GVX_VOLUME_DIR`). |
 | `-keep-blobs` | Retain compressed layer blobs in cache (`GVX_KEEP_BLOBS`) for offline `save` and `push`. |
 | `-checkpoint-dir DIR` | Pre-open a host directory before lockdown to hold local checkpoint bundle files. |
 | `-S`, `--control-socket SPEC` | Bind an owner-only Unix socket or loopback TCP listener before lockdown for `gvx-ctrl/2`. |
@@ -277,7 +278,7 @@ The runtime writes the guest hostname to `/etc/hostname` and maps both the hostn
 
 `rungvx` supports four mount classes:
 
-- **Named `ext4lite` volumes (`-v NAME:DST[:ro]`, default driver)**: Stored as `<NAME>.ext4` under `<cacheDir>/volumes/` (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). Images grow in 16 MiB steps up to 64 TiB and keep an ordered JBD2 journal. Mounts hold `LOCK_EX` (read-write) or `LOCK_SH` (read-only), compact trailing blocks on clean exit, and need no post-lockdown path rules. In `--mount type=volume`, a `src` with a path separator targets a host `.ext4` file directly. `size=SIZE` caps growth, while `ephemeral` creates a scratch image in `ephemeral-volumes/` and disables checkpointing.
+- **Named `ext4lite` volumes (`-v NAME:DST[:ro]`, default driver)**: Stored as `<NAME>.ext4` in the volume directory of [Section 6.2](#62-named-volumes-rungvx-volume) (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). Images grow in 16 MiB steps up to 64 TiB and keep an ordered JBD2 journal. Mounts hold `LOCK_EX` (read-write) or `LOCK_SH` (read-only), compact trailing blocks on clean exit, and need no post-lockdown path rules. In `--mount type=volume`, a `src` with a path separator targets a host `.ext4` file directly. `size=SIZE` caps growth, while `ephemeral` creates a scratch image under the cache directory (`ephemeral-volumes/`) and disables checkpointing.
 - **Copy-on-write volume overlays (`--mount type=overlay,src=BASE,dst=PATH[,upper=BRANCH][,tmpfs-size=SIZE]`)**: Branches a shared read-only base volume into a persistent upper volume or an ephemeral `tmpfs` upper layer.
 - **Host bind mounts (`-v HOST:DST[:ro]`, `--mount type=bind`, `-workspace DIR`)**: Backed by `hostfs` (see [`components/hostfs.md`](components/hostfs.md)). `-v` creates missing directories (never missing single files), whereas `--mount type=bind` and `-workspace` require existing paths. Single-file mounts expose only that regular file without writing `.gvx_meta`; Windows defaults unrecorded host files to `0755` (`0555` read-only). `-rootfs-volume NAME|PATH` mounts an `ext4lite` image as the persistent root overlay.
 - **Memory mounts (`--tmpfs PATH[:size=64m,ro]`)**: Pure in-memory directories.
@@ -457,6 +458,19 @@ The layer cache lives under `%LOCALAPPDATA%\gvx\cache\layers` (Windows), `~/Libr
 ### 6.2 Named Volumes (`rungvx volume`)
 
 `rungvx volume` inspects `ext4lite` host file locks (`ProbeVolumeLock`) and refuses to compact or delete any mounted volume.
+
+On macOS, Linux, and Android, named volumes live in the user data directory, because a host can purge its cache directory. macOS deletes the content of `~/Library/Caches` when the disk runs low. `rungvx system info` prints the active directory as `Volume Dir`.
+
+| Source | Volume directory |
+| :--- | :--- |
+| `-volume-dir DIR` (`Config.VolumeDir`) | The given directory. It takes precedence over `-cache-dir` and `GVX_VOLUME_DIR`. |
+| `-cache-dir DIR` (`Config.OCICacheDir`) | `DIR/volumes`. It takes precedence over `GVX_VOLUME_DIR`. |
+| `GVX_VOLUME_DIR` | The given directory when neither `-volume-dir` nor `-cache-dir` is set. |
+| Default on macOS | `~/Library/Application Support/gvx/volumes`. |
+| Default on Linux and Android | `$XDG_DATA_HOME/gvx/volumes`, or `~/.local/share/gvx/volumes` when `XDG_DATA_HOME` is unset or relative. |
+| Default on Windows | `%LOCALAPPDATA%\gvx\cache\volumes`. Windows does not purge this directory. |
+
+Earlier releases kept the default volume directory on macOS, Linux, and Android beside the layer cache, for example `~/Library/Caches/gvx/volumes`. The first command that uses the default directory renames that directory to the new location. It leaves a symbolic link at the earlier path, so an earlier release finds the same volumes. When the rename fails, `gvx` keeps the volumes at the earlier location.
 
 | Command | Behavior |
 | :--- | :--- |
