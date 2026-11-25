@@ -158,7 +158,6 @@ seam pkg/sentry/mm/io.go
 # (pkg/tcpip/transport/tcp/keepalive_xplat.go and pkg/tcpip/keepalive_xplat.go).
 seam pkg/tcpip/transport/tcp/protocol.go
 seam pkg/tcpip/transport/tcp/endpoint.go
-seam pkg/tcpip/transport/tcp/tcp_state_autogen.go
 # Content seam: the sender starts the retransmit timer while it has unacked data, whatever the
 # estimate of outstanding packets says. The seam is one condition in postXmit. Loss recovery can
 # leave the estimate at zero, and no timer then runs for the lost tail of a stream.

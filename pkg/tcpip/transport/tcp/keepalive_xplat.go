@@ -20,32 +20,36 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip"
 )
 
+const keepaliveDefaultsExtKey = "tcp/keepalive_defaults"
+
 // setKeepaliveDefaults sets the keepalive parameters that new endpoints start
 // with. Each field must be above zero.
 func (p *protocol) setKeepaliveDefaults(v tcpip.TCPKeepaliveDefaultsOption) tcpip.Error {
 	if v.Idle <= 0 || v.Interval <= 0 || v.Count <= 0 {
 		return &tcpip.ErrInvalidOptionValue{}
 	}
-	p.mu.Lock()
-	p.keepaliveDefaults = v
-	p.mu.Unlock()
+	if p.stack != nil {
+		cp := v
+		p.stack.SetExtensionState(keepaliveDefaultsExtKey, &cp)
+	}
 	return nil
 }
 
-// getKeepaliveDefaults returns the keepalive parameters of new endpoints. The
-// field is zero until a write sets it. A zero field gives the built-in
-// defaults.
+// getKeepaliveDefaults returns the keepalive parameters of new endpoints. When
+// unset, it returns the built-in defaults.
 func (p *protocol) getKeepaliveDefaults() tcpip.TCPKeepaliveDefaultsOption {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.keepaliveDefaults == (tcpip.TCPKeepaliveDefaultsOption{}) {
-		return tcpip.TCPKeepaliveDefaultsOption{
-			Idle:     DefaultKeepaliveIdle,
-			Interval: DefaultKeepaliveInterval,
-			Count:    DefaultKeepaliveCount,
+	if p.stack != nil {
+		if raw, ok := p.stack.ExtensionState(keepaliveDefaultsExtKey); ok {
+			if v, ok := raw.(*tcpip.TCPKeepaliveDefaultsOption); ok && v != nil && *v != (tcpip.TCPKeepaliveDefaultsOption{}) {
+				return *v
+			}
 		}
 	}
-	return p.keepaliveDefaults
+	return tcpip.TCPKeepaliveDefaultsOption{
+		Idle:     DefaultKeepaliveIdle,
+		Interval: DefaultKeepaliveInterval,
+		Count:    DefaultKeepaliveCount,
+	}
 }
 
 // keepaliveParameters returns the keepalive parameters of a new endpoint.

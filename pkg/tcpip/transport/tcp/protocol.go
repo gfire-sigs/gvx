@@ -125,10 +125,6 @@ type protocol struct {
 	maxRetries uint32
 	// +checklocks:mu
 	synRetries uint8
-	// keepaliveDefaults holds the keepalive parameters of new endpoints. The
-	// zero value stands for the built-in defaults. See keepalive_xplat.go.
-	// +checklocks:mu
-	keepaliveDefaults tcpip.TCPKeepaliveDefaultsOption
 
 	dispatcher dispatcher
 
