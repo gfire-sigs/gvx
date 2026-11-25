@@ -2,6 +2,17 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.24.10012026112300] - 2026-11-25
+
+This release adds Tier 2 allocation statistics and releaser synchronization helpers to `pgalloc`. It also fixes external `shmem` scan interference in the Linux `systrap` idle-stub leak test.
+
+### Testing and Memory Accounting
+
+- **Deterministic `pgalloc` releaser status and `systrap` leak verification (`pkg/sentry/pgalloc`, `pkg/sentry/platform/systrap`)** (#263, #264):
+  - Adds `MemoryFile.AllocationStats()`, `MemoryFile.WaitReleaserIdle(ctx)`, and `ErrMemoryFileDestroyed` in `pkg/sentry/pgalloc/usage_stats_xplat.go` to query logical allocations and wait for releaser quiescence.
+  - Updates `TestDestroyingEveryReleasedStubLeaksNothing` to wait for releaser quiescence, assert exact allocated bytes and file size, and check `SEEK_DATA`/`SEEK_HOLE` residency on owned stub ranges.
+  - Accounts for shared host pages on 16 KiB Linux kernels and isolates leak checks from external scanners that read-fault free `memfd` offsets.
+
 ## [v0.24.10002026112300] - 2026-11-25
 
 This release moves default named volumes out of host cache directories into user data directories with automatic legacy migration. It also adds `-volume-dir` and `GVX_VOLUME_DIR` controls across the CLI and Go SDK, and resolves relative guest executables against the working directory.
