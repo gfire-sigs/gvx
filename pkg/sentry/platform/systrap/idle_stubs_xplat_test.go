@@ -17,11 +17,15 @@
 package systrap
 
 import (
+	"cmp"
+	"context"
+	"errors"
 	"fmt"
-	"math"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,8 +33,11 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/memutil"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
@@ -286,57 +293,192 @@ func openFDs(t testing.TB) int {
 	return len(entries)
 }
 
-// settledUsage returns the allocated bytes of the memory file after the value
-// stops changing and does not exceed atMost. The releaser goroutine of the
-// file decommits waste pages in the background, so the value settles later
-// than the last release. The call returns the last value when it does not
-// settle in 20 seconds.
-func settledUsage(t testing.TB, mf *pgalloc.MemoryFile, atMost uint64) uint64 {
+// waitMemoryFileIdle waits until the asynchronous releaser of mf drains all
+// waste pages and returns to idle.
+func waitMemoryFileIdle(t testing.TB, mf *pgalloc.MemoryFile) {
 	t.Helper()
-	const stableReads = 5
-	deadline := time.Now().Add(20 * time.Second)
-	var prev uint64
-	stable := 0
-	for {
-		got, err := mf.TotalUsage()
-		if err != nil {
-			t.Fatalf("TotalUsage: %v", err)
-		}
-		if got == prev {
-			stable++
-		} else {
-			stable = 0
-		}
-		prev = got
-		if (stable >= stableReads && got <= atMost) || time.Now().After(deadline) {
-			return got
-		}
-		runtime.Gosched()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	if err := mf.WaitReleaserIdle(ctx); err != nil {
+		t.Fatalf("WaitReleaserIdle: %v", err)
 	}
+}
+
+// stubMemoryRanges returns every memory-file range owned by sp.
+func stubMemoryRanges(sp *subprocess) []memmap.FileRange {
+	ranges := []memmap.FileRange{
+		sp.syscallThread.stackRange,
+		sp.contextQueueRange,
+		sp.threadContextRange,
+	}
+	sp.sysmsgThreadsMu.Lock()
+	for _, st := range sp.sysmsgThreads {
+		ranges = append(ranges, st.stackRange)
+	}
+	sp.sysmsgThreadsMu.Unlock()
+	return ranges
+}
+
+// alignRangesOutward expands each non-empty range to align-byte boundaries.
+func alignRangesOutward(ranges []memmap.FileRange, align uint64) []memmap.FileRange {
+	mask := align - 1
+	out := make([]memmap.FileRange, 0, len(ranges))
+	for _, r := range ranges {
+		if r.Length() == 0 {
+			continue
+		}
+		start := r.Start &^ mask
+		end := (r.End + mask) &^ mask
+		out = append(out, memmap.FileRange{Start: start, End: end})
+	}
+	return out
+}
+
+// mergeFileRanges returns a sorted slice of disjoint non-empty ranges covering
+// the same offsets as ranges.
+func mergeFileRanges(ranges []memmap.FileRange) []memmap.FileRange {
+	filtered := make([]memmap.FileRange, 0, len(ranges))
+	for _, r := range ranges {
+		if r.Length() > 0 {
+			filtered = append(filtered, r)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	slices.SortFunc(filtered, func(a, b memmap.FileRange) int {
+		if c := cmp.Compare(a.Start, b.Start); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.End, b.End)
+	})
+	merged := filtered[:1]
+	for _, r := range filtered[1:] {
+		last := &merged[len(merged)-1]
+		if r.Start <= last.End {
+			last.End = max(last.End, r.End)
+			continue
+		}
+		merged = append(merged, r)
+	}
+	return merged
+}
+
+// subtractFileRanges removes every offset in exclude from base. Both inputs
+// must be sorted and disjoint, as returned by mergeFileRanges.
+func subtractFileRanges(base, exclude []memmap.FileRange) []memmap.FileRange {
+	if len(base) == 0 {
+		return nil
+	}
+	if len(exclude) == 0 {
+		return slices.Clone(base)
+	}
+	out := make([]memmap.FileRange, 0, len(base))
+	j := 0
+	for _, cur := range base {
+		for j < len(exclude) && exclude[j].End <= cur.Start {
+			j++
+		}
+		for k := j; k < len(exclude) && exclude[k].Start < cur.End; k++ {
+			if exclude[k].Start > cur.Start {
+				out = append(out, memmap.FileRange{Start: cur.Start, End: exclude[k].Start})
+			}
+			if exclude[k].End >= cur.End {
+				cur.Start = cur.End
+				break
+			}
+			cur.Start = exclude[k].End
+		}
+		if cur.Start < cur.End {
+			out = append(out, cur)
+		}
+	}
+	return out
+}
+
+// residentBytesInRanges queries the host kernel with SEEK_DATA and SEEK_HOLE
+// and returns the total committed bytes inside the sorted, disjoint ranges.
+//
+// Querying owned ranges instead of whole-file st_blocks isolates the test from
+// external host scanners that read-fault free memfd offsets on shared runners.
+// Those read faults charge Linux shmem i_blocks without any leak in pgalloc.
+func residentBytesInRanges(t testing.TB, f *os.File, ranges []memmap.FileRange) uint64 {
+	t.Helper()
+	defer runtime.KeepAlive(f)
+	fd := int(f.Fd())
+	origOff, err := unix.Seek(fd, 0, io.SeekCurrent)
+	if err != nil {
+		t.Fatalf("seek current offset on memory file: %v", err)
+	}
+	defer func() {
+		if _, err := unix.Seek(fd, origOff, io.SeekStart); err != nil {
+			t.Errorf("restore memory file offset to %d: %v", origOff, err)
+		}
+	}()
+
+	var total uint64
+	for _, r := range ranges {
+		pos := int64(r.Start)
+		end := int64(r.End)
+		for pos < end {
+			dataOff, err := unix.Seek(fd, pos, unix.SEEK_DATA)
+			if errors.Is(err, unix.ENXIO) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("seek SEEK_DATA at %#x on memory file: %v", pos, err)
+			}
+			if dataOff >= end {
+				break
+			}
+			holeOff, err := unix.Seek(fd, dataOff, unix.SEEK_HOLE)
+			if err != nil {
+				t.Fatalf("seek SEEK_HOLE at %#x on memory file: %v", dataOff, err)
+			}
+			if holeOff <= dataOff {
+				t.Fatalf("SEEK_HOLE at %#x returned non-advancing offset %#x", dataOff, holeOff)
+			}
+			segEnd := min(holeOff, end)
+			total += uint64(segEnd - dataOff)
+			pos = segEnd
+		}
+	}
+	return total
 }
 
 type hostCounts struct {
 	fds, children, memfdLines, totalMemfdLines, allLines int
-	memfdBytes, totalMemfdBytes, usage                   uint64
+	memfdBytes, totalMemfdBytes                          uint64
+	allocatedBytes, pendingBytes, totalSize              uint64
+	sourceResidentBytes, stubResidentBytes               uint64
 }
 
 func (c hostCounts) String() string {
-	return fmt.Sprintf("fds=%d children=%d memfd mapping lines=%d memfd mapped bytes=%d all memfd lines=%d all memfd bytes=%d all mapping lines=%d memory file usage=%d",
-		c.fds, c.children, c.memfdLines, c.memfdBytes, c.totalMemfdLines, c.totalMemfdBytes, c.allLines, c.usage)
+	return fmt.Sprintf(
+		"fds=%d children=%d memfd mapping lines=%d memfd mapped bytes=%d all memfd lines=%d all memfd bytes=%d all mapping lines=%d allocated=%d pending=%d totalSize=%d sourceResident=%d stubResident=%d",
+		c.fds, c.children, c.memfdLines, c.memfdBytes, c.totalMemfdLines, c.totalMemfdBytes, c.allLines,
+		c.allocatedBytes, c.pendingBytes, c.totalSize, c.sourceResidentBytes, c.stubResidentBytes,
+	)
 }
 
-func measureHost(t testing.TB, mf *pgalloc.MemoryFile, ino uint64, usageAtMost uint64) hostCounts {
+func measureHost(t testing.TB, mf *pgalloc.MemoryFile, ino uint64, sourceRanges, stubRanges []memmap.FileRange) hostCounts {
 	t.Helper()
+	waitMemoryFileIdle(t, mf)
 	lines, bytes, allMemfdLines, allMemfdBytes, all := memfdMappings(t, ino)
+	stats := mf.AllocationStats()
 	return hostCounts{
-		fds:             openFDs(t),
-		children:        countChildren(t),
-		memfdLines:      lines,
-		memfdBytes:      bytes,
-		totalMemfdLines: allMemfdLines,
-		totalMemfdBytes: allMemfdBytes,
-		allLines:        all,
-		usage:           settledUsage(t, mf, usageAtMost),
+		fds:                 openFDs(t),
+		children:            countChildren(t),
+		memfdLines:          lines,
+		memfdBytes:          bytes,
+		totalMemfdLines:     allMemfdLines,
+		totalMemfdBytes:     allMemfdBytes,
+		allLines:            all,
+		allocatedBytes:      stats.AllocatedBytes,
+		pendingBytes:        stats.PendingReleaseBytes,
+		totalSize:           mf.TotalSize(),
+		sourceResidentBytes: residentBytesInRanges(t, mf.File(), sourceRanges),
+		stubResidentBytes:   residentBytesInRanges(t, mf.File(), stubRanges),
 	}
 }
 
@@ -350,6 +492,21 @@ func TestDestroyingEveryReleasedStubLeaksNothing(t *testing.T) {
 	}
 	ino := st.Sys().(*syscall.Stat_t).Ino
 
+	// Expand source ranges to host pages so sub-pages sharing a host page with
+	// globalPool.source on 16 KiB hosts stay in sourceHostRanges.
+	if globalPool.source == nil {
+		t.Fatal("source stub not initialized")
+	}
+	waitMemoryFileIdle(t, p.memoryFile)
+	sourceRanges := mergeFileRanges(stubMemoryRanges(globalPool.source))
+	var sourceAllocatedBytes uint64
+	for _, r := range sourceRanges {
+		sourceAllocatedBytes += r.Length()
+	}
+	hostPage := uint64(unix.Getpagesize())
+	sourceHostRanges := mergeFileRanges(alignRangesOutward(sourceRanges, hostPage))
+	var rawStubRanges []memmap.FileRange
+
 	oneRound := func() {
 		sp, err := newTestAddressSpace(p)
 		if err != nil {
@@ -358,6 +515,7 @@ func TestDestroyingEveryReleasedStubLeaksNothing(t *testing.T) {
 		if err := mapAndUnmapPage(p, sp); err != nil {
 			t.Fatalf("use address space: %v", err)
 		}
+		rawStubRanges = append(rawStubRanges, stubMemoryRanges(sp)...)
 		sp.Release()
 	}
 
@@ -368,14 +526,24 @@ func TestDestroyingEveryReleasedStubLeaksNothing(t *testing.T) {
 		oneRound()
 	}
 	runtime.GC()
-	first := measureHost(t, p.memoryFile, ino, math.MaxUint64)
+	warmupStubRanges := subtractFileRanges(mergeFileRanges(rawStubRanges), sourceHostRanges)
+	if len(warmupStubRanges) == 0 {
+		t.Fatal("expected non-empty destroyed stub ranges after warm-up")
+	}
+	first := measureHost(t, p.memoryFile, ino, sourceHostRanges, warmupStubRanges)
 	t.Logf("after %d warm-up rounds: %v", warmupRounds, first)
+	if first.allocatedBytes != sourceAllocatedBytes || first.pendingBytes != 0 || first.stubResidentBytes != 0 {
+		t.Fatalf("after %d warm-up rounds, destroyed stub memory remained allocated, pending, or resident (want allocated=%d, stubRanges=%v): %v",
+			warmupRounds, sourceAllocatedBytes, warmupStubRanges, first)
+	}
+
 	const rounds = 500
 	for range rounds {
 		oneRound()
 	}
 	runtime.GC()
-	last := measureHost(t, p.memoryFile, ino, first.usage)
+	allStubRanges := subtractFileRanges(mergeFileRanges(rawStubRanges), sourceHostRanges)
+	last := measureHost(t, p.memoryFile, ino, sourceHostRanges, allStubRanges)
 	t.Logf("after %d rounds: %v", rounds, last)
 
 	// Every systrap shared mapping backs a memfd, so totalMemfdLines and
@@ -386,9 +554,123 @@ func TestDestroyingEveryReleasedStubLeaksNothing(t *testing.T) {
 	if last.fds != first.fds || last.children != first.children ||
 		last.memfdLines != first.memfdLines || last.memfdBytes != first.memfdBytes ||
 		last.totalMemfdLines != first.totalMemfdLines || last.totalMemfdBytes != first.totalMemfdBytes ||
-		last.usage > first.usage || last.allLines > first.allLines+runtimeSlack {
-		t.Fatalf("after %d create and release rounds with bound 0, the host counts differ from the baseline\nfirst: %v\nlast:  %v",
-			rounds, first, last)
+		last.allocatedBytes != first.allocatedBytes || last.pendingBytes != 0 ||
+		last.totalSize != first.totalSize ||
+		last.sourceResidentBytes > first.sourceResidentBytes || last.stubResidentBytes != 0 ||
+		last.allLines > first.allLines+runtimeSlack {
+		t.Fatalf("after %d create and release rounds with bound 0, the host counts differ from the baseline\nfirst: %v\nlast:  %v\nsourceHostRanges: %v\nstubRanges:       %v",
+			rounds, first, last, sourceHostRanges, allStubRanges)
+	}
+}
+
+func TestResidentBytesInRangesDetectsLeaksAndIgnoresFreeSpaceFaults(t *testing.T) {
+	const (
+		fileSize      = 16 << 20
+		scanLength    = 8 << 20
+		stubOffset    = 12 << 20
+		untouchedBase = 14 << 20
+	)
+	page := uint64(unix.Getpagesize())
+	fd, err := memutil.CreateMemFD("systrap-seek-data-test", 0)
+	if err != nil {
+		t.Fatalf("CreateMemFD: %v", err)
+	}
+	f := os.NewFile(uintptr(fd), "systrap-seek-data-test")
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close memfd: %v", err)
+		}
+	}()
+	if err := f.Truncate(fileSize); err != nil {
+		t.Fatalf("truncate memfd: %v", err)
+	}
+
+	// Simulate an external scanner read-faulting free offsets at [0, 8 MiB) via
+	// MAP_SHARED, which charges Linux shmem st_blocks across the scanned span.
+	mapped, err := unix.Mmap(fd, 0, scanLength, unix.PROT_READ, unix.MAP_SHARED)
+	if err != nil {
+		t.Fatalf("mmap free-space window: %v", err)
+	}
+	defer func() {
+		if err := unix.Munmap(mapped); err != nil {
+			t.Errorf("munmap free-space window: %v", err)
+		}
+	}()
+	var sink byte
+	for off := 0; off < len(mapped); off += int(page) {
+		sink ^= mapped[off]
+	}
+	runtime.KeepAlive(sink)
+
+	// Commit one host page inside the simulated stub range. On hosts with
+	// shmem THP enabled, the write may commit up to all four pages. Clamping to
+	// the single written page always returns exactly one page.
+	stubRanges := []memmap.FileRange{{Start: stubOffset, End: stubOffset + 4*page}}
+	writtenPage := []memmap.FileRange{{Start: stubOffset + page, End: stubOffset + 2*page}}
+	untouchedRange := []memmap.FileRange{{Start: untouchedBase, End: untouchedBase + 4*page}}
+	if _, err := f.WriteAt([]byte{1}, stubOffset+int64(page)); err != nil {
+		t.Fatalf("write stub page: %v", err)
+	}
+	if got := residentBytesInRanges(t, f, stubRanges); got < page || got > 4*page {
+		t.Fatalf("residentBytesInRanges before punch = %d, want [%d, %d]", got, page, 4*page)
+	}
+	if got := residentBytesInRanges(t, f, writtenPage); got != page {
+		t.Fatalf("residentBytesInRanges on written page = %d, want %d", got, page)
+	}
+	if got := residentBytesInRanges(t, f, untouchedRange); got != 0 {
+		t.Fatalf("residentBytesInRanges on untouched range = %d, want 0", got)
+	}
+
+	// Punch the committed stub page and verify only stubRanges drops to zero
+	// while whole-file st_blocks still reflects the external free-space scan.
+	if err := unix.Fallocate(fd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, stubOffset, int64(4*page)); err != nil {
+		t.Fatalf("fallocate punch hole: %v", err)
+	}
+	if got := residentBytesInRanges(t, f, stubRanges); got != 0 {
+		t.Fatalf("residentBytesInRanges after punch = %d, want 0", got)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		t.Fatalf("fstat memfd: %v", err)
+	}
+	if got := uint64(stat.Blocks * 512); got < scanLength {
+		t.Fatalf("whole-file st_blocks usage = %d, want at least %d from MAP_SHARED read faults", got, scanLength)
+	}
+}
+
+func TestSubtractFileRangesWithHostPageAlignment(t *testing.T) {
+	const hostPage = 16 << 10
+	// Source owns [0x3fffc000, 0x3fffe000), which expands to [0x3fffc000, 0x40000000).
+	source := mergeFileRanges(alignRangesOutward([]memmap.FileRange{
+		{Start: 0x3fffc000, End: 0x3fffe000},
+	}, hostPage))
+	// Child stub allocated a sub-page in the same 16 KiB host page plus two
+	// adjacent ranges below it.
+	raw := []memmap.FileRange{
+		{Start: 0x3fffe000, End: 0x40000000},
+		{Start: 0x3eff0000, End: 0x3fff0000},
+		{Start: 0x3fff0000, End: 0x3fffc000},
+	}
+	got := subtractFileRanges(mergeFileRanges(raw), source)
+	want := []memmap.FileRange{
+		{Start: 0x3eff0000, End: 0x3fffc000},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("subtractFileRanges = %v, want %v", got, want)
+	}
+
+	// Verify splitting a base range around an interior excluded range.
+	splitGot := subtractFileRanges(
+		[]memmap.FileRange{{Start: 0x1000, End: 0x9000}},
+		[]memmap.FileRange{{Start: 0x3000, End: 0x5000}, {Start: 0x6000, End: 0x7000}},
+	)
+	splitWant := []memmap.FileRange{
+		{Start: 0x1000, End: 0x3000},
+		{Start: 0x5000, End: 0x6000},
+		{Start: 0x7000, End: 0x9000},
+	}
+	if !slices.Equal(splitGot, splitWant) {
+		t.Fatalf("subtractFileRanges interior split = %v, want %v", splitGot, splitWant)
 	}
 }
 
