@@ -2,6 +2,22 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.23.10012026112300] - 2026-11-25
+
+This release syncs the embedded gVisor Sentry kernel and netstack to upstream `release-20261123.0` (`83df8eae069e`) and aligns `hostfs`, `ext4lite`, and `erofs` extended attribute capability reads with upstream user-namespace security rules.
+
+### Upstream Sync
+
+- **gVisor `release-20261123.0` (`UPSTREAM_COMMIT`, `tools/upstream/sync_manifest.json`, `pkg/gvx`, `pkg/sentry`, `pkg/tcpip`)**:
+  - Advances `UPSTREAM_COMMIT` from `83282de1f21f` (`release-20261116.0`) to `83df8eae069e` (`release-20261123.0`, release tag commit `6abe42f82cb9`) and refreshes `pkg/rungvx/licenses/THIRD_PARTY_LICENSES.txt`.
+  - Brings in EROFS tail-packed inline data mapping (gVisor #17772) with block I/O accounting preserved, overlay stacking depth limit of two and hidden `trusted.*` xattrs for unprivileged callers (gVisor #17440), unconditional NUMA `sysfs` topology (gVisor #15766), TCP Delayed ACKs (gVisor #17082), `seccomp` filter cache reuse (gVisor #17852), and `epoll_ctl` `EPOLLEXCLUSIVE` validation (gVisor #16222).
+  - Updates `pkg/gvx` Linux seccomp callers from `config.Options.HostFilesystem` to `config.Options.HostFS` (`HostFSNone` and `HostFSReadWrite`, gVisor #17737).
+
+### Security
+
+- **Raw v3 file capability reads during `execve` (`pkg/sentry/fsimpl/fsutilx`, `pkg/sentry/fsimpl/erofs`)**:
+  - Honors `vfs.GetXattrOptions.RawCapability` (gVisor #17771) in `fsutilx.FinishGetXattr` (used by `hostfs` and `ext4lite`) and `erofs` `getXattr`, skipping user-namespace `RootID` translation during `GetFilePrivileges` lookups to match `memxattr`.
+
 ## [v0.23.10002026111600] - 2026-11-25
 
 This release renames the CLI binary and build artifacts from `rungv` to `rungvx`, extends `rungvx version` with nginx-style compile-time build options, adds the Sandbox Extension SPI with a nested `ext/` Go submodule and separated extension CI, ships the optional macOS GPU extension (`-tags ext_gpu`), and overhauls user-facing documentation.
