@@ -19,6 +19,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
@@ -63,11 +64,5 @@ func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (st
 	if err != nil {
 		return "", err
 	}
-	if opts.Size != 0 && uint64(len(value)) > opts.Size {
-		return "", linuxerr.ERANGE
-	}
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY && !opts.RawCapability {
-		return auth.FixupVfsCapDataOnGet(creds, string(value))
-	}
-	return string(value), nil
+	return fsutilx.FinishGetXattr(creds, opts, value)
 }

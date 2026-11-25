@@ -138,6 +138,7 @@ func GitSync(ctx context.Context, cfg GitSyncConfig) (SyncManifest, error) {
 		return SyncManifest{}, errDirtyTree
 	}
 
+	oldSHA, _ := ReadUpstreamCommit(cfg.RootDir)
 	if err := auditAgainst(ctx, cfg, ""); err != nil {
 		return SyncManifest{}, fmt.Errorf("step 3: budget of current tree: %w", err)
 	}
@@ -171,6 +172,11 @@ func GitSync(ctx context.Context, cfg GitSyncConfig) (SyncManifest, error) {
 		GoBranchSHA: target,
 		DestDir:     cfg.RootDir,
 		Strategy:    StrategyGit,
+	}
+	if oldSHA != "" {
+		if changed, diffErr := git(ctx, cfg.RootDir, "diff", "--name-only", oldSHA, target); diffErr == nil && changed != "" {
+			manifest.WatchlistHits = FilterWatchlistPaths(strings.Split(changed, "\n"))
+		}
 	}
 	manifest.ReleaseTag, manifest.ReleaseTagSHA = releaseTagFor(ctx, cfg)
 	if err := WriteSyncRecord(cfg.RootDir, manifest); err != nil {

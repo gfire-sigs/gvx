@@ -724,7 +724,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:           "pkg/sentry/fsimpl/erofs",
 		tier:          Tier2Sibling,
-		allowed:       []string{"pkg/abi/linux", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel/auth", "pkg/sentry/vfs"},
+		allowed:       []string{"pkg/abi/linux", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/fsimpl/fsutilx", "pkg/sentry/kernel/auth", "pkg/sentry/vfs"},
 		forbidden:     append([]string{xSysWindows}, append(slices.Clone(platformSiblings), without(tier2UpperBans, "pkg/oci/*")...)...),
 		forbiddenProd: []string{"pkg/sentry/platform/*", "pkg/oci/*"},
 	},

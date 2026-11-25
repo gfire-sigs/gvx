@@ -279,6 +279,7 @@ func syncMode(ctx context.Context, o options, patches *PatchSet, mask *FileMask,
 			})
 			if err == nil {
 				fmt.Fprintf(stdout, "sync complete (git merge, uncommitted): commit=%s\n", manifest.GoBranchSHA)
+				printWatchlistNotice(stdout, manifest.WatchlistHits)
 				return nil
 			}
 			if o.strategy == "git" || !errors.Is(err, errNoSharedHistory) {
@@ -321,12 +322,14 @@ func syncMode(ctx context.Context, o options, patches *PatchSet, mask *FileMask,
 		return fmt.Errorf("audit failed with %d finding(s): %w", countErrors(rawAuditErr), rawAuditErr)
 	}
 	if err != nil {
+		printWatchlistNotice(stdout, manifest.WatchlistHits)
 		return err
 	}
 	fmt.Fprintf(stdout,
 		"sync complete (archive overlay): commit=%s release=%s extracted=%d merged=%d deleted=%d protected_skipped=%d excluded_skipped=%d dest=%s\n",
 		manifest.GoBranchSHA[:12], manifest.ReleaseTag, manifest.ExtractedFiles, manifest.MergedFiles, manifest.DeletedFiles, manifest.ProtectedSkips, manifest.ExcludedSkips, manifest.DestDir,
 	)
+	printWatchlistNotice(stdout, manifest.WatchlistHits)
 	if !inPlace {
 		fmt.Fprintln(stdout, "run `go mod tidy`, then -mode=audit, then the five-target builds")
 		return nil

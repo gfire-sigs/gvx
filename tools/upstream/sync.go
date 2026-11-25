@@ -312,6 +312,7 @@ type SyncManifest struct {
 	Conflicts      []string `json:"conflicts,omitempty"`
 	DestDir        string   `json:"dest_dir"`
 	Strategy       string   `json:"strategy,omitempty"`
+	WatchlistHits  []string `json:"-"`
 }
 
 // Sync strategy names recorded in the manifest.
@@ -380,6 +381,7 @@ func SyncUpstream(ctx context.Context, cfg SyncConfig) (SyncManifest, error) {
 	manifest.ReleaseTagSHA = refs.ReleaseTagSHA
 	manifest.DestDir = destRoot
 	manifest.Strategy = StrategyArchive
+	manifest.WatchlistHits = CollectWatchlistChanges(oldTree, tree)
 
 	if len(manifest.Conflicts) > 0 {
 		return manifest, fmt.Errorf(
