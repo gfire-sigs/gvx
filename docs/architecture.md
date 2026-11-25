@@ -363,7 +363,7 @@ These workflows verify pure-Go builds, nested extensions, cross-OS unit and E2E 
 
 | Workflow / Job | Runner | Verified Scope |
 | :--- | :--- | :--- |
-| `ci.yml` (`build, vet, and audit`) | `ubuntu-24.04` | `gofmt`, 5-target + `android/arm64` builds, `go vet`, `gostateify -check`, `tools/licenses -check`, `gvisorlint`, `tools/upstream -max-ratio=0.045`, consumer module check. |
+| `ci.yml` (`audit`, `build, vet, and lint`) | `ubuntu-24.04` | `gofmt`, 5-target + `android/arm64` builds, `go vet`, `gostateify -check`, `tools/licenses -check`, `gvisorlint`, `tools/upstream -max-ratio=0.045`, consumer module check. |
 | `ci.yml` (`test linux/*`, `repro`, `dind-build`) | `ubuntu-24.04`, `ubuntu-24.04-arm` | `-race` owned tests, `GVX_SYSTRAP_SUBBLOCKS=1`, offline `e2e/`, SHA-256 reproducible build, local-registry `docker:dind` build. |
 | `ci.yml` (`test darwin/arm64`, `windows/*`) | `macos-26`, `windows-latest`, `windows-11-arm` | Signed owned tests (`codesign-exec.sh`), real `whpx` + `winsystrap` (`windows/amd64`), `winsystrap` + shim (`windows/arm64`). |
 | `ext.yml` (`build`, `test-*`) | `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-26`, `windows-latest` | Cross-compiles, vets, tests (`-race` and `CGO_ENABLED=0`), and repro-verifies `ext/` with `-tags ext_gpu` and `-tags ext_all`. |

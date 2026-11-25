@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
-# Verifies that OWNED in .github/workflows/ci.yml covers every package with a
-# Go test file outside e2e and pkg/sentry/platform/systrap.
+# Verifies that OWNED_* groups in .github/workflows/ci.yml cover every package
+# with a Go test file outside e2e and pkg/sentry/platform/systrap, without
+# duplicate patterns across shards.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 if [ -z "${OWNED:-}" ]; then
 	OWNED=$(awk '
-		/^  OWNED: >-/ { in_owned = 1; next }
+		/^  OWNED(_[A-Z0-9_]+)?: >-/ { in_owned = 1; next }
+		/^  OWNED(_[A-Z0-9_]+)?: [^>]/ {
+			sub(/^  OWNED(_[A-Z0-9_]+)?:[[:space:]]*/, "")
+			printf "%s ", $0
+			in_owned = 0
+			next
+		}
 		in_owned && /^    / { sub(/^    /, ""); printf "%s ", $0; next }
-		in_owned { exit }
+		in_owned { in_owned = 0 }
 	' .github/workflows/ci.yml)
 fi
 
 if [ -z "${OWNED// /}" ]; then
 	echo "OWNED is empty" >&2
+	exit 1
+fi
+
+# shellcheck disable=SC2086
+dups=$(printf '%s\n' $OWNED | sort | uniq -d)
+if [ -n "$dups" ]; then
+	printf 'Duplicate entries across OWNED groups in .github/workflows/ci.yml:\n' >&2
+	# shellcheck disable=SC2086
+	printf '  %s\n' $dups >&2
 	exit 1
 fi
 
@@ -34,7 +50,7 @@ while IFS= read -r dir; do
 done < <(find . \( -path './.git' -o -path './ext' -o -path './tools/shiminterop' -o -name testdata \) -prune -o -name '*_test.go' -print | sed 's|/[^/]*$||' | sort -u)
 
 if [ "${#missing[@]}" -gt 0 ]; then
-	printf 'Packages with _test.go missing from OWNED in .github/workflows/ci.yml:\n' >&2
+	printf 'Packages with _test.go missing from OWNED_* groups in .github/workflows/ci.yml:\n' >&2
 	printf '  %s\n' "${missing[@]}" >&2
 	exit 1
 fi

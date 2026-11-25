@@ -26,17 +26,21 @@ permissions:
 
 env:
   GOFLAGS: -mod=readonly
-  # Packages that gvx owns or extends. The upstream gVisor trees have their own
-  # tests, which the project does not run.
-  OWNED: >-
-    ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/... ./tools/gostateify/...
-    ./pkg/gvx/... ./pkg/rungvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
-    ./pkg/abi/linux/... ./pkg/cpuid/... ./pkg/erofs/... ./pkg/fd/... ./pkg/fdnotifier/... ./pkg/fsutil/... ./pkg/hostarch/...
-    ./pkg/memutil/... ./pkg/rawfile/... ./pkg/ring0/... ./pkg/sync/... ./pkg/syserr/...
-    ./pkg/sentry/arch/... ./pkg/sentry/blockdev/... ./pkg/sentry/devices/memdev/...
+  # Packages that gvx owns or extends, split into disjoint shards so heavy
+  # storage tests (ext4lite) and runtime tests (pkg/gvx) run in parallel.
+  # scripts/check-ci-owned.sh verifies union coverage and disjointness.
+  OWNED_STORAGE: >-
     ./pkg/sentry/fsimpl/cgroup2fs/... ./pkg/sentry/fsimpl/chunkcache/... ./pkg/sentry/fsimpl/devpts/... ./pkg/sentry/fsimpl/erofs/...
     ./pkg/sentry/fsimpl/ext4lite/... ./pkg/sentry/fsimpl/fsutilx/... ./pkg/sentry/fsimpl/hostfs/... ./pkg/sentry/fsimpl/iouringfs/...
     ./pkg/sentry/fsimpl/overlay/... ./pkg/sentry/fsimpl/proc/... ./pkg/sentry/fsimpl/rpcfs/... ./pkg/sentry/fsimpl/sys/...
+  OWNED_RUNTIME: >-
+    ./pkg/gvx/...
+  OWNED_CORE: >-
+    ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/... ./tools/gostateify/...
+    ./pkg/rungvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
+    ./pkg/abi/linux/... ./pkg/cpuid/... ./pkg/erofs/... ./pkg/fd/... ./pkg/fdnotifier/... ./pkg/fsutil/... ./pkg/hostarch/...
+    ./pkg/memutil/... ./pkg/rawfile/... ./pkg/ring0/... ./pkg/sync/... ./pkg/syserr/...
+    ./pkg/sentry/arch/... ./pkg/sentry/blockdev/... ./pkg/sentry/devices/memdev/...
     ./pkg/sentry/hostcpu/... ./pkg/sentry/kernel/... ./pkg/sentry/loader/... ./pkg/sentry/mm/... ./pkg/sentry/pgalloc/... ./pkg/sentry/time/...
     ./pkg/sentry/platform ./pkg/sentry/platform/hvcommon/... ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
     ./pkg/sentry/socket/netfilter/... ./pkg/sentry/socket/netlink/... ./pkg/sentry/socket/netstack/...
@@ -54,11 +58,11 @@ env:
     ./e2e/...
 
 jobs:
-  build:
-    name: build, vet, and audit
+  audit:
+    name: audit and static checks
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'build'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -80,40 +84,9 @@ jobs:
         run: ./scripts/check-ci-owned.sh
       - name: Check stateify generated files
         run: ./scripts/gostateify.sh -check
-      - name: Build all target platforms
-        run: |
-          for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
-            echo "::group::build $target"
-            GOOS=${target%/*} GOARCH=${target#*/} go build ./...
-            echo "::endgroup::"
-          done
-          # Android uses the Linux code paths (docs/gvxip/gvxip-006-android-host-support.md).
-          echo "::group::build android/arm64"
-          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./...
-          echo "::endgroup::"
-      - name: Vet all target platforms
-        run: |
-          for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
-            echo "::group::vet $target"
-            # The embedded copy of x/sys/unix keeps the unsafe.Pointer idioms of its upstream.
-            export GOOS=${target%/*} GOARCH=${target#*/}
-            go vet $(go list $VET | grep -v '/internal/xsys/')
-            if [ "$GOOS" = linux ]; then
-              go vet ./tools/androidprobe/...
-            fi
-            unset GOOS GOARCH
-            echo "::endgroup::"
-          done
-          # The systrap package mixes upstream Linux files with gvx files, so vet it where only gvx files build.
-          for target in darwin/arm64 windows/amd64 windows/arm64; do
-            GOOS=${target%/*} GOARCH=${target#*/} go vet ./pkg/sentry/platform/systrap/
-          done
-      - name: Lint with the gVisor analyzers
-        # Runs checklocks, checkconst, and checklinkname on every package of the five targets.
-        # The tool tests prove that a new violation fails the step. See docs/gvisorlint.md.
-        run: |
-          go test ./tools/gvisorlint/
-          scripts/gvisorlint.sh
+      - name: Test gVisor analyzer suite
+        # The tool tests prove that a new violation fails the step. See docs/architecture.md.
+        run: go test ./tools/gvisorlint/
       - name: Cache upstream archive
         uses: actions/cache@v6
         with:
@@ -156,19 +129,90 @@ jobs:
           go vet ./...
           go test -count=1 ./...
 
+  build:
+    name: build, vet, and lint (${{ matrix.label }})
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux/amd64
+            targets: linux/amd64
+            build_android: false
+          - label: linux/arm64
+            targets: linux/arm64
+            build_android: false
+          - label: darwin and android
+            targets: darwin/arm64
+            build_android: true
+          - label: windows
+            targets: windows/amd64 windows/arm64
+            build_android: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build and vet assigned targets
+        # Running build, vet, and gvisorlint for one target in the same job reuses
+        # the warmed Go build cache for that GOOS/GOARCH pair.
+        run: |
+          for target in ${{ matrix.targets }}; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            echo "::group::build $target"
+            GOOS=$goos GOARCH=$goarch go build ./...
+            echo "::endgroup::"
+
+            echo "::group::vet $target"
+            # The embedded copy of x/sys/unix keeps the unsafe.Pointer idioms of its upstream.
+            export GOOS=$goos GOARCH=$goarch
+            go vet $(go list $VET | grep -v '/internal/xsys/')
+            if [ "$goos" = linux ]; then
+              go vet ./tools/androidprobe/...
+            else
+              # The systrap package mixes upstream Linux files with gvx files, so vet it where only gvx files build.
+              go vet ./pkg/sentry/platform/systrap/
+            fi
+            unset GOOS GOARCH
+            echo "::endgroup::"
+          done
+      - name: Lint assigned targets with gVisor analyzers
+        # Runs checklocks, checkconst, and checklinkname on every package of the assigned targets.
+        run: scripts/gvisorlint.sh ${{ matrix.targets }}
+      - name: Build android/arm64
+        if: matrix.build_android
+        run: |
+          # Android uses the Linux code paths (docs/components/android.md).
+          echo "::group::build android/arm64"
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./...
+          echo "::endgroup::"
+
   linux:
-    name: test linux/${{ matrix.arch }}
+    name: test linux/${{ matrix.arch }} (${{ matrix.shard }})
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-24.04
+            shard: storage
+          - arch: amd64
+            runner: ubuntu-24.04
+            shard: runtime
           - arch: arm64
             runner: ubuntu-24.04-arm
+            shard: storage
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            shard: runtime
     env:
       GVX_E2E_OFFLINE: "1"
     steps:
@@ -178,21 +222,26 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Test owned packages
+      - name: Test storage packages
+        if: matrix.shard == 'storage'
         env:
           EXT4LITE_REQUIRE_E2FSCK: "1"
           EXT4LITE_REQUIRE_LOOPMOUNT: "1"
-        run: go test -race -count=1 $OWNED ./pkg/sentry/platform/systrap/...
+        run: go test -race -count=1 $OWNED_STORAGE
+      - name: Test core and runtime packages
+        if: matrix.shard == 'runtime'
+        run: go test -race -count=1 $OWNED_CORE $OWNED_RUNTIME ./pkg/sentry/platform/systrap/...
       # The release builds without cgo, so the steps below do too. The race
       # step above runs the systrap package in a cgo build.
       - name: Test systrap engine and end-to-end suite
+        if: matrix.shard == 'runtime'
         env:
           CGO_ENABLED: "0"
         run: go test -count=1 ./pkg/hostlockdown/ ./pkg/gvx/ ./pkg/sentry/platform/systrap/ ./e2e/
       # A hosted runner has 4 KB pages. The variable runs the sub-block layer
       # of a 16 KB host (Android) under the guest probes.
       - name: Test the systrap sub-block layer
-        if: matrix.arch == 'arm64'
+        if: matrix.shard == 'runtime' && matrix.arch == 'arm64'
         env:
           CGO_ENABLED: "0"
           GVX_SYSTRAP_SUBBLOCKS: "1"
@@ -200,6 +249,7 @@ jobs:
           go test -count=1 ./pkg/sentry/platform/systrap/
           go test -count=1 -run 'TestE2ESystrap|TestE2EGateETExec|TestE2EGateM2' ./e2e/
       - name: Build rungvx and the smoke guest
+        if: matrix.shard == 'runtime'
         env:
           CGO_ENABLED: "0"
         run: |
@@ -207,6 +257,7 @@ jobs:
           ./rungvx version -V
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
       - name: Run smoke guest without lockdown
+        if: matrix.shard == 'runtime'
         env:
           GVX_DEBUG_LOG: "1"
         run: |
@@ -216,6 +267,7 @@ jobs:
           grep -q gvx-smoke-ok smoke.out
       # A cgo build adds the thread start of the C library to the filter.
       - name: Run smoke guest with lockdown in a cgo build
+        if: matrix.shard == 'runtime'
         env:
           CGO_ENABLED: "1"
           GVX_DEBUG_LOG: "1"
@@ -226,6 +278,7 @@ jobs:
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
       - name: Run smoke guest with lockdown
+        if: matrix.shard == 'runtime'
         env:
           GVX_DEBUG_LOG: "1"
         run: |
@@ -235,10 +288,14 @@ jobs:
           grep -q gvx-smoke-ok smoke.out
 
   darwin-arm64:
-    name: test darwin/arm64
+    name: test darwin/arm64 (${{ matrix.shard }})
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [storage, runtime]
     env:
       # A hosted runner is a virtual machine, so it cannot create a nested VM.
       # Tests that need Hypervisor.framework skip.
@@ -251,18 +308,29 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Test owned packages
-        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED ./pkg/sentry/platform/systrap/...
+      - name: Test storage packages
+        if: matrix.shard == 'storage'
+        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED_STORAGE
+      - name: Test core and runtime packages
+        if: matrix.shard == 'runtime'
+        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED_CORE $OWNED_RUNTIME ./pkg/sentry/platform/systrap/...
       # macOS has no systrap engine and macos-26 offers no Hypervisor.framework,
       # so this step runs the host-level e2e gates that need no guest VM.
       - name: Test host-level end-to-end gates
+        if: matrix.shard == 'runtime'
         run: go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" -run '^TestE2E(OtherOSHypervisorFailsExplicitly|SystrapPrerequisiteError|RungvxConfigurationErrors)$' ./e2e/
 
   windows-amd64:
-    name: test windows/amd64
+    name: test windows/amd64 (${{ matrix.shard }})
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [storage, core, e2e]
+    env:
+      GVX_E2E_OFFLINE: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -271,15 +339,24 @@ jobs:
         with:
           go-version-file: go.mod
       # The race detector needs cgo. The runner image has gcc from MinGW.
-      - name: Test owned packages
+      - name: Test storage packages
+        if: matrix.shard == 'storage'
         shell: bash
         env:
           CGO_ENABLED: "1"
-        run: go test -race -count=1 -timeout 20m $OWNED
+        run: go test -race -count=1 -timeout 20m $OWNED_STORAGE
+      - name: Test core and runtime packages
+        if: matrix.shard == 'core'
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 -timeout 20m $OWNED_CORE $OWNED_RUNTIME
       - name: Test systrap engine
+        if: matrix.shard == 'core'
         shell: bash
         run: go test -count=1 ./pkg/sentry/platform/systrap/
       - name: Report runner hypervisor state
+        if: matrix.shard == 'e2e'
         shell: pwsh
         continue-on-error: true
         run: |
@@ -287,6 +364,7 @@ jobs:
           Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent
           Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
       - name: Build rungvx and the smoke guest
+        if: matrix.shard == 'e2e'
         shell: bash
         run: |
           go build -o rungvx.exe ./cmd/rungvx
@@ -296,6 +374,7 @@ jobs:
       # GVX_DEBUG_LOG prints the Sentry log, which names the reason of a guest
       # crash.
       - name: Run smoke guest on whpx
+        if: matrix.shard == 'e2e'
         shell: bash
         env:
           GVX_DEBUG_LOG: "1"
@@ -306,20 +385,25 @@ jobs:
       # The suite runs each test on whpx and on systrap. The hypervisor tests
       # fail here and never skip, because GVX_ALLOW_NO_HYPERVISOR is unset.
       - name: Test end-to-end suite
+        if: matrix.shard == 'e2e'
         shell: bash
-        env:
-          GVX_E2E_OFFLINE: "1"
         run: go test -count=1 -timeout 25m ./pkg/gvx/ ./pkg/rungvx/ ./cmd/rungvx/ ./e2e/
 
   windows-arm64:
-    name: test windows/arm64
+    name: test windows/arm64 (${{ matrix.shard }})
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-11-arm
-    timeout-minutes: 40
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [unit, runtime, e2e]
     # The hosted runner has no hypervisor. The job runs the same tests as
     # windows/amd64 on the systrap engine, and the whpx subtests skip.
+    # Go has no race detector on windows/arm64, so each package runs once.
     env:
       GVX_ALLOW_NO_HYPERVISOR: "1"
+      GVX_E2E_OFFLINE: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -327,21 +411,23 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # Go has no race detector for windows/arm64, so this step runs
-      # without -race.
-      - name: Test owned packages
+      - name: Test storage, core, and systrap packages
+        if: matrix.shard == 'unit'
         shell: bash
-        run: go test -count=1 -timeout 20m $OWNED
-      - name: Test execution backends
+        run: go test -count=1 -timeout 20m $OWNED_STORAGE $OWNED_CORE ./pkg/sentry/platform/systrap/
+      - name: Test runtime packages
+        if: matrix.shard == 'runtime'
         shell: bash
-        run: go test -count=1 ./pkg/sentry/platform/whpx/ ./pkg/sentry/platform/systrap/
+        run: go test -count=1 -timeout 20m $OWNED_RUNTIME
       - name: Build rungvx and the smoke guest
+        if: matrix.shard == 'runtime'
         shell: bash
         run: |
           go build -o rungvx.exe ./cmd/rungvx
           ./rungvx.exe version -V
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
       - name: Run smoke guest on systrap
+        if: matrix.shard == 'runtime'
         shell: bash
         env:
           GVX_DEBUG_LOG: "1"
@@ -350,10 +436,9 @@ jobs:
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
       - name: Test end-to-end suite
+        if: matrix.shard == 'e2e'
         shell: bash
-        env:
-          GVX_E2E_OFFLINE: "1"
-        run: go test -count=1 -timeout 25m ./pkg/gvx/ ./pkg/rungvx/ ./cmd/rungvx/ ./e2e/
+        run: go test -count=1 -timeout 25m ./e2e/
 
   repro:
     name: reproducible build in gvx
