@@ -139,6 +139,16 @@ Keep CI consumption modest. Avoid redundant jobs and reserve the following varia
 | `GVX_E2E_DIND_CACHE_DIR` | Layer cache directory for `TestE2EDockerBuildDindLocalRegistry`. |
 | `GVX_PREBUILT_DIR` | Directory holding prebuilt guest binaries for `e2e.test` on VMs without a Go toolchain. |
 | `GVX_E2E_CPUMAX_CHECKS` | Comma-separated `cpumaxprobe` subtest list for `TestE2ECPUMaxEnforcement`. |
+| `GVX_E2E_BROWSER=1` | Runs the SwiftShader browser gates in `ext/e2e/gate_browser_test.go` (pulls a ~1 GB Playwright image). |
+| `GVX_E2E_BROWSER_BENCH=1` | Runs `TestE2EBrowserBench` alongside `GVX_E2E_BROWSER=1`. |
+| `GVX_E2E_GPU=1` | Runs the GPU gates in `ext/e2e/gate_gpu*_test.go` on `darwin/arm64` with `hvf` (requires `GVX_GPU_RENDERER`). |
+| `GVX_E2E_ARTIFACT_DIR` | Output directory for GPU gate records (`g1`, `g1-kill`, `g2`, `g3`, `webgl-cts`, `venus-guard`). |
+| `GVX_GPU_RENDERER` | Path to `gvx-gpu-renderer` for `-gpu=venus` and `-gpu=virgl` (`scripts/gpu/build-renderer.sh` outputs to `build/gpu/gvx-gpu-renderer/bin/`). |
+| `GVX_E2E_GPU_MODES` | Comma-separated GPU modes (`venus`, `virgl`) for `ext/e2e` GPU gates (unset runs both). |
+| `GVX_E2E_GPU_CHROMIUM_FLAGS` | Overrides `venus` Chromium flags in `TestE2EGateGPUChromium` and `TestE2EGateGPUWebGLCTS`. |
+| `GVX_E2E_GPU_CHROMIUM_VIRGL_FLAGS` | Overrides `virgl` Chromium flags in `TestE2EGateGPUChromium` and `TestE2EGateGPUWebGLCTS`. |
+| `GVX_E2E_WEBGL_CTS` | Selects `TestE2EGateGPUWebGLCTS` scope (`subset`, `full`, or `full-deqp`) when `GVX_E2E_GPU=1`. |
+| `GVX_E2E_WEBGL_CTS_PAGES` | Comma-separated subset selectors overriding `webgl-cts-subset.txt` during diagnosis runs. |
 | `GVX_DEBUG_LOG=1` | Prints Sentry kernel logs (`2` adds debug lines including unresolved guest faults). |
 | `GVX_SYSTRAP_SUBBLOCKS=1` | Exercises the 16 KiB sub-block layer of Linux `systrap` on a 4 KiB host. |
 | `GVX_SYSTRAP_TRACE=1` | Prints Windows `systrap` guest exception signals (`2` logs every stop; `3` prints stop counts and patch summaries; `4` samples hot PCs). |

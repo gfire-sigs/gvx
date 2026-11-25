@@ -1,0 +1,150 @@
+<!doctype html>
+<!--
+  gvx WebGL scene for gate G2. The page draws a fixed scene on an 800x600
+  canvas: a clear color, three solid triangles (red, green, blue), a quad with
+  a 2x2 checker texture (NEAREST filter), and a quad of white at 50 % alpha
+  with blending. It reads fixed pixels back and compares them with the
+  expected values (tolerance 2 of 255). The result is a JSON object on
+  window.__gvxScene and in the text of the element "out".
+  Expected image (y down): dark blue background; red, green, and blue
+  triangles side by side in the lower middle; a checker quad (white at the
+  top right and bottom left of its four cells) in the upper middle; a light
+  grey rectangle near the bottom right corner.
+-->
+<html><head><meta charset="utf-8"><title>gvx-webgl-scene</title>
+<style>html,body{margin:0;background:#fff}canvas{display:block}</style></head>
+<body><canvas id="c" width="800" height="600"></canvas><pre id="out">pending</pre>
+<script>
+(function () {
+  const W = 800, H = 600, TOL = 2;
+  const result = { webglVersion: 0, vendor: '', renderer: '', unmaskedVendor: '', unmaskedRenderer: '', pixelChecks: [], errors: [], pass: false };
+  function publish() {
+    window.__gvxScene = result;
+    document.getElementById('out').textContent = JSON.stringify(result);
+  }
+  const canvas = document.getElementById('c');
+  const attrs = { antialias: false, preserveDrawingBuffer: true, alpha: false };
+  let gl = canvas.getContext('webgl2', attrs);
+  result.webglVersion = gl ? 2 : 0;
+  if (!gl) { gl = canvas.getContext('webgl', attrs); result.webglVersion = gl ? 1 : 0; }
+  if (!gl) { result.errors.push('no WebGL context'); publish(); return; }
+  result.vendor = gl.getParameter(gl.VENDOR);
+  result.renderer = gl.getParameter(gl.RENDERER);
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  if (dbg) {
+    result.unmaskedVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+    result.unmaskedRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+  }
+
+  // GLSL ES 1.00 runs in WebGL 1 and WebGL 2 contexts.
+  function program(vs, fs) {
+    function shader(type, src) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) result.errors.push('compile: ' + gl.getShaderInfoLog(s));
+      return s;
+    }
+    const p = gl.createProgram();
+    gl.attachShader(p, shader(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) result.errors.push('link: ' + gl.getProgramInfoLog(p));
+    return p;
+  }
+  const colorProg = program(
+    'precision highp float; attribute vec2 p; attribute vec4 c; varying vec4 v; void main() { v = c; gl_Position = vec4(p, 0.0, 1.0); }',
+    'precision highp float; varying vec4 v; void main() { gl_FragColor = v; }');
+  const texProg = program(
+    'precision highp float; attribute vec2 p; attribute vec2 t; varying vec2 uv; void main() { uv = t; gl_Position = vec4(p, 0.0, 1.0); }',
+    'precision highp float; varying vec2 uv; uniform sampler2D s; void main() { gl_FragColor = texture2D(s, uv); }');
+
+  function drawColored(verts) {
+    gl.useProgram(colorProg);
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+    const lp = gl.getAttribLocation(colorProg, 'p'), lc = gl.getAttribLocation(colorProg, 'c');
+    gl.enableVertexAttribArray(lp); gl.vertexAttribPointer(lp, 2, gl.FLOAT, false, 24, 0);
+    gl.enableVertexAttribArray(lc); gl.vertexAttribPointer(lc, 4, gl.FLOAT, false, 24, 8);
+    gl.drawArrays(gl.TRIANGLES, 0, verts.length / 6);
+    gl.disableVertexAttribArray(lp); gl.disableVertexAttribArray(lc);
+  }
+  function tri(x0, y0, x1, y1, x2, y2, r, g, b, a) {
+    return [x0, y0, r, g, b, a, x1, y1, r, g, b, a, x2, y2, r, g, b, a];
+  }
+  function quad(xa, ya, xb, yb, r, g, b, a) {
+    return tri(xa, ya, xb, ya, xa, yb, r, g, b, a).concat(tri(xa, yb, xb, ya, xb, yb, r, g, b, a));
+  }
+
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.BLEND);
+  gl.clearColor(26 / 255, 51 / 255, 77 / 255, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // Three solid triangles (clip space, y up).
+  drawColored(
+    tri(-0.9, -0.6, -0.4, -0.6, -0.65, 0.2, 1, 0, 0, 1)
+      .concat(tri(-0.3, -0.6, 0.2, -0.6, -0.05, 0.2, 0, 1, 0, 1))
+      .concat(tri(0.3, -0.6, 0.8, -0.6, 0.55, 0.2, 0, 0, 1, 1)));
+
+  // A quad with a 2x2 checker texture. Texture row 0 is the bottom row.
+  gl.useProgram(texProg);
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([
+    255, 255, 255, 255, 0, 0, 0, 255,
+    0, 0, 0, 255, 255, 255, 255, 255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.uniform1i(gl.getUniformLocation(texProg, 's'), 0);
+  const tb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, tb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -0.5, 0.35, 0, 0,   0.5, 0.35, 1, 0,   -0.5, 0.9, 0, 1,
+    -0.5, 0.9, 0, 1,    0.5, 0.35, 1, 0,    0.5, 0.9, 1, 1]), gl.STATIC_DRAW);
+  const tp = gl.getAttribLocation(texProg, 'p'), tt = gl.getAttribLocation(texProg, 't');
+  gl.enableVertexAttribArray(tp); gl.vertexAttribPointer(tp, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(tt); gl.vertexAttribPointer(tt, 2, gl.FLOAT, false, 16, 8);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.disableVertexAttribArray(tp); gl.disableVertexAttribArray(tt);
+
+  // White at 50 % alpha over the clear color.
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  drawColored(quad(0.6, -0.9, 0.95, -0.7, 1, 1, 1, 0.5));
+  gl.disable(gl.BLEND);
+  gl.finish();
+
+  // Pixel checks in readPixels coordinates (origin at the bottom left).
+  const checks = [
+    ['clear-corner', 20, 20, [26, 51, 77]],
+    ['clear-top', 400, 580, [26, 51, 77]],
+    ['red-triangle', 140, 200, [255, 0, 0]],
+    ['green-triangle', 380, 200, [0, 255, 0]],
+    ['blue-triangle', 620, 200, [0, 0, 255]],
+    ['checker-bottom-left', 300, 446, [255, 255, 255]],
+    ['checker-bottom-right', 500, 446, [0, 0, 0]],
+    ['checker-top-left', 300, 529, [0, 0, 0]],
+    ['checker-top-right', 500, 529, [255, 255, 255]],
+    ['blend', 710, 60, [141, 153, 166]],
+  ];
+  const px = new Uint8Array(4);
+  let pass = result.errors.length === 0;
+  for (const [name, x, y, want] of checks) {
+    gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const got = [px[0], px[1], px[2]];
+    const ok = got.every((v, i) => Math.abs(v - want[i]) <= TOL);
+    if (!ok) pass = false;
+    result.pixelChecks.push({ name, x, y, want, got, ok });
+  }
+  const err = gl.getError();
+  if (err !== gl.NO_ERROR) { result.errors.push('glError ' + err); pass = false; }
+  result.pass = pass;
+  publish();
+})();
+</script></body></html>

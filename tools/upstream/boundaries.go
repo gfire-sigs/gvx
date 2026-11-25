@@ -212,7 +212,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/gvx/exttest",
 		tier:      Tier1Additive,
-		allowed:   []string{"pkg/gvx", "internal/hvtest", "internal/systraptest", "internal/testimage"},
+		allowed:   []string{"pkg/gvx", "internal/hvtest", "internal/systraptest", "internal/testimage", "internal/acceptprog"},
 		forbidden: []string{"cmd/*", "ext/*", "pkg/rungvx/*", "internal/gvxshim/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
 	},
 	{

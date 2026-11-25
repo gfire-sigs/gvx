@@ -4,7 +4,7 @@ This document specifies the architecture and phased rollout for hardware extensi
 
 | Field | Value |
 | :--- | :--- |
-| **Status** | Stages 0 to 4b Implemented; Stage 5 Pending |
+| **Status** | Stages 0 to 5 Implemented |
 | **Tracking Issue** | [#250](https://github.com/gfire-sigs/gvx/issues/250) |
 | **GPU Reference Baseline** | PR #239 (`42f8c9f1`, split across PRs #252 to #255; `1,004` of `1,009` WebGL CTS pages) |
 | **Primary Build Objective** | Default pure-Go compilation (`CGO_ENABLED=0`) with zero C toolchains and zero extension entries in root `go.mod` |

@@ -27,6 +27,11 @@ This release renames the CLI binary and build artifacts from `rungv` to `rungvx`
   - Keeps root `z.gfire.dev/gvx` builds pure Go (`CGO_ENABLED=0`) with zero extension dependencies in root `go.mod`.
   - Adds `pkg/rungvx.CLIPlugin`, `MainWithPlugins`, `pkg/gvx/exttest`, and `ext/cmd/rungvx` supporting compile-time Go build tags (`-tags ext_gpu`, `-tags ext_all`) with `GVX_BUILD_TAGS` support in `scripts/repro-build.sh`.
   - Separates extension CI into path-filtered `.github/workflows/ext.yml` and adds `ext/**` to `paths-ignore` in `.github/workflows/ci.yml`.
+- **Optional macOS GPU extension (`-tags ext_gpu`, `ext/extensions/gpu`, `ext/workers/gpu-renderer`)** (#252, #253, #254, #255):
+  - Adds the confined C11 host renderer `gvx-gpu-renderer` (`ext/workers/gpu-renderer/`, `scripts/gpu/`) supporting `--mode=venus` (KosmicKrisp on Metal) and `--mode=virgl` (`vrend` on Apple OpenGL 4.1), with Seatbelt self-confinement and pinned third-party inputs.
+  - Adds the virtio-gpu render node (`/dev/dri/renderD128`) under `ext/extensions/gpu/virtgpu`, backed by `pkg/gvx/shm.Importer` (non-executable shared-memory views) and declarative `sysfs` discovery (`sys.VirtioPCIDeviceTopology`), wired into `rungvx` (`-gpu=venus`, `-gpu=virgl`, `-gpu-renderer`, `-gpu-memory-limit`) via `gvx.Extension` and `rungvx.CLIPlugin`.
+  - Adds opt-in browser SwiftShader gates (`ext/e2e/gate_browser_test.go`, `internal/acceptprog`), GPU gates (`GVX_E2E_GPU=1`), and Khronos WebGL conformance gates (`ext/e2e/`, `GVX_E2E_WEBGL_CTS=subset|full|full-deqp`).
+  - Adds the `gpu-renderer` build job to `.github/workflows/ext.yml` and `.github/workflows/release.yml`, and checks renderer license manifests in `tools/licenses`.
 
 ## [v0.22.10002026111600] - 2026-11-24
 
