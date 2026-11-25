@@ -429,7 +429,7 @@ func (*TransportEndpointInfo) IsEndpointInfo() {}
 func New(opts Options) *Stack {
 	clock := opts.Clock
 	if clock == nil {
-		clock = tcpip.NewStdClock()
+		clock = tcpip.NewHostClock()
 	}
 
 	if opts.SecureRNG == nil {

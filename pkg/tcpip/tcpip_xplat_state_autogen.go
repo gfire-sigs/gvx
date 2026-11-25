@@ -127,9 +127,49 @@ func (e *ErrRouteProhibited) afterLoad(context.Context) {}
 func (e *ErrRouteProhibited) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 }
 
+func (s *hostClock) StateTypeName() string {
+	return "pkg/tcpip.hostClock"
+}
+
+func (s *hostClock) StateFields() []string {
+	return []string{
+		"monotonicOffset",
+	}
+}
+
+func (s *hostClock) beforeSave() {}
+
+// +checklocksignore
+func (s *hostClock) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	monotonicOffsetValue := s.saveMonotonicOffset()
+	_ = (MonotonicTime)(monotonicOffsetValue)
+	stateSinkObject.SaveValue(0, monotonicOffsetValue)
+}
+
+// +checklocksignore
+func (s *hostClock) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.LoadValueTo(0, (*MonotonicTime)(nil), s)
+	stateSourceObject.AfterLoadTo(s)
+}
+
+// +checklocksignore
+func (s *hostClock) StateLoadValue(ctx context.Context, stateSlot int, stateValue any) {
+	switch stateSlot {
+	case 0:
+		s.loadMonotonicOffset(ctx, stateValue.(MonotonicTime))
+	}
+}
+
+// +checklocksignore
+func (s *hostClock) StateAfterLoad(ctx context.Context) {
+	s.afterLoad(ctx)
+}
+
 func init() {
 	state.RegisterNoHooks((*TCPKeepaliveDefaultsOption)(nil))
 	state.RegisterNoHooks((*RouteAttrs)(nil))
 	state.RegisterNoHooks((*ErrRouteBlackhole)(nil))
 	state.RegisterNoHooks((*ErrRouteProhibited)(nil))
+	state.RegisterStruct((*hostClock)(nil))
 }

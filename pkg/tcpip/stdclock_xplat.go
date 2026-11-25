@@ -12,17 +12,68 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !windows
-
 package tcpip
 
-import "time"
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-// hostTicks returns zero. The time package reads a clock with a fine
-// resolution on this host, so hostSince needs no tick counter.
-func hostTicks() int64 { return 0 }
+// hostClock implements Clock with a monotonic source that keeps sub-millisecond
+// resolution on hosts where time.Since reads a coarse interrupt clock.
+//
+// Keeping hostClock in a Tier 2 xplat file leaves stdclock.go and
+// stdclock_state.go pristine while preserving cross-OS checkpoint/restore
+// compatibility because every OS registers pkg/tcpip.hostClock.
+//
+// +stateify savable
+type hostClock struct {
+	baseTime        time.Time     `state:"nosave"`
+	baseTicks       int64         `state:"nosave"`
+	monotonicOffset MonotonicTime `state:".(MonotonicTime)"`
+}
 
-// hostSince returns the monotonic time that passed since baseTime.
-func hostSince(baseTime time.Time, _ int64) time.Duration {
-	return time.Since(baseTime)
+// NewHostClock returns a Clock backed by the finest monotonic host counter.
+func NewHostClock() Clock {
+	return &hostClock{
+		baseTime:  time.Now(),
+		baseTicks: hostTicks(),
+	}
+}
+
+var _ Clock = (*hostClock)(nil)
+
+// Now implements Clock.Now.
+func (*hostClock) Now() time.Time {
+	return time.Now()
+}
+
+// NowMonotonic implements Clock.NowMonotonic.
+func (s *hostClock) NowMonotonic() MonotonicTime {
+	sinceBase := hostSince(s.baseTime, s.baseTicks)
+	if sinceBase < 0 {
+		panic(fmt.Sprintf("got negative duration = %s since base time = %s", sinceBase, s.baseTime))
+	}
+	return s.monotonicOffset.Add(sinceBase)
+}
+
+// AfterFunc implements Clock.AfterFunc.
+func (*hostClock) AfterFunc(d time.Duration, f func()) Timer {
+	return &stdTimer{
+		t: time.AfterFunc(d, f),
+	}
+}
+
+func (s *hostClock) saveMonotonicOffset() MonotonicTime {
+	return s.NowMonotonic()
+}
+
+func (s *hostClock) loadMonotonicOffset(_ context.Context, offset MonotonicTime) {
+	s.monotonicOffset = offset
+}
+
+func (s *hostClock) afterLoad(context.Context) {
+	s.baseTime = time.Now()
+	s.baseTicks = hostTicks()
 }

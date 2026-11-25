@@ -15,10 +15,14 @@
 package netbackend
 
 import (
+	"bytes"
+	"context"
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/state"
 	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
 // maxStdClockStep is the largest step that NowMonotonic may take between two
@@ -31,7 +35,9 @@ const maxStdClockStep = 100 * time.Microsecond
 // interrupt time lets two events of one burst share one timestamp, and RACK
 // then marks every outstanding segment as lost for each acknowledgement.
 func TestStdClockMonotonicStepIsFine(t *testing.T) {
-	clock := tcpip.NewStdClock()
+	s := stack.New(stack.Options{})
+	defer s.Close()
+	clock := s.Clock()
 	const wantSteps = 50
 	deadline := time.Now().Add(5 * time.Second)
 	prev := clock.NowMonotonic()
@@ -63,7 +69,9 @@ func TestStdClockMonotonicStepIsFine(t *testing.T) {
 // so preemption widens the expected interval instead of failing the test.
 func TestStdClockMonotonicRate(t *testing.T) {
 	const goClockStep = 20 * time.Millisecond
-	clock := tcpip.NewStdClock()
+	s := stack.New(stack.Options{})
+	defer s.Close()
+	clock := s.Clock()
 	tStart0 := time.Now()
 	cStart := clock.NowMonotonic()
 	tStart1 := time.Now()
@@ -78,5 +86,39 @@ func TestStdClockMonotonicRate(t *testing.T) {
 	if gotClock < minTime-goClockStep || gotClock > maxTime+goClockStep {
 		t.Fatalf("NowMonotonic advanced %v outside runtime interval [%v, %v] with step %v",
 			gotClock, minTime, maxTime, goClockStep)
+	}
+}
+
+func TestHostClockSurvivesSaveLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		clock tcpip.Clock
+	}{
+		{name: "hostClock", clock: tcpip.NewHostClock()},
+		{name: "legacyStdClock", clock: tcpip.NewStdClock()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := tc.clock
+			time.Sleep(10 * time.Millisecond)
+			beforeSave := clock.NowMonotonic()
+
+			var buf bytes.Buffer
+			ctx := context.Background()
+			if _, err := state.Save(ctx, &buf, &clock); err != nil {
+				t.Fatalf("state.Save: %v", err)
+			}
+
+			var restored tcpip.Clock
+			if _, err := state.Load(ctx, bytes.NewReader(buf.Bytes()), &restored); err != nil {
+				t.Fatalf("state.Load: %v", err)
+			}
+			afterLoad := restored.NowMonotonic()
+			if afterLoad.Before(beforeSave) {
+				t.Fatalf("restored NowMonotonic = %v, went back before saved %v", afterLoad, beforeSave)
+			}
+			if jump := afterLoad.Sub(beforeSave); jump > 5*time.Second {
+				t.Fatalf("restored NowMonotonic jumped forward by %v (possible uninitialized baseTicks)", jump)
+			}
+		})
 	}
 }

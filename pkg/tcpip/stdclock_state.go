@@ -34,5 +34,4 @@ func (s *stdClock) loadMonotonicOffset(_ context.Context, offset MonotonicTime) 
 // decoded, so time spent decoding it does not advance the clock.
 func (s *stdClock) afterLoad(context.Context) {
 	s.baseTime = time.Now()
-	s.baseTicks = hostTicks()
 }
