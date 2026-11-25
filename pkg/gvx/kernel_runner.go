@@ -414,7 +414,7 @@ func (s *Sandbox) applyInitialKernelLimits(k *kernel.Kernel) error {
 // stdio descriptors, and limits, then creates the initial thread group in k.
 func (s *Sandbox) createInitialGuestProcess(ctx context.Context, sctx, sctxWithRoot gvcontext.Context, k *kernel.Kernel, creds *auth.Credentials, mntns *vfs.MountNamespace, root vfs.VirtualDentry, argv []string) (*kernel.ThreadGroup, func(), error) {
 	vfsObj := k.VFS()
-	execPath, err := resolveGuestExecutable(sctxWithRoot, vfsObj, creds, root, argv[0], s.cfg.Envv)
+	execPath, err := resolveGuestExecutable(sctxWithRoot, vfsObj, creds, root, argv[0], s.initialWorkingDir(), s.cfg.Envv)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -748,7 +748,11 @@ func vfsEnsureEmptyFile(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, c
 	return nil
 }
 
-func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, cmd string, envv []string) (string, error) {
+// resolveGuestExecutable returns the absolute guest path that execve(2) would
+// run for cmd. A cmd that contains a slash names a path. A relative path, and
+// a relative PATH entry, resolve against workDir, as execve(2) resolves them
+// against the working directory of the new process.
+func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, cmd, workDir string, envv []string) (string, error) {
 	isRegularFile := func(candidate string) bool {
 		pop := vfs.PathOperation{
 			Root:               root,
@@ -764,10 +768,11 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 	}
 
 	if strings.Contains(cmd, "/") {
-		if isRegularFile(cmd) {
-			return cmd, nil
+		candidate := guestPathFrom(workDir, cmd)
+		if isRegularFile(candidate) {
+			return candidate, nil
 		}
-		return "", fmt.Errorf("gvx: executable %q not found in guest rootfs", cmd)
+		return "", fmt.Errorf("gvx: executable %q not found in guest rootfs at %s", cmd, candidate)
 	}
 
 	pathEnv := defaultPath
@@ -779,16 +784,26 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 	}
 
 	for _, dir := range strings.Split(pathEnv, ":") {
-		if dir == "" {
-			dir = "/"
-		}
-		candidate := path.Join(dir, cmd)
+		// An empty PATH entry names the working directory.
+		candidate := path.Join(guestPathFrom(workDir, dir), cmd)
 		if isRegularFile(candidate) {
 			return candidate, nil
 		}
 	}
 
 	return "", fmt.Errorf("gvx: executable %q not found in PATH (%s)", cmd, pathEnv)
+}
+
+// guestPathFrom returns p as a clean absolute guest path. A relative p lies
+// below workDir; an empty workDir stands for the guest root.
+func guestPathFrom(workDir, p string) string {
+	if path.IsAbs(p) {
+		return path.Clean(p)
+	}
+	if !path.IsAbs(workDir) {
+		workDir = "/" + workDir
+	}
+	return path.Join(workDir, p)
 }
 
 func makeFPath(p string) fspath.Path {

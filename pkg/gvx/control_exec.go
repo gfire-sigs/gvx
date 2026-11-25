@@ -263,7 +263,15 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 
 	// Build merged environment (sandbox env + exec -e overrides).
 	mergedEnv := mergeExecEnv(s.cfg.Envv, req.Env)
-	execPath, err := resolveGuestExecutable(sctxWithRoot, vfsObj, rootCreds, root, req.Argv[0], mergedEnv)
+	workDir := strings.TrimSpace(req.WorkDir)
+	if workDir == "" {
+		workDir = s.initialWorkingDir()
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return control.NewErrorf(control.CodeInvalidArgument, "working directory %q must be absolute", workDir)
+	}
+
+	execPath, err := resolveGuestExecutable(sctxWithRoot, vfsObj, rootCreds, root, req.Argv[0], workDir, mergedEnv)
 	if err != nil {
 		return control.NewError(control.CodeNotFound, err.Error())
 	}
@@ -271,14 +279,6 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	user, procCreds, err := s.resolveExecCredentials(sctxWithRoot, vfsObj, rootCreds, root, req.User, req.Privileged)
 	if err != nil {
 		return err
-	}
-
-	workDir := strings.TrimSpace(req.WorkDir)
-	if workDir == "" {
-		workDir = s.initialWorkingDir()
-	}
-	if !strings.HasPrefix(workDir, "/") {
-		return control.NewErrorf(control.CodeInvalidArgument, "working directory %q must be absolute", workDir)
 	}
 
 	ls, err := createSandboxLimitSet()
