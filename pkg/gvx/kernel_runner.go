@@ -209,6 +209,7 @@ func createSandboxLimitSet() (*limits.LimitSet, error) {
 func (s *Sandbox) setActiveKernel(k *kernel.Kernel, dog *watchdog.Watchdog) {
 	s.mu.Lock()
 	s.activeKernel = k
+	s.runningKernel = k
 	s.activeWatchdog = dog
 	s.mu.Unlock()
 	if s.kernelReady != nil {
@@ -222,6 +223,12 @@ func (s *Sandbox) clearActiveKernel() {
 	s.mu.Lock()
 	s.activeKernel = nil
 	s.activeWatchdog = nil
+	s.mu.Unlock()
+}
+
+func (s *Sandbox) clearRunningKernel() {
+	s.mu.Lock()
+	s.runningKernel = nil
 	s.mu.Unlock()
 }
 
@@ -291,7 +298,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}()
 	sctxWithRoot := vfs.WithRoot(sctx, root)
 
-	if err := s.setupKernelSubmountsAndFiles(sctxWithRoot, k.VFS(), creds, root); err != nil {
+	if err := s.setupKernelSubmountsAndFiles(ctx, sctxWithRoot, k.VFS(), creds, root); err != nil {
 		return 1, err
 	}
 	if err := s.startBootUnixForwards(ctx, k, creds, root, mntns); err != nil {
@@ -581,12 +588,14 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	s.setActiveKernel(k, dog)
 	if err := k.Start(); err != nil {
 		s.clearActiveKernel()
+		s.clearRunningKernel()
 		s.opMu.Unlock()
 		return 1, fmt.Errorf("%s: %w", startErrPrefix, err)
 	}
 	dog.Start()
 	s.opMu.Unlock()
 	defer dog.Stop()
+	defer s.clearRunningKernel()
 	defer s.clearActiveKernel()
 	s.emitEvent("sandbox", "started", nil)
 
@@ -595,6 +604,7 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 		select {
 		case <-ctx.Done():
 			s.unpauseForShutdown(k, dog)
+			s.abortExtensions()
 			s.closeRPCMounts()
 			s.closeUnixForwards()
 			_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
@@ -613,8 +623,9 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	s.closeUnixForwards()
 	s.ckptMu.Lock()
 	s.clearActiveKernel()
-	k.WaitExited()
 	s.ckptMu.Unlock()
+	k.WaitExited()
+	s.clearRunningKernel()
 	close(doneCh)
 	k.Pause()
 	s.emitEvent("sandbox", "exited", nil)

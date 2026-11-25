@@ -58,6 +58,9 @@ func (s *Sandbox) syscallFilter() func() error {
 		}
 		rules, denyRules := config.Rules(opt)
 		rules.Merge(embedderRules(s.cfg, hostDirs, len(s.volumes) > 0 || s.rootVolume != nil))
+		if len(s.extRecvMsgFDs) > 0 {
+			rules.Merge(extensionSeccompRules(s.extRecvMsgFDs))
+		}
 		if cgoBuild {
 			// The cgo rules of runsc allow clone3 for any flags, because runsc
 			// cannot return ENOSYS. Seccomp cannot read the flags of clone3,
@@ -298,6 +301,22 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 		rules.Add(unix.SYS_SENDTO, seccomp.MatchAll{})
 		rules.Add(unix.SYS_RECVFROM, seccomp.MatchAll{})
 	case NetModeNone:
+	}
+	return rules
+}
+
+// extensionSeccompRules allows SYS_RECVMSG pinned to each pre-opened extension
+// socketpair descriptor via seccomp.EqualTo. It never adds SYS_SENDMSG, because
+// seccomp cannot inspect SCM_RIGHTS payloads and must prevent descriptor leaks.
+func extensionSeccompRules(recvMsgFDs []int) seccomp.SyscallRules {
+	rules := seccomp.MakeSyscallRules(nil)
+	for _, fd := range recvMsgFDs {
+		if fd < 0 {
+			continue
+		}
+		rules.Add(unix.SYS_RECVMSG, seccomp.PerArg{
+			seccomp.EqualTo(uintptr(fd)),
+		})
 	}
 	return rules
 }

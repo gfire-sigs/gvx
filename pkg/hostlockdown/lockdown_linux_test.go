@@ -269,7 +269,7 @@ func TestLinuxApplyWithWorkspaceConfinesDirectoryDescriptorOpens(t *testing.T) {
 	}
 	defer unix.Close(rootFD)
 
-	// Start ensureSigM before Apply, matching cmd/rungv signal.NotifyContext.
+	// Start ensureSigM before Apply, matching cmd/rungvx signal.NotifyContext.
 	sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSig()
 	_ = sigCtx

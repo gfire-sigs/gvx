@@ -296,13 +296,13 @@ type Config struct {
 	// NetRaw lets the guest open raw IP sockets and use iptables, as the runsc
 	// flag --net-raw does. dockerd and its bridge network need it. A raw
 	// socket can send packets with any source address on the guest network,
-	// so the SDK default is off. The rungv CLI turns it on through its
+	// so the SDK default is off. The rungvx CLI turns it on through its
 	// --privileged flag, which is on by default.
 	NetRaw bool
 
 	// AllowPacketSocketWrite lets the guest send packets on AF_PACKET sockets.
 	// It needs NetRaw. The SDK default allows only reads, as in runsc. The
-	// rungv CLI turns it on through --privileged.
+	// rungvx CLI turns it on through --privileged.
 	AllowPacketSocketWrite bool
 
 	// PortForwards lists inbound host-to-guest port forwardings (-p host:guest).
@@ -441,7 +441,7 @@ type Config struct {
 	// AllowSUID makes the guest obey the set-user-ID and set-group-ID bits of
 	// executables, as the runsc flag --allow-suid does. sudo, su, and passwd
 	// need it when the guest user is not root. The SDK default ignores the
-	// bits. The rungv CLI turns it on through --privileged.
+	// bits. The rungvx CLI turns it on through --privileged.
 	AllowSUID bool
 
 	// Name is an optional container name that follows the Docker rule
@@ -549,6 +549,11 @@ type Config struct {
 	// the host process, so embedders that keep using the process for other
 	// work must set this field.
 	DisableHostLockdown bool
+
+	// Extensions lists optional host-backed sandbox extensions bound to this
+	// Sandbox instance before host lockdown. Core defines no global registry;
+	// every caller supplies extensions explicitly per sandbox.
+	Extensions []Extension
 }
 
 // defaultHostname is the guest hostname when Config.Hostname is empty.
@@ -670,7 +675,7 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 					return fmt.Errorf("%w: unix forward %q requires HostSocket or Dial", ErrInvalidConfig, uf.GuestPath)
 				}
 				if !c.DisableHostLockdown {
-					return fmt.Errorf("%w: unix forward %q without a pre-lockdown Dial callback is denied under host lockdown; use rungv --unix-forward, the net.unix_forward control RPC, or DisableHostLockdown", ErrInvalidConfig, uf.GuestPath)
+					return fmt.Errorf("%w: unix forward %q without a pre-lockdown Dial callback is denied under host lockdown; use rungvx --unix-forward, the net.unix_forward control RPC, or DisableHostLockdown", ErrInvalidConfig, uf.GuestPath)
 				}
 			}
 		}

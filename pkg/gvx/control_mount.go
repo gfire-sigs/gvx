@@ -370,10 +370,10 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 		if len(fds) > 0 {
 			if !slices.Contains(caps, control.CapMountBindAttach) {
 				if runtime.GOOS == "windows" {
-					return control.NewError(control.CodeUnsupported, "live hostfs bind attachment via SCM_RIGHTS is POSIX-only; use rungv mount serve or -lockdown=false")
+					return control.NewError(control.CodeUnsupported, "live hostfs bind attachment via SCM_RIGHTS is POSIX-only; use rungvx mount serve or -lockdown=false")
 				}
 				if locked && !s.cfg.AllowBindAttach {
-					return control.NewError(control.CodeLockdownDenied, "live hostfs bind attachment under host lockdown requires --allow-bind-attach; or use rungv mount serve")
+					return control.NewError(control.CodeLockdownDenied, "live hostfs bind attachment under host lockdown requires --allow-bind-attach; or use rungvx mount serve")
 				}
 				return control.NewError(control.CodeForbiddenByPolicy, "bind attachment is disabled by policy")
 			}
@@ -469,10 +469,10 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 
 		if locked {
 			if !s.cfg.AllowBindAttach {
-				return control.NewError(control.CodeLockdownDenied, "dynamic host bind mounts are denied under host lockdown; start with --allow-bind-attach, use rungv mount serve, or start with -lockdown=false")
+				return control.NewError(control.CodeLockdownDenied, "dynamic host bind mounts are denied under host lockdown; start with --allow-bind-attach, use rungvx mount serve, or start with -lockdown=false")
 			}
 			if runtime.GOOS == "windows" {
-				return control.NewError(control.CodeUnsupported, "live hostfs bind attach under lockdown is POSIX-only; use rungv mount serve or start with -lockdown=false")
+				return control.NewError(control.CodeUnsupported, "live hostfs bind attach under lockdown is POSIX-only; use rungvx mount serve or start with -lockdown=false")
 			}
 			return control.NewError(control.CodeInvalidArgument, "bind attach under host lockdown requires one SCM_RIGHTS directory file descriptor over a Unix control socket")
 		}

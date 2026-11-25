@@ -588,6 +588,9 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	if err := s.checkEphemeralCheckpointGuard(); err != nil {
 		return err
 	}
+	if err := s.checkExtensionCheckpointGuard(); err != nil {
+		return err
+	}
 	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
 	// deadlocks with executeActiveKernel.
 	s.mu.Lock()
@@ -627,6 +630,9 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	}()
 
 	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return err
+	}
+	if err := s.checkExtensionCheckpointGuard(); err != nil {
 		return err
 	}
 
@@ -868,6 +874,9 @@ func (s *Sandbox) checkpointStreamRun(
 	if err := s.checkEphemeralCheckpointGuard(); err != nil {
 		return err
 	}
+	if err := s.checkExtensionCheckpointGuard(); err != nil {
+		return err
+	}
 	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
 	// deadlocks with executeActiveKernel.
 	s.mu.Lock()
@@ -902,6 +911,9 @@ func (s *Sandbox) checkpointStreamRun(
 	}()
 
 	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return err
+	}
+	if err := s.checkExtensionCheckpointGuard(); err != nil {
 		return err
 	}
 

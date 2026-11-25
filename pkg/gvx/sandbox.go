@@ -32,12 +32,14 @@ import (
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/hostcerts"
+	"z.gfire.dev/gvx/pkg/gvx/shm"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/oci"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/sys"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -98,45 +100,55 @@ type Sandbox struct {
 	cleanCkptDir string
 	absCkptDir   string
 	// Lock order: opMu -> mountOpMu / ckptMu -> resourceMu -> mu -> execMu / rpcMountsMu.
-	opMu              sync.RWMutex
-	mountOpMu         sync.Mutex
-	ckptMu            sync.Mutex
-	resourceMu        sync.Mutex
-	kernelReady       chan struct{}
-	kernelReadyOnce   sync.Once
-	runDone           chan struct{}
-	runDoneOnce       sync.Once
-	activeKernel      *kernel.Kernel
-	activeWatchdog    *watchdog.Watchdog
-	checkpointStopped atomic.Bool
-	restoredKernel    *kernel.Kernel
-	restoredStdio     *restoreStdioCollector
-	detachDebugLog    func()
-	startedAt         time.Time
-	events            *eventHub
-	controlSrv        *control.Server
-	execMu            sync.Mutex
-	execReserved      int
-	execSessions      map[int32]*execSession
-	nextStdioMinor    atomic.Uint32
-	userPaused        bool
-	userPauseQuiesced bool
-	liveMemoryBytes   atomic.Int64
-	liveMemoryLimit   atomic.Uint64
-	liveMemoryIntNS   atomic.Int64
-	liveMemoryWake    chan struct{}
-	rpcMountsMu       sync.Mutex
-	rpcMounts         map[string]*rpcMountEntry
-	unixFwdMu         sync.Mutex
-	unixForwards      map[string]*activeUnixForward
-	pendingUnixConns  map[uint64]*pendingUnixConn
-	unixClosed        bool
-	unixCloseCh       chan struct{}
-	unixRelayWG       sync.WaitGroup
-	nextUnixConnID    atomic.Uint64
-	closed            bool
-	closeDone         chan struct{}
-	closeErr          error
+	opMu                 sync.RWMutex
+	mountOpMu            sync.Mutex
+	ckptMu               sync.Mutex
+	resourceMu           sync.Mutex
+	kernelReady          chan struct{}
+	kernelReadyOnce      sync.Once
+	runDone              chan struct{}
+	runDoneOnce          sync.Once
+	runStarted           bool
+	activeKernel         *kernel.Kernel
+	runningKernel        *kernel.Kernel
+	activeWatchdog       *watchdog.Watchdog
+	checkpointStopped    atomic.Bool
+	restoredKernel       *kernel.Kernel
+	restoredStdio        *restoreStdioCollector
+	detachDebugLog       func()
+	startedAt            time.Time
+	events               *eventHub
+	controlSrv           *control.Server
+	execMu               sync.Mutex
+	execReserved         int
+	execSessions         map[int32]*execSession
+	nextStdioMinor       atomic.Uint32
+	userPaused           bool
+	userPauseQuiesced    bool
+	liveMemoryBytes      atomic.Int64
+	liveMemoryLimit      atomic.Uint64
+	liveMemoryIntNS      atomic.Int64
+	liveMemoryWake       chan struct{}
+	rpcMountsMu          sync.Mutex
+	rpcMounts            map[string]*rpcMountEntry
+	unixFwdMu            sync.Mutex
+	unixForwards         map[string]*activeUnixForward
+	pendingUnixConns     map[uint64]*pendingUnixConn
+	unixClosed           bool
+	unixCloseCh          chan struct{}
+	unixRelayWG          sync.WaitGroup
+	nextUnixConnID       atomic.Uint64
+	shmImporter          *shm.Importer
+	boundExts            []boundExtEntry
+	extHelpers           []*HelperProcess
+	extRecvMsgFDs        []int
+	extSysfsTopologies   []sys.TopologyAddition
+	extCheckpointBlocked bool
+	extStopTimeout       time.Duration
+	closing              bool
+	closed               bool
+	closeDone            chan struct{}
+	closeErr             error
 }
 
 func (s *Sandbox) controlListener() net.Listener {
@@ -210,6 +222,9 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	if len(cfg.ServeMounts) > 0 {
 		return nil, fmt.Errorf("%w: ServeMounts is supported only with Restore", ErrInvalidConfig)
 	}
+	if err := validateConfigExtensions(cfg, false); err != nil {
+		return nil, err
+	}
 	applyHostMemoryDefaults()
 
 	sb := &Sandbox{
@@ -238,6 +253,10 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	sb.plat = opened.plat
 	sb.platName = opened.name
 	sb.fallbackFrom = opened.fallbackFrom
+
+	if err := sb.openExtensions(ctx); err != nil {
+		return cleanup(err)
+	}
 
 	if err := sb.initOCILayers(ctx); err != nil {
 		return cleanup(err)
@@ -274,6 +293,7 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 		if err != nil {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", err))
 		}
+		recordProcessExtensionLockdown(sb.extRecvMsgFDs)
 		sb.lockdown = st
 		installHostLockdownBridges()
 		if tb, ok := sb.plat.(interface{ SetThreadInit(func() error) }); ok {
@@ -645,6 +665,18 @@ func (s *Sandbox) Wait(ctx context.Context) (int, error) {
 // Run executes the configured Linux ELF64 binary or OCI container command
 // inside the Sentry kernel and returns its Linux exit code.
 func (s *Sandbox) Run(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return 1, ErrSandboxClosing
+	}
+	if s.runStarted {
+		s.mu.Unlock()
+		return 1, errRunConsumed
+	}
+	s.runStarted = true
+	s.mu.Unlock()
+
 	if s.portForwarder != nil && s.netStack != nil {
 		s.portForwarder.Start(s.netStack)
 	}
@@ -659,7 +691,7 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 // the hypervisor platform.
 func (s *Sandbox) Close() error {
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.closing {
 		done := s.closeDone
 		s.mu.Unlock()
 		if done != nil {
@@ -670,10 +702,20 @@ func (s *Sandbox) Close() error {
 		s.mu.Unlock()
 		return err
 	}
+	if len(s.boundExts) > 0 {
+		s.closing = true
+		done := make(chan struct{})
+		s.closeDone = done
+		stopTimeout := s.extStopTimeout
+		s.mu.Unlock()
+		return s.closeWithExtensions(done, stopTimeout)
+	}
+	s.closing = true
 	s.closed = true
 	done := make(chan struct{})
 	s.closeDone = done
 	defer func() {
+		s.closing = false
 		s.mu.Unlock()
 		close(done)
 	}()
@@ -776,6 +818,18 @@ func (s *Sandbox) Close() error {
 			}
 		}
 		s.plat = nil
+	}
+
+	if s.shmImporter != nil || len(s.extHelpers) > 0 {
+		imp := s.shmImporter
+		s.mu.Unlock()
+		if imp != nil {
+			imp.ReleaseAll()
+		}
+		if err := s.closeExtensionHelpers(); err != nil {
+			errs = append(errs, err)
+		}
+		s.mu.Lock()
 	}
 
 	if err := s.closeMounts(); err != nil {

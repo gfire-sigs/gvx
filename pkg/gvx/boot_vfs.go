@@ -16,6 +16,7 @@ package gvx
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"path"
 	"strings"
@@ -388,7 +389,7 @@ func ensureSharedExt4ReadOnly(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesys
 	return entry, nil
 }
 
-func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
+func (s *Sandbox) setupKernelSubmountsAndFiles(ctx context.Context, sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
 	if err := createDefaultGuestDirs(sctx, vfsObj, creds, root, s.rootUpperExisting); err != nil {
 		return err
 	}
@@ -406,7 +407,7 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 		}
 		return nil
 	}
-	if err := mountStandardSubfilesystems(sctx, vfsObj, creds, root, mountSubfs); err != nil {
+	if err := s.mountStandardSubfilesystems(ctx, sctx, vfsObj, creds, root, mountSubfs); err != nil {
 		return err
 	}
 	if err := populateDefaultEtcFiles(sctx, vfsObj, creds, root, s.guestResolvConf); err != nil {
@@ -462,21 +463,29 @@ func createDefaultGuestDirs(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 	return nil
 }
 
-func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
+func (s *Sandbox) mountStandardSubfilesystems(ctx context.Context, sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
 	dataOpts := func(data string) *vfs.MountOptions {
 		return &vfs.MountOptions{GetFilesystemOptions: vfs.GetFilesystemOptions{Data: data}}
 	}
-	for _, sub := range []struct {
-		target string
-		fsName string
-	}{
-		{"/proc", "proc"},
-		{"/sys", "sysfs"},
-		{"/dev", "devtmpfs"},
-	} {
-		if err := mountSubfs(sub.target, sub.fsName, dataOpts("")); err != nil {
-			return err
+	if err := mountSubfs("/proc", "proc", dataOpts("")); err != nil {
+		return err
+	}
+	sysOpts := dataOpts("")
+	if len(s.extSysfsTopologies) > 0 {
+		sysOpts.GetFilesystemOptions.InternalData = &sys.InternalData{
+			Topologies: s.extSysfsTopologies,
 		}
+	}
+	if err := mountSubfs("/sys", "sysfs", sysOpts); err != nil {
+		return err
+	}
+	// Attach extensions once per kernel immediately before mounting devtmpfs so
+	// character devices registered in AttachKernel appear in /dev on mount.
+	if err := s.attachKernelExtensions(ctx, vfsObj); err != nil {
+		return err
+	}
+	if err := mountSubfs("/dev", "devtmpfs", dataOpts("")); err != nil {
+		return err
 	}
 	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, "/dev/pts", 0o755); err != nil {
 		return fmt.Errorf("gvx: create guest directory /dev/pts: %w", err)

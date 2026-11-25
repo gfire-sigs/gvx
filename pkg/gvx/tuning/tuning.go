@@ -18,8 +18,8 @@
 // knob for. Linux limits do not belong here: the guest sets them through its
 // own sysctl files, module parameters, and netlink requests. Every entry has a
 // dotted name, a type, a default, a range, a unit, and a one-sentence
-// description. The Go SDK (gvx.Config.Tuning), the rungv flags (--tune and
-// --tune-file), "rungv tune list", and the table in docs/cli.md all come from
+// description. The Go SDK (gvx.Config.Tuning), the rungvx flags (--tune and
+// --tune-file), "rungvx tune list", and the table in docs/cli.md all come from
 // the same registry.
 //
 // A Values holds the settings of one sandbox. The zero value holds the

@@ -549,6 +549,12 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
 	}
+	if len(cfg.Extensions) > 0 {
+		if err := validateConfigExtensions(cfg, true); err != nil {
+			return nil, err
+		}
+		return nil, ErrCheckpointExtensionUnsupported
+	}
 	for _, cm := range cfg.Mounts {
 		if cm.Ephemeral {
 			return nil, fmt.Errorf("%w: ephemeral ext4lite volume at %q cannot be restored", ErrInvalidConfig, cm.GuestPath)

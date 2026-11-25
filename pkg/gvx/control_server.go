@@ -198,6 +198,10 @@ func supportsVolumeAttach(goos string, locked, allowVolumeAttach bool) bool {
 // or Sandbox.Close runs.
 func (s *Sandbox) ServeControl(ctx context.Context) error {
 	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return ErrSandboxClosing
+	}
 	ln := s.controlListener()
 	locked := s.lockdown.Applied
 	cfg := s.cfg
@@ -223,9 +227,9 @@ func (s *Sandbox) ServeControl(ctx context.Context) error {
 		Features:         features,
 	})
 	s.mu.Lock()
-	if s.closed {
+	if s.closing || s.closed {
 		s.mu.Unlock()
-		return nil
+		return ErrSandboxClosing
 	}
 	s.controlSrv = srv
 	s.mu.Unlock()
@@ -429,8 +433,10 @@ func mapControlErr(err error) error {
 	switch {
 	case errors.Is(err, ErrCheckpointExecActive):
 		return control.NewError(control.CodeExecActive, err.Error())
-	case errors.Is(err, ErrCheckpointEphemeralVolume):
+	case errors.Is(err, ErrCheckpointEphemeralVolume), errors.Is(err, ErrCheckpointExtensionUnsupported):
 		return control.NewError(control.CodeUnsupported, err.Error())
+	case errors.Is(err, ErrSandboxClosing):
+		return control.NewError(control.CodeSandboxExiting, err.Error())
 	case errors.Is(err, ErrCheckpointRPCFSActive), errors.Is(err, ErrCheckpointNATTunnelActive):
 		return control.NewError(control.CodeBusy, err.Error())
 	case errors.Is(err, ErrInvalidConfig):

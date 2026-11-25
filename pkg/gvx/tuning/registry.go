@@ -24,7 +24,7 @@ const (
 )
 
 // This block is the one table of tunables. Add a tunable here and nowhere
-// else: the SDK, the rungv flags, "rungv tune list", and the table in
+// else: the SDK, the rungvx flags, "rungvx tune list", and the table in
 // docs/cli.md follow. Run "go test ./pkg/gvx/tuning -run TestDocsMatchRegistry
 // -update" after a change. Do not add a limit that Linux controls through a
 // sysctl file, a module parameter, or a netlink request. The guest sets

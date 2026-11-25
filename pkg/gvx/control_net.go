@@ -183,7 +183,7 @@ func (s *Sandbox) handlePortAdd(_ context.Context, stream *control.Stream, raw j
 					}
 				} else {
 					if !canLoopback && !dynamicBindAddrAllowed(allowedAddrs, r.HostIP) {
-						return control.NewError(control.CodeLockdownDenied, "dynamic loopback port publishing is disabled under lockdown; start sandbox with --dynamic-ports or --auto-publish, or use rungv port-forward")
+						return control.NewError(control.CodeLockdownDenied, "dynamic loopback port publishing is disabled under lockdown; start sandbox with --dynamic-ports or --auto-publish, or use rungvx port-forward")
 					}
 					if !slices.Contains(caps, control.CapPortDynamicLoopback) && !slices.Contains(caps, control.CapPortAnyBind) {
 						return control.NewError(control.CodeForbiddenByPolicy, "dynamic loopback port publishing is disabled by control policy")

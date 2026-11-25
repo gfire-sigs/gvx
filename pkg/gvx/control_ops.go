@@ -118,6 +118,7 @@ func (s *Sandbox) handleInspect(_ context.Context, stream *control.Stream) error
 		ActiveExecSessions: s.activeExecCount(),
 		PIDCount:           pidCount,
 		Capabilities:       s.ControlCapabilities(),
+		Extensions:         s.inspectExtensions(),
 		StartedAt:          started.UTC(),
 		UptimeNanos:        time.Since(started).Nanoseconds(),
 	})
@@ -202,6 +203,7 @@ func (s *Sandbox) sampleStats(k *kernel.Kernel) control.StatsSample {
 			}
 		}
 	}
+	sample.Extensions = s.statsExtensions()
 	return sample
 }
 

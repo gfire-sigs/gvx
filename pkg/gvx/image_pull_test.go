@@ -108,7 +108,7 @@ func TestResolveRegistryImageFollowsThePullPolicy(t *testing.T) {
 				var se *oci.StatusError
 				return errors.As(err, &se) && se.StatusCode == 500
 			}},
-		{name: "always for rungv pull does not use the cache after 401", policy: PullAlways, cached: true, pullErr: statusErr(401), wantFetch: true,
+		{name: "always for rungvx pull does not use the cache after 401", policy: PullAlways, cached: true, pullErr: statusErr(401), wantFetch: true,
 			wantErr: func(err error) bool {
 				var se *oci.StatusError
 				return errors.As(err, &se) && se.StatusCode == 401
@@ -243,7 +243,7 @@ func TestResolveImageWithPolicyUsesALoadedImageWhenTheRegistryDeniesIt(t *testin
 			}
 
 			if _, err := ResolveImage(context.Background(), cache, baseURL, image, runtime.GOARCH); err == nil {
-				t.Errorf("ResolveImage with a denying registry succeeded, want the registry error for rungv pull")
+				t.Errorf("ResolveImage with a denying registry succeeded, want the registry error for rungvx pull")
 			}
 			uncached, err := NewLayerCache(t.TempDir())
 			if err != nil {

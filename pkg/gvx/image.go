@@ -133,6 +133,14 @@ func elfLayerTar(elfData []byte) ([]byte, error) {
 // reopens the same path, and the SameFile check rejects a path swapped
 // between the two opens.
 func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
+	if !s.hasLayerSource() {
+		if len(s.cfg.Argv) == 0 && (len(s.cfg.Cmd) > 0 || s.cfg.EntrypointSet) {
+			if err := s.applyImageDefaults(oci.RuntimeConfig{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	cache, err := NewLayerCacheWithTuning(s.cfg.OCICacheDir, s.cfg.Tuning)
 	if err != nil {
 		return err
@@ -310,7 +318,7 @@ func verifySameLayerFile(opened *os.File, path string) error {
 // unreachable, ResolveImage falls back to the image that an earlier pull
 // cached. It looks in the cache first. Without an override, it then looks in
 // the default host layer cache. ResolveImage always pulls first, as
-// rungv pull needs. Use ResolveImageWithPolicy to select another order.
+// rungvx pull needs. Use ResolveImageWithPolicy to select another order.
 func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, arch string) (*oci.ResolvedImage, error) {
 	return resolveImage(ctx, cache, baseURL, image, arch, pullOrder{policy: PullAlways}, oci.PullRegistryImage)
 }

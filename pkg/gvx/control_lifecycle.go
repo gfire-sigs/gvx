@@ -35,6 +35,12 @@ import (
 
 // Pause pauses all guest vCPUs/tasks and optionally quiesces host network traffic.
 func (s *Sandbox) Pause(ctx context.Context, quiesceNet bool) error {
+	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return ErrSandboxClosing
+	}
+	s.mu.Unlock()
 	// Wait for kernel startup before acquiring s.opMu to avoid AB-BA deadlocks
 	// with executeActiveKernel.
 	if _, _, err := s.activeKernelChecked(ctx); err != nil {
@@ -52,6 +58,10 @@ func (s *Sandbox) Pause(ctx context.Context, quiesceNet bool) error {
 	}
 
 	s.mu.Lock()
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return ErrSandboxClosing
+	}
 	if s.userPaused {
 		s.mu.Unlock()
 		return control.NewError(control.CodeAlreadyPaused, "sandbox is already paused")
@@ -212,6 +222,9 @@ func (s *Sandbox) handleCheckpoint(ctx context.Context, stream *control.Stream, 
 		return err
 	}
 	if err := s.checkEphemeralCheckpointGuard(); err != nil {
+		return mapControlErr(err)
+	}
+	if err := s.checkExtensionCheckpointGuard(); err != nil {
 		return mapControlErr(err)
 	}
 	if err := s.validateCheckpointDir(req.Dir); err != nil {

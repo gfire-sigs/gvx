@@ -828,13 +828,14 @@ type BlockStatsSample struct {
 
 // StatsSample is one point-in-time resource measurement.
 type StatsSample struct {
-	Timestamp time.Time          `json:"timestamp"`
-	CPU       CPUStatsSample     `json:"cpu"`
-	Memory    MemoryStatsSample  `json:"memory"`
-	Network   []NetStatsSample   `json:"network,omitempty"`
-	BlockIO   []BlockStatsSample `json:"block_io,omitempty"`
-	PIDs      int                `json:"pids"`
-	PIDsLimit int64              `json:"pids_limit"`
+	Timestamp  time.Time                  `json:"timestamp"`
+	CPU        CPUStatsSample             `json:"cpu"`
+	Memory     MemoryStatsSample          `json:"memory"`
+	Network    []NetStatsSample           `json:"network,omitempty"`
+	BlockIO    []BlockStatsSample         `json:"block_io,omitempty"`
+	PIDs       int                        `json:"pids"`
+	PIDsLimit  int64                      `json:"pids_limit"`
+	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
 }
 
 // KernelLogRequest configures MethodKernelLog.
@@ -878,25 +879,26 @@ type DebugLogLevelRequest struct {
 
 // InspectResponse describes a running sandbox.
 type InspectResponse struct {
-	ID                 string           `json:"id"`
-	Name               string           `json:"name,omitempty"`
-	State              string           `json:"state"`
-	Platform           string           `json:"platform"`
-	Architecture       string           `json:"architecture"`
-	SyscallIsolation   string           `json:"syscall_isolation"`
-	LockdownApplied    bool             `json:"lockdown_applied"`
-	NetworkMode        string           `json:"network_mode"`
-	Eth0IP             string           `json:"eth0_ip,omitempty"`
-	Eth0MTU            uint32           `json:"eth0_mtu,omitempty"`
-	Resources          ResourceSnapshot `json:"resources"`
-	MemoryUsedBytes    uint64           `json:"memory_used_bytes"`
-	Ports              []PortRuleInfo   `json:"ports,omitempty"`
-	DynamicBindAddrs   []string         `json:"dynamic_bind_addrs,omitempty"`
-	AutoPublishAddr    string           `json:"auto_publish_addr,omitempty"`
-	Mounts             []MountInfo      `json:"mounts,omitempty"`
-	ActiveExecSessions int              `json:"active_exec_sessions"`
-	PIDCount           int              `json:"pid_count"`
-	Capabilities       []string         `json:"capabilities"`
-	StartedAt          time.Time        `json:"started_at"`
-	UptimeNanos        int64            `json:"uptime_ns"`
+	ID                 string                     `json:"id"`
+	Name               string                     `json:"name,omitempty"`
+	State              string                     `json:"state"`
+	Platform           string                     `json:"platform"`
+	Architecture       string                     `json:"architecture"`
+	SyscallIsolation   string                     `json:"syscall_isolation"`
+	LockdownApplied    bool                       `json:"lockdown_applied"`
+	NetworkMode        string                     `json:"network_mode"`
+	Eth0IP             string                     `json:"eth0_ip,omitempty"`
+	Eth0MTU            uint32                     `json:"eth0_mtu,omitempty"`
+	Resources          ResourceSnapshot           `json:"resources"`
+	MemoryUsedBytes    uint64                     `json:"memory_used_bytes"`
+	Ports              []PortRuleInfo             `json:"ports,omitempty"`
+	DynamicBindAddrs   []string                   `json:"dynamic_bind_addrs,omitempty"`
+	AutoPublishAddr    string                     `json:"auto_publish_addr,omitempty"`
+	Mounts             []MountInfo                `json:"mounts,omitempty"`
+	ActiveExecSessions int                        `json:"active_exec_sessions"`
+	PIDCount           int                        `json:"pid_count"`
+	Capabilities       []string                   `json:"capabilities"`
+	Extensions         map[string]json.RawMessage `json:"extensions,omitempty"`
+	StartedAt          time.Time                  `json:"started_at"`
+	UptimeNanos        int64                      `json:"uptime_ns"`
 }
