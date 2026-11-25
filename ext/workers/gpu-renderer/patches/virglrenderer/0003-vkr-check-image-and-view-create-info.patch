@@ -1,0 +1,2033 @@
+From 596b3af961fc7c3e7bf59e44a1ce4cadad0b8294 Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 12:46:40 +0900
+Subject: [PATCH] vkr: add tests of image, image view, and buffer view create
+ info
+
+The Vulkan specification makes the application responsible for valid
+usage, and vkr gives the create info of the guest to the host driver
+as it is. A driver on top of Metal turns that create info into Metal
+descriptors. Metal does a validation of each descriptor in every
+process and stops the process when a descriptor is not valid. The
+guest is not trusted, so one guest command must not stop the renderer.
+
+Add vkr_validate.c with tests of the valid usage rules that control
+the content of those descriptors. vkr does the tests before it calls
+the driver:
+
+- Image create info (vkCreateImage and the three vkGetDeviceImage*
+  commands): type, extent, mip level count, layer count, sample count,
+  create flags, and the even extent of 4:2:0 and 4:2:2 formats. Then
+  the image creation limits that the driver gives through
+  vkGetPhysicalDeviceImageFormatProperties2.
+- vkCreateImageView: view type, level range, layer range, aspects,
+  plane, component swizzle, format, slices, and usage. vkr_image keeps
+  the create info of the image and the planes that have memory.
+- vkCreateBuffer and vkGetDeviceBufferMemoryRequirements: size.
+- vkCreateBufferView: range, format, element count, usage, and offset
+  alignment. vkr_buffer keeps the size and the usage of the buffer and
+  records that it has memory.
+- vkBindImageMemory, vkBindBufferMemory, the image memory requirement
+  commands, and the image subresource layout commands: the image, the
+  buffer, the memory, the plane, and the subresource.
+
+vkr_format_table.h gives the compatibility class, the texel block
+size, and the plane formats of each format. A script of gvx
+(scripts/gpu/gen_vkr_format_table.py) writes it from vk.xml of
+venus-protocol.
+
+A command with a result returns VK_ERROR_VALIDATION_FAILED. A command
+without a result stops the context. Each refusal writes one warning,
+up to a fixed number of lines.
+
+Also add a workaround for KosmicKrisp (Mesa 26.3). For a 3D image
+with VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT or
+VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT, the driver makes a second
+Metal texture of type 2D array with the mip level count of the 3D
+image. A valid 3D image can have more levels than a 2D texture of its
+width and height (1x1x8 with 4 levels), and Metal then stops the
+process in vkBindImageMemory. ANGLE sets the flag on each 3D texture,
+so the WebGL conformance page
+conformance2/textures/misc/tex-storage-and-subimage-3d.html stopped
+the renderer. For such an image, vkr removes the two flags and then
+refuses 2D views of that image.
+---
+ src/meson.build                 |   1 +
+ src/venus/vkr_buffer.c          |  81 ++-
+ src/venus/vkr_buffer.h          |   6 +
+ src/venus/vkr_format_table.h    | 363 +++++++++++++
+ src/venus/vkr_image.c           | 183 ++++++-
+ src/venus/vkr_image.h           |   8 +
+ src/venus/vkr_physical_device.c |  44 ++
+ src/venus/vkr_physical_device.h |  20 +
+ src/venus/vkr_validate.c        | 866 ++++++++++++++++++++++++++++++++
+ src/venus/vkr_validate.h        | 106 ++++
+ 10 files changed, 1666 insertions(+), 12 deletions(-)
+ create mode 100644 src/venus/vkr_format_table.h
+ create mode 100644 src/venus/vkr_validate.c
+ create mode 100644 src/venus/vkr_validate.h
+
+diff --git a/src/meson.build b/src/meson.build
+index 1603fef..2a01187 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -93,6 +93,7 @@ venus_sources = [
+    'venus/vkr_renderer.c',
+    'venus/vkr_ring.c',
+    'venus/vkr_transport.c',
++   'venus/vkr_validate.c',
+ ]
+ 
+ venus_codegen = custom_target(
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index bba1f6a..421ae58 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -7,6 +7,7 @@
+ 
+ #include "vkr_buffer_gen.h"
+ #include "vkr_physical_device.h"
++#include "vkr_validate.h"
+ 
+ static void
+ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+@@ -37,7 +38,21 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
+-   vkr_buffer_create_and_add(dispatch->data, args);
++   /* a driver gives this result for a size that is more than its limit */
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   const VkBufferCreateInfo *info = args->pCreateInfo;
++   if (!vkr_validate_buffer_create_info(dev->physical_device, info)) {
++      args->ret = info && info->size ? VK_ERROR_OUT_OF_DEVICE_MEMORY
++                                     : VK_ERROR_VALIDATION_FAILED;
++      return;
++   }
++
++   /* set the info before a command of a different ring can find the buffer */
++   struct vkr_buffer *buf = vkr_buffer_create(dispatch->data, args);
++   if (!buf)
++      return;
++   vkr_buffer_info_init(&buf->info, info);
++   vkr_device_add_object(dispatch->data, dev, &buf->base);
+ }
+ 
+ static void
+@@ -49,12 +64,17 @@ vkr_dispatch_vkDestroyBuffer(struct vn_dispatch_context *dispatch,
+ 
+ static void
+ vkr_dispatch_vkGetBufferMemoryRequirements(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetBufferMemoryRequirements *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!args->buffer) {
++      vkr_context_set_fatal(dispatch->data);
++      return;
++   }
++
+    vn_replace_vkGetBufferMemoryRequirements_args_handle(args);
+    vk->GetBufferMemoryRequirements(args->device, args->buffer, args->pMemoryRequirements);
+    vkr_physical_device_mem_type_spoof(dev->physical_device,
+@@ -63,12 +83,17 @@ vkr_dispatch_vkGetBufferMemoryRequirements(
+ 
+ static void
+ vkr_dispatch_vkGetBufferMemoryRequirements2(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetBufferMemoryRequirements2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!args->pInfo || !args->pInfo->buffer) {
++      vkr_context_set_fatal(dispatch->data);
++      return;
++   }
++
+    vn_replace_vkGetBufferMemoryRequirements2_args_handle(args);
+    vk->GetBufferMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+    vkr_physical_device_mem_type_spoof(
+@@ -83,9 +108,17 @@ vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   struct vkr_buffer *buf = vkr_buffer_from_handle(args->buffer);
++   if (!vkr_validate_bind(buf != NULL, args->memory != VK_NULL_HANDLE)) {
++      args->ret = VK_ERROR_VALIDATION_FAILED;
++      return;
++   }
++
+    vn_replace_vkBindBufferMemory_args_handle(args);
+    args->ret =
+       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
++   if (args->ret == VK_SUCCESS)
++      atomic_store(&buf->memory_bound, true);
+ }
+ 
+ static void
+@@ -95,8 +128,32 @@ vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   STACK_ARRAY(struct vkr_buffer *, bufs, args->bindInfoCount);
++   if (!bufs) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
++
++   bool ok = args->pBindInfos || !args->bindInfoCount;
++   for (uint32_t i = 0; ok && i < args->bindInfoCount; i++) {
++      const VkBindBufferMemoryInfo *info = &args->pBindInfos[i];
++
++      bufs[i] = vkr_buffer_from_handle(info->buffer);
++      ok = vkr_validate_bind(bufs[i] != NULL, info->memory != VK_NULL_HANDLE);
++   }
++   if (!ok) {
++      args->ret = VK_ERROR_VALIDATION_FAILED;
++      STACK_ARRAY_FINISH(bufs);
++      return;
++   }
++
+    vn_replace_vkBindBufferMemory2_args_handle(args);
+    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
++   if (args->ret == VK_SUCCESS) {
++      for (uint32_t i = 0; i < args->bindInfoCount; i++)
++         atomic_store(&bufs[i]->memory_bound, true);
++   }
++   STACK_ARRAY_FINISH(bufs);
+ }
+ 
+ static void
+@@ -126,6 +183,16 @@ static void
+ vkr_dispatch_vkCreateBufferView(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkCreateBufferView *args)
+ {
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   const VkBufferViewCreateInfo *info = args->pCreateInfo;
++   struct vkr_buffer *buf = info ? vkr_buffer_from_handle(info->buffer) : NULL;
++   if (!vkr_validate_buffer_view_create_info(
++          dev->physical_device, buf ? &buf->info : NULL,
++          buf ? atomic_load(&buf->memory_bound) : false, info)) {
++      args->ret = VK_ERROR_VALIDATION_FAILED;
++      return;
++   }
++
+    vkr_buffer_view_create_and_add(dispatch->data, args);
+ }
+ 
+@@ -138,12 +205,18 @@ vkr_dispatch_vkDestroyBufferView(struct vn_dispatch_context *dispatch,
+ 
+ static void
+ vkr_dispatch_vkGetDeviceBufferMemoryRequirements(
+-   UNUSED struct vn_dispatch_context *ctx,
++   struct vn_dispatch_context *ctx,
+    struct vn_command_vkGetDeviceBufferMemoryRequirements *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!args->pInfo ||
++       !vkr_validate_buffer_create_info(dev->physical_device, args->pInfo->pCreateInfo)) {
++      vkr_context_set_fatal(ctx->data);
++      return;
++   }
++
+    vn_replace_vkGetDeviceBufferMemoryRequirements_args_handle(args);
+    vk->GetDeviceBufferMemoryRequirements(args->device, args->pInfo,
+                                          args->pMemoryRequirements);
+diff --git a/src/venus/vkr_buffer.h b/src/venus/vkr_buffer.h
+index d1575b5..825ad0b 100644
+--- a/src/venus/vkr_buffer.h
++++ b/src/venus/vkr_buffer.h
+@@ -8,8 +8,14 @@
+ 
+ #include "vkr_common.h"
+ 
++#include "vkr_validate.h"
++
+ struct vkr_buffer {
+    struct vkr_object base;
++
++   /* for the tests of the buffer views of the buffer */
++   struct vkr_buffer_info info;
++   atomic_bool memory_bound;
+ };
+ VKR_DEFINE_OBJECT_CAST(buffer, VK_OBJECT_TYPE_BUFFER, VkBuffer)
+ 
+diff --git a/src/venus/vkr_format_table.h b/src/venus/vkr_format_table.h
+new file mode 100644
+index 0000000..4a1ad6a
+--- /dev/null
++++ b/src/venus/vkr_format_table.h
+@@ -0,0 +1,363 @@
++/*
++ * Copyright 2026 The gVisor Authors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* This file is generated by scripts/gpu/gen_vkr_format_table.py of gvx from
++ * xmls/vk.xml of venus-protocol.  Do not edit.
++ */
++
++#ifndef VKR_FORMAT_TABLE_H
++#define VKR_FORMAT_TABLE_H
++
++#include <stdint.h>
++
++#define VKR_FORMAT_FLAG_COMPRESSED 1u
++#define VKR_FORMAT_FLAG_CHROMA_420 2u
++#define VKR_FORMAT_FLAG_CHROMA_422 4u
++
++struct vkr_format_entry {
++   uint32_t format;
++   uint16_t class_id;   /* formats of one compatibility class have one id */
++   uint8_t block_size;  /* bytes of a texel block; 0 for a multi-planar format */
++   uint8_t flags;
++   uint8_t plane_count; /* 0 for a format that is not multi-planar */
++};
++
++/* sorted by format */
++static const struct vkr_format_entry vkr_format_table[] = {
++   { 1u, 1, 1, 0, 0 }, /* R4G4_UNORM_PACK8 */
++   { 2u, 2, 2, 0, 0 }, /* R4G4B4A4_UNORM_PACK16 */
++   { 3u, 2, 2, 0, 0 }, /* B4G4R4A4_UNORM_PACK16 */
++   { 4u, 2, 2, 0, 0 }, /* R5G6B5_UNORM_PACK16 */
++   { 5u, 2, 2, 0, 0 }, /* B5G6R5_UNORM_PACK16 */
++   { 6u, 2, 2, 0, 0 }, /* R5G5B5A1_UNORM_PACK16 */
++   { 7u, 2, 2, 0, 0 }, /* B5G5R5A1_UNORM_PACK16 */
++   { 8u, 2, 2, 0, 0 }, /* A1R5G5B5_UNORM_PACK16 */
++   { 9u, 1, 1, 0, 0 }, /* R8_UNORM */
++   { 10u, 1, 1, 0, 0 }, /* R8_SNORM */
++   { 11u, 1, 1, 0, 0 }, /* R8_USCALED */
++   { 12u, 1, 1, 0, 0 }, /* R8_SSCALED */
++   { 13u, 1, 1, 0, 0 }, /* R8_UINT */
++   { 14u, 1, 1, 0, 0 }, /* R8_SINT */
++   { 15u, 1, 1, 0, 0 }, /* R8_SRGB */
++   { 16u, 2, 2, 0, 0 }, /* R8G8_UNORM */
++   { 17u, 2, 2, 0, 0 }, /* R8G8_SNORM */
++   { 18u, 2, 2, 0, 0 }, /* R8G8_USCALED */
++   { 19u, 2, 2, 0, 0 }, /* R8G8_SSCALED */
++   { 20u, 2, 2, 0, 0 }, /* R8G8_UINT */
++   { 21u, 2, 2, 0, 0 }, /* R8G8_SINT */
++   { 22u, 2, 2, 0, 0 }, /* R8G8_SRGB */
++   { 23u, 4, 3, 0, 0 }, /* R8G8B8_UNORM */
++   { 24u, 4, 3, 0, 0 }, /* R8G8B8_SNORM */
++   { 25u, 4, 3, 0, 0 }, /* R8G8B8_USCALED */
++   { 26u, 4, 3, 0, 0 }, /* R8G8B8_SSCALED */
++   { 27u, 4, 3, 0, 0 }, /* R8G8B8_UINT */
++   { 28u, 4, 3, 0, 0 }, /* R8G8B8_SINT */
++   { 29u, 4, 3, 0, 0 }, /* R8G8B8_SRGB */
++   { 30u, 4, 3, 0, 0 }, /* B8G8R8_UNORM */
++   { 31u, 4, 3, 0, 0 }, /* B8G8R8_SNORM */
++   { 32u, 4, 3, 0, 0 }, /* B8G8R8_USCALED */
++   { 33u, 4, 3, 0, 0 }, /* B8G8R8_SSCALED */
++   { 34u, 4, 3, 0, 0 }, /* B8G8R8_UINT */
++   { 35u, 4, 3, 0, 0 }, /* B8G8R8_SINT */
++   { 36u, 4, 3, 0, 0 }, /* B8G8R8_SRGB */
++   { 37u, 5, 4, 0, 0 }, /* R8G8B8A8_UNORM */
++   { 38u, 5, 4, 0, 0 }, /* R8G8B8A8_SNORM */
++   { 39u, 5, 4, 0, 0 }, /* R8G8B8A8_USCALED */
++   { 40u, 5, 4, 0, 0 }, /* R8G8B8A8_SSCALED */
++   { 41u, 5, 4, 0, 0 }, /* R8G8B8A8_UINT */
++   { 42u, 5, 4, 0, 0 }, /* R8G8B8A8_SINT */
++   { 43u, 5, 4, 0, 0 }, /* R8G8B8A8_SRGB */
++   { 44u, 5, 4, 0, 0 }, /* B8G8R8A8_UNORM */
++   { 45u, 5, 4, 0, 0 }, /* B8G8R8A8_SNORM */
++   { 46u, 5, 4, 0, 0 }, /* B8G8R8A8_USCALED */
++   { 47u, 5, 4, 0, 0 }, /* B8G8R8A8_SSCALED */
++   { 48u, 5, 4, 0, 0 }, /* B8G8R8A8_UINT */
++   { 49u, 5, 4, 0, 0 }, /* B8G8R8A8_SINT */
++   { 50u, 5, 4, 0, 0 }, /* B8G8R8A8_SRGB */
++   { 51u, 5, 4, 0, 0 }, /* A8B8G8R8_UNORM_PACK32 */
++   { 52u, 5, 4, 0, 0 }, /* A8B8G8R8_SNORM_PACK32 */
++   { 53u, 5, 4, 0, 0 }, /* A8B8G8R8_USCALED_PACK32 */
++   { 54u, 5, 4, 0, 0 }, /* A8B8G8R8_SSCALED_PACK32 */
++   { 55u, 5, 4, 0, 0 }, /* A8B8G8R8_UINT_PACK32 */
++   { 56u, 5, 4, 0, 0 }, /* A8B8G8R8_SINT_PACK32 */
++   { 57u, 5, 4, 0, 0 }, /* A8B8G8R8_SRGB_PACK32 */
++   { 58u, 5, 4, 0, 0 }, /* A2R10G10B10_UNORM_PACK32 */
++   { 59u, 5, 4, 0, 0 }, /* A2R10G10B10_SNORM_PACK32 */
++   { 60u, 5, 4, 0, 0 }, /* A2R10G10B10_USCALED_PACK32 */
++   { 61u, 5, 4, 0, 0 }, /* A2R10G10B10_SSCALED_PACK32 */
++   { 62u, 5, 4, 0, 0 }, /* A2R10G10B10_UINT_PACK32 */
++   { 63u, 5, 4, 0, 0 }, /* A2R10G10B10_SINT_PACK32 */
++   { 64u, 5, 4, 0, 0 }, /* A2B10G10R10_UNORM_PACK32 */
++   { 65u, 5, 4, 0, 0 }, /* A2B10G10R10_SNORM_PACK32 */
++   { 66u, 5, 4, 0, 0 }, /* A2B10G10R10_USCALED_PACK32 */
++   { 67u, 5, 4, 0, 0 }, /* A2B10G10R10_SSCALED_PACK32 */
++   { 68u, 5, 4, 0, 0 }, /* A2B10G10R10_UINT_PACK32 */
++   { 69u, 5, 4, 0, 0 }, /* A2B10G10R10_SINT_PACK32 */
++   { 70u, 2, 2, 0, 0 }, /* R16_UNORM */
++   { 71u, 2, 2, 0, 0 }, /* R16_SNORM */
++   { 72u, 2, 2, 0, 0 }, /* R16_USCALED */
++   { 73u, 2, 2, 0, 0 }, /* R16_SSCALED */
++   { 74u, 2, 2, 0, 0 }, /* R16_UINT */
++   { 75u, 2, 2, 0, 0 }, /* R16_SINT */
++   { 76u, 2, 2, 0, 0 }, /* R16_SFLOAT */
++   { 77u, 5, 4, 0, 0 }, /* R16G16_UNORM */
++   { 78u, 5, 4, 0, 0 }, /* R16G16_SNORM */
++   { 79u, 5, 4, 0, 0 }, /* R16G16_USCALED */
++   { 80u, 5, 4, 0, 0 }, /* R16G16_SSCALED */
++   { 81u, 5, 4, 0, 0 }, /* R16G16_UINT */
++   { 82u, 5, 4, 0, 0 }, /* R16G16_SINT */
++   { 83u, 5, 4, 0, 0 }, /* R16G16_SFLOAT */
++   { 84u, 6, 6, 0, 0 }, /* R16G16B16_UNORM */
++   { 85u, 6, 6, 0, 0 }, /* R16G16B16_SNORM */
++   { 86u, 6, 6, 0, 0 }, /* R16G16B16_USCALED */
++   { 87u, 6, 6, 0, 0 }, /* R16G16B16_SSCALED */
++   { 88u, 6, 6, 0, 0 }, /* R16G16B16_UINT */
++   { 89u, 6, 6, 0, 0 }, /* R16G16B16_SINT */
++   { 90u, 6, 6, 0, 0 }, /* R16G16B16_SFLOAT */
++   { 91u, 7, 8, 0, 0 }, /* R16G16B16A16_UNORM */
++   { 92u, 7, 8, 0, 0 }, /* R16G16B16A16_SNORM */
++   { 93u, 7, 8, 0, 0 }, /* R16G16B16A16_USCALED */
++   { 94u, 7, 8, 0, 0 }, /* R16G16B16A16_SSCALED */
++   { 95u, 7, 8, 0, 0 }, /* R16G16B16A16_UINT */
++   { 96u, 7, 8, 0, 0 }, /* R16G16B16A16_SINT */
++   { 97u, 7, 8, 0, 0 }, /* R16G16B16A16_SFLOAT */
++   { 98u, 5, 4, 0, 0 }, /* R32_UINT */
++   { 99u, 5, 4, 0, 0 }, /* R32_SINT */
++   { 100u, 5, 4, 0, 0 }, /* R32_SFLOAT */
++   { 101u, 7, 8, 0, 0 }, /* R32G32_UINT */
++   { 102u, 7, 8, 0, 0 }, /* R32G32_SINT */
++   { 103u, 7, 8, 0, 0 }, /* R32G32_SFLOAT */
++   { 104u, 8, 12, 0, 0 }, /* R32G32B32_UINT */
++   { 105u, 8, 12, 0, 0 }, /* R32G32B32_SINT */
++   { 106u, 8, 12, 0, 0 }, /* R32G32B32_SFLOAT */
++   { 107u, 9, 16, 0, 0 }, /* R32G32B32A32_UINT */
++   { 108u, 9, 16, 0, 0 }, /* R32G32B32A32_SINT */
++   { 109u, 9, 16, 0, 0 }, /* R32G32B32A32_SFLOAT */
++   { 110u, 7, 8, 0, 0 }, /* R64_UINT */
++   { 111u, 7, 8, 0, 0 }, /* R64_SINT */
++   { 112u, 7, 8, 0, 0 }, /* R64_SFLOAT */
++   { 113u, 9, 16, 0, 0 }, /* R64G64_UINT */
++   { 114u, 9, 16, 0, 0 }, /* R64G64_SINT */
++   { 115u, 9, 16, 0, 0 }, /* R64G64_SFLOAT */
++   { 116u, 10, 24, 0, 0 }, /* R64G64B64_UINT */
++   { 117u, 10, 24, 0, 0 }, /* R64G64B64_SINT */
++   { 118u, 10, 24, 0, 0 }, /* R64G64B64_SFLOAT */
++   { 119u, 11, 32, 0, 0 }, /* R64G64B64A64_UINT */
++   { 120u, 11, 32, 0, 0 }, /* R64G64B64A64_SINT */
++   { 121u, 11, 32, 0, 0 }, /* R64G64B64A64_SFLOAT */
++   { 122u, 5, 4, 0, 0 }, /* B10G11R11_UFLOAT_PACK32 */
++   { 123u, 5, 4, 0, 0 }, /* E5B9G9R9_UFLOAT_PACK32 */
++   { 124u, 12, 2, 0, 0 }, /* D16_UNORM */
++   { 125u, 13, 4, 0, 0 }, /* X8_D24_UNORM_PACK32 */
++   { 126u, 14, 4, 0, 0 }, /* D32_SFLOAT */
++   { 127u, 15, 1, 0, 0 }, /* S8_UINT */
++   { 128u, 16, 3, 0, 0 }, /* D16_UNORM_S8_UINT */
++   { 129u, 17, 4, 0, 0 }, /* D24_UNORM_S8_UINT */
++   { 130u, 18, 5, 0, 0 }, /* D32_SFLOAT_S8_UINT */
++   { 131u, 19, 8, 1, 0 }, /* BC1_RGB_UNORM_BLOCK */
++   { 132u, 19, 8, 1, 0 }, /* BC1_RGB_SRGB_BLOCK */
++   { 133u, 20, 8, 1, 0 }, /* BC1_RGBA_UNORM_BLOCK */
++   { 134u, 20, 8, 1, 0 }, /* BC1_RGBA_SRGB_BLOCK */
++   { 135u, 21, 16, 1, 0 }, /* BC2_UNORM_BLOCK */
++   { 136u, 21, 16, 1, 0 }, /* BC2_SRGB_BLOCK */
++   { 137u, 22, 16, 1, 0 }, /* BC3_UNORM_BLOCK */
++   { 138u, 22, 16, 1, 0 }, /* BC3_SRGB_BLOCK */
++   { 139u, 23, 8, 1, 0 }, /* BC4_UNORM_BLOCK */
++   { 140u, 23, 8, 1, 0 }, /* BC4_SNORM_BLOCK */
++   { 141u, 24, 16, 1, 0 }, /* BC5_UNORM_BLOCK */
++   { 142u, 24, 16, 1, 0 }, /* BC5_SNORM_BLOCK */
++   { 143u, 25, 16, 1, 0 }, /* BC6H_UFLOAT_BLOCK */
++   { 144u, 25, 16, 1, 0 }, /* BC6H_SFLOAT_BLOCK */
++   { 145u, 26, 16, 1, 0 }, /* BC7_UNORM_BLOCK */
++   { 146u, 26, 16, 1, 0 }, /* BC7_SRGB_BLOCK */
++   { 147u, 27, 8, 1, 0 }, /* ETC2_R8G8B8_UNORM_BLOCK */
++   { 148u, 27, 8, 1, 0 }, /* ETC2_R8G8B8_SRGB_BLOCK */
++   { 149u, 28, 8, 1, 0 }, /* ETC2_R8G8B8A1_UNORM_BLOCK */
++   { 150u, 28, 8, 1, 0 }, /* ETC2_R8G8B8A1_SRGB_BLOCK */
++   { 151u, 29, 16, 1, 0 }, /* ETC2_R8G8B8A8_UNORM_BLOCK */
++   { 152u, 29, 16, 1, 0 }, /* ETC2_R8G8B8A8_SRGB_BLOCK */
++   { 153u, 30, 8, 1, 0 }, /* EAC_R11_UNORM_BLOCK */
++   { 154u, 30, 8, 1, 0 }, /* EAC_R11_SNORM_BLOCK */
++   { 155u, 31, 16, 1, 0 }, /* EAC_R11G11_UNORM_BLOCK */
++   { 156u, 31, 16, 1, 0 }, /* EAC_R11G11_SNORM_BLOCK */
++   { 157u, 32, 16, 1, 0 }, /* ASTC_4x4_UNORM_BLOCK */
++   { 158u, 32, 16, 1, 0 }, /* ASTC_4x4_SRGB_BLOCK */
++   { 159u, 33, 16, 1, 0 }, /* ASTC_5x4_UNORM_BLOCK */
++   { 160u, 33, 16, 1, 0 }, /* ASTC_5x4_SRGB_BLOCK */
++   { 161u, 34, 16, 1, 0 }, /* ASTC_5x5_UNORM_BLOCK */
++   { 162u, 34, 16, 1, 0 }, /* ASTC_5x5_SRGB_BLOCK */
++   { 163u, 35, 16, 1, 0 }, /* ASTC_6x5_UNORM_BLOCK */
++   { 164u, 35, 16, 1, 0 }, /* ASTC_6x5_SRGB_BLOCK */
++   { 165u, 36, 16, 1, 0 }, /* ASTC_6x6_UNORM_BLOCK */
++   { 166u, 36, 16, 1, 0 }, /* ASTC_6x6_SRGB_BLOCK */
++   { 167u, 37, 16, 1, 0 }, /* ASTC_8x5_UNORM_BLOCK */
++   { 168u, 37, 16, 1, 0 }, /* ASTC_8x5_SRGB_BLOCK */
++   { 169u, 38, 16, 1, 0 }, /* ASTC_8x6_UNORM_BLOCK */
++   { 170u, 38, 16, 1, 0 }, /* ASTC_8x6_SRGB_BLOCK */
++   { 171u, 39, 16, 1, 0 }, /* ASTC_8x8_UNORM_BLOCK */
++   { 172u, 39, 16, 1, 0 }, /* ASTC_8x8_SRGB_BLOCK */
++   { 173u, 40, 16, 1, 0 }, /* ASTC_10x5_UNORM_BLOCK */
++   { 174u, 40, 16, 1, 0 }, /* ASTC_10x5_SRGB_BLOCK */
++   { 175u, 41, 16, 1, 0 }, /* ASTC_10x6_UNORM_BLOCK */
++   { 176u, 41, 16, 1, 0 }, /* ASTC_10x6_SRGB_BLOCK */
++   { 177u, 42, 16, 1, 0 }, /* ASTC_10x8_UNORM_BLOCK */
++   { 178u, 42, 16, 1, 0 }, /* ASTC_10x8_SRGB_BLOCK */
++   { 179u, 43, 16, 1, 0 }, /* ASTC_10x10_UNORM_BLOCK */
++   { 180u, 43, 16, 1, 0 }, /* ASTC_10x10_SRGB_BLOCK */
++   { 181u, 44, 16, 1, 0 }, /* ASTC_12x10_UNORM_BLOCK */
++   { 182u, 44, 16, 1, 0 }, /* ASTC_12x10_SRGB_BLOCK */
++   { 183u, 45, 16, 1, 0 }, /* ASTC_12x12_UNORM_BLOCK */
++   { 184u, 45, 16, 1, 0 }, /* ASTC_12x12_SRGB_BLOCK */
++   { 1000054000u, 76, 8, 1, 0 }, /* PVRTC1_2BPP_UNORM_BLOCK_IMG */
++   { 1000054001u, 77, 8, 1, 0 }, /* PVRTC1_4BPP_UNORM_BLOCK_IMG */
++   { 1000054002u, 78, 8, 1, 0 }, /* PVRTC2_2BPP_UNORM_BLOCK_IMG */
++   { 1000054003u, 79, 8, 1, 0 }, /* PVRTC2_4BPP_UNORM_BLOCK_IMG */
++   { 1000054004u, 76, 8, 1, 0 }, /* PVRTC1_2BPP_SRGB_BLOCK_IMG */
++   { 1000054005u, 77, 8, 1, 0 }, /* PVRTC1_4BPP_SRGB_BLOCK_IMG */
++   { 1000054006u, 78, 8, 1, 0 }, /* PVRTC2_2BPP_SRGB_BLOCK_IMG */
++   { 1000054007u, 79, 8, 1, 0 }, /* PVRTC2_4BPP_SRGB_BLOCK_IMG */
++   { 1000066000u, 32, 16, 1, 0 }, /* ASTC_4x4_SFLOAT_BLOCK */
++   { 1000066001u, 33, 16, 1, 0 }, /* ASTC_5x4_SFLOAT_BLOCK */
++   { 1000066002u, 34, 16, 1, 0 }, /* ASTC_5x5_SFLOAT_BLOCK */
++   { 1000066003u, 35, 16, 1, 0 }, /* ASTC_6x5_SFLOAT_BLOCK */
++   { 1000066004u, 36, 16, 1, 0 }, /* ASTC_6x6_SFLOAT_BLOCK */
++   { 1000066005u, 37, 16, 1, 0 }, /* ASTC_8x5_SFLOAT_BLOCK */
++   { 1000066006u, 38, 16, 1, 0 }, /* ASTC_8x6_SFLOAT_BLOCK */
++   { 1000066007u, 39, 16, 1, 0 }, /* ASTC_8x8_SFLOAT_BLOCK */
++   { 1000066008u, 40, 16, 1, 0 }, /* ASTC_10x5_SFLOAT_BLOCK */
++   { 1000066009u, 41, 16, 1, 0 }, /* ASTC_10x6_SFLOAT_BLOCK */
++   { 1000066010u, 42, 16, 1, 0 }, /* ASTC_10x8_SFLOAT_BLOCK */
++   { 1000066011u, 43, 16, 1, 0 }, /* ASTC_10x10_SFLOAT_BLOCK */
++   { 1000066012u, 44, 16, 1, 0 }, /* ASTC_12x10_SFLOAT_BLOCK */
++   { 1000066013u, 45, 16, 1, 0 }, /* ASTC_12x12_SFLOAT_BLOCK */
++   { 1000156000u, 46, 4, 4, 0 }, /* G8B8G8R8_422_UNORM */
++   { 1000156001u, 47, 4, 4, 0 }, /* B8G8R8G8_422_UNORM */
++   { 1000156002u, 48, 0, 2, 3 }, /* G8_B8_R8_3PLANE_420_UNORM */
++   { 1000156003u, 49, 0, 2, 2 }, /* G8_B8R8_2PLANE_420_UNORM */
++   { 1000156004u, 50, 0, 4, 3 }, /* G8_B8_R8_3PLANE_422_UNORM */
++   { 1000156005u, 51, 0, 4, 2 }, /* G8_B8R8_2PLANE_422_UNORM */
++   { 1000156006u, 52, 0, 0, 3 }, /* G8_B8_R8_3PLANE_444_UNORM */
++   { 1000156007u, 2, 2, 0, 0 }, /* R10X6_UNORM_PACK16 */
++   { 1000156008u, 5, 4, 0, 0 }, /* R10X6G10X6_UNORM_2PACK16 */
++   { 1000156009u, 53, 8, 0, 0 }, /* R10X6G10X6B10X6A10X6_UNORM_4PACK16 */
++   { 1000156010u, 54, 8, 4, 0 }, /* G10X6B10X6G10X6R10X6_422_UNORM_4PACK16 */
++   { 1000156011u, 55, 8, 4, 0 }, /* B10X6G10X6R10X6G10X6_422_UNORM_4PACK16 */
++   { 1000156012u, 56, 0, 2, 3 }, /* G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 */
++   { 1000156013u, 57, 0, 2, 2 }, /* G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 */
++   { 1000156014u, 58, 0, 4, 3 }, /* G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16 */
++   { 1000156015u, 59, 0, 4, 2 }, /* G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16 */
++   { 1000156016u, 60, 0, 0, 3 }, /* G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16 */
++   { 1000156017u, 2, 2, 0, 0 }, /* R12X4_UNORM_PACK16 */
++   { 1000156018u, 5, 4, 0, 0 }, /* R12X4G12X4_UNORM_2PACK16 */
++   { 1000156019u, 61, 8, 0, 0 }, /* R12X4G12X4B12X4A12X4_UNORM_4PACK16 */
++   { 1000156020u, 62, 8, 4, 0 }, /* G12X4B12X4G12X4R12X4_422_UNORM_4PACK16 */
++   { 1000156021u, 63, 8, 4, 0 }, /* B12X4G12X4R12X4G12X4_422_UNORM_4PACK16 */
++   { 1000156022u, 64, 0, 2, 3 }, /* G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16 */
++   { 1000156023u, 65, 0, 2, 2 }, /* G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16 */
++   { 1000156024u, 66, 0, 4, 3 }, /* G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16 */
++   { 1000156025u, 67, 0, 4, 2 }, /* G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16 */
++   { 1000156026u, 68, 0, 0, 3 }, /* G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16 */
++   { 1000156027u, 69, 8, 4, 0 }, /* G16B16G16R16_422_UNORM */
++   { 1000156028u, 70, 8, 4, 0 }, /* B16G16R16G16_422_UNORM */
++   { 1000156029u, 71, 0, 2, 3 }, /* G16_B16_R16_3PLANE_420_UNORM */
++   { 1000156030u, 72, 0, 2, 2 }, /* G16_B16R16_2PLANE_420_UNORM */
++   { 1000156031u, 73, 0, 4, 3 }, /* G16_B16_R16_3PLANE_422_UNORM */
++   { 1000156032u, 74, 0, 4, 2 }, /* G16_B16R16_2PLANE_422_UNORM */
++   { 1000156033u, 75, 0, 0, 3 }, /* G16_B16_R16_3PLANE_444_UNORM */
++   { 1000288000u, 80, 16, 1, 0 }, /* ASTC_3x3x3_UNORM_BLOCK_EXT */
++   { 1000288001u, 80, 16, 1, 0 }, /* ASTC_3x3x3_SRGB_BLOCK_EXT */
++   { 1000288002u, 80, 16, 1, 0 }, /* ASTC_3x3x3_SFLOAT_BLOCK_EXT */
++   { 1000288003u, 81, 16, 1, 0 }, /* ASTC_4x3x3_UNORM_BLOCK_EXT */
++   { 1000288004u, 81, 16, 1, 0 }, /* ASTC_4x3x3_SRGB_BLOCK_EXT */
++   { 1000288005u, 81, 16, 1, 0 }, /* ASTC_4x3x3_SFLOAT_BLOCK_EXT */
++   { 1000288006u, 82, 16, 1, 0 }, /* ASTC_4x4x3_UNORM_BLOCK_EXT */
++   { 1000288007u, 82, 16, 1, 0 }, /* ASTC_4x4x3_SRGB_BLOCK_EXT */
++   { 1000288008u, 82, 16, 1, 0 }, /* ASTC_4x4x3_SFLOAT_BLOCK_EXT */
++   { 1000288009u, 83, 16, 1, 0 }, /* ASTC_4x4x4_UNORM_BLOCK_EXT */
++   { 1000288010u, 83, 16, 1, 0 }, /* ASTC_4x4x4_SRGB_BLOCK_EXT */
++   { 1000288011u, 83, 16, 1, 0 }, /* ASTC_4x4x4_SFLOAT_BLOCK_EXT */
++   { 1000288012u, 84, 16, 1, 0 }, /* ASTC_5x4x4_UNORM_BLOCK_EXT */
++   { 1000288013u, 84, 16, 1, 0 }, /* ASTC_5x4x4_SRGB_BLOCK_EXT */
++   { 1000288014u, 84, 16, 1, 0 }, /* ASTC_5x4x4_SFLOAT_BLOCK_EXT */
++   { 1000288015u, 85, 16, 1, 0 }, /* ASTC_5x5x4_UNORM_BLOCK_EXT */
++   { 1000288016u, 85, 16, 1, 0 }, /* ASTC_5x5x4_SRGB_BLOCK_EXT */
++   { 1000288017u, 85, 16, 1, 0 }, /* ASTC_5x5x4_SFLOAT_BLOCK_EXT */
++   { 1000288018u, 86, 16, 1, 0 }, /* ASTC_5x5x5_UNORM_BLOCK_EXT */
++   { 1000288019u, 86, 16, 1, 0 }, /* ASTC_5x5x5_SRGB_BLOCK_EXT */
++   { 1000288020u, 86, 16, 1, 0 }, /* ASTC_5x5x5_SFLOAT_BLOCK_EXT */
++   { 1000288021u, 87, 16, 1, 0 }, /* ASTC_6x5x5_UNORM_BLOCK_EXT */
++   { 1000288022u, 87, 16, 1, 0 }, /* ASTC_6x5x5_SRGB_BLOCK_EXT */
++   { 1000288023u, 87, 16, 1, 0 }, /* ASTC_6x5x5_SFLOAT_BLOCK_EXT */
++   { 1000288024u, 88, 16, 1, 0 }, /* ASTC_6x6x5_UNORM_BLOCK_EXT */
++   { 1000288025u, 88, 16, 1, 0 }, /* ASTC_6x6x5_SRGB_BLOCK_EXT */
++   { 1000288026u, 88, 16, 1, 0 }, /* ASTC_6x6x5_SFLOAT_BLOCK_EXT */
++   { 1000288027u, 89, 16, 1, 0 }, /* ASTC_6x6x6_UNORM_BLOCK_EXT */
++   { 1000288028u, 89, 16, 1, 0 }, /* ASTC_6x6x6_SRGB_BLOCK_EXT */
++   { 1000288029u, 89, 16, 1, 0 }, /* ASTC_6x6x6_SFLOAT_BLOCK_EXT */
++   { 1000330000u, 90, 0, 0, 2 }, /* G8_B8R8_2PLANE_444_UNORM */
++   { 1000330001u, 91, 0, 0, 2 }, /* G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16 */
++   { 1000330002u, 92, 0, 0, 2 }, /* G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16 */
++   { 1000330003u, 93, 0, 0, 2 }, /* G16_B16R16_2PLANE_444_UNORM */
++   { 1000340000u, 2, 2, 0, 0 }, /* A4R4G4B4_UNORM_PACK16 */
++   { 1000340001u, 2, 2, 0, 0 }, /* A4B4G4R4_UNORM_PACK16 */
++   { 1000460000u, 1, 1, 0, 0 }, /* R8_BOOL_ARM */
++   { 1000460001u, 2, 2, 0, 0 }, /* R16_SFLOAT_FPENCODING_BFLOAT16_ARM */
++   { 1000460002u, 1, 1, 0, 0 }, /* R8_SFLOAT_FPENCODING_FLOAT8E4M3_ARM */
++   { 1000460003u, 1, 1, 0, 0 }, /* R8_SFLOAT_FPENCODING_FLOAT8E5M2_ARM */
++   { 1000464000u, 5, 4, 0, 0 }, /* R16G16_SFIXED5_NV */
++   { 1000470000u, 2, 2, 0, 0 }, /* A1B5G5R5_UNORM_PACK16 */
++   { 1000470001u, 3, 1, 0, 0 }, /* A8_UNORM */
++   { 1000609000u, 2, 2, 0, 0 }, /* R10X6_UINT_PACK16_ARM */
++   { 1000609001u, 5, 4, 0, 0 }, /* R10X6G10X6_UINT_2PACK16_ARM */
++   { 1000609002u, 53, 8, 0, 0 }, /* R10X6G10X6B10X6A10X6_UINT_4PACK16_ARM */
++   { 1000609003u, 2, 2, 0, 0 }, /* R12X4_UINT_PACK16_ARM */
++   { 1000609004u, 5, 4, 0, 0 }, /* R12X4G12X4_UINT_2PACK16_ARM */
++   { 1000609005u, 61, 8, 0, 0 }, /* R12X4G12X4B12X4A12X4_UINT_4PACK16_ARM */
++   { 1000609006u, 2, 2, 0, 0 }, /* R14X2_UINT_PACK16_ARM */
++   { 1000609007u, 5, 4, 0, 0 }, /* R14X2G14X2_UINT_2PACK16_ARM */
++   { 1000609008u, 94, 8, 0, 0 }, /* R14X2G14X2B14X2A14X2_UINT_4PACK16_ARM */
++   { 1000609009u, 2, 2, 0, 0 }, /* R14X2_UNORM_PACK16_ARM */
++   { 1000609010u, 5, 4, 0, 0 }, /* R14X2G14X2_UNORM_2PACK16_ARM */
++   { 1000609011u, 94, 8, 0, 0 }, /* R14X2G14X2B14X2A14X2_UNORM_4PACK16_ARM */
++   { 1000609012u, 95, 0, 2, 2 }, /* G14X2_B14X2R14X2_2PLANE_420_UNORM_3PACK16_ARM */
++   { 1000609013u, 96, 0, 4, 2 }, /* G14X2_B14X2R14X2_2PLANE_422_UNORM_3PACK16_ARM */
++};
++
++struct vkr_format_planes {
++   uint32_t format;
++   uint32_t plane_formats[3]; /* the compatible format of each plane */
++};
++
++/* sorted by format */
++static const struct vkr_format_planes vkr_format_planes_table[] = {
++   { 1000156002u, { 9u, 9u, 9u } }, /* G8_B8_R8_3PLANE_420_UNORM */
++   { 1000156003u, { 9u, 16u, 0u } }, /* G8_B8R8_2PLANE_420_UNORM */
++   { 1000156004u, { 9u, 9u, 9u } }, /* G8_B8_R8_3PLANE_422_UNORM */
++   { 1000156005u, { 9u, 16u, 0u } }, /* G8_B8R8_2PLANE_422_UNORM */
++   { 1000156006u, { 9u, 9u, 9u } }, /* G8_B8_R8_3PLANE_444_UNORM */
++   { 1000156012u, { 1000156007u, 1000156007u, 1000156007u } }, /* G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 */
++   { 1000156013u, { 1000156007u, 1000156008u, 0u } }, /* G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 */
++   { 1000156014u, { 1000156007u, 1000156007u, 1000156007u } }, /* G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16 */
++   { 1000156015u, { 1000156007u, 1000156008u, 0u } }, /* G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16 */
++   { 1000156016u, { 1000156007u, 1000156007u, 1000156007u } }, /* G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16 */
++   { 1000156022u, { 1000156017u, 1000156017u, 1000156017u } }, /* G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16 */
++   { 1000156023u, { 1000156017u, 1000156018u, 0u } }, /* G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16 */
++   { 1000156024u, { 1000156017u, 1000156017u, 1000156017u } }, /* G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16 */
++   { 1000156025u, { 1000156017u, 1000156018u, 0u } }, /* G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16 */
++   { 1000156026u, { 1000156017u, 1000156017u, 1000156017u } }, /* G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16 */
++   { 1000156029u, { 70u, 70u, 70u } }, /* G16_B16_R16_3PLANE_420_UNORM */
++   { 1000156030u, { 70u, 77u, 0u } }, /* G16_B16R16_2PLANE_420_UNORM */
++   { 1000156031u, { 70u, 70u, 70u } }, /* G16_B16_R16_3PLANE_422_UNORM */
++   { 1000156032u, { 70u, 77u, 0u } }, /* G16_B16R16_2PLANE_422_UNORM */
++   { 1000156033u, { 70u, 70u, 70u } }, /* G16_B16_R16_3PLANE_444_UNORM */
++   { 1000330000u, { 9u, 16u, 0u } }, /* G8_B8R8_2PLANE_444_UNORM */
++   { 1000330001u, { 1000156007u, 1000156008u, 0u } }, /* G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16 */
++   { 1000330002u, { 1000156017u, 1000156018u, 0u } }, /* G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16 */
++   { 1000330003u, { 70u, 77u, 0u } }, /* G16_B16R16_2PLANE_444_UNORM */
++   { 1000609012u, { 1000609009u, 1000609010u, 0u } }, /* G14X2_B14X2R14X2_2PLANE_420_UNORM_3PACK16_ARM */
++   { 1000609013u, { 1000609009u, 1000609010u, 0u } }, /* G14X2_B14X2R14X2_2PLANE_422_UNORM_3PACK16_ARM */
++};
++
++#endif /* VKR_FORMAT_TABLE_H */
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index e1dee8e..0cc7524 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -31,7 +31,76 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+     * situation because the app does not consider the memory external.
+     */
+ 
+-   vkr_image_create_and_add(dispatch->data, args);
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   VkImageCreateInfo *info = (VkImageCreateInfo *)args->pCreateInfo;
++   if (!vkr_validate_image_create_info(dev->physical_device, info)) {
++      args->ret = VK_ERROR_VALIDATION_FAILED;
++      return;
++   }
++
++   /* set the info before a command of a different ring can find the image */
++   struct vkr_image *img = vkr_image_create(dispatch->data, args);
++   if (!img)
++      return;
++   vkr_image_info_init(&img->info, info);
++   vkr_device_add_object(dispatch->data, dev, &img->base);
++}
++
++/* For a command that returns no result: stops the context when the create
++ * info or the plane is not valid.
++ */
++static bool
++vkr_image_validate_device_image_info(struct vn_dispatch_context *dispatch,
++                                     struct vkr_device *dev,
++                                     const VkDeviceImageMemoryRequirements *info)
++{
++   struct vkr_image_info image;
++   uint32_t planes;
++
++   if (!info || !vkr_validate_image_create_info(dev->physical_device,
++                                                (VkImageCreateInfo *)info->pCreateInfo)) {
++      vkr_context_set_fatal(dispatch->data);
++      return false;
++   }
++
++   vkr_image_info_init(&image, info->pCreateInfo);
++   if (!vkr_validate_image_planes(&image, info->planeAspect != 0, info->planeAspect,
++                                  &planes)) {
++      vkr_context_set_fatal(dispatch->data);
++      return false;
++   }
++
++   return true;
++}
++
++/* For a command that returns no result: stops the context when the guest
++ * gave no image or a plane that the image does not have.
++ */
++static bool
++vkr_image_validate_planes(struct vn_dispatch_context *dispatch,
++                          const struct vkr_image *img,
++                          const VkImagePlaneMemoryRequirementsInfo *plane_info)
++{
++   uint32_t planes;
++
++   if (!vkr_validate_image_planes(img ? &img->info : NULL, plane_info != NULL,
++                                  plane_info ? plane_info->planeAspect : 0, &planes)) {
++      vkr_context_set_fatal(dispatch->data);
++      return false;
++   }
++   return true;
++}
++
++static bool
++vkr_image_validate_subresource(struct vn_dispatch_context *dispatch,
++                               const struct vkr_image *img,
++                               const VkImageSubresource *subres)
++{
++   if (!vkr_validate_image_subresource(img ? &img->info : NULL, subres)) {
++      vkr_context_set_fatal(dispatch->data);
++      return false;
++   }
++   return true;
+ }
+ 
+ static void
+@@ -43,12 +112,15 @@ vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
+ 
+ static void
+ vkr_dispatch_vkGetImageMemoryRequirements(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetImageMemoryRequirements *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!vkr_image_validate_planes(dispatch, vkr_image_from_handle(args->image), NULL))
++      return;
++
+    vn_replace_vkGetImageMemoryRequirements_args_handle(args);
+    vk->GetImageMemoryRequirements(args->device, args->image, args->pMemoryRequirements);
+    vkr_physical_device_mem_type_spoof(dev->physical_device,
+@@ -57,12 +129,20 @@ vkr_dispatch_vkGetImageMemoryRequirements(
+ 
+ static void
+ vkr_dispatch_vkGetImageMemoryRequirements2(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetImageMemoryRequirements2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   const VkImageMemoryRequirementsInfo2 *info = args->pInfo;
++   if (!vkr_image_validate_planes(
++          dispatch, info ? vkr_image_from_handle(info->image) : NULL,
++          info ? vkr_find_struct(info->pNext,
++                                 VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO)
++               : NULL))
++      return;
++
+    vn_replace_vkGetImageMemoryRequirements2_args_handle(args);
+    vk->GetImageMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+    vkr_physical_device_mem_type_spoof(
+@@ -105,9 +185,20 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   /* this command has no plane, so it is not for a disjoint image */
++   struct vkr_image *img = vkr_image_from_handle(args->image);
++   uint32_t planes;
++   if (!vkr_validate_bind(img != NULL, args->memory != VK_NULL_HANDLE) ||
++       !vkr_validate_image_planes(&img->info, false, 0, &planes)) {
++      args->ret = VK_ERROR_VALIDATION_FAILED;
++      return;
++   }
++
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
++   if (args->ret == VK_SUCCESS)
++      atomic_fetch_or(&img->bound_planes, planes);
+ }
+ 
+ static void
+@@ -117,18 +208,55 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   struct vkr_image_bind {
++      struct vkr_image *img;
++      uint32_t planes;
++   };
++   STACK_ARRAY(struct vkr_image_bind, binds, args->bindInfoCount);
++   if (!binds) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
++
++   bool ok = args->pBindInfos || !args->bindInfoCount;
++   for (uint32_t i = 0; ok && i < args->bindInfoCount; i++) {
++      const VkBindImageMemoryInfo *info = &args->pBindInfos[i];
++      const VkBindImagePlaneMemoryInfo *plane_info =
++         vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO);
++
++      binds[i].img = vkr_image_from_handle(info->image);
++      ok = vkr_validate_bind(binds[i].img != NULL, info->memory != VK_NULL_HANDLE) &&
++           vkr_validate_image_planes(&binds[i].img->info, plane_info != NULL,
++                                     plane_info ? plane_info->planeAspect : 0,
++                                     &binds[i].planes);
++   }
++   if (!ok) {
++      args->ret = VK_ERROR_VALIDATION_FAILED;
++      STACK_ARRAY_FINISH(binds);
++      return;
++   }
++
+    vn_replace_vkBindImageMemory2_args_handle(args);
+    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
++   if (args->ret == VK_SUCCESS) {
++      for (uint32_t i = 0; i < args->bindInfoCount; i++)
++         atomic_fetch_or(&binds[i].img->bound_planes, binds[i].planes);
++   }
++   STACK_ARRAY_FINISH(binds);
+ }
+ 
+ static void
+ vkr_dispatch_vkGetImageSubresourceLayout(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetImageSubresourceLayout *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!vkr_image_validate_subresource(dispatch, vkr_image_from_handle(args->image),
++                                       args->pSubresource))
++      return;
++
+    vn_replace_vkGetImageSubresourceLayout_args_handle(args);
+    vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
+                                  args->pLayout);
+@@ -136,12 +264,17 @@ vkr_dispatch_vkGetImageSubresourceLayout(
+ 
+ static void
+ vkr_dispatch_vkGetImageSubresourceLayout2(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetImageSubresourceLayout2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!vkr_image_validate_subresource(
++          dispatch, vkr_image_from_handle(args->image),
++          args->pSubresource ? &args->pSubresource->imageSubresource : NULL))
++      return;
++
+    vn_replace_vkGetImageSubresourceLayout2_args_handle(args);
+    vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
+                                   args->pLayout);
+@@ -149,12 +282,26 @@ vkr_dispatch_vkGetImageSubresourceLayout2(
+ 
+ static void
+ vkr_dispatch_vkGetDeviceImageSubresourceLayout(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetDeviceImageSubresourceLayout *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   const VkDeviceImageSubresourceInfo *info = args->pInfo;
++   struct vkr_image_info image;
++   if (!info || !info->pSubresource ||
++       !vkr_validate_image_create_info(dev->physical_device,
++                                       (VkImageCreateInfo *)info->pCreateInfo)) {
++      vkr_context_set_fatal(dispatch->data);
++      return;
++   }
++   vkr_image_info_init(&image, info->pCreateInfo);
++   if (!vkr_validate_image_subresource(&image, &info->pSubresource->imageSubresource)) {
++      vkr_context_set_fatal(dispatch->data);
++      return;
++   }
++
+    vn_replace_vkGetDeviceImageSubresourceLayout_args_handle(args);
+    vk->GetDeviceImageSubresourceLayout(args->device, args->pInfo, args->pLayout);
+ }
+@@ -176,6 +323,20 @@ static void
+ vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCreateImageView *args)
+ {
++   /* The guest driver can send this command without a reply.  It then does
++    * not see the result, and the first use of the missing view stops the
++    * context.
++    */
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   const VkImageViewCreateInfo *info = args->pCreateInfo;
++   struct vkr_image *img = info ? vkr_image_from_handle(info->image) : NULL;
++   if (!vkr_validate_image_view_create_info(
++          dev->physical_device, img ? &img->info : NULL,
++          img ? atomic_load(&img->bound_planes) : 0, info)) {
++      args->ret = VK_ERROR_VALIDATION_FAILED;
++      return;
++   }
++
+    vkr_image_view_create_and_add(dispatch->data, args);
+ }
+ 
+@@ -218,12 +379,15 @@ vkr_dispatch_vkDestroySamplerYcbcrConversion(
+ 
+ static void
+ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
+-   UNUSED struct vn_dispatch_context *ctx,
++   struct vn_dispatch_context *ctx,
+    struct vn_command_vkGetDeviceImageMemoryRequirements *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!vkr_image_validate_device_image_info(ctx, dev, args->pInfo))
++      return;
++
+    vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
+    vk->GetDeviceImageMemoryRequirements(args->device, args->pInfo,
+                                         args->pMemoryRequirements);
+@@ -234,12 +398,15 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
+ 
+ static void
+ vkr_dispatch_vkGetDeviceImageSparseMemoryRequirements(
+-   UNUSED struct vn_dispatch_context *ctx,
++   struct vn_dispatch_context *ctx,
+    struct vn_command_vkGetDeviceImageSparseMemoryRequirements *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (!vkr_image_validate_device_image_info(ctx, dev, args->pInfo))
++      return;
++
+    vn_replace_vkGetDeviceImageSparseMemoryRequirements_args_handle(args);
+    vk->GetDeviceImageSparseMemoryRequirements(args->device, args->pInfo,
+                                               args->pSparseMemoryRequirementCount,
+diff --git a/src/venus/vkr_image.h b/src/venus/vkr_image.h
+index 70a9800..8edced0 100644
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -8,8 +8,16 @@
+ 
+ #include "vkr_common.h"
+ 
++#include "vkr_validate.h"
++
+ struct vkr_image {
+    struct vkr_object base;
++
++   /* for the tests of the commands that use the image */
++   struct vkr_image_info info;
++
++   /* bit mask of the planes that have memory */
++   atomic_uint bound_planes;
+ };
+ VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+ 
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index d4a128e..f69dc26 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -175,7 +175,41 @@ vkr_physical_device_init_extra_properties(struct vkr_physical_device *physical_d
+       props2.pNext = &physical_dev->host_ptr_props;
+    }
+ 
++   VkPhysicalDeviceDriverProperties driver_props = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++      .pNext = props2.pNext,
++   };
++   /* The version of the device controls these structures, not the version
++    * that the guest application gave to vkCreateInstance
++    * (physical_dev->api_version).
++    */
++   const uint32_t device_version = physical_dev->properties.apiVersion;
++   if (device_version >= VK_API_VERSION_1_2 || physical_dev->KHR_driver_properties)
++      props2.pNext = &driver_props;
++
++   VkPhysicalDeviceMaintenance4Properties maintenance4_props = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES,
++      .pNext = props2.pNext,
++   };
++   if (device_version >= VK_API_VERSION_1_3 || physical_dev->KHR_maintenance4)
++      props2.pNext = &maintenance4_props;
++
++   physical_dev->texel_buffer_alignment =
++      (VkPhysicalDeviceTexelBufferAlignmentProperties){
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES,
++         .pNext = props2.pNext,
++      };
++   physical_dev->has_texel_buffer_alignment =
++      device_version >= VK_API_VERSION_1_3 || physical_dev->EXT_texel_buffer_alignment;
++   if (physical_dev->has_texel_buffer_alignment)
++      props2.pNext = &physical_dev->texel_buffer_alignment;
++
+    vk->GetPhysicalDeviceProperties2(handle, &props2);
++
++   physical_dev->texel_buffer_alignment.pNext = NULL;
++   physical_dev->max_buffer_size = maintenance4_props.maxBufferSize;
++   physical_dev->image_3d_alias_quirk =
++      driver_props.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP;
+ }
+ 
+ static void
+@@ -328,6 +362,16 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+          physical_dev->KHR_external_fence_fd = true;
+       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
+          physical_dev->EXT_external_memory_host = true;
++      else if (!strcmp(props->extensionName, "VK_EXT_image_drm_format_modifier"))
++         physical_dev->EXT_image_drm_format_modifier = true;
++      else if (!strcmp(props->extensionName, "VK_EXT_image_sliced_view_of_3d"))
++         physical_dev->EXT_image_sliced_view_of_3d = true;
++      else if (!strcmp(props->extensionName, "VK_EXT_texel_buffer_alignment"))
++         physical_dev->EXT_texel_buffer_alignment = true;
++      else if (!strcmp(props->extensionName, "VK_KHR_driver_properties"))
++         physical_dev->KHR_driver_properties = true;
++      else if (!strcmp(props->extensionName, "VK_KHR_maintenance4"))
++         physical_dev->KHR_maintenance4 = true;
+       else if (!strcmp(props->extensionName, "VK_KHR_portability_subset"))
+          physical_dev->KHR_portability_subset = true;
+ 
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index c58af35..7e60cd4 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -30,6 +30,26 @@ struct vkr_physical_device {
+ 
+    bool EXT_external_memory_host;
+ 
++   bool EXT_image_drm_format_modifier;
++   bool EXT_image_sliced_view_of_3d;
++   bool EXT_texel_buffer_alignment;
++   bool KHR_driver_properties;
++   bool KHR_maintenance4;
++
++   /* 0 when the driver gives no limit */
++   VkDeviceSize max_buffer_size;
++   bool has_texel_buffer_alignment;
++   VkPhysicalDeviceTexelBufferAlignmentProperties texel_buffer_alignment;
++
++   /* The driver makes a second image of type 2D array for each 3D image with
++    * VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT or
++    * VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT, with the mip level count of
++    * the 3D image.  That count can be more than a 2D image of the same width
++    * and height can have (a valid 1x1x8 image has 4 levels), and the host API
++    * then stops the process.  KosmicKrisp of Mesa 26.3 does this on Metal.
++    */
++   bool image_3d_alias_quirk;
++
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    bool mem_type_spoof;
+    VkPhysicalDeviceIDProperties id_properties;
+diff --git a/src/venus/vkr_validate.c b/src/venus/vkr_validate.c
+new file mode 100644
+index 0000000..5a47789
+--- /dev/null
++++ b/src/venus/vkr_validate.c
+@@ -0,0 +1,866 @@
++/*
++ * Copyright 2026 The gVisor Authors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "vkr_validate.h"
++
++#include "vkr_format_table.h"
++#include "vkr_physical_device.h"
++
++/* A guest can make a test fail at any rate, so each log has a line limit. */
++#define VKR_VALIDATE_LOG_LIMIT 64
++#define VKR_VALIDATE_QUIRK_LOG_LIMIT 8
++
++/* Returns true for the first limit calls. */
++static bool
++vkr_validate_log_allowed(atomic_uint *line_count, unsigned limit)
++{
++   if (atomic_load(line_count) >= limit)
++      return false;
++   return atomic_fetch_add(line_count, 1) < limit;
++}
++
++static bool PRINTFLIKE(1, 2)
++vkr_validate_fail(const char *fmt, ...)
++{
++   static atomic_uint line_count;
++
++   if (vkr_validate_log_allowed(&line_count, VKR_VALIDATE_LOG_LIMIT)) {
++      va_list va;
++      va_start(va, fmt);
++      virgl_prefixed_logv("vkr", VIRGL_LOG_LEVEL_WARNING, fmt, va);
++      va_end(va);
++   }
++
++   return false;
++}
++
++/* Returns NULL for a format that the Vulkan registry of the protocol does
++ * not have.
++ */
++static const struct vkr_format_entry *
++vkr_format_lookup(VkFormat format)
++{
++   const uint32_t f = (uint32_t)format;
++   uint32_t begin = 0;
++   uint32_t end = ARRAY_SIZE(vkr_format_table);
++
++   while (begin < end) {
++      const uint32_t mid = begin + (end - begin) / 2;
++      if (vkr_format_table[mid].format == f)
++         return &vkr_format_table[mid];
++      if (vkr_format_table[mid].format < f)
++         begin = mid + 1;
++      else
++         end = mid;
++   }
++   return NULL;
++}
++
++/* Returns the compatible format of each plane of a multi-planar format. */
++static const uint32_t *
++vkr_format_get_plane_formats(VkFormat format)
++{
++   for (uint32_t i = 0; i < ARRAY_SIZE(vkr_format_planes_table); i++) {
++      if (vkr_format_planes_table[i].format == (uint32_t)format)
++         return vkr_format_planes_table[i].plane_formats;
++   }
++   return NULL;
++}
++
++/* Returns true when a and b are in one compatibility class. */
++static bool
++vkr_format_is_compatible(VkFormat a, VkFormat b)
++{
++   const struct vkr_format_entry *entry_a = vkr_format_lookup(a);
++   const struct vkr_format_entry *entry_b = vkr_format_lookup(b);
++   return entry_a && entry_b && entry_a->class_id == entry_b->class_id;
++}
++
++/* Returns the aspects of a depth and stencil format, or 0 for other formats. */
++static VkImageAspectFlags
++vkr_format_get_depth_stencil_aspects(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_D16_UNORM:
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D32_SFLOAT:
++      return VK_IMAGE_ASPECT_DEPTH_BIT;
++   case VK_FORMAT_S8_UINT:
++      return VK_IMAGE_ASPECT_STENCIL_BIT;
++   case VK_FORMAT_D16_UNORM_S8_UINT:
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++   default:
++      return 0;
++   }
++}
++
++static void
++vkr_format_get_features(struct vkr_physical_device *physical_dev,
++                        VkFormat format,
++                        VkFormatProperties *props)
++{
++   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
++
++   memset(props, 0, sizeof(*props));
++   vk->GetPhysicalDeviceFormatProperties(physical_dev->base.handle.physical_device,
++                                         format, props);
++}
++
++/* Sets plane to the index of a plane aspect of image. */
++static bool
++vkr_image_get_plane(const struct vkr_image_info *image,
++                    VkImageAspectFlags aspect,
++                    uint32_t *plane)
++{
++   switch (aspect) {
++   case VK_IMAGE_ASPECT_PLANE_0_BIT:
++      *plane = 0;
++      break;
++   case VK_IMAGE_ASPECT_PLANE_1_BIT:
++      *plane = 1;
++      break;
++   case VK_IMAGE_ASPECT_PLANE_2_BIT:
++      *plane = 2;
++      break;
++   default:
++      return false;
++   }
++   return image->plane_count > 1 && *plane < image->plane_count;
++}
++
++static bool
++vkr_image_aspect_is_memory_plane(VkImageAspectFlags aspect)
++{
++   return aspect == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT ||
++          aspect == VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT ||
++          aspect == VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT ||
++          aspect == VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT;
++}
++
++/* The image creation limits of the Vulkan specification. */
++struct vkr_image_limits {
++   VkExtent3D max_extent;
++   uint32_t max_mip_levels;
++   uint32_t max_array_layers;
++   VkSampleCountFlags sample_counts;
++};
++
++/*
++ * Gets the limits of the driver for the format, type, tiling, usage, and
++ * flags of info.  Returns false when the driver does not support them.
++ *
++ * VkExternalMemoryImageCreateInfo is not a part of the query.  The handle
++ * types of the guest are not those of the host, and
++ * vkr_dispatch_vkCreateImage gives them to the driver as they are.
++ */
++static bool
++vkr_image_get_limits(struct vkr_physical_device *physical_dev,
++                     const VkImageCreateInfo *info,
++                     struct vkr_image_limits *limits)
++{
++   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
++   if (!vk->GetPhysicalDeviceImageFormatProperties2)
++      return false;
++
++   VkPhysicalDeviceImageFormatInfo2 format_info = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++      .format = info->format,
++      .type = info->imageType,
++      .tiling = info->tiling,
++      .usage = info->usage,
++      .flags = info->flags,
++   };
++
++   VkImageStencilUsageCreateInfo stencil_usage;
++   const VkImageStencilUsageCreateInfo *guest_stencil_usage =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO);
++   if (guest_stencil_usage) {
++      stencil_usage = *guest_stencil_usage;
++      stencil_usage.pNext = format_info.pNext;
++      format_info.pNext = &stencil_usage;
++   }
++
++   VkImageFormatListCreateInfo format_list;
++   const VkImageFormatListCreateInfo *guest_format_list =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
++   if (guest_format_list) {
++      format_list = *guest_format_list;
++      format_list.pNext = format_info.pNext;
++      format_info.pNext = &format_list;
++   }
++
++   /* The specification wants each modifier of a list to be compatible with
++    * the create info, and the limits of the image are the minimum of the
++    * limits of all modifiers.
++    */
++   VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++      .sharingMode = info->sharingMode,
++      .queueFamilyIndexCount = info->queueFamilyIndexCount,
++      .pQueueFamilyIndices = info->pQueueFamilyIndices,
++   };
++   const uint64_t *modifiers = NULL;
++   uint32_t query_count = 1;
++   if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
++      if (!physical_dev->EXT_image_drm_format_modifier)
++         return false;
++
++      const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_info =
++         vkr_find_struct(
++            info->pNext,
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
++      const VkImageDrmFormatModifierListCreateInfoEXT *list_info = vkr_find_struct(
++         info->pNext, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
++      if (explicit_info && !list_info) {
++         modifiers = &explicit_info->drmFormatModifier;
++      } else if (list_info && !explicit_info && list_info->drmFormatModifierCount &&
++                 list_info->pDrmFormatModifiers) {
++         modifiers = list_info->pDrmFormatModifiers;
++         query_count = list_info->drmFormatModifierCount;
++      } else {
++         return false;
++      }
++
++      modifier_info.pNext = format_info.pNext;
++      format_info.pNext = &modifier_info;
++   }
++
++   for (uint32_t i = 0; i < query_count; i++) {
++      if (modifiers)
++         modifier_info.drmFormatModifier = modifiers[i];
++
++      VkImageFormatProperties2 props = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++      };
++      const VkResult result = vk->GetPhysicalDeviceImageFormatProperties2(
++         physical_dev->base.handle.physical_device, &format_info, &props);
++      if (result != VK_SUCCESS)
++         return false;
++
++      const VkImageFormatProperties *p = &props.imageFormatProperties;
++      if (i == 0) {
++         limits->max_extent = p->maxExtent;
++         limits->max_mip_levels = p->maxMipLevels;
++         limits->max_array_layers = p->maxArrayLayers;
++         limits->sample_counts = p->sampleCounts;
++      } else {
++         limits->max_extent.width = MIN2(limits->max_extent.width, p->maxExtent.width);
++         limits->max_extent.height =
++            MIN2(limits->max_extent.height, p->maxExtent.height);
++         limits->max_extent.depth = MIN2(limits->max_extent.depth, p->maxExtent.depth);
++         limits->max_mip_levels = MIN2(limits->max_mip_levels, p->maxMipLevels);
++         limits->max_array_layers = MIN2(limits->max_array_layers, p->maxArrayLayers);
++         limits->sample_counts &= p->sampleCounts;
++      }
++   }
++
++   return true;
++}
++
++bool
++vkr_validate_image_create_info(struct vkr_physical_device *physical_dev,
++                               VkImageCreateInfo *info)
++{
++   if (!info)
++      return vkr_validate_fail("image: no create info");
++
++   const VkExtent3D *extent = &info->extent;
++   if (!extent->width || !extent->height || !extent->depth || !info->mipLevels ||
++       !info->arrayLayers || !info->usage) {
++      return vkr_validate_fail(
++         "image: extent %ux%ux%u, %u levels, %u layers, or usage 0x%x is zero",
++         extent->width, extent->height, extent->depth, info->mipLevels,
++         info->arrayLayers, info->usage);
++   }
++
++   bool ok;
++   switch (info->imageType) {
++   case VK_IMAGE_TYPE_1D:
++      ok = extent->height == 1 && extent->depth == 1;
++      break;
++   case VK_IMAGE_TYPE_2D:
++      ok = extent->depth == 1;
++      break;
++   case VK_IMAGE_TYPE_3D:
++      ok = info->arrayLayers == 1;
++      break;
++   default:
++      ok = false;
++      break;
++   }
++   if (!ok) {
++      return vkr_validate_fail("image: type %d does not allow extent %ux%ux%u, %u layers",
++                               info->imageType, extent->width, extent->height,
++                               extent->depth, info->arrayLayers);
++   }
++
++   switch (info->tiling) {
++   case VK_IMAGE_TILING_OPTIMAL:
++   case VK_IMAGE_TILING_LINEAR:
++   case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:
++      break;
++   default:
++      return vkr_validate_fail("image: tiling %d is not valid", info->tiling);
++   }
++
++   if (!util_is_power_of_two_nonzero(info->samples) ||
++       info->samples > VK_SAMPLE_COUNT_64_BIT)
++      return vkr_validate_fail("image: sample count 0x%x is not valid", info->samples);
++
++   const uint32_t max_dim = MAX3(extent->width, extent->height, extent->depth);
++   if (info->mipLevels > util_logbase2(max_dim) + 1) {
++      return vkr_validate_fail("image: %u levels are too many for extent %ux%ux%u",
++                               info->mipLevels, extent->width, extent->height,
++                               extent->depth);
++   }
++
++   /* The chroma planes of these formats have one half of the width, or of
++    * the width and the height.  An odd extent can give a plane of size 0.
++    */
++   const struct vkr_format_entry *entry = vkr_format_lookup(info->format);
++   if (!entry)
++      return vkr_validate_fail("image: format %d is not known", info->format);
++   if (((entry->flags & (VKR_FORMAT_FLAG_CHROMA_420 | VKR_FORMAT_FLAG_CHROMA_422)) &&
++        (extent->width & 1)) ||
++       ((entry->flags & VKR_FORMAT_FLAG_CHROMA_420) && (extent->height & 1))) {
++      return vkr_validate_fail("image: format %d does not allow the odd extent %ux%u",
++                               info->format, extent->width, extent->height);
++   }
++
++   if ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
++       (info->imageType != VK_IMAGE_TYPE_2D || extent->width != extent->height ||
++        info->arrayLayers < 6)) {
++      return vkr_validate_fail(
++         "image: cube flag does not allow type %d, extent %ux%u, %u layers",
++         info->imageType, extent->width, extent->height, info->arrayLayers);
++   }
++
++   const VkImageCreateFlags flags_2d_of_3d =
++      VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
++   if ((info->flags & flags_2d_of_3d) && info->imageType != VK_IMAGE_TYPE_3D) {
++      return vkr_validate_fail("image: flags 0x%x need type 3D, not type %d", info->flags,
++                               info->imageType);
++   }
++
++   if ((info->flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) &&
++       (!(entry->flags & VKR_FORMAT_FLAG_COMPRESSED) ||
++        !(info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))) {
++      return vkr_validate_fail("image: flags 0x%x do not allow format %d", info->flags,
++                               info->format);
++   }
++
++   if (info->samples != VK_SAMPLE_COUNT_1_BIT &&
++       (info->imageType != VK_IMAGE_TYPE_2D ||
++        (info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) || info->mipLevels != 1 ||
++        info->tiling == VK_IMAGE_TILING_LINEAR)) {
++      return vkr_validate_fail(
++         "image: %d samples do not allow type %d, flags 0x%x, %u levels, tiling %d",
++         info->samples, info->imageType, info->flags, info->mipLevels, info->tiling);
++   }
++
++   struct vkr_image_limits limits;
++   if (!vkr_image_get_limits(physical_dev, info, &limits)) {
++      return vkr_validate_fail(
++         "image: no driver support for format %d, type %d, tiling %d, usage 0x%x, "
++         "flags 0x%x",
++         info->format, info->imageType, info->tiling, info->usage, info->flags);
++   }
++   if (extent->width > limits.max_extent.width ||
++       extent->height > limits.max_extent.height ||
++       extent->depth > limits.max_extent.depth ||
++       info->mipLevels > limits.max_mip_levels ||
++       info->arrayLayers > limits.max_array_layers ||
++       !(limits.sample_counts & info->samples)) {
++      return vkr_validate_fail("image: extent %ux%ux%u, %u levels, %u layers, or %d "
++                               "samples is more than the limit of format %d",
++                               extent->width, extent->height, extent->depth,
++                               info->mipLevels, info->arrayLayers, info->samples,
++                               info->format);
++   }
++
++   /* See vkr_physical_device::image_3d_alias_quirk.  The image is valid, and
++    * it stays usable as a 3D image.  Without the flags,
++    * vkr_validate_image_view_create_info refuses 2D views of it.
++    */
++   if (physical_dev->image_3d_alias_quirk && (info->flags & flags_2d_of_3d) &&
++       info->mipLevels > util_logbase2(MAX2(extent->width, extent->height)) + 1) {
++      static atomic_uint line_count;
++      if (vkr_validate_log_allowed(&line_count, VKR_VALIDATE_QUIRK_LOG_LIMIT)) {
++         vkr_log("3D image workaround: 2D views are off for extent %ux%ux%u, %u levels",
++                 extent->width, extent->height, extent->depth, info->mipLevels);
++      }
++      info->flags &= ~flags_2d_of_3d;
++   }
++
++   return true;
++}
++
++void
++vkr_image_info_init(struct vkr_image_info *image, const VkImageCreateInfo *info)
++{
++   const struct vkr_format_entry *entry = vkr_format_lookup(info->format);
++   const VkImageStencilUsageCreateInfo *stencil_usage =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO);
++
++   *image = (struct vkr_image_info){
++      .flags = info->flags,
++      .type = info->imageType,
++      .format = info->format,
++      .extent = info->extent,
++      .mip_levels = info->mipLevels,
++      .array_layers = info->arrayLayers,
++      .samples = info->samples,
++      .tiling = info->tiling,
++      .usage = info->usage | (stencil_usage ? stencil_usage->stencilUsage : 0),
++      .plane_count = entry && entry->plane_count ? entry->plane_count : 1,
++   };
++}
++
++bool
++vkr_validate_image_subresource(const struct vkr_image_info *image,
++                               const VkImageSubresource *subres)
++{
++   if (!image || !subres)
++      return vkr_validate_fail("image subresource: no image or no subresource");
++
++   if (subres->mipLevel >= image->mip_levels ||
++       subres->arrayLayer >= image->array_layers) {
++      return vkr_validate_fail(
++         "image subresource: level %u, layer %u is not in %u levels, %u layers",
++         subres->mipLevel, subres->arrayLayer, image->mip_levels, image->array_layers);
++   }
++
++   /* The subresource has one aspect.  An image with a modifier has memory
++    * planes, and a linear multi-planar image has planes, in place of the
++    * color aspect.
++    */
++   const VkImageAspectFlags aspect = subres->aspectMask;
++   const VkImageAspectFlags depth_stencil =
++      vkr_format_get_depth_stencil_aspects(image->format);
++   uint32_t plane;
++   bool ok;
++   if (image->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
++      ok = vkr_image_aspect_is_memory_plane(aspect);
++   else if (depth_stencil)
++      ok = util_is_power_of_two_nonzero(aspect) && !(aspect & ~depth_stencil);
++   else if (vkr_image_get_plane(image, aspect, &plane))
++      ok = true;
++   else
++      ok = aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
++           (image->plane_count == 1 || image->tiling != VK_IMAGE_TILING_LINEAR);
++   if (!ok) {
++      return vkr_validate_fail("image subresource: aspects 0x%x do not match format %d",
++                               aspect, image->format);
++   }
++
++   return true;
++}
++
++bool
++vkr_validate_image_planes(const struct vkr_image_info *image,
++                          bool has_plane,
++                          VkImageAspectFlags plane_aspect,
++                          uint32_t *planes)
++{
++   if (!image)
++      return vkr_validate_fail("image: a command gave no image");
++
++   /* the driver ignores the plane of an image that is not disjoint */
++   const uint32_t all_planes = BITFIELD_MASK(image->plane_count);
++   if (!(image->flags & VK_IMAGE_CREATE_DISJOINT_BIT) || image->plane_count == 1) {
++      *planes = all_planes;
++      return true;
++   }
++
++   uint32_t plane;
++   if (has_plane && image->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++       vkr_image_aspect_is_memory_plane(plane_aspect)) {
++      *planes = all_planes;
++      return true;
++   }
++   if (has_plane && image->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++       vkr_image_get_plane(image, plane_aspect, &plane)) {
++      *planes = 1u << plane;
++      return true;
++   }
++
++   return vkr_validate_fail("image: plane aspect 0x%x is not a plane of a disjoint "
++                            "image of format %d",
++                            has_plane ? plane_aspect : 0, image->format);
++}
++
++bool
++vkr_validate_image_view_create_info(struct vkr_physical_device *physical_dev,
++                                    const struct vkr_image_info *image,
++                                    uint32_t bound_planes,
++                                    const VkImageViewCreateInfo *info)
++{
++   if (!info || !image)
++      return vkr_validate_fail("image view: no create info or no image");
++
++   const VkImageSubresourceRange *range = &info->subresourceRange;
++
++   if (range->baseMipLevel >= image->mip_levels) {
++      return vkr_validate_fail("image view: base level %u is not in %u levels",
++                               range->baseMipLevel, image->mip_levels);
++   }
++   const uint32_t level_limit = image->mip_levels - range->baseMipLevel;
++   const uint32_t level_count =
++      range->levelCount == VK_REMAINING_MIP_LEVELS ? level_limit : range->levelCount;
++   if (!level_count || level_count > level_limit) {
++      return vkr_validate_fail("image view: %u levels from level %u are not in %u levels",
++                               level_count, range->baseMipLevel, image->mip_levels);
++   }
++
++   /* a 2D view of a 3D image uses the depth slices of one level as layers */
++   const uint32_t level_depth = u_minify(image->extent.depth, range->baseMipLevel);
++   uint32_t layer_limit = image->array_layers;
++   bool ok;
++   switch (info->viewType) {
++   case VK_IMAGE_VIEW_TYPE_1D:
++   case VK_IMAGE_VIEW_TYPE_1D_ARRAY:
++      ok = image->type == VK_IMAGE_TYPE_1D;
++      break;
++   case VK_IMAGE_VIEW_TYPE_2D:
++   case VK_IMAGE_VIEW_TYPE_2D_ARRAY:
++      if (image->type == VK_IMAGE_TYPE_3D) {
++         VkImageCreateFlags flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
++         if (info->viewType == VK_IMAGE_VIEW_TYPE_2D)
++            flags |= VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
++         ok = (image->flags & flags) && level_count == 1;
++         layer_limit = level_depth;
++      } else {
++         ok = image->type == VK_IMAGE_TYPE_2D;
++      }
++      break;
++   case VK_IMAGE_VIEW_TYPE_CUBE:
++   case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY:
++      ok = image->type == VK_IMAGE_TYPE_2D &&
++           (image->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
++      break;
++   case VK_IMAGE_VIEW_TYPE_3D:
++      ok = image->type == VK_IMAGE_TYPE_3D;
++      break;
++   default:
++      ok = false;
++      break;
++   }
++   if (ok && image->samples != VK_SAMPLE_COUNT_1_BIT) {
++      ok = info->viewType == VK_IMAGE_VIEW_TYPE_2D ||
++           info->viewType == VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++   }
++   if (!ok) {
++      return vkr_validate_fail("image view: type %d with %u levels does not match an "
++                               "image of type %d, flags 0x%x, %d samples",
++                               info->viewType, level_count, image->type, image->flags,
++                               image->samples);
++   }
++
++   if (range->baseArrayLayer >= layer_limit) {
++      return vkr_validate_fail("image view: base layer %u is not in %u layers",
++                               range->baseArrayLayer, layer_limit);
++   }
++   const uint32_t layer_count = range->layerCount == VK_REMAINING_ARRAY_LAYERS
++                                   ? layer_limit - range->baseArrayLayer
++                                   : range->layerCount;
++   if (!layer_count || layer_count > layer_limit - range->baseArrayLayer) {
++      return vkr_validate_fail("image view: %u layers from layer %u are not in %u layers",
++                               layer_count, range->baseArrayLayer, layer_limit);
++   }
++   switch (info->viewType) {
++   case VK_IMAGE_VIEW_TYPE_1D:
++   case VK_IMAGE_VIEW_TYPE_2D:
++   case VK_IMAGE_VIEW_TYPE_3D:
++      ok = layer_count == 1;
++      break;
++   case VK_IMAGE_VIEW_TYPE_CUBE:
++      ok = layer_count == 6;
++      break;
++   case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY:
++      ok = layer_count % 6 == 0;
++      break;
++   default:
++      ok = true;
++      break;
++   }
++   if (!ok) {
++      return vkr_validate_fail("image view: type %d does not allow %u layers",
++                               info->viewType, layer_count);
++   }
++
++   /* A plane aspect makes a view of one plane of a multi-planar image.  The
++    * image must have the mutable format flag for that.  Other views have the
++    * color aspect, or depth and stencil aspects of the format.
++    */
++   const VkImageAspectFlags aspects = range->aspectMask;
++   const VkImageAspectFlags depth_stencil =
++      vkr_format_get_depth_stencil_aspects(image->format);
++   uint32_t plane = 0;
++   const bool is_plane_view = vkr_image_get_plane(image, aspects, &plane);
++   if (is_plane_view)
++      ok = image->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++   else if (depth_stencil)
++      ok = aspects && !(aspects & ~depth_stencil);
++   else
++      ok = aspects == VK_IMAGE_ASPECT_COLOR_BIT;
++   if (!ok) {
++      return vkr_validate_fail("image view: aspects 0x%x do not match an image of "
++                               "format %d, flags 0x%x",
++                               aspects, image->format, image->flags);
++   }
++
++   /* the driver makes its view from the object that a bind command makes */
++   const uint32_t view_planes =
++      is_plane_view ? 1u << plane : BITFIELD_MASK(image->plane_count);
++   if (!(image->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
++       (bound_planes & view_planes) != view_planes)
++      return vkr_validate_fail("image view: the image has no memory");
++
++   const VkComponentMapping *swizzle = &info->components;
++   if ((uint32_t)swizzle->r > VK_COMPONENT_SWIZZLE_A ||
++       (uint32_t)swizzle->g > VK_COMPONENT_SWIZZLE_A ||
++       (uint32_t)swizzle->b > VK_COMPONENT_SWIZZLE_A ||
++       (uint32_t)swizzle->a > VK_COMPONENT_SWIZZLE_A) {
++      return vkr_validate_fail("image view: component swizzle %d, %d, %d, %d is not valid",
++                               swizzle->r, swizzle->g, swizzle->b, swizzle->a);
++   }
++
++   /* the driver gets a query only for a view that changes the format */
++   VkFormatProperties view_format_props = { 0 };
++   if (info->format != image->format)
++      vkr_format_get_features(physical_dev, info->format, &view_format_props);
++   if (is_plane_view) {
++      /* the format of the plane or a format of its class */
++      const uint32_t *plane_formats = vkr_format_get_plane_formats(image->format);
++      ok = plane_formats &&
++           vkr_format_is_compatible(info->format, (VkFormat)plane_formats[plane]);
++   } else if (info->format == image->format) {
++      ok = true;
++   } else if (image->plane_count > 1 ||
++              !(image->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
++      ok = false;
++   } else if (vkr_format_is_compatible(info->format, image->format)) {
++      ok = true;
++   } else {
++      /* a view of one subresource of a block image as texel blocks */
++      const struct vkr_format_entry *image_entry = vkr_format_lookup(image->format);
++      const struct vkr_format_entry *view_entry = vkr_format_lookup(info->format);
++      ok = (image->flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) &&
++           image_entry && view_entry &&
++           (image_entry->flags & VKR_FORMAT_FLAG_COMPRESSED) && !view_entry->flags &&
++           view_entry->block_size && image_entry->block_size == view_entry->block_size &&
++           level_count == 1 && layer_count == 1 &&
++           info->viewType != VK_IMAGE_VIEW_TYPE_3D;
++   }
++   if (ok && info->format != image->format) {
++      ok = view_format_props.linearTilingFeatures |
++           view_format_props.optimalTilingFeatures;
++   }
++   if (!ok) {
++      return vkr_validate_fail("image view: format %d, aspects 0x%x does not match an "
++                               "image of format %d, flags 0x%x",
++                               info->format, aspects, image->format, image->flags);
++   }
++
++   const VkImageViewSlicedCreateInfoEXT *sliced =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT);
++   if (sliced) {
++      ok = physical_dev->EXT_image_sliced_view_of_3d &&
++           info->viewType == VK_IMAGE_VIEW_TYPE_3D && level_count == 1 &&
++           sliced->sliceOffset < level_depth &&
++           (sliced->sliceCount == VK_REMAINING_3D_SLICES_EXT ||
++            (sliced->sliceCount &&
++             sliced->sliceCount <= level_depth - sliced->sliceOffset));
++      if (!ok) {
++         return vkr_validate_fail(
++            "image view: slices %u+%u of a view of type %d with %u levels are not in "
++            "depth %u, or the driver has no sliced views",
++            sliced->sliceOffset, sliced->sliceCount, info->viewType, level_count,
++            level_depth);
++      }
++   }
++
++   /* The view has the usage of the image when it gives no usage.  When the
++    * view changes the format, the features of its format must allow its
++    * usage.
++    */
++   VkImageUsageFlags usage = image->usage;
++   const VkImageViewUsageCreateInfo *usage_info =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO);
++   if (usage_info) {
++      if (!usage_info->usage || (usage_info->usage & ~image->usage)) {
++         return vkr_validate_fail("image view: usage 0x%x is not in image usage 0x%x",
++                                  usage_info->usage, image->usage);
++      }
++      usage = usage_info->usage;
++   }
++   if (info->format != image->format) {
++      const VkFormatFeatureFlags features = image->tiling == VK_IMAGE_TILING_LINEAR
++                                               ? view_format_props.linearTilingFeatures
++                                               : view_format_props.optimalTilingFeatures;
++      const VkFormatFeatureFlags attachment = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
++                                              VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
++      VkFormatFeatureFlags need = 0;
++      if (usage & VK_IMAGE_USAGE_SAMPLED_BIT)
++         need |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
++      if (usage & VK_IMAGE_USAGE_STORAGE_BIT)
++         need |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
++      if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
++         need |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
++      if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
++         need |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
++      if ((features & need) != need ||
++          ((usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) && !(features & attachment))) {
++         return vkr_validate_fail(
++            "image view: features 0x%x of format %d do not allow usage 0x%x", features,
++            info->format, usage);
++      }
++   }
++
++   return true;
++}
++
++bool
++vkr_validate_bind(bool has_object, bool has_memory)
++{
++   if (!has_object || !has_memory)
++      return vkr_validate_fail("bind: a command gave no object or no memory");
++   return true;
++}
++
++bool
++vkr_validate_buffer_create_info(struct vkr_physical_device *physical_dev,
++                                const VkBufferCreateInfo *info)
++{
++   if (!info)
++      return vkr_validate_fail("buffer: no create info");
++
++   /* max_buffer_size is 0 when the driver gives no limit */
++   if (!info->size ||
++       (physical_dev->max_buffer_size && info->size > physical_dev->max_buffer_size)) {
++      return vkr_validate_fail("buffer: size %" PRIu64 " is zero or more than %" PRIu64,
++                               info->size, physical_dev->max_buffer_size);
++   }
++
++   return true;
++}
++
++void
++vkr_buffer_info_init(struct vkr_buffer_info *buffer, const VkBufferCreateInfo *info)
++{
++   const VkBufferUsageFlags2CreateInfo *usage_info =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO);
++
++   *buffer = (struct vkr_buffer_info){
++      .size = info->size,
++      .usage = usage_info ? usage_info->usage : info->usage,
++      .sparse = info->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT,
++   };
++}
++
++/* Returns the alignment that the offset of a buffer view must have. */
++static VkDeviceSize
++vkr_buffer_view_get_alignment(const struct vkr_physical_device *physical_dev,
++                              bool storage,
++                              uint32_t texel_size)
++{
++   if (!physical_dev->has_texel_buffer_alignment)
++      return physical_dev->properties.limits.minTexelBufferOffsetAlignment;
++
++   const VkPhysicalDeviceTexelBufferAlignmentProperties *props =
++      &physical_dev->texel_buffer_alignment;
++   const VkDeviceSize alignment = storage ? props->storageTexelBufferOffsetAlignmentBytes
++                                          : props->uniformTexelBufferOffsetAlignmentBytes;
++   const bool single_texel = storage ? props->storageTexelBufferOffsetSingleTexelAlignment
++                                     : props->uniformTexelBufferOffsetSingleTexelAlignment;
++   /* The size of a texel, or the size of a component when the format has 3
++    * components.  That is the largest power of two that divides the size.
++    */
++   if (single_texel)
++      return MIN2(alignment, (VkDeviceSize)(texel_size & -texel_size));
++   return alignment;
++}
++
++bool
++vkr_validate_buffer_view_create_info(struct vkr_physical_device *physical_dev,
++                                     const struct vkr_buffer_info *buffer,
++                                     bool memory_bound,
++                                     const VkBufferViewCreateInfo *info)
++{
++   if (!info || !buffer)
++      return vkr_validate_fail("buffer view: no create info or no buffer");
++
++   if (!buffer->sparse && !memory_bound)
++      return vkr_validate_fail("buffer view: the buffer has no memory");
++
++   if (info->offset >= buffer->size) {
++      return vkr_validate_fail("buffer view: offset %" PRIu64
++                               " is not in a buffer of %" PRIu64 " bytes",
++                               info->offset, buffer->size);
++   }
++   const VkDeviceSize range =
++      info->range == VK_WHOLE_SIZE ? buffer->size - info->offset : info->range;
++   if (range > buffer->size - info->offset) {
++      return vkr_validate_fail("buffer view: range %" PRIu64 " from offset %" PRIu64
++                               " is not in a buffer of %" PRIu64 " bytes",
++                               range, info->offset, buffer->size);
++   }
++
++   /* The view has the texel buffer usage of the buffer, or a part of it. */
++   const VkBufferUsageFlags2 texel_usage = VK_BUFFER_USAGE_2_UNIFORM_TEXEL_BUFFER_BIT |
++                                           VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT;
++   VkBufferUsageFlags2 usage = buffer->usage & texel_usage;
++   const VkBufferUsageFlags2CreateInfo *usage_info =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO);
++   if (usage_info) {
++      if ((usage_info->usage & ~texel_usage) || (usage_info->usage & ~buffer->usage))
++         usage = 0;
++      else
++         usage = usage_info->usage;
++   }
++   if (!usage) {
++      return vkr_validate_fail(
++         "buffer view: buffer usage 0x%" PRIx64 " does not allow the view",
++         buffer->usage);
++   }
++
++   const struct vkr_format_entry *entry = vkr_format_lookup(info->format);
++   VkFormatProperties props;
++   vkr_format_get_features(physical_dev, info->format, &props);
++   VkFormatFeatureFlags need = 0;
++   if (usage & VK_BUFFER_USAGE_2_UNIFORM_TEXEL_BUFFER_BIT)
++      need |= VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
++   if (usage & VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT)
++      need |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
++   if (!entry || !entry->block_size || entry->flags ||
++       (props.bufferFeatures & need) != need) {
++      return vkr_validate_fail(
++         "buffer view: no driver support for format %d with usage 0x%" PRIx64,
++         info->format, usage);
++   }
++
++   const VkDeviceSize elements = range / entry->block_size;
++   if (!elements || elements > physical_dev->properties.limits.maxTexelBufferElements) {
++      return vkr_validate_fail(
++         "buffer view: %" PRIu64 " elements of format %d are zero or more than %u",
++         elements, info->format, physical_dev->properties.limits.maxTexelBufferElements);
++   }
++
++   for (int storage = 0; storage < 2; storage++) {
++      const VkBufferUsageFlags2 bit = storage ? VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT
++                                              : VK_BUFFER_USAGE_2_UNIFORM_TEXEL_BUFFER_BIT;
++      const VkDeviceSize alignment =
++         vkr_buffer_view_get_alignment(physical_dev, storage, entry->block_size);
++      if ((usage & bit) && alignment && info->offset % alignment) {
++         return vkr_validate_fail("buffer view: offset %" PRIu64
++                                  " is not a multiple of %" PRIu64,
++                                  info->offset, alignment);
++      }
++   }
++
++   return true;
++}
+diff --git a/src/venus/vkr_validate.h b/src/venus/vkr_validate.h
+new file mode 100644
+index 0000000..db30dc2
+--- /dev/null
++++ b/src/venus/vkr_validate.h
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2026 The gVisor Authors
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VKR_VALIDATE_H
++#define VKR_VALIDATE_H
++
++#include "vkr_common.h"
++
++/*
++ * Tests of guest create info that must pass before the host driver gets it.
++ *
++ * The Vulkan specification makes the application responsible for valid usage,
++ * and a driver can do anything on invalid usage.  The guest is not trusted, so
++ * the renderer cannot give it that role.  These tests are for the create info
++ * of images, image views, and buffer views: a driver on top of a different
++ * API (Metal) turns them into descriptors, and that API stops the process
++ * when a descriptor is not valid.
++ *
++ * The tests are not a full validation layer.  They are for the valid usage
++ * rules that control the content of those descriptors.
++ */
++
++struct vkr_physical_device;
++
++/* The create info of an image in the form that the driver got. */
++struct vkr_image_info {
++   VkImageCreateFlags flags;
++   VkImageType type;
++   VkFormat format;
++   VkExtent3D extent;
++   uint32_t mip_levels;
++   uint32_t array_layers;
++   VkSampleCountFlagBits samples;
++   VkImageTiling tiling;
++   VkImageUsageFlags usage; /* includes the stencil usage */
++   uint32_t plane_count;    /* 1 for a format that is not multi-planar */
++};
++
++/* The create info of a buffer. */
++struct vkr_buffer_info {
++   VkDeviceSize size;
++   VkBufferUsageFlags2 usage;
++   bool sparse;
++};
++
++/*
++ * Returns true when the driver can get info.  The function can remove create
++ * flags that the host driver cannot use for this image (see
++ * vkr_physical_device::image_3d_alias_quirk); the caller must give the same
++ * info to the driver and to vkr_image_info_init.
++ */
++bool
++vkr_validate_image_create_info(struct vkr_physical_device *physical_dev,
++                               VkImageCreateInfo *info);
++
++void
++vkr_image_info_init(struct vkr_image_info *image, const VkImageCreateInfo *info);
++
++/* Returns true when subres is a subresource of image. */
++bool
++vkr_validate_image_subresource(const struct vkr_image_info *image,
++                               const VkImageSubresource *subres);
++
++/*
++ * For a command that binds memory to image or gets its memory requirements.
++ * has_plane and plane_aspect come from the plane structure of the command.
++ * Sets planes to the bit mask of the planes that the command is for.  image
++ * is NULL when the guest gave no image.
++ */
++bool
++vkr_validate_image_planes(const struct vkr_image_info *image,
++                          bool has_plane,
++                          VkImageAspectFlags plane_aspect,
++                          uint32_t *planes);
++
++/*
++ * bound_planes is the bit mask of the planes that have memory.  image is NULL
++ * when the guest gave no image.
++ */
++bool
++vkr_validate_image_view_create_info(struct vkr_physical_device *physical_dev,
++                                    const struct vkr_image_info *image,
++                                    uint32_t bound_planes,
++                                    const VkImageViewCreateInfo *info);
++
++/* For a command that binds memory to an image or a buffer. */
++bool
++vkr_validate_bind(bool has_object, bool has_memory);
++
++bool
++vkr_validate_buffer_create_info(struct vkr_physical_device *physical_dev,
++                                const VkBufferCreateInfo *info);
++
++void
++vkr_buffer_info_init(struct vkr_buffer_info *buffer, const VkBufferCreateInfo *info);
++
++/* buffer is NULL when the guest gave no buffer. */
++bool
++vkr_validate_buffer_view_create_info(struct vkr_physical_device *physical_dev,
++                                     const struct vkr_buffer_info *buffer,
++                                     bool memory_bound,
++                                     const VkBufferViewCreateInfo *info);
++
++#endif /* VKR_VALIDATE_H */
+-- 
+2.55.0
+

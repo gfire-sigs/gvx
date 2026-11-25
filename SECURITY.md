@@ -21,6 +21,7 @@ A security vulnerability is any defect enabling a guest program, image, volume, 
 | **Network isolation** | `-net=wg` forwards guest packets solely through WireGuard; `-net=none` blocks external host network access. |
 | **Control shim** | `containerd-shim-gvx-v2` never signals a PID from metadata and never removes containerd-owned files. |
 | **Release archives** | Every release archive carries a SLSA v1 provenance bundle from `.github/workflows/release.yml`. Reject archives failing verification. |
+| **GPU renderer (`-gpu=venus`, `-gpu=virgl`)** | Guest data cannot spawn processes, write host files, or open network sockets in `gvx-gpu-renderer`. Renderer faults never corrupt Sentry memory. |
 
 ### Verifying Release Provenance
 
@@ -49,6 +50,9 @@ The following behaviors are deliberate design limits rather than security defect
 - On Android, host directory mounts leave `Status.UnboundFileOpenBlocked` false because Zygote's `untrusted_app` seccomp policy traps Landlock syscalls.
 - Passing `-lockdown=false` disables host self-lockdown for debugging.
 - Under `-net=nat`, `-p`, and `--auto-publish`, guests can reach host endpoints and loopback listeners explicitly exposed to them.
+- Opt-in `-gpu=venus` and `-gpu=virgl` launch a confined C worker calling `virglrenderer`, KosmicKrisp/Metal, or Apple OpenGL. Host driver bugs stay reachable inside that worker.
+- The host kernel does not bound GPU renderer memory. An internal watchdog exits above the configured limit, though a compromised renderer can bypass it.
+- A guest sending malformed GPU commands stops its own renderer permanently without automatic restart.
 
 ---
 

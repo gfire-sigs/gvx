@@ -38,3 +38,10 @@ go.work.sum
 # .vscode/
 /rungvx
 /rungvx.exe
+
+# Renderer bundle and caches of scripts/gpu/build-renderer.sh
+/build/
+__pycache__/
+
+# macOS Finder metadata
+.DS_Store

@@ -1,0 +1,47 @@
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 21:45:00 +0900
+Subject: [PATCH] kk: use MTL_MATH_MODE_RELAXED for Metal shader libraries
+
+In src/kosmickrisp/vulkan/kk_shader.c, kk_compile_compute_pipeline and
+kk_compile_graphics_pipeline compile Metal shader libraries with
+MTL_MATH_MODE_FAST. When guest SPIR-V omits SignedZeroInfNanPreserve,
+Metal fast math makes infinity and NaN arithmetic undefined, which
+breaks WebGL floating-point parsing.
+
+Pass MTL_MATH_MODE_RELAXED to mtl_new_library for compute, vertex, and
+fragment shaders so Metal preserves infinity and NaN. Upstream Mesa
+issue 16920 tracks the same cause.
+
+License: MIT
+---
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index e3d07a4..8df8c1b 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1220,7 +1220,7 @@ kk_compile_compute_pipeline(struct kk_device *device,
+ 
+    mtl_library *library = mtl_new_library(
+       device->mtl_compiler_handle, data->code, pdev->info.msl_version,
+-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
++      MTL_MATH_MODE_RELAXED, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+    if (library == NULL)
+       return VK_ERROR_INVALID_SHADER_NV;
+ 
+@@ -1465,7 +1465,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+    mtl_library *vertex_library = mtl_new_library(
+       device->mtl_compiler_handle, vs_data->code, pdev->info.msl_version,
+-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
++      MTL_MATH_MODE_RELAXED, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+    if (vertex_library == NULL)
+       return VK_ERROR_INVALID_SHADER_NV;
+ 
+@@ -1476,7 +1476,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+    const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
+    mtl_library *fragment_library = mtl_new_library(
+       device->mtl_compiler_handle, fs_data->code, pdev->info.msl_version,
+-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
++      MTL_MATH_MODE_RELAXED, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+    if (fragment_library == NULL) {
+       result = VK_ERROR_INVALID_SHADER_NV;
+       goto destroy_vertex;

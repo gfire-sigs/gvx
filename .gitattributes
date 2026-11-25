@@ -1,3 +1,6 @@
 # Shell scripts also run inside Linux guests from a Windows checkout, and a
 # carriage return breaks them there. Keep LF line endings on every host.
 *.sh text eol=lf
+ext/workers/gpu-renderer/gvx_gpu_protocol.h text eol=lf
+ext/workers/gpu-renderer/licenses/*.txt text eol=lf
+ext/workers/gpu-renderer/third_party.lock text eol=lf
