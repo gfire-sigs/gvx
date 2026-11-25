@@ -44,10 +44,14 @@ func (s *Sandbox) syscallFilter() func() error {
 			}
 		}
 		hostDirs := s.usesHostDirs() || s.cfg.AllowBindAttach
+		hostFS := config.HostFSNone
+		if hostDirs {
+			hostFS = config.HostFSReadWrite
+		}
 		opt := config.Options{
-			Platform:       s.plat.SeccompInfo(),
-			HostNetwork:    s.cfg.NetworkMode == NetModeNAT,
-			HostFilesystem: hostDirs,
+			Platform:    s.plat.SeccompInfo(),
+			HostNetwork: s.cfg.NetworkMode == NetModeNAT,
+			HostFS:      hostFS,
 			// gvx has no control server and opens no /proc/self/fd directory. No
 			// descriptor has this number.
 			ControllerFD: math.MaxUint32,

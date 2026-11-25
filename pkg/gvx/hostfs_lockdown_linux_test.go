@@ -33,11 +33,11 @@ func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, er
 		},
 		InstallSyscallFilter: func() error {
 			opt := config.Options{
-				Platform:       platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()},
-				HostFilesystem: true,
-				ControllerFD:   math.MaxUint32,
-				ProcSelfFD:     math.MaxUint32,
-				CgoEnabled:     cgoBuild,
+				Platform:     platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()},
+				HostFS:       config.HostFSReadWrite,
+				ControllerFD: math.MaxUint32,
+				ProcSelfFD:   math.MaxUint32,
+				CgoEnabled:   cgoBuild,
 			}
 			rules, denyRules := config.Rules(opt)
 			rules.Merge(embedderRules(Config{}, true, false))

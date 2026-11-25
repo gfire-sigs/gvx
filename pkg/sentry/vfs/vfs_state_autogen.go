@@ -1913,6 +1913,7 @@ func (g *GetXattrOptions) StateFields() []string {
 	return []string{
 		"Name",
 		"Size",
+		"RawCapability",
 	}
 }
 
@@ -1923,6 +1924,7 @@ func (g *GetXattrOptions) StateSave(stateSinkObject state.Sink) {
 	g.beforeSave()
 	stateSinkObject.SaveString(0, &g.Name)
 	stateSinkObject.SaveUint64(1, &g.Size)
+	stateSinkObject.SaveBool(2, &g.RawCapability)
 }
 
 func (g *GetXattrOptions) afterLoad(context.Context) {}
@@ -1931,6 +1933,7 @@ func (g *GetXattrOptions) afterLoad(context.Context) {}
 func (g *GetXattrOptions) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.LoadString(0, &g.Name)
 	stateSourceObject.LoadUint64(1, &g.Size)
+	stateSourceObject.LoadBool(2, &g.RawCapability)
 }
 
 func (s *SetXattrOptions) StateTypeName() string {

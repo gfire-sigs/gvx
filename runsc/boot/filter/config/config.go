@@ -35,12 +35,42 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/socket/plugin"
 )
 
+// HostFSAccess is the access to the host filesystem that the Sentry needs in
+// addition to I/O on the host FDs that it holds. That I/O includes changes to
+// the size and the timestamps of a file.
+//
+// The levels are ordered. Each level allows all that the level before it
+// allows.
+type HostFSAccess int
+
+const (
+	// HostFSNone means that the Sentry only does I/O on the host FDs that it
+	// holds.
+	HostFSNone HostFSAccess = iota
+
+	// HostFSReadWrite means that the Sentry can look up, create, rename and
+	// remove host files and directories, and can change their metadata.
+	HostFSReadWrite
+)
+
+// String returns the name of the access level.
+func (a HostFSAccess) String() string {
+	switch a {
+	case HostFSNone:
+		return "none"
+	case HostFSReadWrite:
+		return "readwrite"
+	default:
+		return fmt.Sprintf("HostFSAccess(%d)", int(a))
+	}
+}
+
 // Options are seccomp filter related options.
 type Options struct {
 	Platform              platform.SeccompInfo
 	HostNetwork           bool
 	HostNetworkRawSockets bool
-	HostFilesystem        bool
+	HostFS                HostFSAccess
 	ProcSelfFD            uint32
 	ProfileEnable         bool
 	NVProxy               bool
@@ -85,7 +115,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "Platform=%q ", opt.Platform.ConfigKey())
 	fmt.Fprintf(&sb, "HostNetwork=%t ", opt.HostNetwork)
 	fmt.Fprintf(&sb, "HostNetworkRawSockets=%t ", opt.HostNetworkRawSockets)
-	fmt.Fprintf(&sb, "HostFilesystem=%t ", opt.HostFilesystem)
+	fmt.Fprintf(&sb, "HostFS=%v ", opt.HostFS)
 	fmt.Fprintf(&sb, "ProfileEnable=%t ", opt.ProfileEnable)
 	fmt.Fprintf(&sb, "Instrumentation=%t ", isInstrumentationEnabled())
 	fmt.Fprintf(&sb, "NVProxy=%t ", opt.NVProxy)
@@ -112,7 +142,7 @@ func Warnings(opt Options) []string {
 	if opt.ProfileEnable {
 		warnings = append(warnings, "profile enabled: syscall filters less restrictive!")
 	}
-	if opt.HostFilesystem {
+	if opt.HostFS != HostFSNone {
 		warnings = append(warnings, "host filesystem enabled: syscall filters less restrictive!")
 	}
 	if isInstrumentationEnabled() {
@@ -142,7 +172,7 @@ func (opt Options) Vars() precompiledseccomp.Values {
 	vars := precompiledseccomp.Values{
 		controllerFDVarName: opt.ControllerFD,
 	}
-	if opt.HostFilesystem {
+	if opt.HostFS != HostFSNone {
 		vars[procSelfFDVarName] = opt.ProcSelfFD
 	}
 	vars.SetUint64(selfPIDVarName, uint64(os.Getpid()))
@@ -177,7 +207,7 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 		s.Merge(profileFilters())
 		s.Merge(cpuProfilerFilters())
 	}
-	if opt.HostFilesystem {
+	if opt.HostFS != HostFSNone {
 		s.Merge(hostFilesystemFilters(vars))
 	}
 	if opt.NVProxy {

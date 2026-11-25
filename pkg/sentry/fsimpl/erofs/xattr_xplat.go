@@ -66,7 +66,7 @@ func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (st
 	if opts.Size != 0 && uint64(len(value)) > opts.Size {
 		return "", linuxerr.ERANGE
 	}
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
+	if opts.Name == linux.XATTR_SECURITY_CAPABILITY && !opts.RawCapability {
 		return auth.FixupVfsCapDataOnGet(creds, string(value))
 	}
 	return string(value), nil

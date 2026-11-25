@@ -875,7 +875,7 @@ func New(args Args) (*Loader, error) {
 
 	// Create timekeeper.
 	tk := kernel.NewTimekeeper()
-	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
+	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamsFileRange())
 	tk.SetClocks(time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(args.Spec, args.Conf)), params)
 	args.StartupTimer.Reached("timekeeper configured")
 
@@ -1088,6 +1088,14 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 			l.hostinetPortRange = nil
 		}
 		return nil
+	}
+
+	if eps, ok := s.(*netstack.Stack); ok {
+		// A stack restored from a checkpoint has the setting it was saved
+		// with.
+		if err := setTCPDelayedACK(eps.Stack, l.root.conf.TCPDelayedACK); err != nil {
+			return err
+		}
 	}
 
 	if l.networkArgs == nil {
@@ -1360,11 +1368,15 @@ func (l *Loader) installSeccompFilters() error {
 				return fmt.Errorf("NVIDIA capabilities: %w", err)
 			}
 		}
+		hostFS := filter.HostFSNone
+		if l.root.conf.DirectFS {
+			hostFS = filter.HostFSReadWrite
+		}
 		opts := filter.Options{
 			Platform:              l.k.Platform.SeccompInfo(),
 			HostNetwork:           hostnet,
 			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
-			HostFilesystem:        l.root.conf.DirectFS,
+			HostFS:                hostFS,
 			ProcSelfFD:            uint32(l.procSelfFD),
 			ProfileEnable:         l.root.conf.ProfileEnable,
 			NVProxy:               nvproxyEnabled,
@@ -1839,14 +1851,14 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	info.procArgs.FDTable.DecRef(ctx)
 
 	// Install seccomp filters with the new task if there are any.
-	program, err := buildOCISeccompProgram(info.conf, info.spec)
+	filter, err := buildOCISeccompFilter(info.conf, info.spec)
 	if err != nil {
 		return nil, nil, err
 	}
-	if program != nil {
+	if filter != nil {
 		task := tg.Leader()
 		// NOTE: It seems Flags are ignored by runc so we ignore them too.
-		if err := task.AppendSyscallFilter(*program, true); err != nil {
+		if err := task.AppendSyscallFilter(*filter, true); err != nil {
 			return nil, nil, fmt.Errorf("appending seccomp filters: %w", err)
 		}
 		info.procArgs.StartupTimeline.Reached("OCI seccomp filters applied")
@@ -2014,11 +2026,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		return 0, fmt.Errorf("creating limits: %w", err)
 	}
 
-	seccompProgram, err := buildOCISeccompProgram(l.root.conf, spec)
+	seccompFilter, err := buildOCISeccompFilter(l.root.conf, spec)
 	if err != nil {
 		return 0, err
 	}
-	args.SeccompProgram = seccompProgram
+	args.SeccompFilter = seccompFilter
 
 	// Start the process.
 	proc := control.Proc{Kernel: l.k}
@@ -2285,7 +2297,20 @@ func (c *sandboxNetstackCreator) newEmptySandboxNetworkStack() (*netstack.Stack,
 		}
 	}
 
+	if err := setTCPDelayedACK(s.Stack, c.tcpDelayedACK); err != nil {
+		return nil, err
+	}
+
 	return s, nil
+}
+
+// setTCPDelayedACK sets tcpip.TCPDelayedACKEnabled on s.
+func setTCPDelayedACK(s *stack.Stack, mode config.TCPDelayedACK) error {
+	opt := tcpip.TCPDelayedACKEnabled(mode == config.TCPDelayedACKEnabled)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		return fmt.Errorf("SetTransportProtocolOption(%d, &%T(%t)): %s", tcp.ProtocolNumber, opt, opt, err)
+	}
+	return nil
 }
 
 // sandboxNetstackCreator implements inet.NetworkStackCreator and
@@ -2296,6 +2321,7 @@ type sandboxNetstackCreator struct {
 	clock                    tcpip.Clock
 	allowPacketEndpointWrite bool
 	allowLiveTCPMigration    bool
+	tcpDelayedACK            config.TCPDelayedACK
 	uid                      uniqueid.Provider
 }
 
@@ -2306,6 +2332,7 @@ func newSandboxNetstackCreator(conf *config.Config, clock tcpip.Clock, uid uniqu
 		clock:                    clock,
 		allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
 		allowLiveTCPMigration:    conf.AllowLiveTCPMigration,
+		tcpDelayedACK:            conf.TCPDelayedACK,
 		uid:                      uid,
 	}
 }

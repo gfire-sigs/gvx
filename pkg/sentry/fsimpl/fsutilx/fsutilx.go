@@ -210,7 +210,7 @@ func FinishGetXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions, raw []by
 	if opts.Size != 0 && uint64(len(value)) > opts.Size {
 		return "", linuxerr.ERANGE
 	}
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
+	if opts.Name == linux.XATTR_SECURITY_CAPABILITY && !opts.RawCapability {
 		return auth.FixupVfsCapDataOnGet(creds, value)
 	}
 	return value, nil

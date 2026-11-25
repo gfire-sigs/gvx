@@ -21,6 +21,7 @@ import (
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/ring0"
@@ -67,9 +68,10 @@ type kvmVcpuEvents struct {
 
 // updateGlobalOnce does global initialization. It has to be called only once.
 func updateGlobalOnce(fd int) error {
-	if err := disableHostPAC(); err != nil {
-		return err
-	}
+	// Initialize is idempotent; HWCAP_PACA must be read before any vCPU is
+	// bound (see disableHostPAC).
+	cpuid.Initialize()
+	hostAddressAuth = cpuid.HostFeatureSet().HasPointerAuth()
 	err := updateSystemValues(int(fd))
 
 	maxIPA, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(fd), KVM_CHECK_EXTENSION, _KVM_CAP_ARM_VM_IPA_SIZE)

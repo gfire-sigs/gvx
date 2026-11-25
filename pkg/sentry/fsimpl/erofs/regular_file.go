@@ -28,6 +28,8 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/hostfd"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
@@ -203,14 +205,6 @@ func (i *inode) Translate(ctx context.Context, required, optional memmap.Mappabl
 		})
 		return nil, &memmap.BusError{Err: linuxerr.EROFS}
 	}
-	// TODO: Tail-packed inline data isn't block aligned in the image, so
-	// regular files with inline data can't be mapped. The image should be
-	// created with the "-E noinline_data" option, which was introduced for
-	// the DAX feature support in Linux [1].
-	// [1] https://github.com/erofs/erofs-utils/commit/60549d52c3b636f0ddd1d51b0c1517c1dee22595
-	if i.DataLayout() == erofs.InodeDataLayoutFlatInline {
-		return nil, &memmap.BusError{Err: linuxerr.ENOTSUP}
-	}
 	var ts []memmap.Translation
 	for off := required.Start; off < required.End; {
 		e, err := i.MapBlocks(off)
@@ -234,9 +228,23 @@ func (i *inode) Translate(ctx context.Context, required, optional memmap.Mappabl
 			File:   &i.fs.mf,
 			Perms:  hostarch.ReadExecute,
 		}
-		t.Offset = e.ImageOff + t.Source.Start - e.Off
-		start, end := max(t.Source.Start, required.Start), min(t.Source.End, required.End)
-		i.fs.countMappedRead(ctx, t.Offset+start-t.Source.Start, end-start)
+		start := e.ImageOff
+		if e.Inline {
+			fr, err := i.inlineTailPages(ctx, e)
+			if err != nil {
+				return ts, &memmap.BusError{Err: err}
+			}
+			t.Source.End = min(e.Off+fr.Length(), optional.End)
+			t.File = i.fs.memoryFile
+			start = fr.Start
+		}
+		t.Offset = start + t.Source.Start - e.Off
+		if !e.Inline {
+			reqStart, reqEnd := max(t.Source.Start, required.Start), min(t.Source.End, required.End)
+			i.fs.countMappedRead(ctx, e.ImageOff+reqStart-e.Off, reqEnd-reqStart)
+		} else {
+			i.fs.countMappedRead(ctx, e.ImageOff, e.Length)
+		}
 		ts = append(ts, t)
 		off = t.Source.End
 	}
@@ -247,6 +255,33 @@ func (i *inode) Translate(ctx context.Context, required, optional memmap.Mappabl
 }
 
 var inodeTranslateWriteWarnOnce sync.Once
+
+func (i *inode) inlineTailPages(ctx context.Context, e erofs.Extent) (memmap.FileRange, error) {
+	i.inlineTailMu.Lock()
+	defer i.inlineTailMu.Unlock()
+	if i.inlineTail.Length() != 0 {
+		return i.inlineTail, nil
+	}
+	data, err := i.fs.image.BytesAt(e.ImageOff, e.Length)
+	if err != nil {
+		return memmap.FileRange{}, err
+	}
+	length, _ := hostarch.PageRoundUp(e.Length)
+	fr, err := i.fs.memoryFile.Allocate(length, pgalloc.AllocOpts{Kind: usage.PageCache, MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx)})
+	if err != nil {
+		return memmap.FileRange{}, err
+	}
+	dsts, err := i.fs.memoryFile.MapInternal(fr, hostarch.Write)
+	if err == nil {
+		_, err = safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data)))
+	}
+	if err != nil {
+		i.fs.memoryFile.DecRef(fr)
+		return memmap.FileRange{}, err
+	}
+	i.inlineTail = fr
+	return fr, nil
+}
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 func (i *inode) InvalidateUnsavable(ctx context.Context) error {

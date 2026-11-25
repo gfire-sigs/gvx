@@ -352,3 +352,50 @@ func TestSeekAndRWFlagHelpers(t *testing.T) {
 		t.Fatal("AppendsWrite(0, 0) = true, want false")
 	}
 }
+
+func TestFinishGetXattrRawCapability(t *testing.T) {
+	t.Parallel()
+
+	// Build a v3 security.capability xattr owned by KUID 5000.
+	rootNS := auth.NewRootUserNamespace()
+	rootCreds := auth.NewRootCredentials(rootNS)
+	childNS, err := rootCreds.NewChildUserNamespace()
+	if err != nil {
+		t.Fatalf("NewChildUserNamespace: %v", err)
+	}
+	rootCtx := context.WithValue(context.Background(), auth.CtxCredentials, rootCreds)
+	if err := childNS.SetUIDMap(rootCtx, []auth.IDMapEntry{
+		{FirstID: 0, FirstParentID: 1000, Length: 100},
+	}); err != nil {
+		t.Fatalf("SetUIDMap: %v", err)
+	}
+	childCreds := auth.NewRootCredentials(childNS)
+
+	capData := linux.VfsNsCapData{
+		VfsCapData: linux.VfsCapData{
+			MagicEtc:    linux.VFS_CAP_REVISION_3 | linux.VFS_CAP_FLAGS_EFFECTIVE,
+			PermittedLo: 1 << linux.CAP_NET_BIND_SERVICE,
+		},
+		RootID: 5000,
+	}
+	raw := []byte(capData.ToString())
+
+	// Without RawCapability, FixupVfsCapDataOnGet rejects the unmapped RootID.
+	if _, err := FinishGetXattr(childCreds, &vfs.GetXattrOptions{
+		Name: linux.XATTR_SECURITY_CAPABILITY,
+	}, raw); !linuxerr.Equals(linuxerr.EOVERFLOW, err) {
+		t.Fatalf("FinishGetXattr(RawCapability=false) err = %v, want EOVERFLOW", err)
+	}
+
+	// With RawCapability, execve privilege reads receive the raw KUID payload untouched.
+	got, err := FinishGetXattr(childCreds, &vfs.GetXattrOptions{
+		Name:          linux.XATTR_SECURITY_CAPABILITY,
+		RawCapability: true,
+	}, raw)
+	if err != nil {
+		t.Fatalf("FinishGetXattr(RawCapability=true): %v", err)
+	}
+	if got != string(raw) {
+		t.Fatalf("FinishGetXattr(RawCapability=true) = %x, want %x", got, raw)
+	}
+}

@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"unsafe"
 
-	"z.gfire.dev/gvx/pkg/gohacks"
 	"z.gfire.dev/gvx/pkg/safecopy"
 	"z.gfire.dev/gvx/pkg/sync"
 )
@@ -149,7 +148,7 @@ func (b Block) TakeFirst64(n uint64) Block {
 
 // ToSlice returns a []byte equivalent to b.
 func (b Block) ToSlice() []byte {
-	return gohacks.Slice((*byte)(b.start), b.length)
+	return unsafe.Slice((*byte)(b.start), b.length)
 }
 
 // Addr returns b's start address as a uintptr. It returns uintptr instead of

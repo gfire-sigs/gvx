@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
-	"z.gfire.dev/gvx/pkg/bpf"
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/log"
@@ -70,9 +69,9 @@ type ExecArgs struct {
 	// Limits is the limit set for the process being executed.
 	Limits *limits.LimitSet
 
-	// SeccompProgram is an optional seccomp BPF program to install on the
-	// new process.
-	SeccompProgram *bpf.Program
+	// SeccompFilter is an optional seccomp filter to install on the new
+	// process.
+	SeccompFilter *kernel.SyscallFilter
 }
 
 // Exec runs a new task.
@@ -244,9 +243,9 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		return nil, 0, nil, err
 	}
 
-	if args.SeccompProgram != nil {
+	if args.SeccompFilter != nil {
 		task := tg.Leader()
-		if err := task.AppendSyscallFilter(*args.SeccompProgram, true); err != nil {
+		if err := task.AppendSyscallFilter(*args.SeccompFilter, true); err != nil {
 			return nil, 0, nil, fmt.Errorf("appending seccomp filters: %w", err)
 		}
 	}

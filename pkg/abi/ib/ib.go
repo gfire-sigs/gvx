@@ -71,6 +71,11 @@ type UverbsAttr struct {
 	Data     uint64
 }
 
+// UVERBS_ATTR_F_MANDATORY is the UverbsAttr.Flags bit (enum
+// uverbs_attrs_flags) that makes the kernel reject a request whose attribute
+// it does not support instead of ignoring the attribute.
+const UVERBS_ATTR_F_MANDATORY = 1 << 0
+
 // UVERBS ioctl object, method, and attribute IDs from
 // include/uapi/rdma/ib_user_ioctl_cmds.h. Only the entries the rdma proxy
 // models are listed; the enums are cherry-picked, so values are explicit.
@@ -300,6 +305,15 @@ const (
 // the CQ/QP doorbell page.
 const (
 	MLX5_IB_OBJECT_UAR = 0x1008
+
+	// enum mlx5_ib_device_methods.
+	MLX5_IB_METHOD_GET_DATA_DIRECT_SYSFS_PATH = 0x1001
+
+	// enum mlx5_ib_get_data_direct_sysfs_path_attrs.
+	MLX5_IB_ATTR_GET_DATA_DIRECT_SYSFS_PATH = 0x1000
+
+	// enum mlx5_ib_reg_dmabuf_mr_attrs.
+	MLX5_IB_ATTR_REG_DMABUF_MR_ACCESS_FLAGS = 0x1000
 
 	// enum mlx5_ib_uar_obj_methods.
 	MLX5_IB_METHOD_UAR_OBJ_ALLOC   = 0x1000

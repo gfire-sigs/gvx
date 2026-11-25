@@ -21,7 +21,6 @@ package main
 
 import (
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/plugin/stack"
-	_ "z.gfire.dev/gvx/runsc/cgoextras"
 	"z.gfire.dev/gvx/runsc/cli/sentrycli"
 	"z.gfire.dev/gvx/runsc/gvisorbinaries"
 )

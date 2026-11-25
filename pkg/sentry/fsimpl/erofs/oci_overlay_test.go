@@ -525,3 +525,58 @@ func patternBytes(n int, seed uint64) []byte {
 	rand.NewChaCha8(key).Read(b)
 	return b
 }
+
+func TestErofsGetXattrRawCapability(t *testing.T) {
+	capData := linux.VfsNsCapData{
+		VfsCapData: linux.VfsCapData{
+			MagicEtc:    linux.VFS_CAP_REVISION_3 | linux.VFS_CAP_FLAGS_EFFECTIVE,
+			PermittedLo: 1 << linux.CAP_NET_BIND_SERVICE,
+		},
+		RootID: 5000,
+	}
+	rawCap := capData.ToString()
+
+	entry := fileEntry("bin/captool", "elf")
+	entry.hdr.Mode = 0o755
+	entry.hdr.PAXRecords = map[string]string{
+		"SCHILY.xattr." + linux.XATTR_SECURITY_CAPABILITY: rawCap,
+	}
+	layerPath, _ := compileTar(t, 4096, buildTar(t, dirEntry("bin"), entry))
+
+	s := newSentry(t)
+	root := s.mountErofs(layerPath)
+	defer root.DecRef(s.ctx)
+
+	childNS, err := s.creds.NewChildUserNamespace()
+	if err != nil {
+		t.Fatalf("NewChildUserNamespace: %v", err)
+	}
+	if err := childNS.SetUIDMap(s.ctx, []auth.IDMapEntry{
+		{FirstID: 0, FirstParentID: 1000, Length: 100},
+	}); err != nil {
+		t.Fatalf("SetUIDMap: %v", err)
+	}
+	childCreds := auth.NewRootCredentials(childNS)
+
+	pop := &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse("bin/captool"),
+	}
+	if _, err := s.vfs.GetXattrAt(s.ctx, childCreds, pop, &vfs.GetXattrOptions{
+		Name: linux.XATTR_SECURITY_CAPABILITY,
+	}); !linuxerr.Equals(linuxerr.EOVERFLOW, err) {
+		t.Fatalf("GetXattrAt(RawCapability=false) err = %v, want EOVERFLOW", err)
+	}
+
+	got, err := s.vfs.GetXattrAt(s.ctx, childCreds, pop, &vfs.GetXattrOptions{
+		Name:          linux.XATTR_SECURITY_CAPABILITY,
+		RawCapability: true,
+	})
+	if err != nil {
+		t.Fatalf("GetXattrAt(RawCapability=true): %v", err)
+	}
+	if got != rawCap {
+		t.Fatalf("GetXattrAt(RawCapability=true) = %x, want %x", got, rawCap)
+	}
+}

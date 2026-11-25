@@ -32,7 +32,7 @@ import (
 // four descriptor forms of the xattr calls.
 func TestHostFilesystemRulesAllowTheXattrCalls(t *testing.T) {
 	plat := platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()}
-	rules, _ := config.Rules(config.Options{Platform: plat, HostFilesystem: true})
+	rules, _ := config.Rules(config.Options{Platform: plat, HostFS: config.HostFSReadWrite})
 	for name, sysno := range map[string]uintptr{
 		"fgetxattr":    unix.SYS_FGETXATTR,
 		"fsetxattr":    unix.SYS_FSETXATTR,
@@ -155,7 +155,7 @@ func TestEmbedderRulesAllowFallocateKeepSizeForHostDirsOnly(t *testing.T) {
 	}
 
 	plat := platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()}
-	merged, _ := config.Rules(config.Options{Platform: plat, HostFilesystem: true})
+	merged, _ := config.Rules(config.Options{Platform: plat, HostFS: config.HostFSReadWrite})
 	merged.Merge(rules)
 	mergedModes := fallocateArgReprs(t, merged, 1)
 	for _, wantMode := range []uintptr{

@@ -67,7 +67,7 @@ func containsRepr(reprs []string, vm seccomp.ValueMatcher) bool {
 // the host filesystem, and the descriptor form needs only the base rule.
 func TestHostFilesystemRulesAllowTheStatxCalls(t *testing.T) {
 	plat := platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()}
-	with, _ := config.Rules(config.Options{Platform: plat, HostFilesystem: true})
+	with, _ := config.Rules(config.Options{Platform: plat, HostFS: config.HostFSReadWrite})
 	without, _ := config.Rules(config.Options{Platform: plat})
 	if !with.Has(unix.SYS_STATX) {
 		t.Fatal("the host filesystem rules lack statx, so hostfs stat calls kill the process after the lockdown")

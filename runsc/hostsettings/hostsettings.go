@@ -217,7 +217,7 @@ func check(conf *config.Config) ([]*Delta, []error) {
 		},
 		{
 			path:    "/sys/kernel/mm/transparent_hugepage/defrag",
-			purpose: "disabling direct compaction improves page fault latency when hugepages are not immediately available",
+			purpose: "deferring compaction to kcompactd improves page fault latency when hugepages are not immediately available",
 			delta: func(conf *config.Config, current string) (string, bool, error) {
 				cur, err := hostmm.GetTransparentHugepageEnum(current)
 				if err != nil {
@@ -229,7 +229,7 @@ func check(conf *config.Config) ([]*Delta, []error) {
 				case "defer+madvise":
 					return "defer", false, nil
 				case "madvise":
-					return "never", false, nil
+					return "defer", false, nil
 				default:
 					// Linux can reasonably add new options, so this shouldn't
 					// be fatal.

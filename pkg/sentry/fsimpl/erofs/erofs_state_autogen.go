@@ -251,6 +251,7 @@ func (i *inode) StateFields() []string {
 		"inodeRefs",
 		"fs",
 		"mappings",
+		"inlineTail",
 		"locks",
 		"watches",
 	}
@@ -266,8 +267,9 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &i.inodeRefs)
 	stateSinkObject.Save(3, &i.fs)
 	stateSinkObject.Save(4, &i.mappings)
-	stateSinkObject.Save(5, &i.locks)
-	stateSinkObject.Save(6, &i.watches)
+	stateSinkObject.Save(5, &i.inlineTail)
+	stateSinkObject.Save(6, &i.locks)
+	stateSinkObject.Save(7, &i.watches)
 }
 
 func (i *inode) afterLoad(context.Context) {}
@@ -279,8 +281,9 @@ func (i *inode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &i.inodeRefs)
 	stateSourceObject.Load(3, &i.fs)
 	stateSourceObject.Load(4, &i.mappings)
-	stateSourceObject.Load(5, &i.locks)
-	stateSourceObject.Load(6, &i.watches)
+	stateSourceObject.Load(5, &i.inlineTail)
+	stateSourceObject.Load(6, &i.locks)
+	stateSourceObject.Load(7, &i.watches)
 }
 
 func (d *dentry) StateTypeName() string {
