@@ -209,7 +209,7 @@ func TestSystemInfoDFPruneAndCompletionCommands(t *testing.T) {
 
 	for _, sh := range []string{"bash", "zsh", "fish", "powershell"} {
 		comp := runCLIArgs(t, nil, "completion", sh).mustSucceed(t, "completion "+sh)
-		if !strings.Contains(comp.stdout, "rungvx") || !strings.Contains(comp.stdout, "volume") {
+		if !strings.Contains(comp.stdout, "rungvx") || !strings.Contains(comp.stdout, "volume") || !strings.Contains(comp.stdout, "volume-dir") {
 			t.Errorf("completion %s output missing expected tokens:\n%s", sh, comp.stdout)
 		}
 	}
@@ -362,5 +362,72 @@ func TestVolumeCompactAndAllocatedBytesCLI(t *testing.T) {
 	}
 	if items[0].SizeBytes != initialSize || items[0].LockMode != "none" || items[0].InUse {
 		t.Fatalf("inspected after compact = %+v, want SizeBytes=%d LockMode=none InUse=false", items[0], initialSize)
+	}
+}
+
+func TestVolumeAndSystemCLIVolumeDirFlag(t *testing.T) {
+	canaryDir := t.TempDir()
+	t.Setenv(gvx.VolumeDirEnv, canaryDir)
+	if _, err := gvx.CreateVolume("", "canary", gvx.DriverExt4lite); err != nil {
+		t.Fatalf("CreateVolume(canary): %v", err)
+	}
+
+	env := newCLIEnv(t)
+	volDir := t.TempDir()
+
+	runCLIArgs(t, nil, "volume", "create", "db", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume create -volume-dir")
+	if _, err := os.Stat(filepath.Join(volDir, "db.ext4")); err != nil {
+		t.Fatalf("expected %s/db.ext4: %v", volDir, err)
+	}
+	if _, err := os.Lstat(filepath.Join(env.cacheDir, "volumes")); !os.IsNotExist(err) {
+		t.Fatalf("cacheDir/volumes should not exist when -volume-dir is set: %v", err)
+	}
+
+	lsOut := runCLIArgs(t, nil, "volume", "ls", "-q", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume ls -volume-dir")
+	if got := strings.Fields(lsOut.stdout); len(got) != 1 || got[0] != "db" {
+		t.Fatalf("volume ls -q = %v, want [db]", got)
+	}
+
+	inspOut := runCLIArgs(t, nil, "volume", "inspect", "db", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume inspect -volume-dir")
+	var items []gvx.VolumeInfo
+	if err := json.Unmarshal([]byte(inspOut.stdout), &items); err != nil || len(items) != 1 {
+		t.Fatalf("volume inspect JSON = %q, err = %v", inspOut.stdout, err)
+	}
+	if filepath.Dir(items[0].Mountpoint) != volDir {
+		t.Fatalf("inspect Mountpoint = %q, want under %q", items[0].Mountpoint, volDir)
+	}
+
+	runCLIArgs(t, nil, "volume", "compact", "db", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume compact -volume-dir")
+
+	infoOut := runCLIArgs(t, nil, "info", "--format", "json", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "info -volume-dir")
+	var si gvx.SystemInfo
+	if err := json.Unmarshal([]byte(infoOut.stdout), &si); err != nil {
+		t.Fatalf("unmarshal info json: %v\n%s", err, infoOut.stdout)
+	}
+	if si.VolumeDir != volDir || si.Volumes != 1 {
+		t.Fatalf("info = (VolumeDir=%q, Volumes=%d), want (%q, 1)", si.VolumeDir, si.Volumes, volDir)
+	}
+
+	dfOut := runCLIArgs(t, nil, "system", "df", "-v", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "system df -volume-dir").stdout
+	if !strings.Contains(dfOut, "db") || strings.Contains(dfOut, "canary") {
+		t.Fatalf("system df -v = %q, want db and not canary", dfOut)
+	}
+
+	runCLIArgs(t, nil, "volume", "rm", "db", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume rm -volume-dir")
+
+	runCLIArgs(t, nil, "volume", "create", "tmpv", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume create tmpv")
+	runCLIArgs(t, nil, "volume", "prune", "-f", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume prune -volume-dir")
+	if got := strings.Fields(runCLIArgs(t, nil, "volume", "ls", "-q", "-cache-dir", env.cacheDir, "-volume-dir", volDir).stdout); len(got) != 0 {
+		t.Fatalf("volumes after volume prune -f = %v, want empty", got)
+	}
+
+	runCLIArgs(t, nil, "volume", "create", "tmpv2", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "volume create tmpv2")
+	runCLIArgs(t, nil, "system", "prune", "-af", "--volumes", "-cache-dir", env.cacheDir, "-volume-dir", volDir).mustSucceed(t, "system prune -volume-dir")
+	if got := strings.Fields(runCLIArgs(t, nil, "volume", "ls", "-q", "-cache-dir", env.cacheDir, "-volume-dir", volDir).stdout); len(got) != 0 {
+		t.Fatalf("volumes after system prune --volumes = %v, want empty", got)
+	}
+
+	if _, err := gvx.InspectVolume("", "canary"); err != nil {
+		t.Fatalf("canary volume in %s was affected: %v", gvx.VolumeDirEnv, err)
 	}
 }

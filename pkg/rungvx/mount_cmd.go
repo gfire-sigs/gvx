@@ -133,7 +133,7 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 	fs := newImageFlagSet(cmdName, stderr)
 	target := addControlFlags(fs, 10*time.Second)
 
-	var mountType, src, dst, sizeStr, cacheDir string
+	var mountType, src, dst, sizeStr, cacheDir, volumeDir string
 	var readOnly bool
 	fs.StringVar(&mountType, "type", "", "Mount type: tmpfs, volume, or bind")
 	registerAlias([]string{"src", "source"}, func(n string) {
@@ -149,6 +149,7 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 		fs.StringVar(&sizeStr, n, "", "Maximum tmpfs size (e.g. 64m)")
 	})
 	fs.StringVar(&cacheDir, "cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
+	fs.StringVar(&volumeDir, "volume-dir", "", volumeDirFlagUsage)
 
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
@@ -196,7 +197,7 @@ func mountAddSubcommand(ctx context.Context, args []string, stdout, stderr io.Wr
 		}
 		volPath := src
 		if !strings.ContainsAny(src, `/\`) && !strings.HasSuffix(strings.ToLower(src), ".ext4") {
-			volDir, err := gvx.VolumeDir(cacheDir)
+			volDir, err := gvx.VolumeStore{OCICacheDir: cacheDir, VolumeDir: volumeDir}.Dir()
 			if err != nil {
 				return controlFail(stderr, cmdName, err)
 			}

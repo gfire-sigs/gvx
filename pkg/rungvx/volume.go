@@ -76,10 +76,13 @@ func printVolumeGroupUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "  prune       Remove all unlocked local volumes")
 }
 
+const volumeDirFlagUsage = "Named volume directory (overrides -cache-dir and GVX_VOLUME_DIR)"
+
 func volumeCreateSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	const cmdName = "volume create"
 	fs := newImageFlagSet(cmdName, stderr)
 	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	var driver string
 	registerAlias([]string{"d", "driver"}, func(n string) {
 		fs.StringVar(&driver, n, string(gvx.DriverExt4lite), "Volume driver (ext4lite or hostfs)")
@@ -94,7 +97,8 @@ func volumeCreateSubcommand(_ context.Context, args []string, stdout, stderr io.
 	if fs.NArg() == 1 {
 		name = fs.Arg(0)
 	}
-	vi, err := gvx.CreateVolume(*cacheDir, name, gvx.MountDriver(strings.TrimSpace(driver)))
+	store := gvx.VolumeStore{OCICacheDir: *cacheDir, VolumeDir: *volumeDir}
+	vi, err := store.Create(name, gvx.MountDriver(strings.TrimSpace(driver)))
 	if err != nil {
 		if errors.Is(err, gvx.ErrInvalidConfig) {
 			return imageUsageError(stderr, cmdName, "%v", err)
@@ -122,6 +126,7 @@ func volumeListSubcommand(_ context.Context, args []string, stdout, stderr io.Wr
 	const cmdName = "volume ls"
 	fs := newImageFlagSet(cmdName, stderr)
 	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	var quiet bool
 	fs.BoolVar(&quiet, "q", false, "Print only volume names")
 	fs.BoolVar(&quiet, "quiet", false, "Print only volume names")
@@ -138,7 +143,8 @@ func volumeListSubcommand(_ context.Context, args []string, stdout, stderr io.Wr
 		}
 	}
 
-	vols, err := gvx.ListVolumes(*cacheDir)
+	store := gvx.VolumeStore{OCICacheDir: *cacheDir, VolumeDir: *volumeDir}
+	vols, err := store.List()
 	if err != nil {
 		return imageFail(stderr, cmdName, err)
 	}
@@ -185,6 +191,7 @@ func volumeInspectSubcommand(_ context.Context, args []string, stdout, stderr io
 	const cmdName = "volume inspect"
 	fs := newImageFlagSet(cmdName, stderr)
 	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	var format string
 	registerAlias([]string{"f", "format"}, func(n string) {
 		fs.StringVar(&format, n, "", "Format output using json (default) or a Go template")
@@ -205,10 +212,11 @@ func volumeInspectSubcommand(_ context.Context, args []string, stdout, stderr io
 		}
 	}
 
+	store := gvx.VolumeStore{OCICacheDir: *cacheDir, VolumeDir: *volumeDir}
 	code := 0
 	items := []gvx.VolumeInfo{}
 	for _, name := range fs.Args() {
-		vi, err := gvx.InspectVolume(*cacheDir, name)
+		vi, err := store.Inspect(name)
 		if err != nil {
 			if errors.Is(err, gvx.ErrVolumeNotFound) {
 				code = imageFail(stderr, cmdName, fmt.Errorf("no such volume: %s", name))
@@ -236,6 +244,7 @@ func volumeCompactSubcommand(_ context.Context, args []string, stdout, stderr io
 	const cmdName = "volume compact"
 	fs := newImageFlagSet(cmdName, stderr)
 	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
 	}
@@ -243,9 +252,10 @@ func volumeCompactSubcommand(_ context.Context, args []string, stdout, stderr io
 		return imageUsageError(stderr, cmdName, "missing VOLUME argument")
 	}
 
+	store := gvx.VolumeStore{OCICacheDir: *cacheDir, VolumeDir: *volumeDir}
 	code := 0
 	for _, name := range fs.Args() {
-		vi, err := gvx.CompactVolume(*cacheDir, name)
+		vi, err := store.Compact(name)
 		if err == nil {
 			_, _ = fmt.Fprintln(stdout, vi.Name)
 			continue
@@ -263,6 +273,7 @@ func volumeRemoveSubcommand(_ context.Context, args []string, stdout, stderr io.
 	const cmdName = "volume rm"
 	fs := newImageFlagSet(cmdName, stderr)
 	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	var force bool
 	fs.BoolVar(&force, "f", false, "Ignore nonexistent volumes")
 	fs.BoolVar(&force, "force", false, "Ignore nonexistent volumes")
@@ -273,9 +284,10 @@ func volumeRemoveSubcommand(_ context.Context, args []string, stdout, stderr io.
 		return imageUsageError(stderr, cmdName, "missing VOLUME argument")
 	}
 
+	store := gvx.VolumeStore{OCICacheDir: *cacheDir, VolumeDir: *volumeDir}
 	code := 0
 	for _, name := range fs.Args() {
-		err := gvx.RemoveVolume(*cacheDir, name)
+		err := store.Remove(name)
 		if err == nil {
 			_, _ = fmt.Fprintln(stdout, name)
 			continue
@@ -296,6 +308,7 @@ func volumePruneSubcommand(_ context.Context, args []string, streams cliIO) int 
 	const cmdName = "volume prune"
 	fs := newImageFlagSet(cmdName, streams.stderr)
 	cacheDir := fs.String("cache-dir", "", "Override cache parent directory (uses DIR/volumes; otherwise GVX_VOLUME_DIR or platform data dir)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	var force bool
 	fs.BoolVar(&force, "f", false, "Do not prompt for confirmation")
 	fs.BoolVar(&force, "force", false, "Do not prompt for confirmation")
@@ -314,7 +327,8 @@ func volumePruneSubcommand(_ context.Context, args []string, streams cliIO) int 
 		return 0
 	}
 
-	report, err := gvx.PruneVolumes(*cacheDir)
+	store := gvx.VolumeStore{OCICacheDir: *cacheDir, VolumeDir: *volumeDir}
+	report, err := store.Prune()
 	writeVolumePruneReport(streams.stdout, report)
 	if err != nil {
 		return imageFail(streams.stderr, cmdName, err)

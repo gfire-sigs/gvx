@@ -44,11 +44,27 @@ type SystemInfo struct {
 	BackendDetails    map[string]string `json:"BackendDetails,omitempty"`
 }
 
+// SystemInfoOptions configures ProbeSystemInfoWithOptions.
+type SystemInfoOptions struct {
+	CacheDir  string
+	VolumeDir string
+	Tuning    tuning.Values
+}
+
 // ProbeSystemInfo inspects available execution backends, lockdown profile, and
 // local image and volume store statistics without applying host lockdown. On
 // hosts that probe systrap, it initializes the reusable stub host process.
 func ProbeSystemInfo(cacheDir string, tuned tuning.Values) (SystemInfo, error) {
-	cacheDir = strings.TrimSpace(cacheDir)
+	return ProbeSystemInfoWithOptions(SystemInfoOptions{
+		CacheDir: cacheDir,
+		Tuning:   tuned,
+	})
+}
+
+// ProbeSystemInfoWithOptions is ProbeSystemInfo with an optional explicit
+// VolumeDir override.
+func ProbeSystemInfoWithOptions(opts SystemInfoOptions) (SystemInfo, error) {
+	cacheDir := strings.TrimSpace(opts.CacheDir)
 	resolvedCacheDir := cacheDir
 	if resolvedCacheDir == "" {
 		var err error
@@ -57,7 +73,11 @@ func ProbeSystemInfo(cacheDir string, tuned tuning.Values) (SystemInfo, error) {
 			return SystemInfo{}, err
 		}
 	}
-	volDir, err := VolumeDir(cacheDir)
+	store := VolumeStore{
+		OCICacheDir: cacheDir,
+		VolumeDir:   opts.VolumeDir,
+	}
+	volDir, err := store.Dir()
 	if err != nil {
 		return SystemInfo{}, err
 	}
@@ -77,13 +97,13 @@ func ProbeSystemInfo(cacheDir string, tuned tuning.Values) (SystemInfo, error) {
 	probeExecutionBackends(&info)
 
 	if st, statErr := os.Stat(resolvedCacheDir); statErr == nil && st.IsDir() {
-		if cache, openErr := NewLayerCacheWithTuning(resolvedCacheDir, tuned); openErr == nil {
+		if cache, openErr := NewLayerCacheWithTuning(resolvedCacheDir, opts.Tuning); openErr == nil {
 			if du, duErr := cache.DiskUsage(); duErr == nil {
 				info.Images = du.TotalImages
 			}
 		}
 	}
-	if vdu, vErr := ComputeVolumeDiskUsage(cacheDir); vErr == nil {
+	if vdu, vErr := store.DiskUsage(); vErr == nil {
 		info.Volumes = vdu.Total
 	}
 	return info, nil

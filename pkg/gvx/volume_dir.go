@@ -38,13 +38,6 @@ func (c Config) volumeRoot() (string, error) {
 	return c.volumeRootWithMigrate(true)
 }
 
-// volumeRootReadOnly resolves the directory that holds named volumes without
-// moving or creating host directories. Config.normalize uses it so validation
-// never mutates the host filesystem.
-func (c Config) volumeRootReadOnly() (string, error) {
-	return c.volumeRootWithMigrate(false)
-}
-
 func (c Config) volumeRootWithMigrate(migrate bool) (string, error) {
 	if dir := strings.TrimSpace(c.VolumeDir); dir != "" {
 		abs, err := filepath.Abs(dir)
@@ -54,7 +47,11 @@ func (c Config) volumeRootWithMigrate(migrate bool) (string, error) {
 		return abs, nil
 	}
 	if dir := strings.TrimSpace(c.OCICacheDir); dir != "" {
-		return filepath.Join(dir, "volumes"), nil
+		abs, err := filepath.Abs(filepath.Join(dir, "volumes"))
+		if err != nil {
+			return "", fmt.Errorf("gvx: resolve OCICacheDir %q: %w", dir, err)
+		}
+		return abs, nil
 	}
 	if dir := strings.TrimSpace(os.Getenv(VolumeDirEnv)); dir != "" {
 		abs, err := filepath.Abs(dir)
@@ -79,11 +76,11 @@ func (c Config) volumeRootWithMigrate(migrate bool) (string, error) {
 }
 
 // defaultVolumeDirFor returns the default directory of the named volumes on
-// goos. On macOS and Linux it lies in the user data directory and not in the
-// user cache directory, because a host can purge the cache directory. macOS
-// deletes the content of ~/Library/Caches when the disk runs low on space.
-// Windows does not purge %LOCALAPPDATA%, so the directory there stays beside
-// the layer cache.
+// goos. On macOS, Linux, and Android it lies in the user data directory and
+// not in the user cache directory, because a host can purge the cache
+// directory. macOS deletes the content of ~/Library/Caches when the disk runs
+// low on space. Windows does not purge %LOCALAPPDATA%, so the directory there
+// stays beside the layer cache.
 func defaultVolumeDirFor(goos string, getenv func(string) string, userHomeDir func() (string, error)) (string, error) {
 	if goos == "windows" {
 		localAppData := getenv("LOCALAPPDATA")
@@ -144,6 +141,16 @@ func migrateVolumeRoot(legacy, root string) string {
 			// A missing link costs an earlier release the volumes, not this one.
 			_ = os.Symlink(root, legacy)
 			return root
+		}
+		// When rename fails (for example EXDEV across filesystems) and legacy
+		// is empty, switch to root rather than trapping new volumes in cache.
+		if entries, readErr := os.ReadDir(legacy); readErr == nil && len(entries) == 0 {
+			if err := os.Mkdir(root, 0o700); err == nil {
+				if os.Remove(legacy) == nil {
+					_ = os.Symlink(root, legacy)
+				}
+				return root
+			}
 		}
 	}
 	if _, err := os.Lstat(root); err == nil {

@@ -459,7 +459,7 @@ The layer cache lives under `%LOCALAPPDATA%\gvx\cache\layers` (Windows), `~/Libr
 
 `rungvx volume` inspects `ext4lite` host file locks (`ProbeVolumeLock`) and refuses to compact or delete any mounted volume.
 
-On macOS and Linux, named volumes live in the user data directory, because a host can purge its cache directory. macOS deletes the content of `~/Library/Caches` when the disk runs low. `rungvx system info` prints the active directory as `Volume Dir`.
+On macOS, Linux, and Android, named volumes live in the user data directory, because a host can purge its cache directory. macOS deletes the content of `~/Library/Caches` when the disk runs low. `rungvx system info` prints the active directory as `Volume Dir`.
 
 | Source | Volume directory |
 | :--- | :--- |
@@ -470,7 +470,7 @@ On macOS and Linux, named volumes live in the user data directory, because a hos
 | Default on Linux and Android | `$XDG_DATA_HOME/gvx/volumes`, or `~/.local/share/gvx/volumes` when `XDG_DATA_HOME` is unset or relative. |
 | Default on Windows | `%LOCALAPPDATA%\gvx\cache\volumes`. Windows does not purge this directory. |
 
-Earlier releases kept the default volume directory on macOS and Linux beside the layer cache, for example `~/Library/Caches/gvx/volumes`. The first command that uses the default directory renames that directory to the new location. It leaves a symbolic link at the earlier path, so an earlier release finds the same volumes. When the rename fails, `gvx` keeps the volumes at the earlier location.
+Earlier releases kept the default volume directory on macOS, Linux, and Android beside the layer cache, for example `~/Library/Caches/gvx/volumes`. The first command that uses the default directory renames that directory to the new location. It leaves a symbolic link at the earlier path, so an earlier release finds the same volumes. When the rename fails, `gvx` keeps the volumes at the earlier location.
 
 | Command | Behavior |
 | :--- | :--- |

@@ -275,7 +275,7 @@ func prepareRestoreConfigMounts(cfg *Config, m CheckpointManifest) (map[string]b
 			if cm.Kind != MountVolume {
 				return nil, fmt.Errorf("%w: capped mount %q requires type=volume, config has %s", ErrCheckpointManifest, cm.GuestPath, cm.Kind)
 			}
-			driver, err := cfg.resolveVolumeDriver(*cm)
+			driver, err := cfg.resolveVolumeDriverWithMigrate(*cm, false)
 			if err != nil {
 				return nil, err
 			}
@@ -311,7 +311,7 @@ func prepareRestoreConfigMounts(cfg *Config, m CheckpointManifest) (map[string]b
 			if err != nil {
 				return nil, err
 			}
-			rootImg, err = cfg.volumeImagePath(rm)
+			rootImg, err = cfg.volumeImagePathWithMigrate(rm, false)
 			if err != nil {
 				return nil, err
 			}

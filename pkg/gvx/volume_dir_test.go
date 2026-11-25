@@ -356,4 +356,215 @@ func TestMigrateVolumeRoot(t *testing.T) {
 			t.Fatalf("legacy path is not a symlink after concurrent migration: mode %v", st.Mode())
 		}
 	})
+	t.Run("switches to root when rename fails on an empty legacy directory", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("needs a directory that the test user cannot modify")
+		}
+		dir := t.TempDir()
+		legacyParent := filepath.Join(dir, "ro-parent")
+		legacy := filepath.Join(legacyParent, "volumes")
+		root := filepath.Join(dir, "data", "volumes")
+		if err := os.MkdirAll(legacy, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(legacyParent, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(legacyParent, 0o700) })
+
+		if got := migrateVolumeRoot(legacy, root); got != root {
+			t.Fatalf("migrateVolumeRoot() = %q, want %q", got, root)
+		}
+		if st, err := os.Lstat(root); err != nil || !st.IsDir() {
+			t.Fatalf("root directory %q not created: st=%v err=%v", root, st, err)
+		}
+	})
+	t.Run("keeps a non-empty legacy directory when rename fails", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("needs a directory that the test user cannot modify")
+		}
+		dir := t.TempDir()
+		legacyParent := filepath.Join(dir, "ro-parent")
+		legacy := filepath.Join(legacyParent, "volumes")
+		root := filepath.Join(dir, "data", "volumes")
+		if err := os.MkdirAll(legacy, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(legacy, "keep.ext4"), []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(legacyParent, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(legacyParent, 0o700) })
+
+		if got := migrateVolumeRoot(legacy, root); got != legacy {
+			t.Fatalf("migrateVolumeRoot() = %q, want %q", got, legacy)
+		}
+		if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("migrateVolumeRoot() created %q while leaving volumes in %q: %v", root, legacy, err)
+		}
+	})
+}
+
+func TestVolumeRootRelativeAndWhitespaceInputs(t *testing.T) {
+	isolateUserDirs(t)
+	work := t.TempDir()
+	t.Chdir(work)
+
+	absWork, err := filepath.Abs(work)
+	if err != nil {
+		t.Fatalf("filepath.Abs(%q): %v", work, err)
+	}
+
+	gotCache, err := (Config{OCICacheDir: "rel-cache"}).volumeRoot()
+	if err != nil {
+		t.Fatalf("volumeRoot(rel-cache): %v", err)
+	}
+	wantCache := filepath.Join(absWork, "rel-cache", "volumes")
+	if !filepath.IsAbs(gotCache) || gotCache != wantCache {
+		t.Fatalf("volumeRoot(rel-cache) = %q, want %q", gotCache, wantCache)
+	}
+
+	gotVol, err := (Config{OCICacheDir: "rel-cache", VolumeDir: "rel-vols"}).volumeRoot()
+	if err != nil {
+		t.Fatalf("volumeRoot(rel-vols): %v", err)
+	}
+	wantVol := filepath.Join(absWork, "rel-vols")
+	if !filepath.IsAbs(gotVol) || gotVol != wantVol {
+		t.Fatalf("volumeRoot(rel-vols) = %q, want %q", gotVol, wantVol)
+	}
+
+	t.Setenv(VolumeDirEnv, "rel-env-vols")
+	gotEnv, err := (Config{VolumeDir: "   ", OCICacheDir: "\t"}).volumeRoot()
+	if err != nil {
+		t.Fatalf("volumeRoot(whitespace + rel env): %v", err)
+	}
+	wantEnv := filepath.Join(absWork, "rel-env-vols")
+	if !filepath.IsAbs(gotEnv) || gotEnv != wantEnv {
+		t.Fatalf("volumeRoot(whitespace + rel env) = %q, want %q", gotEnv, wantEnv)
+	}
+
+	t.Setenv(VolumeDirEnv, "  \t ")
+	def, err := defaultVolumeDirFor(runtime.GOOS, os.Getenv, os.UserHomeDir)
+	if err != nil {
+		t.Fatalf("defaultVolumeDirFor: %v", err)
+	}
+	if gotDef, err := (Config{}).volumeRoot(); err != nil || gotDef != def {
+		t.Fatalf("volumeRoot(whitespace env) = (%q, %v), want %q", gotDef, err, def)
+	}
+}
+
+func TestOpenMountsUsesExplicitVolumeDir(t *testing.T) {
+	isolateUserDirs(t)
+	canary := t.TempDir()
+	t.Setenv(VolumeDirEnv, canary)
+
+	cacheDir := t.TempDir()
+	volDir := t.TempDir()
+
+	cfg := Config{
+		OCIImage:    "alpine:3.20",
+		OCICacheDir: cacheDir,
+		VolumeDir:   volDir,
+		RootVolume:  "rvol",
+		Mounts: []Mount{
+			{Kind: MountVolume, VolumeName: "vext4", Driver: DriverExt4lite, GuestPath: "/data"},
+			{Kind: MountVolume, VolumeName: "vhost", Driver: DriverHostfs, GuestPath: "/hostvol"},
+		},
+	}
+	if err := NormalizeConfigForTest(&cfg); err != nil {
+		t.Fatalf("NormalizeConfigForTest: %v", err)
+	}
+	sb := NewSandboxForMountTest(cfg)
+	if err := OpenMountsForTest(sb); err != nil {
+		t.Fatalf("OpenMountsForTest: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := CloseMountsForTest(sb); err != nil {
+			t.Errorf("CloseMountsForTest: %v", err)
+		}
+	})
+
+	for _, want := range []string{
+		filepath.Join(volDir, "rvol.ext4"),
+		filepath.Join(volDir, "vext4.ext4"),
+		filepath.Join(volDir, "vhost"),
+	} {
+		if _, err := os.Stat(want); err != nil {
+			t.Errorf("expected volume artifact %q: %v", want, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(cacheDir, "volumes")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("cacheDir/volumes should not exist when VolumeDir is set: %v", err)
+	}
+	if entries, err := os.ReadDir(canary); err != nil || len(entries) != 0 {
+		t.Errorf("ambient %s directory modified: entries=%v err=%v", VolumeDirEnv, entries, err)
+	}
+}
+
+func TestVolumeStoreAndSystemInfoVolumeDir(t *testing.T) {
+	isolateUserDirs(t)
+	canary := t.TempDir()
+	t.Setenv(VolumeDirEnv, canary)
+	if _, err := CreateVolume("", "canary", DriverExt4lite); err != nil {
+		t.Fatalf("CreateVolume(canary): %v", err)
+	}
+
+	cacheDir := t.TempDir()
+	volDir := t.TempDir()
+	store := VolumeStore{OCICacheDir: cacheDir, VolumeDir: volDir}
+
+	if gotDir, err := store.Dir(); err != nil || gotDir != volDir {
+		t.Fatalf("store.Dir() = (%q, %v), want %q", gotDir, err, volDir)
+	}
+	v1, err := store.Create("v1", DriverExt4lite)
+	if err != nil {
+		t.Fatalf("store.Create(v1): %v", err)
+	}
+	if filepath.Dir(v1.Mountpoint) != volDir {
+		t.Fatalf("v1.Mountpoint = %q, want under %q", v1.Mountpoint, volDir)
+	}
+	if _, err := store.Create("v2", DriverHostfs); err != nil {
+		t.Fatalf("store.Create(v2): %v", err)
+	}
+	if got, err := store.Inspect("v1"); err != nil || got.Name != "v1" {
+		t.Fatalf("store.Inspect(v1) = (%+v, %v)", got, err)
+	}
+	vols, err := store.List()
+	if err != nil || len(vols) != 2 || vols[0].Name != "v1" || vols[1].Name != "v2" {
+		t.Fatalf("store.List() = (%+v, %v), want [v1 v2]", vols, err)
+	}
+	if _, err := store.Compact("v1"); err != nil {
+		t.Fatalf("store.Compact(v1): %v", err)
+	}
+	du, err := store.DiskUsage()
+	if err != nil || du.Total != 2 {
+		t.Fatalf("store.DiskUsage() = (%+v, %v), want Total=2", du, err)
+	}
+
+	si, err := ProbeSystemInfoWithOptions(SystemInfoOptions{
+		CacheDir:  cacheDir,
+		VolumeDir: volDir,
+	})
+	if err != nil {
+		t.Fatalf("ProbeSystemInfoWithOptions: %v", err)
+	}
+	if si.VolumeDir != volDir || si.Volumes != 2 {
+		t.Fatalf("SystemInfo = (VolumeDir=%q, Volumes=%d), want (%q, 2)", si.VolumeDir, si.Volumes, volDir)
+	}
+
+	if err := store.Remove("v2"); err != nil {
+		t.Fatalf("store.Remove(v2): %v", err)
+	}
+	report, err := store.Prune()
+	if err != nil {
+		t.Fatalf("store.Prune(): %v", err)
+	}
+	if len(report.Deleted) != 1 || report.Deleted[0] != "v1" {
+		t.Fatalf("store.Prune().Deleted = %v, want [v1]", report.Deleted)
+	}
+	if _, err := InspectVolume("", "canary"); err != nil {
+		t.Fatalf("canary volume in %s was affected: %v", VolumeDirEnv, err)
+	}
 }

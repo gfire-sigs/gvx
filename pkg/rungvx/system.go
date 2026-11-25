@@ -39,7 +39,7 @@ func init() {
 	register(command{
 		name:    "info",
 		summary: "Display host system, execution backend, and cache directory information.",
-		usage:   []string{"rungvx info [-f|--format json|TEMPLATE] [-cache-dir DIR]"},
+		usage:   []string{"rungvx info [-f|--format json|TEMPLATE] [-cache-dir DIR] [-volume-dir DIR]"},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return systemInfoSubcommand(ctx, "info", args, streams.stdout, streams.stderr)
 		},
@@ -81,7 +81,8 @@ func printSystemGroupUsage(w io.Writer) {
 
 func systemInfoSubcommand(_ context.Context, cmdName string, args []string, stdout, stderr io.Writer) int {
 	fs := newImageFlagSet(cmdName, stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS layer cache directory")
+	cacheDir := fs.String("cache-dir", "", "EROFS layer cache directory (also sets named volumes to DIR/volumes unless -volume-dir is set)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	tune := addTuneFlags(fs)
 	var format string
 	registerAlias([]string{"f", "format"}, func(n string) {
@@ -103,7 +104,11 @@ func systemInfoSubcommand(_ context.Context, cmdName string, args []string, stdo
 	if err != nil {
 		return imageUsageError(stderr, cmdName, "%v", err)
 	}
-	info, err := gvx.ProbeSystemInfo(*cacheDir, tuned)
+	info, err := gvx.ProbeSystemInfoWithOptions(gvx.SystemInfoOptions{
+		CacheDir:  *cacheDir,
+		VolumeDir: *volumeDir,
+		Tuning:    tuned,
+	})
 	if err != nil {
 		return imageFail(stderr, cmdName, err)
 	}
@@ -163,7 +168,8 @@ func formatReclaimable(reclaimable, total int64) string {
 func systemDFSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	const cmdName = "system df"
 	fs := newImageFlagSet(cmdName, stderr)
-	cacheDir := fs.String("cache-dir", "", "EROFS layer cache directory")
+	cacheDir := fs.String("cache-dir", "", "EROFS layer cache directory (also sets named volumes to DIR/volumes unless -volume-dir is set)")
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	tune := addTuneFlags(fs)
 	var verbose bool
 	fs.BoolVar(&verbose, "v", false, "Show detailed per-image and per-volume space usage")
@@ -206,7 +212,8 @@ func systemDFSubcommand(_ context.Context, args []string, stdout, stderr io.Writ
 		}
 	}
 
-	volDU, err := gvx.ComputeVolumeDiskUsage(*cacheDir)
+	volStore := gvx.VolumeStore{OCICacheDir: *cacheDir, VolumeDir: *volumeDir}
+	volDU, err := volStore.DiskUsage()
 	if err != nil {
 		return imageFail(stderr, cmdName, err)
 	}
@@ -240,7 +247,7 @@ func systemDFSubcommand(_ context.Context, args []string, stdout, stderr io.Writ
 		if !verbose {
 			return nil
 		}
-		return writeVerboseSystemDF(w, cache, *cacheDir)
+		return writeVerboseSystemDF(w, cache, volStore)
 	})
 	if usageErr != nil {
 		return imageUsageError(stderr, cmdName, "%v", usageErr)
@@ -251,7 +258,7 @@ func systemDFSubcommand(_ context.Context, args []string, stdout, stderr io.Writ
 	return 0
 }
 
-func writeVerboseSystemDF(w io.Writer, cache *oci.LayerCache, cacheDir string) error {
+func writeVerboseSystemDF(w io.Writer, cache *oci.LayerCache, volStore gvx.VolumeStore) error {
 	now := time.Now()
 	_, _ = fmt.Fprintln(w, "\nImages space usage:")
 	itw := tabwriter.NewWriter(w, 10, 1, 3, ' ', 0)
@@ -272,7 +279,7 @@ func writeVerboseSystemDF(w io.Writer, cache *oci.LayerCache, cacheDir string) e
 		return err
 	}
 
-	vols, err := gvx.ListVolumes(cacheDir)
+	vols, err := volStore.List()
 	if err != nil {
 		return err
 	}
@@ -289,6 +296,7 @@ func systemPruneSubcommand(_ context.Context, args []string, streams cliIO) int 
 	const cmdName = "system prune"
 	fs := newImageFlagSet(cmdName, streams.stderr)
 	cacheFlags := addImageCacheFlags(fs)
+	volumeDir := fs.String("volume-dir", "", volumeDirFlagUsage)
 	platformFlag := fs.String("platform", "", "Target image platform (linux/amd64 or linux/arm64)")
 	var all, pruneVolumes, force bool
 	fs.BoolVar(&all, "a", false, "Remove all cached images, not only dangling images")
@@ -373,7 +381,8 @@ func systemPruneSubcommand(_ context.Context, args []string, streams cliIO) int 
 	}
 
 	if pruneVolumes {
-		volReport, volErr := gvx.PruneVolumes(*cacheFlags.cacheDir)
+		volStore := gvx.VolumeStore{OCICacheDir: *cacheFlags.cacheDir, VolumeDir: *volumeDir}
+		volReport, volErr := volStore.Prune()
 		writeVolumePruneReport(streams.stdout, volReport)
 		totalReclaimed += volReport.SpaceReclaimed
 		if volErr != nil {
