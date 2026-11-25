@@ -84,10 +84,6 @@ var _ IGMPEndpoint = (*endpoint)(nil)
 // +checklocksalias:igmp.ep.mu=mu
 // +stateify savable
 type endpoint struct {
-	// allowMartianLoopback is the route_localnet setting of this endpoint. See
-	// martian_xplat.go.
-	allowMartianLoopback atomicbitops.Bool
-
 	nic        stack.NetworkInterface
 	dispatcher stack.TransportDispatcher
 	protocol   *protocol
@@ -198,6 +194,8 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, dispatcher stack.Tran
 	p.mu.Lock()
 	p.eps[nic.ID()] = e
 	p.mu.Unlock()
+
+	e.clearMartianLoopback()
 
 	return e
 }
@@ -994,14 +992,14 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	defer hView.Release()
 
 	if !e.nic.IsLoopback() {
-		if !e.protocol.allowExternalLoopbackTraffic.Load() && !e.allowMartianLoopback.Load() && !e.nic.AllowExternalIPv4LoopbackTraffic() {
-			if header.IsV4LoopbackAddress(h.SourceAddress()) {
+		if !e.protocol.allowExternalLoopbackTraffic.Load() && !e.nic.AllowExternalIPv4LoopbackTraffic() {
+			if header.IsV4LoopbackAddress(h.SourceAddress()) && !e.AllowMartianLoopback() {
 				martianPacketLogger.Infof("Martian packet dropped with loopback source address. If your traffic is unexpectedly dropped, you may want to allow martian packets.")
 				stats.InvalidSourceAddressesReceived.Increment()
 				return
 			}
 
-			if header.IsV4LoopbackAddress(h.DestinationAddress()) {
+			if header.IsV4LoopbackAddress(h.DestinationAddress()) && !e.AllowMartianLoopback() {
 				martianPacketLogger.Infof("Martian packet dropped with loopback destination address. If your traffic is unexpectedly dropped, you may want to allow martian packets.")
 				stats.InvalidDestinationAddressesReceived.Increment()
 				return
@@ -1582,6 +1580,7 @@ func (e *endpoint) Close() {
 	e.mu.Unlock()
 
 	e.protocol.forgetEndpoint(e.nic.ID())
+	e.clearMartianLoopback()
 }
 
 // AddAndAcquirePermanentAddress implements stack.AddressableEndpoint.

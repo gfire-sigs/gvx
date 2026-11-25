@@ -146,7 +146,6 @@ seam pkg/sentry/kernel/task_sched.go
 # Content seam: route_localnet of one IPv4 endpoint (pkg/tcpip/network/ipv4/martian_xplat.go).
 # conf/<link>/route_localnet must not change the martian filter of other links.
 seam pkg/tcpip/network/ipv4/ipv4.go
-seam pkg/tcpip/network/ipv4/ipv4_state_autogen.go
 
 # Content seam: the memory manager reports each Sentry write into guest memory to the memory
 # file after it completes, so that the Windows systrap engine drops the patched copies of the

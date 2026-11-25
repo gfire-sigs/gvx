@@ -175,3 +175,75 @@ func TestAllowMartianLoopbackSurvivesSaveLoad(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteLocalnetResetsOnNICRecreation(t *testing.T) {
+	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}})
+	defer s.Close()
+
+	if err := s.CreateNIC(1, channel.New(8, 1500, "")); err != nil {
+		t.Fatalf("CreateNIC(1): %v", err)
+	}
+	ep1, err := s.GetNetworkEndpoint(1, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("GetNetworkEndpoint(1): %v", err)
+	}
+	ep1.(martianSetter).SetAllowMartianLoopback(true)
+	if !ep1.(martianSetter).AllowMartianLoopback() {
+		t.Fatal("endpoint 1 AllowMartianLoopback = false, want true")
+	}
+
+	if err := s.RemoveNIC(1); err != nil {
+		t.Fatalf("RemoveNIC(1): %v", err)
+	}
+	if err := s.CreateNIC(1, channel.New(8, 1500, "")); err != nil {
+		t.Fatalf("recreate CreateNIC(1): %v", err)
+	}
+	recreated, err := s.GetNetworkEndpoint(1, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("recreated GetNetworkEndpoint(1): %v", err)
+	}
+	if recreated.(martianSetter).AllowMartianLoopback() {
+		t.Fatal("recreated endpoint 1 inherited AllowMartianLoopback = true, want false")
+	}
+}
+
+func TestRouteLocalnetResetsAfterResetConfigAndIsolatesStacks(t *testing.T) {
+	s1 := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}})
+	defer s1.Close()
+	s2 := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}})
+	defer s2.Close()
+
+	if err := s1.CreateNIC(1, channel.New(8, 1500, "")); err != nil {
+		t.Fatalf("s1.CreateNIC(1): %v", err)
+	}
+	if err := s2.CreateNIC(1, channel.New(8, 1500, "")); err != nil {
+		t.Fatalf("s2.CreateNIC(1): %v", err)
+	}
+	ep1, err := s1.GetNetworkEndpoint(1, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("s1.GetNetworkEndpoint(1): %v", err)
+	}
+	ep2, err := s2.GetNetworkEndpoint(1, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("s2.GetNetworkEndpoint(1): %v", err)
+	}
+
+	ep1.(martianSetter).SetAllowMartianLoopback(true)
+	if ep2.(martianSetter).AllowMartianLoopback() {
+		t.Fatal("s2 endpoint 1 observed s1 route_localnet setting")
+	}
+
+	// ResetConfig discards non-preserved NICs without invoking endpoint.Close.
+	// A new NIC reusing ID 1 must still start with AllowMartianLoopback == false.
+	s1.ResetConfig()
+	if err := s1.CreateNIC(1, channel.New(8, 1500, "")); err != nil {
+		t.Fatalf("s1.CreateNIC(1) after ResetConfig: %v", err)
+	}
+	recreated, err := s1.GetNetworkEndpoint(1, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("s1.GetNetworkEndpoint(1) after ResetConfig: %v", err)
+	}
+	if recreated.(martianSetter).AllowMartianLoopback() {
+		t.Fatal("endpoint 1 after ResetConfig inherited stale AllowMartianLoopback = true, want false")
+	}
+}
