@@ -17,6 +17,7 @@ package gvx
 import (
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/oci"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/ktime"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -91,10 +92,13 @@ func TestResolveGuestExecutableUsesWorkingDirectory(t *testing.T) {
 		{name: "symlinked workdir traverses real parent", cmd: "../shared/run.sh", workDir: "/app", want: "/opt/releases/v2/shared/run.sh"},
 		{name: "symlinked workdir with relative parent PATH", cmd: "run.sh", workDir: "/app", path: "../shared", want: "/opt/releases/v2/shared/run.sh"},
 		{name: "absolute path traverses symlink before parent", cmd: "/app/../shared/run.sh", workDir: "/", want: "/app/../shared/run.sh"},
+		{name: "absolute PATH traverses symlink before parent", cmd: "run.sh", workDir: "/", path: "/app/../shared", want: "/app/../shared/run.sh"},
 		{name: "relative symlink preserves link path", cmd: "./run-link", workDir: "/qdrant", want: "/qdrant/run-link"},
+		{name: "symlink via empty PATH preserves link path", cmd: "run-link", workDir: "/qdrant", path: ":", want: "/qdrant/run-link"},
 		{name: "dot slash outside workdir", cmd: "./entrypoint.sh", workDir: "/"},
 		{name: "bare name does not search workdir", cmd: "entrypoint.sh", workDir: "/qdrant", path: "/usr/bin"},
 		{name: "trailing slash on relative regular file", cmd: "./entrypoint.sh/", workDir: "/qdrant"},
+		{name: "trailing slash on symlink to regular file", cmd: "./run-link/", workDir: "/qdrant"},
 		{name: "trailing slash on absolute regular file", cmd: "/usr/bin/sh/", workDir: "/"},
 		{name: "missing intermediate before parent", cmd: "./missing/../entrypoint.sh", workDir: "/qdrant"},
 		{name: "missing workdir rejects parent escape", cmd: "../usr/bin/sh", workDir: "/no-such-dir"},
@@ -118,6 +122,33 @@ func TestResolveGuestExecutableUsesWorkingDirectory(t *testing.T) {
 			}
 			if err != nil || got != tc.want {
 				t.Fatalf("resolveGuestExecutable(%q, %q) = %q, %v; want %q", tc.cmd, tc.workDir, got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSandboxInitialWorkingDir(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfgDir  string
+		imgDir  string
+		wantDir string
+	}{
+		{name: "empty defaults to root", wantDir: "/"},
+		{name: "whitespace cfg falls back to image workdir", cfgDir: "   ", imgDir: "/qdrant", wantDir: "/qdrant"},
+		{name: "trimmed slash cfg falls back to image workdir", cfgDir: " / ", imgDir: "/qdrant", wantDir: "/qdrant"},
+		{name: "relative image workdir gets leading slash", cfgDir: "/", imgDir: "app", wantDir: "/app"},
+		{name: "explicit cfg workdir overrides image", cfgDir: "/custom", imgDir: "/qdrant", wantDir: "/custom"},
+		{name: "relative cfg workdir gets leading slash", cfgDir: "rel/dir", imgDir: "/qdrant", wantDir: "/rel/dir"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &Sandbox{cfg: Config{WorkDir: tc.cfgDir}}
+			if tc.imgDir != "" {
+				sb.resolvedImg = &oci.ResolvedImage{Config: oci.RuntimeConfig{WorkingDir: tc.imgDir}}
+			}
+			if got := sb.initialWorkingDir(); got != tc.wantDir {
+				t.Fatalf("initialWorkingDir() = %q, want %q", got, tc.wantDir)
 			}
 		})
 	}

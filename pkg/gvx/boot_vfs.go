@@ -762,17 +762,20 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 			Path:               makeFPath(workDir),
 			FollowFinalSymlink: true,
 		}
-		st, err := vfsObj.StatAt(sctx, creds, &wdPop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
-		switch {
-		case err != nil:
+		resolvedWD, err := vfsObj.GetDentryAt(sctx, creds, &wdPop, &vfs.GetDentryOptions{})
+		if err != nil {
 			wdErr = err
-		case (st.Mode & linux.S_IFMT) != linux.S_IFDIR:
-			wdErr = linuxerr.ENOTDIR
-		default:
-			resolvedWD, err := vfsObj.GetDentryAt(sctx, creds, &wdPop, &vfs.GetDentryOptions{})
-			if err != nil {
+		} else {
+			stPop := vfs.PathOperation{Root: root, Start: resolvedWD}
+			st, err := vfsObj.StatAt(sctx, creds, &stPop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+			switch {
+			case err != nil:
+				resolvedWD.DecRef(sctx)
 				wdErr = err
-			} else {
+			case (st.Mode & linux.S_IFMT) != linux.S_IFDIR:
+				resolvedWD.DecRef(sctx)
+				wdErr = linuxerr.ENOTDIR
+			default:
 				wd = resolvedWD
 				defer wd.DecRef(sctx)
 			}
@@ -804,9 +807,9 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 		if fp.Absolute {
 			return candidate, true
 		}
-		// Keep the final symlink name intact so shebang scripts ($0) and
-		// multicall binaries (e.g. BusyBox) observe the invoked link path while
-		// returning an absolute path addressable from root.
+		// Keep the final symlink name intact so shebang $0, AT_EXECFN, and
+		// task comm reflect the invoked link path while returning an absolute
+		// path reachable from root.
 		dentryPop := vfs.PathOperation{
 			Root:               root,
 			Start:              start,
@@ -818,8 +821,8 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 			return "", false
 		}
 		defer vd.DecRef(sctx)
-		absPath, err := vfsObj.PathnameWithDeleted(sctx, root, vd)
-		if err != nil {
+		absPath, err := vfsObj.PathnameReachable(sctx, root, vd)
+		if err != nil || absPath == "" || vd.Dentry().IsDead() {
 			return "", false
 		}
 		return absPath, true

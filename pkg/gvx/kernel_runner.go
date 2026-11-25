@@ -483,11 +483,12 @@ func (s *Sandbox) createInitialGuestProcess(ctx context.Context, sctx, sctxWithR
 }
 
 func (s *Sandbox) initialWorkingDir() string {
-	workDir := s.cfg.WorkDir
-	if (workDir == "" || workDir == "/") && s.resolvedImg != nil && s.resolvedImg.Config.WorkingDir != "" {
-		workDir = s.resolvedImg.Config.WorkingDir
+	workDir := strings.TrimSpace(s.cfg.WorkDir)
+	if (workDir == "" || workDir == "/") && s.resolvedImg != nil {
+		if imgDir := strings.TrimSpace(s.resolvedImg.Config.WorkingDir); imgDir != "" {
+			workDir = imgDir
+		}
 	}
-	workDir = strings.TrimSpace(workDir)
 	if workDir == "" {
 		return "/"
 	}
