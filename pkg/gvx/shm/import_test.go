@@ -150,14 +150,16 @@ func TestImportWholeFDSeparatesGuestAndHostSize(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX FD shm mapping runs on Unix hosts")
 	}
-	fd, cleanup := createTestBackingFD(t, 16384)
+	hostAlign := uint64(os.Getpagesize())
+	hostSize := max(uint64(16384), hostAlign)
+	fd, cleanup := createTestBackingFD(t, int64(hostSize))
 	defer cleanup()
 
 	imp := NewImporter(Options{
-		HostMappingAlign: 16384,
-		QuotaBytes:       32768,
+		HostMappingAlign: hostAlign,
+		QuotaBytes:       hostSize * 2,
 	})
-	guestSize := uint64(hostarch.PageSize) // 4096 < 16384 host alignment
+	guestSize := uint64(hostarch.PageSize) // 4096 < hostSize
 	reg, err := imp.ImportWholeFD(fd, guestSize, 1<<20, true)
 	if err != nil {
 		t.Fatalf("ImportWholeFD: %v", err)
@@ -165,20 +167,28 @@ func TestImportWholeFDSeparatesGuestAndHostSize(t *testing.T) {
 	if reg.Size() != guestSize {
 		t.Fatalf("Size() = %d, want %d", reg.Size(), guestSize)
 	}
-	if reg.HostSize() != 16384 {
-		t.Fatalf("HostSize() = %d, want 16384", reg.HostSize())
+	if reg.HostSize() != hostSize {
+		t.Fatalf("HostSize() = %d, want %d", reg.HostSize(), hostSize)
 	}
-	if imp.UsedBytes() != 16384 {
-		t.Fatalf("UsedBytes() = %d, want 16384", imp.UsedBytes())
+	if imp.UsedBytes() != hostSize {
+		t.Fatalf("UsedBytes() = %d, want %d", imp.UsedBytes(), hostSize)
 	}
-	// Guest mapping past guestSize must fault even though hostSize is 16384.
+	// Guest mapping past guestSize must fault even though hostSize is larger.
 	beyond := memmap.MappableRange{Start: guestSize, End: guestSize * 2}
 	if _, err := reg.Translate(nil, beyond, beyond, hostarch.Read); err == nil {
 		t.Fatal("Translate past guestSize succeeded, want error")
 	}
 	// Reject hostSize exceeding maxHostSize.
-	if _, err := imp.ImportWholeFD(fd, guestSize, 8192, true); !errors.Is(err, ErrInvalidRange) {
+	if _, err := imp.ImportWholeFD(fd, guestSize, hostSize/2, true); !errors.Is(err, ErrInvalidRange) {
 		t.Fatalf("ImportWholeFD(maxHostSize < hostSize) err = %v, want ErrInvalidRange", err)
+	}
+	// Reject hostSize that is not aligned to HostMappingAlign.
+	strictImp := NewImporter(Options{
+		HostMappingAlign: hostSize * 2,
+		QuotaBytes:       hostSize * 4,
+	})
+	if _, err := strictImp.ImportWholeFD(fd, guestSize, hostSize*4, true); !errors.Is(err, ErrMisaligned) {
+		t.Fatalf("ImportWholeFD(misaligned hostSize) err = %v, want ErrMisaligned", err)
 	}
 	reg.Release()
 	if !reg.Unmapped() || imp.UsedBytes() != 0 {

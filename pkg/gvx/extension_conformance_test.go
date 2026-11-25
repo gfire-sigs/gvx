@@ -70,42 +70,52 @@ func TestExtensionLockdownSecondSandboxHelper(t *testing.T) {
 		recvMsgFDs:       []int{42},
 	}
 
-	// Open a real first sandbox with lockdown enabled so Linux installs its real
-	// Landlock + seccomp filter (including granted RecvMsgFD 42) and macOS
-	// applies Seatbelt. On hosted macOS runners without nested HVF, fall back to
-	// applying Seatbelt directly.
-	sb1, err := New(ctx, Config{
-		Platform:            PlatformAuto,
-		NetworkMode:         NetModeNone,
-		DisableHostLockdown: false,
-		Extensions:          []Extension{initialExt},
-	})
-	if err != nil {
-		if runtime.GOOS == "darwin" && os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1" {
-			if _, lerr := hostlockdown.Apply(hostlockdown.Options{
-				AllowOutboundNet: false,
-			}); lerr != nil {
-				if errors.Is(lerr, hostlockdown.ErrUnsupported) {
-					t.Skip("hostlockdown unsupported on this OS")
-				}
-				t.Fatalf("hostlockdown.Apply: %v", lerr)
+	// On Linux, apply the race-safe Landlock + seccomp lockdown helper directly
+	// because extra_filters_race.go widens SYS_CLONE under -race. On macOS and
+	// Windows, open a real first sandbox with lockdown enabled (falling back to
+	// direct Seatbelt on hosted macOS runners without nested HVF).
+	var sb1 *Sandbox
+	platName := "hvf"
+	if handled, lerr := applyExtensionTestLockdown(); handled {
+		if lerr != nil {
+			if errors.Is(lerr, hostlockdown.ErrUnsupported) {
+				t.Skip("hostlockdown unsupported on this OS")
 			}
-			recordProcessExtensionLockdown([]int{42})
-		} else if errors.Is(err, hostlockdown.ErrUnsupported) {
-			t.Skip("hostlockdown unsupported on this OS")
-		} else {
-			t.Fatalf("first Sandbox New with lockdown: %v", err)
+			t.Fatalf("applyExtensionTestLockdown: %v", lerr)
 		}
+		recordProcessExtensionLockdown([]int{42})
+		platName = "systrap"
 	} else {
-		defer func() { _ = sb1.Close() }()
+		var err error
+		sb1, err = New(ctx, Config{
+			Platform:            PlatformAuto,
+			NetworkMode:         NetModeNone,
+			DisableHostLockdown: false,
+			Extensions:          []Extension{initialExt},
+		})
+		if err != nil {
+			if runtime.GOOS == "darwin" && os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1" {
+				if _, lerr := hostlockdown.Apply(hostlockdown.Options{
+					AllowOutboundNet: false,
+				}); lerr != nil {
+					if errors.Is(lerr, hostlockdown.ErrUnsupported) {
+						t.Skip("hostlockdown unsupported on this OS")
+					}
+					t.Fatalf("hostlockdown.Apply: %v", lerr)
+				}
+				recordProcessExtensionLockdown([]int{42})
+			} else if errors.Is(err, hostlockdown.ErrUnsupported) {
+				t.Skip("hostlockdown unsupported on this OS")
+			} else {
+				t.Fatalf("first Sandbox New with lockdown: %v", err)
+			}
+		} else {
+			defer func() { _ = sb1.Close() }()
+			platName = sb1.platName
+		}
 	}
 	if !hostlockdown.IsLockedDown() {
 		t.Fatal("hostlockdown.IsLockedDown() = false after lockdown")
-	}
-
-	platName := "hvf"
-	if sb1 != nil {
-		platName = sb1.platName
 	}
 
 	// Direct helper spawning must fail closed with ErrLockdownActive.

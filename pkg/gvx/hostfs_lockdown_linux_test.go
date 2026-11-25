@@ -27,20 +27,22 @@ import (
 )
 
 func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, error) {
+	var mounts []hostlockdown.HostMount
+	if dir != "" {
+		mounts = []hostlockdown.HostMount{{Path: dir, ReadOnly: readOnly}}
+	}
 	return hostlockdown.Apply(hostlockdown.Options{
-		Mounts: []hostlockdown.HostMount{
-			{Path: dir, ReadOnly: readOnly},
-		},
+		Mounts: mounts,
 		InstallSyscallFilter: func() error {
 			opt := config.Options{
 				Platform:       platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()},
-				HostFilesystem: true,
+				HostFilesystem: dir != "",
 				ControllerFD:   math.MaxUint32,
 				ProcSelfFD:     math.MaxUint32,
 				CgoEnabled:     cgoBuild,
 			}
 			rules, denyRules := config.Rules(opt)
-			rules.Merge(embedderRules(Config{}, true, false))
+			rules.Merge(embedderRules(Config{}, dir != "", false))
 			// Under -race, extra_filters_race.go widens SYS_CLONE to MatchAll{},
 			// which bypasses rejectedRules() for hostlockdown's clone(CLONE_THREAD)
 			// probe. Restrict SYS_CLONE to Go and libc thread creation flags so
@@ -86,4 +88,12 @@ func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, er
 			return program.Install(nil)
 		},
 	})
+}
+
+// applyExtensionTestLockdown applies the Linux Landlock and seccomp lockdown
+// with the race-safe SYS_CLONE rule so hostlockdown's clone probe returns
+// EPERM even when tests run under -race.
+func applyExtensionTestLockdown() (bool, error) {
+	_, err := applyHostfsTestLockdown("", true)
+	return true, err
 }
