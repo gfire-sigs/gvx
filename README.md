@@ -1,156 +1,196 @@
-# `gvx`
+# gvx
 
-`gvx` runs unmodified Linux containers (OCI images) and Linux ELF64 binaries on Windows, macOS, and Linux inside a single unprivileged host process. It does not boot a Linux virtual machine, install a kernel driver, or run a background daemon.
+`gvx` executes unmodified Linux containers (OCI images) and Linux ELF64 programs inside a single unprivileged process on Windows, macOS, Linux, and Android. The runtime boots no Linux virtual machine, installs no kernel driver, and requires no background daemon.
 
-It is built on Google's [gVisor](https://github.com/google/gvisor) user-space application kernel (`Sentry` and `netstack`), ported to Windows (`amd64`, `arm64`) and macOS (`arm64`) alongside Linux (`amd64`, `arm64`) while modifying less than `5.0%` of upstream gVisor files (`4.12%` at [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT)). Guest Linux code runs directly on the host CPU, and `gvx` intercepts Linux system calls in user space through the `rungv` CLI or the `pkg/gvx` Go SDK.
+The implementation derives from Google's [gVisor](https://github.com/google/gvisor) user-space application kernel and tracks upstream releases directly. Because the port avoids a diverging fork, upstream Linux compatibility improvements and security fixes reach `gvx` without manual backporting. Guest instructions execute directly on the host processor, while a memory-safe Go kernel intercepts Linux system calls in user space.
 
-```bash
-# Run an Alpine container directly on Windows, macOS, or Linux (no daemon, no sudo)
-./rungv run alpine:3.20 uname -a
+---
 
-# Run Nginx with port forwarding, a persistent .ext4 rootfs or data volume, and a live host directory
-./rungv run -p 8080:80 -rootfs-volume nginx-root -v appdata:/var/lib/nginx -workspace=./my-site nginx:alpine
+## 1. Intended Users and Deliverables
 
-# Checkpoint a running sandbox to disk and restore it later
-./rungv checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
-./rungv restore -checkpoint-dir ./snap
+Different classes of users adopt `gvx` for different operational settings. The repository produces four deliverables, each with a distinct entry point.
+
+| Deliverable | Audience | Entry Point |
+| :--- | :--- | :--- |
+| `rungv` | Developers running Linux containers, Docker Engine, or local Kubernetes without a virtual machine. | Section 2 below; [`docs/cli.md`](docs/cli.md) |
+| `pkg/gvx` | Go programmers embedding isolated Linux execution inside a host application. | Section 2.4 below; `go get z.gfire.dev/gvx` |
+| `gvx-android.aar` | Android developers packaging Linux execution inside an application (`android/arm64`). | [`docs/components/android.md`](docs/components/android.md) |
+| `containerd-shim-gvx-v2` | Runtime integrators testing the optional containerd v3 control-plane adapter. | [`docs/architecture.md`](docs/architecture.md#310-optional-containerd-control-adapter) |
+
+---
+
+## 2. Installation and First Run
+
+This section brings a new user from an empty workstation to a verified container run. Every example below succeeds from an empty directory.
+
+### 2.1 Host Prerequisites
+
+Each supported host operating system imposes a small set of prerequisites. Consult the subsection for your host before installing the binary.
+
+#### macOS (Apple Silicon `arm64`)
+
+1. Verify that the machine uses an Apple Silicon processor (`arm64`); Intel Macs (`darwin/amd64`) are not supported.
+2. Prebuilt release binaries carry an ad-hoc `com.apple.security.hypervisor` signature rather than Apple notarization.
+3. If Gatekeeper blocks a downloaded binary, clear its quarantine attribute with `xattr -d com.apple.quarantine ./rungv`.
+4. If you build from source or run `go install`, sign the binary with `entitlements.plist` (Section 2.3).
+
+#### Windows (`amd64` and `arm64`)
+
+Hardware-assisted execution (`whpx`) requires Windows 10 (version 2004 or later) or Windows 11 on `amd64`, and Windows 11 24H2 (Build 26100.3915 or later) on `arm64`.
+
+1. Open an elevated PowerShell prompt and enable the Windows Hypervisor Platform optional feature.
+2. Restart the machine when the command completes.
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
 ```
 
----
+Release binaries for Windows are not Authenticode-signed. Windows SmartScreen may present a warning on first execution; remove the download mark with `Unblock-File .\rungv.exe` or choose "More info" and "Run anyway". On hosts without hardware virtualization, trusted workloads may opt into the user-mode fallback with `--backend=systrap` or `-allow-unconfined-systrap`.
 
-## 1. How It Compares to WSL2, Lima, and Upstream gVisor
+#### Linux (`amd64` and `arm64`)
 
-Upstream gVisor (`runsc`) is an OCI runtime for Linux hosts. On Windows and macOS, tools like Docker Desktop, WSL2, Lima, and Podman Desktop run Linux containers by booting a persistent Linux utility VM in the background.
+Linux hosts require no administrator privileges, no kernel module, and no hypervisor device. Both 4 KiB and 16 KiB host page kernels are supported. Build from source with `CGO_ENABLED=0` so the binary requires no host C library.
 
-`gvx` takes the opposite approach: it runs gVisor's user-space Linux kernel directly as a normal Windows or macOS process. Without a Linux VM, `gvx` still runs unmodified `dockerd` (`docker:dind`), single-node and multi-node Kubernetes clusters (`rancher/k3s`), `containerd`, `runc`, and Calico CNI with `NetworkPolicy` enforcement.
+### 2.2 Prebuilt Release Archives
 
-| Property | `gvx` (`whpx` / `hvf`) | `gvx` (`systrap`) | WSL2 / Lima / Docker Desktop |
-| :--- | :--- | :--- | :--- |
-| **Host OS** | Windows (`amd64`, `arm64`), macOS (`arm64`) | Linux (`amd64`, `arm64`), Windows (`amd64`, `arm64`) | Windows, macOS |
-| **Background VM / Daemon** | None (single process per sandbox) | None (single process per sandbox) | Persistent Linux VM + daemon |
-| **Admin / `root` Required** | No | No | Yes (initial VM/driver setup) |
-| **Typical Cold Start** | `~20 ms` (cached EROFS layer) | `~25 to 65 ms` (cached EROFS layer) | `800 to 2500 ms` (when VM is cold) |
-| **Base Memory Overhead** | `~16 MiB` per sandbox process | `~16 MiB` per sandbox process | `512 MiB+` reserved for utility VM |
-| **Workload Coverage** | CLI tools, databases, `dockerd`, `k3s` + Calico CNI | CLI tools, databases, `dockerd`, `k3s` + Calico CNI | Full Linux kernel inside the VM |
-| **Cross-Arch Emulation** | Host CPU arch (`amd64` or `arm64`) | Host CPU arch (`amd64` or `arm64`) | Via QEMU `binfmt_misc` / Rosetta |
+Each tagged release on the [Releases](https://github.com/gfire-sigs/gvx/releases) page publishes seven archives, a `SHA256SUMS` file, and a Sigstore SLSA build provenance bundle. Replace `VERSION` below with the desired tag (for example, `v0.22.10002026111600`).
 
-### Core Capabilities
+| Host Target | Release Archive Name |
+| :--- | :--- |
+| macOS Apple Silicon (`arm64`) | `rungv-VERSION-darwin-arm64.tar.gz` |
+| Windows x86-64 (`amd64`) | `rungv-VERSION-windows-amd64.zip` |
+| Windows ARM64 (`arm64`) | `rungv-VERSION-windows-arm64.zip` |
+| Linux x86-64 (`amd64`) | `rungv-VERSION-linux-amd64.tar.gz` |
+| Linux ARM64 (`arm64`, v8.0) | `rungv-VERSION-linux-arm64.tar.gz` |
+| Linux ARM64 (`arm64`, v8.2 LSE) | `rungv-VERSION-linux-arm64v8.2.tar.gz` |
+| Android ARM64 (`gvx-android.aar`) | `rungv-VERSION-android-arm64.tar.gz` |
 
-- **Docker Engine and Kubernetes (`k3s` + Calico CNI) in one process**: `gvx` implements cgroup v2 (`memory.max`, `cpu.max`), `overlayfs`, `pivot_root`, netfilter/iptables (`addrtype`, `conntrack`, `xt_recent`, `rpfilter`, `set`), `ipset`, VXLAN, and kernel WireGuard netlink (`wg0`). An unmodified `rancher/k3s` server or multi-node cluster boots inside `gvx`, passes Kubernetes `sonobuoy` conformance checks (`Quick` and `[sig-network] Services`), and enforces pod `NetworkPolicy` rules with `flannel` (`wireguard-native`) or Calico VXLAN.
-- **Portable, journaled single-file volumes (`ext4lite`)**: Databases (`PostgreSQL`, `SQLite`), `dockerd`, and `k3s` rely on POSIX filesystem semantics (`overlayfs` whiteouts, xattrs, hard links, atomic rename, and `fsync` durability) that break on Windows NTFS or case-insensitive macOS APFS. `ext4lite` stores each named volume (`-v data:/var/lib/data`) as a standard Linux `ext4` image file (`<name>.ext4`) with a `jbd2` journal and dynamic 16 MiB block groups. Volumes start small, grow on demand, recover from crashes through journal replay, and mount unmodified with `mount -o loop` on Linux.
-- **Embedded Linux sandboxes in Go (`pkg/gvx`)**: Launch isolated Linux containers or ELF binaries from a Go library call without shipping a VM image or requiring Docker Desktop.
-- **Lockdown-safe Checkpoint and Restore (`rungv checkpoint` / `restore`)**: Snapshot a running sandbox's task graph, memory pages, `ext4lite` volumes, and child network namespaces to a directory bundle, then resume execution in milliseconds.
+#### Install on macOS or Linux
 
-### Scope and Trade-offs
+1. Set `VERSION` and `TARGET` (for example, `darwin-arm64` or `linux-amd64`).
+2. Download the archive, `SHA256SUMS`, and the provenance bundle from GitHub Releases.
+3. Verify the SHA-256 digest before extracting the archive.
+4. Optionally verify the SLSA build provenance with the GitHub CLI (`gh`).
+5. Extract the archive and place `rungv` on your `PATH`.
 
-- **User-space application kernel vs. hardware kernel**: `gvx` serves system calls in user space rather than booting a hardware Linux kernel image. Kernel modules (`insmod`), eBPF programs (such as Cilium's eBPF datapath), `io_uring`, and `nftables` are not supported; `dockerd`, `k3s`, and Calico run using the `iptables-legacy` backend (`IPTABLES_MODE=legacy`).
-- **Same-architecture execution**: Guest binaries run natively on the host CPU without instruction translation (`linux/arm64` on Apple Silicon and Windows ARM64; `linux/amd64` on x86_64 Windows and Linux).
-- **Windows `whpx` vs. `systrap`**: On Windows, hardware-assisted `whpx` (`WinHvPlatform.dll`) is the default engine. When Hyper-V / WHPX is unavailable, `gvx` offers a user-mode `systrap` engine (`-platform=systrap` or `-allow-unconfined-systrap`) for trusted workloads. Because the Windows kernel does not provide an unprivileged syscall filter like Linux `seccomp`, always use `whpx` for untrusted code on Windows.
+```sh
+VERSION=v0.22.10002026111600
+TARGET=darwin-arm64
+ARCHIVE="rungv-${VERSION}-${TARGET}.tar.gz"
+BASE="https://github.com/gfire-sigs/gvx/releases/download/${VERSION}"
 
----
+curl -fsSLO "${BASE}/${ARCHIVE}"
+curl -fsSLO "${BASE}/SHA256SUMS"
+curl -fsSLO "${BASE}/rungv-${VERSION}.sigstore.json"
 
-## 2. Architecture Overview
+# Verify SHA-256 checksum (use sha256sum -c on Linux)
+grep " ${ARCHIVE}\$" SHA256SUMS | shasum -a 256 -c -
 
-When you start a container with `rungv` or `pkg/gvx`, the host process compiles OCI image layers into cached `.erofs` files, opens all host file handles and sockets up front, locks down its own OS process privileges, and enters the guest execution loop.
+# Verify SLSA v1 build provenance
+gh attestation verify "${ARCHIVE}" \
+  --bundle "rungv-${VERSION}.sigstore.json" \
+  --repo gfire-sigs/gvx \
+  --signer-workflow gfire-sigs/gvx/.github/workflows/release.yml \
+  --source-ref "refs/tags/${VERSION}" \
+  --deny-self-hosted-runners
 
-![gvx Sandbox Architecture](docs/assets/overview.svg)
+tar -xzf "${ARCHIVE}"
+mv "rungv-${VERSION}-${TARGET}/rungv" /usr/local/bin/rungv
+# On macOS, clear Gatekeeper quarantine if prompted:
+xattr -d com.apple.quarantine /usr/local/bin/rungv 2>/dev/null || true
+rungv version
+```
 
-### How `gvx` Bridges Host OS Differences
+#### Install on Windows (PowerShell)
 
-1. **CPU Ring and 4 KB Paging (`whpx`, `hvf`, `systrap`)**:
-   - On macOS (`arm64`), `pkg/sentry/platform/hvf` runs guest code inside an Apple `Hypervisor.framework` vCPU with 4 KB Stage-1 guest pages over 16 KB host pages.
-   - On Windows (`amd64`, `arm64`), `pkg/sentry/platform/whpx` runs guest code inside a Windows Hypervisor Platform (`WinHvPlatform.dll`) partition with 4 KB EPT / Stage-2 mappings.
-   - On Linux (`amd64`, `arm64`) and Android (`arm64`, including 16 KB page kernels), `gvx` uses `systrap` (`seccomp`, shared-memory trampolines, and 4 KB sub-block paging).
-2. **In-Memory OCI-to-EROFS Compilation (`pkg/oci`)**:
-   - Extracting a Linux container `.tar` layer onto Windows NTFS or default macOS APFS breaks case-sensitive filenames (`Makefile` vs `makefile`), device nodes, and Windows reserved names (`CON`, `AUX`, `NUL`).
-   - `pkg/oci` never extracts container layers onto the host filesystem. It streams `.tar.gz` and `.tar.zst` layers in memory and compiles them into read-only `<sha256>.erofs` images cached on disk. By default, `gvx` mounts them under an in-memory `tmpfs` upper layer; `-rootfs-volume` (`Config.RootVolume`) mounts an `ext4lite` image as the persistent overlay upper layer instead.
-3. **Single-File Journaled `ext4` Volumes (`pkg/sentry/fsimpl/ext4lite`)**:
-   - Named volumes (`-v appdata:/var/lib/data`) use `ext4lite`, a pure-Go VFS2 driver that formats and mounts a single `<name>.ext4` file on the host.
-   - `ext4lite` divides disk space into 16 MiB block groups with extent trees, inline data for small files, directory indexing, extended attributes (`security.*`, `trusted.overlay.*`), and an ordered metadata journal (`jbd2`). When sparse hole punching (`FSCTL_SET_ZERO_DATA` or `F_PUNCHHOLE`) is unavailable, `ext4lite` falls back to dense block allocation and compacts unused tail groups on unmount.
-4. **Pinned Host Directory Sharing (`pkg/sentry/fsimpl/hostfs`)**:
-   - When you mount a host directory with `-workspace` or `-v ./src:/src`, `hostfs` opens every path relative to a pinned `os.Root` directory handle (`NtCreateFile` with `FILE_OPEN_REPARSE_POINT` on Windows; `openat` with `O_NOFOLLOW` on macOS and Linux). It encodes Windows-invalid characters and case collisions with a stateless `~gvx~` prefix and bridges host filesystem events into guest `inotify` watches.
-5. **Driverless Networking (`pkg/netbackend`)**:
-   - `-net=nat` runs gVisor's user-space TCP/IP stack (`netstack`) and relays outbound guest TCP and UDP flows through unprivileged host Go `net` sockets. It supports static port forwards and ranges (`-p`), host Unix socket forwarding (`-p unix:path:port`), opt-in dynamic loopback publishing (`--auto-publish`), and `host.docker.internal` (`10.0.2.2`).
-   - `-net=wg` routes L3 packets from `netstack` through an in-memory `wireguard-go` endpoint over one unprivileged host UDP socket, with no `WinTun.dll` or `/dev/tun` driver.
-6. **Pre-Execution Host Self-Lockdown (`pkg/hostlockdown`)**:
-   - Before executing the first guest instruction, `gvx` opens all `.erofs` layers, `.ext4` volume files, workspace directory handles, and static listeners, then calls `hostlockdown.Apply()`.
-   - Linux installs a Landlock filesystem ruleset scoped to mounted paths, followed by a `seccomp-bpf` filter.
-   - macOS applies a Seatbelt profile (`sandbox_init`) denying `process-fork` and unbound `file-*` paths.
-   - Windows lowers the primary token to Untrusted integrity, applies a Restricted Token and Job Object (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, `JOB_OBJECT_UILIMIT_ALL`), and routes post-lockdown workspace opens through an in-process file broker without changing host NTFS ACLs. Outbound NAT and `--auto-publish` loopback binds run through a Low-integrity socket broker.
+1. Set `$Version` and `$Target` (`windows-amd64` or `windows-arm64`).
+2. Download the archive and `SHA256SUMS`.
+3. Compare the computed SHA-256 hash against the entry in `SHA256SUMS`.
+4. Extract `rungv.exe`, unblock the file, and add its directory to `PATH`.
 
----
+```powershell
+$Version = "v0.22.10002026111600"
+$Target = "windows-amd64"
+$Archive = "rungv-$Version-$Target.zip"
+$Base = "https://github.com/gfire-sigs/gvx/releases/download/$Version"
 
-## 3. Quickstart
+Invoke-WebRequest "$Base/$Archive" -OutFile $Archive
+Invoke-WebRequest "$Base/SHA256SUMS" -OutFile SHA256SUMS
 
-### 3.1 Install or Build `rungv`
+$Expected = (Select-String -Path SHA256SUMS -Pattern " $Archive$").Line.Split(" ")[0]
+$Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLower()
+if ($Actual -ne $Expected) { throw "SHA-256 mismatch: $Actual != $Expected" }
 
-Download a prebuilt archive from [Releases](https://github.com/gfire-sigs/gvx/releases) or build from source with Go 1.27.4+.
+Expand-Archive -Path $Archive -DestinationPath . -Force
+Unblock-File ".\rungv-$Version-$Target\rungv.exe"
+.\rungv-$Version-$Target\rungv.exe version
+```
+
+### 2.3 Install with Go or Build from Source
+
+The project does not yet publish packages for Homebrew, Winget, APT, or similar system package managers. Users with Go 1.27.4 or newer may install directly from the Go module proxy or compile from a source checkout.
 
 > [!IMPORTANT]
-> On macOS, sign the binary with `entitlements.plist` so it can call `Hypervisor.framework`. On Windows, enable the "Windows Hypervisor Platform" optional feature for `whpx` execution. On Linux, build with `CGO_ENABLED=0`.
+> On macOS, sign any binary produced by `go install` or `repro-build.sh` with `entitlements.plist`. Without the `com.apple.security.hypervisor` entitlement, `Hypervisor.framework` refuses to create a virtual machine.
 
-1. Run `scripts/repro-build.sh` to build `rungv`.
-2. Sign the binary with `entitlements.plist` on macOS.
+1. Install with `go install` (set `CGO_ENABLED=0` on Linux).
+2. Or clone the repository and run `scripts/repro-build.sh` for a deterministic binary.
+3. On macOS, apply the ad-hoc hypervisor entitlement signature.
 
-```bash
-# macOS (Apple Silicon arm64)
+```sh
+# Option A: install from the Go module proxy (Linux and Windows; sign on macOS below)
+CGO_ENABLED=0 go install z.gfire.dev/gvx/cmd/rungv@latest
+
+# Option B: reproducible build from a source checkout
 ./scripts/repro-build.sh ./rungv ./cmd/rungv
+
+# Required on macOS after either Option A or Option B
 codesign --sign - --entitlements entitlements.plist --force ./rungv
-
-# Windows (amd64 or arm64, in Git Bash)
-./scripts/repro-build.sh ./rungv.exe ./cmd/rungv
-
-# Linux (amd64 or arm64)
-./scripts/repro-build.sh ./rungv ./cmd/rungv
 ```
 
-### 3.2 Common `rungv` Commands
+### 2.4 First Examples
 
-See [`docs/cli.md`](docs/cli.md) for the complete command and flag reference, [`docs/recipes/docker-engine.md`](docs/recipes/docker-engine.md) to run `dockerd` inside `gvx`, and [`docs/recipes/kubernetes.md`](docs/recipes/kubernetes.md) to run a single-node or multi-node `k3s` Kubernetes cluster.
+The commands below verify container execution, port forwarding, volumes, checkpointing, and Go embedding. Copy any block into a fresh directory.
 
-1. Run a command in an OCI image.
-2. Run a service with port forwarding (`-p`), a persistent `.ext4` volume (`-v`), and a shared workspace (`-workspace`).
-3. Run a sandbox with a pre-bound checkpoint socket, snapshot it to disk, and restore it.
-4. Route container traffic through a WireGuard tunnel (`-net=wg`).
+#### Command-Line Examples (`rungv`)
 
-```bash
-# 1. Run an interactive or one-shot container
-./rungv run alpine:3.20 uname -a
+1. Run a command inside an unmodified Alpine Linux image.
+2. Create a local web directory and serve it through nginx on host port `8080`.
+3. Checkpoint a running sandbox to disk and restore it in a new process.
 
-# 2. Run Nginx with port forwarding, a named .ext4 volume, and a host workspace
-./rungv run -p 8080:80 -v appdata:/var/lib/nginx -workspace=./my-site nginx:alpine
+```sh
+# 1. Execute a one-shot Linux container (no daemon, no sudo)
+rungv run alpine:3.20 uname -a
 
-# 3. Checkpoint a running container and restore it from disk
-./rungv run -control-socket ./ctrl.sock -checkpoint-dir ./snap alpine:3.20 sh -c "sleep 300" &
-./rungv checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
-./rungv restore -checkpoint-dir ./snap
+# 2. Serve a local host directory with nginx and a persistent ext4lite volume
+mkdir -p ./my-site
+printf '<h1>Served from gvx</h1>\n' > ./my-site/index.html
+rungv run -p 8080:80 -v appdata:/var/lib/nginx -v "$PWD/my-site:/usr/share/nginx/html:ro" nginx:alpine
 
-# 4. Run Python over a user-space WireGuard tunnel (blocks local LAN access)
-./rungv run -net=wg -wg-conf=./sandbox-wg.conf python:3.12-alpine \
-  python3 -c "import urllib.request; print(urllib.request.urlopen('https://example.com').status)"
+# 3. Checkpoint a running container to disk and restore it later
+rungv run -control-socket ./ctrl.sock -checkpoint-dir ./snap alpine:3.20 sh -c "sleep 300" &
+sleep 1
+rungv checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
+rungv restore -checkpoint-dir ./snap
 ```
 
-| Command | Synopsis | Description |
-| :--- | :--- | :--- |
-| `run` | `rungv run [flags] IMAGE [COMMAND [ARG...]]` | Run a command inside an OCI image or a local Linux ELF64 binary (`-bin`). |
-| `checkpoint` / `restore` | `rungv checkpoint -control-socket PATH` / `rungv restore -checkpoint-dir DIR` | Save a running sandbox (`snapshot`) or resume a saved bundle (`resume`). |
-| `image` (`pull`, `images`, `rmi`, `inspect`, `tag`, `save`, `load`) | `rungv image <subcommand>` | Pull, list, inspect, tag, save, load, remove, or prune cached OCI images. |
-| `volume` | `rungv volume <create\|ls\|inspect\|compact\|rm\|prune>` | Create, inspect, compact, remove, or prune local `ext4lite` and `hostfs` volumes. |
-| `system` / `info` | `rungv system <info\|df\|prune>` / `rungv info` | Probe host backends, show cache and volume usage, or prune local storage. |
-| `login` / `logout` | `rungv login [SERVER]` / `rungv logout [SERVER]` | Store or remove registry credentials in the Docker config store. |
-| `stub` / `tune` / `completion` | `rungv stub` / `rungv tune list` / `rungv completion SHELL` | Probe `systrap` readiness, list runtime tunables, or print shell completions. |
-| `version` / `license` | `rungv version` / `rungv license` | Print version metadata or embedded open-source licenses. |
+Notice that `-v SRC:DST` creates a missing host directory before lockdown, whereas `-workspace DIR` requires that `DIR` already exist. See [`docs/cli.md`](docs/cli.md) for the complete command reference.
 
-### 3.3 Embed in Go (`pkg/gvx`)
+#### Embeddable Go SDK (`pkg/gvx`)
 
-Use `pkg/gvx` to launch and control sandboxes directly from Go without shelling out to a CLI binary.
+Embedders invoke `pkg/gvx` directly from Go without spawning a separate CLI binary.
 
 > [!CAUTION]
-> Always `defer sb.Close()` immediately after `gvx.New()` or `gvx.Restore()` succeeds. Omitting `sb.Close()` leaks hypervisor partitions, shared memory mappings, and open file handles.
+> Always call `defer sb.Close()` immediately after `gvx.New` or `gvx.Restore` succeeds. Omitting `Close` leaks hypervisor partitions, shared memory mappings, and host file descriptors.
 
-1. Construct a `gvx.Config` with the image, command, mounts, and network mode.
-2. Call `gvx.New(ctx, cfg)` to prepare resources and lock down the host process.
-3. Call `sb.Run(ctx)` (or `sb.Start(ctx)` followed by `sb.Checkpoint(ctx, opts)`).
+1. Initialize a Go module and fetch `z.gfire.dev/gvx`.
+2. Save the program below as `main.go` and run `go run .` (on macOS, compile and sign with `entitlements.plist` first).
+
+```sh
+mkdir gvx-demo && cd gvx-demo
+go mod init example.com/gvx-demo
+go get z.gfire.dev/gvx
+```
 
 ```go
 package main
@@ -164,13 +204,18 @@ import (
 )
 
 func main() {
+	if err := os.MkdirAll("./work", 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "create workspace: %v\n", err)
+		os.Exit(1)
+	}
+
 	ctx := context.Background()
 	sb, err := gvx.New(ctx, gvx.Config{
 		Platform:      gvx.PlatformAuto,
 		NetworkMode:   gvx.NetModeNAT,
 		OCIImage:      "alpine:3.20",
-		WorkspacePath: "./repo",
-		Argv:          []string{"/usr/bin/git", "status"},
+		WorkspacePath: "./work",
+		Argv:          []string{"/bin/sh", "-c", "uname -a && ls -ld /workspace"},
 		Stdout:        os.Stdout,
 		Stderr:        os.Stderr,
 	})
@@ -191,47 +236,121 @@ func main() {
 
 ---
 
-## 4. Supported Platforms
+## 3. Execution Backends and Comparison with Virtual-Machine Runtimes
 
-`gvx` runs Linux binaries and OCI images matching the host CPU architecture (`linux/amd64` on `amd64`, `linux/arm64` on `arm64`).
+Traditional container tools on Windows and macOS (Docker Desktop, WSL2, Lima, and Podman Desktop) boot a persistent Linux virtual machine in the background. `gvx` takes the opposite architecture: each sandbox runs a user-space Linux kernel inside one ordinary host process.
 
-| Host OS & CPU | Primary Engine | Fallback Engine | Notes |
+Before comparing approaches, we define the three execution backends that run guest machine code:
+
+- **`hvf` (macOS Apple Silicon)**: Executes guest code inside Apple's `Hypervisor.framework` using hardware two-stage paging (4 KiB guest pages over 16 KiB host pages).
+- **`whpx` (Windows `amd64` and `arm64`)**: Runs guest instructions inside a Windows Hypervisor Platform (`WinHvPlatform.dll`) partition with 4 KiB Extended Page Tables or Stage-2 mappings.
+- **`systrap` (Linux, Android, and opt-in Windows)**: Executes guest instructions in isolated stub processes using system-call interception. On Linux and Android, the host kernel traps system calls with `seccomp`. On Windows, no kernel system-call filter exists, so `systrap` uses binary rewriting and requires explicit opt-in for trusted workloads only.
+
+Use `--backend` (`auto`, `whpx`, `hvf`, or `systrap`) to choose the execution engine, and `--platform linux/ARCH` (`linux/amd64` or `linux/arm64`) to select the image architecture.
+
+| Property | `gvx` (`hvf` / `whpx`) | `gvx` (`systrap`) | WSL2 / Lima / Docker Desktop |
 | :--- | :--- | :--- | :--- |
-| **macOS `arm64`** (Apple Silicon M1 to M5) | `hvf` (`Hypervisor.framework`) | None | Requires `com.apple.security.hypervisor` code-signing entitlement. |
-| **Windows `amd64`** (Intel / AMD) | `whpx` (`WinHvPlatform.dll`) | `systrap` (opt-in) | `whpx` requires Windows Hypervisor Platform. `systrap` requires `-platform=systrap` or `-allow-unconfined-systrap`. |
-| **Windows `arm64`** (Snapdragon X) | `whpx` (`WinHvPlatform.dll`) | `systrap` (opt-in) | `whpx` on Windows 11 24H2+; `systrap` runs without a hypervisor for trusted workloads. |
-| **Linux `amd64` & `arm64`** | `systrap` | None | Supports both 4 KB and 16 KB host page kernels (including Android 15/16 `arm64`). |
+| **Host OS** | macOS (`arm64`), Windows (`amd64`, `arm64`) | Linux (`amd64`, `arm64`), Android (`arm64`), Windows (`amd64`, `arm64` opt-in) | Windows, macOS |
+| **Background VM or Daemon** | None (one process per sandbox) | None (one process per sandbox plus stub processes) | Persistent Linux virtual machine and daemon |
+| **Administrator / `root` Privilege** | Not required at runtime (Windows feature enablement is one-time) | Not required | Required for initial virtual-machine or driver setup |
+| **Linux Kernel Model** | User-space Go kernel (gVisor Sentry) | User-space Go kernel (gVisor Sentry) | Full Linux kernel inside the guest VM |
+| **Guest Architecture** | Must match host CPU (`amd64` or `arm64`) | Must match host CPU (`amd64` or `arm64`) | Cross-architecture via QEMU `binfmt_misc` or Rosetta |
+| **Untrusted Code Isolation** | Hardware page tables plus host process lockdown | Linux/Android: `seccomp` plus lockdown; Windows: trusted workloads only | Hardware virtual machine boundary |
+
+### Measured Micro-Benchmarks
+
+Automated micro-benchmarks run via `TestE2EMicroBench` (`GVX_E2E_BENCH=1 go test -count=1 -v -run TestE2EMicroBench ./e2e/`) and publish longitudinal results on the [`bench-results`](https://github.com/gfire-sigs/gvx/tree/bench-results) branch. The table below summarizes the latest recorded medians from that branch (GitHub-hosted runners at commit `d77169d3`, 2026-11-24; Apple Silicon development host at commit `ce792c97`, 2026-11-10). Note that `windows/amd64` `whpx` runs under nested virtualization on hosted runners, so its latency does not represent bare-metal hardware.
+
+| Target | Backend | `host_new` | `getpid` | `open_close` | `fork_wait` | `fork_exec_true` |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| `darwin/arm64` | `hvf` | 11.39 ms | 1.3 us | 5.2 us | 0.94 ms | 0.23 ms |
+| `linux/amd64` | `systrap` | 47.75 ms | 2.8 us | 8.9 us | 1.80 ms | 0.41 ms |
+| `linux/arm64` | `systrap` | 1.77 ms | 3.2 us | 10.7 us | 1.89 ms | 0.70 ms |
+| `windows/amd64` | `whpx` (nested VM) | 12.24 ms | 12.4 us | 29.0 us | 0.99 ms | 1.12 ms |
+| `windows/amd64` | `systrap` | 42.43 ms | 0.43 us | 3.1 us | 6.72 ms | 4.66 ms |
+| `windows/arm64` | `systrap` | 104.34 ms | 0.96 us | 6.0 us | 17.63 ms | 12.62 ms |
+
+No benchmark in this repository measures WSL2, Lima, or Docker Desktop; therefore no numeric comparison against those systems is claimed here.
 
 ---
 
-## 5. Guides and Internal Documentation
+## 4. Capabilities, Compatibility, and Limitations
+
+When a sandbox starts, `gvx` compiles OCI layers into read-only EROFS files and opens all required host handles. It then seals its own process privileges (`hostlockdown`) before entering the guest.
+
+![Overview of the gvx Sandbox Architecture](docs/assets/overview.svg)
+
+### Verified Workloads
+
+The black-box end-to-end suite (`e2e/`) contains 180 `TestE2E*` functions executed across supported host platforms. Verified workloads include Alpine, BusyBox, nginx, Python 3.12, Node.js 22 (V8), OpenJDK 21 (HotSpot), and Git. They also cover unmodified `docker:dind`, single-node and multi-node `rancher/k3s` with Flannel and Calico, checkpoint/restore, and host NAT policies. See [`docs/compatibility.md`](docs/compatibility.md) for the complete compatibility matrix.
+
+### Core Subsystems
+
+1. **In-memory OCI compilation (`pkg/oci`)**: Streams `.tar.gz` and `.tar.zst` layers into cached EROFS images without extracting Linux files onto host NTFS or APFS.
+2. **Single-file ext4 volumes (`ext4lite`)**: Stores each volume (`-v`) or root overlay (`-rootfs-volume`) in one `.ext4` image with a JBD2 journal and 16 MiB groups.
+3. **Pinned host directories (`hostfs`)**: Anchors bind mounts to a pinned `os.Root` handle, prevents symlink escape, encodes host-incompatible names, and forwards host changes to `inotify`.
+4. **Driverless networking (`pkg/netbackend`)**: Connects gVisor's TCP/IP stack to unprivileged host sockets (`-net=nat`, `-p`, `--auto-publish`) or an in-memory WireGuard tunnel (`-net=wg`) without TUN drivers.
+5. **Pre-execution lockdown (`pkg/hostlockdown`)**: Confines the host process prior to guest entry via Windows Restricted Tokens and Job Objects, macOS Seatbelt, or Linux Landlock and `seccomp-bpf`.
+
+### Scope and Limitations
+
+Evaluating `gvx` requires understanding what the user-space kernel and host platforms omit. All known limitations appear in [`docs/compatibility.md`](docs/compatibility.md); the principal constraints follow:
+
+- **User-space kernel omissions**: Loadable kernel modules (`insmod`), eBPF programs (including Cilium), `io_uring`, and `nftables` are unsupported. `dockerd`, `k3s`, and Calico run using legacy iptables (`IPTABLES_MODE=legacy`).
+- **Same-architecture execution only**: Guest binaries must match the host CPU architecture (`linux/arm64` on Apple Silicon and Windows ARM64; `linux/amd64` on x86-64 Windows and Linux).
+- **Intel Macs unsupported**: `darwin/amd64` is not supported.
+- **Windows `systrap` trust boundary**: Because Windows offers no unprivileged kernel system-call filter, `--backend=systrap` and `-allow-unconfined-systrap` serve trusted workloads only. Always use `whpx` for untrusted code on Windows.
+- **Fixed-address guests and Defender on Windows `systrap`**: AddressSanitizer and 64-bit Wine fail at startup on Windows `systrap` because their fixed reservations cross reserved address holes. Run them under `whpx` instead. The Windows `systrap` stub host, debug object, and executable views remain untested under default Microsoft Defender settings.
+- **Unverified workloads**: Relational databases (PostgreSQL, SQLite) and browsers or GUI tools (Chromium, Playwright, Puppeteer, Electron) have no automated tests in `e2e/`. Hardware GPU acceleration is unimplemented (see [`docs/moonshots.md`](docs/moonshots.md)).
+
+---
+
+## 5. Documentation Index
+
+Documentation is organized by audience so new users can evaluate and operate `gvx` without wading through internal design specifications.
+
+### 5.1 Guides for Users
 
 | Document | Contents |
 | :--- | :--- |
-| [`docs/cli.md`](docs/cli.md) | Complete `rungv` command reference, flags, tunables, mounts, checkpoint/restore, nested use, and Android usage. |
-| [`docs/recipes/docker-engine.md`](docs/recipes/docker-engine.md) | Recipe: Run `dockerd` inside a `gvx` sandbox with an `ext4lite` volume and connect your host `docker` CLI. |
-| [`docs/recipes/kubernetes.md`](docs/recipes/kubernetes.md) | Recipe: Run single-node or multi-node `k3s` Kubernetes clusters (with flannel or Calico CNI) inside `gvx`. |
-| [`docs/architecture.md`](docs/architecture.md) | Internal architecture, Tier 1/2/3 upstream isolation model, containerd control shim, memory/handle ownership, and CI guide. |
-| [`docs/systrap-windows.md`](docs/systrap-windows.md) | Engineering deep dive and measurements for the Windows user-mode `systrap` engine. |
-| [`docs/moonshots.md`](docs/moonshots.md) | Future architecture proposals (`virtgpu` and confined host GPU renderer for browser and GUI guests). |
-| [`SECURITY.md`](SECURITY.md) | Threat model, security boundaries per platform, and vulnerability reporting policy. |
-| [`CHANGELOG.md`](CHANGELOG.md) | Release notes for each version. |
+| [`docs/cli.md`](docs/cli.md) | Complete `rungv` command reference, flags, tunables, mounts, checkpointing, nested use, and Android operation. |
+| [`docs/compatibility.md`](docs/compatibility.md) | Verified workloads from `e2e/`, unverified workloads, and consolidated platform limitations. |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptom-to-remedy guide covering installation, signing, exit code 137, Docker, Kubernetes, DNS, and tracing. |
+| [`docs/glossary.md`](docs/glossary.md) | Concise definitions of subsystems, backends, filesystems, and deliverables. |
+| [`docs/recipes/docker-engine.md`](docs/recipes/docker-engine.md) | Step-by-step recipe to run Docker Engine (`docker:dind`) inside `gvx` from the host `docker` CLI. |
+| [`docs/recipes/kubernetes.md`](docs/recipes/kubernetes.md) | Step-by-step recipe for single-node and multi-node `k3s` clusters with Flannel or Calico CNI. |
+| [`SECURITY.md`](SECURITY.md) | Security boundaries, documented non-vulnerabilities, provenance verification, and reporting procedure. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Chronological release notes for each version. |
+
+### 5.2 Technical Documentation for Contributors
+
+| Document | Contents |
+| :--- | :--- |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | First-contribution workflow, deliverables map, local build and test commands, and review standards. |
+| [`docs/architecture.md`](docs/architecture.md) | System architecture, package boundaries, upstream isolation tiers, guest kernel interfaces, and CI matrix. |
+| [`docs/control-protocol.md`](docs/control-protocol.md) | Wire framing, authentication, capability policy, and RPC reference for `gvx-ctrl/2`. |
+| [`docs/components/hypervisors.md`](docs/components/hypervisors.md) | Component specification for `platform/whpx`, `platform/hvf`, and `platform/hvcommon`. |
+| [`docs/systrap-windows.md`](docs/systrap-windows.md) | Measured behavior, binary patching design, fast path, limits, and evidence for Windows `systrap`. |
+| [`docs/components/ext4lite.md`](docs/components/ext4lite.md) | Component specification for the single-file journaled ext4 volume driver. |
+| [`docs/components/hostfs.md`](docs/components/hostfs.md) | Component specification for the pinned host directory filesystem and `.gvx_meta` journal. |
+| [`docs/components/netbackend.md`](docs/components/netbackend.md) | Component specification for the NAT forwarder, DNS relay, policy filter, and WireGuard backend. |
+| [`docs/components/oci.md`](docs/components/oci.md) | Component specification for OCI registry access, Tar-to-EROFS compilation, and host CA injection. |
+| [`docs/components/hostlockdown.md`](docs/components/hostlockdown.md) | Component specification for pre-execution process containment on Windows, macOS, Linux, and Android. |
+| [`docs/components/android.md`](docs/components/android.md) | Component specification for the Android library (`gvx-android.aar`) and packaging model. |
+| [`docs/moonshots.md`](docs/moonshots.md) | Unimplemented research proposal for confined host GPU acceleration in browser and GUI guests. |
+| [`docs/extensions-plan.md`](docs/extensions-plan.md) | Approved rollout plan for the extension SPI, nested `ext/` submodule, and `rungvx` build-tag model. |
+| [`AGENTS.md`](AGENTS.md) | Repository operating rules, upstream sync discipline, writing standards, and release versioning rules. |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Standards of conduct for project discussions and contributions. |
 
 ---
 
-## 6. Upstream gVisor Tracking and License
+## 6. Upstream Tracking and Licensing
 
-`gvx` is licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for the full text.
+`gvx` is licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for the complete text.
 
-### Upstream Traceability (`< 5.0%` Upstream Diff Budget)
+The repository tracks the pre-generated `go` branch of [google/gvisor](https://github.com/google/gvisor) (Apache License 2.0, Copyright The gVisor Authors) and pins the synced commit in [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT). To prevent merge conflicts across upstream releases, host bindings live in standalone Tier 1 packages and OS-suffixed Tier 2 sibling files (`*_windows.go`, `*_darwin.go`, `*_xplat.go`). Fewer than 5.0% of upstream gVisor files carry Tier 3 build-tag expansions or seams. Every CI run audits this ceiling with `go run ./tools/upstream -mode=audit`.
 
-`gvx` tracks the official `go` branch of [google/gvisor](https://github.com/google/gvisor) (Apache License 2.0, Copyright The gVisor Authors) and pins the synced commit SHA in [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT) (`tools/upstream/sync_manifest.json`). Rather than maintaining a diverging hard fork, `gvx` enforces a three-tier isolation boundary verified on every CI run by `go run ./tools/upstream -mode=audit -max-ratio=0.042` (within the `< 5.0%` budget):
-
-- **Tier 1 (Additive Packages, `0.0%` upstream overlap)**: Windows/macOS hypervisor engines (`whpx`, `hvf`, `hvcommon`), `ext4lite`, `hostfs`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/gvx`, `cmd/rungv`, and `tools/gostateify` live in standalone packages that never collide with upstream gVisor.
-- **Tier 2 (OS-Specific Sibling Files)**: Platform bindings live in `*_windows.go`, `*_darwin.go`, and `*_xplat.go` sibling files alongside unmodified upstream `*_linux.go` files.
-- **Tier 3 (Minimal Upstream Seams, `< 5.0%`)**: Fewer than `5.0%` of upstream gVisor files (`105 / 2,550` files, **`4.12%`**) carry build-tag expansions or hook seams. `tools/upstream -mode=sync` runs automated 3-way merges (`git merge-file`) across upstream releases.
-
-Run `rungv license` to print the full license texts of `gvx`, upstream gVisor, the Go standard library, and all linked third-party Go modules, or `rungv license -list` for the SPDX summary table.
+Run `rungv license` to print embedded notices for `gvx`, upstream gVisor, Go, and linked third-party modules. Pass `-list` for a summary table.
 
 | SPDX identifier | Third-party modules |
 | :--- | :--- |

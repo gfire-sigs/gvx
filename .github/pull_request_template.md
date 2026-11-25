@@ -1,16 +1,29 @@
-## Behavior
+## Summary
 
-<!-- State the one behavior that this PR changes. -->
+<!-- State the one behavior or documentation improvement introduced by this pull request. -->
 
-## Evidence
+## Related Issue
 
-<!-- Show the failure before the fix and the result after it, with run IDs or commands. -->
+<!-- Link the issue addressed, for example: Closes #123 -->
 
-## Checklist (AGENTS.md section 6)
+## Verification
 
-- [ ] A Tier 3 change covers one behavior and stays below about 400 changed lines without tests.
-- [ ] A person or a reviewer agent that did not write the change reviewed it. The result is in a comment.
-- [ ] Tests that check data crossing a boundary get the data from the real producer.
-- [ ] A shared format has one definition with named constants.
-- [ ] A race fix names its invariant and the callers of each changed helper.
-- [ ] A change to accounting, limits, or IDs has a test with two sandboxes in one process.
+<!-- List the commands run locally or the CI run IDs. For bug fixes, record the observed failure before the change and the passing result after it. -->
+
+## First-Time Contributor Steps
+
+If this is your first pull request to `gvx`, consult [`CONTRIBUTING.md`](../CONTRIBUTING.md) before requesting review:
+
+- [ ] Formatted Go code (`go fmt ./...`) or verified Markdown prose (no em-dashes and all relative links resolve).
+- [ ] Confirmed the change targets the owning package documented in [`docs/architecture.md`](../docs/architecture.md).
+
+## Maintainer Checklist (`AGENTS.md` Section 6)
+
+Complete every item applicable to this change (mark non-applicable items with N/A):
+
+- [ ] A Tier 3 change covers one behavior and stays below roughly 400 changed lines excluding tests and generated files.
+- [ ] A person or reviewer agent other than the author reviewed Tier 3, platform, signal, memory, or locking changes, with the result recorded in a comment.
+- [ ] Tests checking cross-boundary data obtain inputs from the real producer (platform, kernel, or guest probe).
+- [ ] Shared binary or memory formats have one canonical definition with named constants.
+- [ ] Concurrency fixes name the restored invariant and audit all callers of modified helpers.
+- [ ] Changes to accounting, limits, or IDs include a test running two sandboxes concurrently in one process.
