@@ -1,12 +1,16 @@
 # Pinned Host Filesystem Driver: `hostfs`
 
-This specification describes `pkg/sentry/fsimpl/hostfs`, the in-process VFS2 driver that mounts host directories and single regular files (`-workspace`, `-v HOST:GUEST`, `--mount type=bind`) without spawning an external `gofer` file server.
+This specification describes `pkg/sentry/fsimpl/hostfs`, the in-process VFS2 driver backing host directory and single-file mounts (`-workspace`, `-v HOST:GUEST`, `--mount type=bind`) without spawning an external `gofer` server.
 
 ---
 
 ## 1. Purpose and Scope
 
-Upstream gVisor shares host directories through an out-of-process 9P/`lisafs` file server (`gofer`). Because `gvx` runs inside a single self-locked host process across Windows, macOS, Linux, and Android, `hostfs` accesses mounted host trees directly through handles pinned prior to `hostlockdown.Apply()`. It prevents symbolic-link escape outside the mounted root, preserves POSIX permissions, ownership, symlinks, special files, and extended attributes on Windows NTFS and macOS APFS, and delivers host edits to guest `inotify` watchers.
+Upstream gVisor shares host directories through an out-of-process 9P/`lisafs` server (`gofer`). Because `gvx` locks its host process before guest entry across Windows, macOS, Linux, and Android, an external server cannot run inside the same sandbox boundary.
+
+`hostfs` pins mounted host directories and files through `os.OpenRoot` handles opened before `hostlockdown.Apply()`. It blocks symlink escapes, encodes host-incompatible filenames, stores POSIX attributes in `.gvx_meta`, and relays host changes to guest `inotify`.
+
+The sections below define handle traversal, caching, single-file mounts, watch budgets, `.gvx_meta` journaling, and component limits.
 
 ---
 
@@ -16,71 +20,73 @@ Upstream gVisor shares host directories through an out-of-process 9P/`lisafs` fi
 
 ### 2.1 Pinned Handle Traversal and Caching
 
-Before lockdown, `OpenWorkspace` anchors each host directory via `os.OpenRoot`. Subsequent lookups, mutations, and listings operate strictly on one path component relative to a pinned parent directory handle (rejecting embedded separators):
+Before lockdown, `OpenWorkspace` anchors each host directory via `os.OpenRoot`. Subsequent lookups, mutations, and listings resolve one path component at a time relative to a pinned directory handle:
 
-- **Windows**: `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory`, `FILE_OPEN_REPARSE_POINT`, and full sharing (`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`). Open-file `rename` uses `FileRenameInformationEx` (`FILE_RENAME_POSIX_SEMANTICS`); `unlink` uses `FileDispositionInfoEx`. Because NTFS refuses to rename a directory containing open descendants, `winHandleRegistry` flushes mapped pages, acquires handle locks in path order, closes descendants, renames the directory, reopens handles, and verifies host file identity (rolling back on failure).
-- **macOS**: `openat` with `O_NOFOLLOW | O_SYMLINK`, native `renameat` and `unlinkat`.
-- **Linux and Android**: `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, falling back to single-component `O_NOFOLLOW` `openat` on `ENOSYS` or Android.
+- **Windows**: Calls `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory`, `FILE_OPEN_REPARSE_POINT`, and full file sharing. Renames use `FILE_RENAME_POSIX_SEMANTICS`; unlinks use `FileDispositionInfoEx`. Because NTFS rejects directory renames with open descendants, `winHandleRegistry` flushes mapped pages, closes descendants under path-ordered locks, renames, reopens, and verifies identity.
+- **macOS**: Uses `openat` with `O_NOFOLLOW | O_SYMLINK`, `renameat`, and `unlinkat`.
+- **Linux and Android**: Uses `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, falling back to single-component `O_NOFOLLOW` `openat` on `ENOSYS` or Android.
 
-Each `Workspace` caches up to 256 pinned directory handles (retiring idle handles after 5 seconds) and closes subtree handles before directory rename or removal. Positive and negative lookup entries remain valid for 1 second without a host call; guest mutations invalidate affected entries immediately, and pinned directory handles revalidate their parent `lstat` after 1 second to detect host directory swaps.
+Each `Workspace` caches up to 256 pinned directory handles (retiring after 5 seconds idle) and closes subtree handles before directory renames or removals. Positive and negative lookup entries expire after 1 second unless invalidated by guest writes. Pinned directory handles revalidate their parent `lstat` after 1 second to detect host swaps.
 
 ### 2.2 Mapped Files (`chunkcache`), Name Translation, and Clutter Filtering
 
-Guest `mmap` reads files in 64 KiB chunks via `pkg/sentry/fsimpl/chunkcache`. On macOS hardware virtualization, chunks reside on the Go heap; on Linux and Windows `systrap`, `pkg/gvx` binds the kernel memory file (`Workspace.SetChunkMemory`) so stub processes can map chunks cleanly (skipping ranges that cross 1 GiB slice boundaries). `ConfigureMMap` reserves the backing host handle against concurrent `munmap` races (`AddMapping` re-attaches it if dropped). `pread` flushes only dirty overlapping chunks.
+Guest `mmap` reads files in 64 KiB chunks via `pkg/sentry/fsimpl/chunkcache`. On macOS `hvf`, chunks live on the Go heap; on `systrap`, `Workspace.SetChunkMemory` backs chunks in the kernel memory file while skipping 1 GiB boundary crossings. `ConfigureMMap` pins the backing handle against concurrent `munmap` races, and `pread` flushes only dirty overlapping chunks.
 
 `OpenWorkspace` probes host volume capabilities (`WorkspaceCaps`) before lockdown:
 
-- **Name translation (`NameCodec`)**: Identity on Linux (zero allocation). On Windows and case-folding volumes, ordinary names stay untouched while reserved names (`CON`, `AUX`, `NUL`), illegal characters, and case collisions encode under a stateless `~gvx~` prefix with `%XX` hex escapes. On APFS, lookups fall back to NFC and listings normalize NFD unless `.gvx_meta` records a guest-created NFD name.
-- **Host clutter**: Hides `.DS_Store`, `._*`, `Thumbs.db`, `.gvx_meta*`, and internal `~gvx~tmp.*`/`~gvx~swap.*` files. `rmdir` sweeps verified clutter from otherwise empty directories; `OpenWorkspace` removes stale internal temporaries.
+- **Name translation (`NameCodec`)**: Identity on Linux with zero allocation. On Windows and case-folding volumes, reserved names (`CON`, `AUX`, `NUL`), illegal characters, and case collisions encode via `~gvx~` hex escapes. On APFS, lookups try NFC fallback and listings normalize NFD unless `.gvx_meta` records NFD.
+- **Host clutter**: Hides `.DS_Store`, `._*`, `Thumbs.db`, `.gvx_meta*`, and `~gvx~tmp.*` or `~gvx~swap.*` files. `rmdir` sweeps verified clutter from empty directories, and `OpenWorkspace` removes stale temporaries.
 
 ### 2.3 Single-File Bind Mounts
 
-`OpenWorkspace` also accepts a single regular file (rejecting sockets, devices, and pipes). It pins the parent directory, records the leaf name, and exposes only that file as the mount root without writing `.gvx_meta`. Mode, ownership, and xattr updates stay in memory while timestamp changes reach the host file. On Windows, unrecorded files default to mode `0755` (`0555` read-only) so mounted scripts execute cleanly. Atomic host renames become visible to fresh opens on macOS and Windows (`winMountBroker`), whereas Linux Landlock pins the original inode descriptor.
+`OpenWorkspace` accepts a single regular file while rejecting sockets, devices, and pipes. It pins the parent directory, tracks the leaf name, and exposes only that file without writing `.gvx_meta`. Mode, owner, and xattr updates stay in memory, while timestamps propagate to the host. Unrecorded Windows files default to `0755` (`0555` read-only); macOS and Windows (`winMountBroker`) observe atomic host renames, whereas Linux Landlock pins the original inode.
 
 ### 2.4 Host Event Bridge (`inotify`) and Watch Caps
 
-When a guest attaches an `inotify` watch to a `hostfs` dentry, `AdmitInotifyWatch` installs a lockdown-safe host watcher: 200 ms pinned polling via `fstatat`/`getdents64` on Linux, `kqueue` `EVFILT_VNODE` on macOS (up to 4,096 registrations plus poll fallback), and overlapped `ReadDirectoryChangesW` on Windows. Diffing pairs same-inode vanished and new names into `IN_MOVED_FROM`/`IN_MOVED_TO`, suppresses guest-originated echoes via generation counters, and evicts clean page-cache chunks before delivering events. Poll loops throttle to `max(200 ms, 3 * passDuration)` to cap CPU use below one quarter of a core.
+When a guest adds an `inotify` watch, `AdmitInotifyWatch` installs a lockdown-safe watcher. Linux polls every 200 ms via `fstatat`/`getdents64`, macOS uses `kqueue` `EVFILT_VNODE` (up to 4,096 descriptors plus poll fallback), and Windows uses overlapped `ReadDirectoryChangesW`. Event diffing pairs vanished and created inodes into `IN_MOVED_FROM`/`IN_MOVED_TO`, suppresses guest echoes, evicts clean cache chunks, and throttles polling to `max(200 ms, 3 * passDuration)`.
 
 All workspaces in one host process draw from a shared watch budget (`processWatches`) computed before lockdown:
 
 | Host | Cost per Watched Object | Process Watch Cap |
 | :--- | :--- | :--- |
 | Linux | One pinned directory descriptor | `soft RLIMIT_NOFILE - 1,024`, clamped to `[2,048, 65,536]` |
-| macOS | One directory descriptor (plus up to 4,096 `kqueue` FDs) | `soft RLIMIT_NOFILE - 5,120`, clamped to `[2,048, 65,536]` (5,120 at default 10,240) |
-| Windows | One directory handle and one 4 KiB buffer | `32,768` objects (at most 128 MiB of buffers) |
+| macOS | One directory descriptor (plus up to 4,096 `kqueue` FDs) | `soft RLIMIT_NOFILE - 5,120`, clamped to `[2,048, 65,536]` (`5,120` at default `10,240`) |
+| Windows | One directory handle and one 4 KiB buffer | `32,768` objects (`128 MiB` buffer cap) |
 
-Exceeding the budget returns `ENOSPC` to `inotify_add_watch(2)`.
+Exceeding the process budget returns `ENOSPC` to `inotify_add_watch(2)`.
 
 ### 2.5 Identity-Keyed `.gvx_meta` Journal and Multi-Sandbox Locking
 
-`.gvx_meta` (format v4, magic `GVXMETA`) is a CRC-32C-framed append-only binary journal persisting virtual modes, `uid`/`gid`, guest symlinks, special nodes, and xattrs. Records key on stable host file identity rather than path (`FILE_ID_INFO` + volume serial on Windows; device + inode + `statx` birth time on Linux; APFS device + inode on macOS without birth time, because `utimensat` lowers APFS birth times). Hard links share one record; atomic editor temp-file renames adopt the orphaned record (dropping SUID/SGID) via directory-identity + leaf hints. Volumes failing the 64-round `StableIDs` probe fall back to path keys.
+`.gvx_meta` (format v4, magic `GVXMETA`) is a CRC-32C-framed journal storing modes, `uid`/`gid`, virtual symlinks, special nodes, and xattrs. Records key on host file identity (`FILE_ID_INFO` + serial on Windows, device + inode + `statx` birth on Linux, or device + inode on macOS). Hard links share one record, and atomic temp-file renames adopt orphaned records (clearing SUID/SGID) via directory-identity hints; volumes failing `StableIDs` use path keys.
 
-Flushes batch after 250 ms (or immediately on `fsync`/`O_SYNC`), compact via atomic temp-file rename when torn, over 64 MiB, or exceeding `2 * live + 1,024` operations, and cap table memory at 512 MiB (roughly 1,100,000 records, returning `ENOSPC` above). A background collector sweeps deleted files after two confirming passes. Multiple concurrent sandboxes sharing one host directory coordinate reads and flushes through `.gvx_meta.lock` opened before lockdown.
+Flushes batch every 250 ms (or immediately on `fsync`/`O_SYNC`), compacting above 64 MiB or `2 * live + 1,024` operations. Table memory caps at 512 MiB (~1,100,000 records, returning `ENOSPC` above), and a sweeper reaps deleted entries after two passes. Concurrent sandboxes sharing a host directory synchronize reads and flushes via `.gvx_meta.lock` opened before lockdown.
 
 ### 2.6 Special Files, Extended Attributes, and Overlay Support
 
-Sockets, FIFOs, and device nodes create empty host placeholders with `.gvx_meta` type records; bound socket endpoints and pipes live in Sentry memory (socket inodes never evict from the dentry cache). On Linux, `user.*` xattrs live on host files while `trusted.*`, `security.*`, and all macOS/Windows xattrs live in `.gvx_meta` (capped at 4 KiB per inode; single values <= 64 KiB). Both `hostfs` and `ext4lite` serve as overlayfs upper and lower layers (whiteouts stored as `0:0` placeholders plus `trusted.overlay.opaque`). `fallocate` supports mode `0`, `KEEP_SIZE`, and `PUNCH_HOLE` (using `FSCTL_SET_ZERO_DATA` on NTFS with automatic zero-fill fallback when `$ATTRIBUTE_LIST` fills).
+Sockets, FIFOs, and device nodes create empty host placeholders with `.gvx_meta` records; active socket endpoints stay in Sentry memory. On Linux, `user.*` xattrs write to host files while `trusted.*`, `security.*`, and macOS/Windows xattrs stay in `.gvx_meta` (`4 KiB`/inode, `64 KiB`/value max). Both `hostfs` and `ext4lite` act as overlay upper/lower layers, and `fallocate` supports `0`, `KEEP_SIZE`, and `PUNCH_HOLE` (`FSCTL_SET_ZERO_DATA` with zero-fill fallback).
 
 ---
 
-## 3. Known Limits
+## 3. Component Limits
 
-- **Slower than `ext4lite` for metadata-heavy workloads**: Individual host syscalls cost more than single-file block I/O (`docker pull nginx:alpine` took 32 to 54 s on `hostfs` vs. 9 s on `ext4lite` on Apple M1).
-- **Non-aligned nested mounts**: Mounting a host subdirectory at an unshadowed guest path (`-v $PWD:/app -v $PWD/logs:/var/log/app`) creates two separate `.gvx_meta` tables; aligned mounts (`-v $PWD/node_modules:/app/node_modules`) avoid overlap.
-- **Host-held open descendants on Windows**: An external Windows process holding a descendant open still blocks guest directory rename with `EACCES`.
-- **Android hard links**: Android SELinux denies `linkat` on app-data files (`EACCES`); use `ext4lite` volumes for workloads needing hard links on Android.
-- **Single-file mounts on Linux under Landlock**: Landlock binds the original inode descriptor, so host atomic rename replacement requires a directory mount or `-lockdown=false`.
-- **Single-file metadata volatility**: Single-file mounts write no `.gvx_meta`; mode, owner, and xattr edits reset on next run.
+Consult [`../compatibility.md`](../compatibility.md) for host-wide limits; the invariants below apply specifically to `hostfs`:
+
+- **Slower than `ext4lite` for metadata-heavy workloads**: Host syscalls add overhead (`docker pull nginx:alpine` took 32 to 54 s on `hostfs` vs. 9 s on `ext4lite`).
+- **Non-aligned nested mounts**: Unshadowed nested mounts (`-v $PWD:/app -v $PWD/logs:/var/log/app`) create separate `.gvx_meta` tables; aligned mounts (`-v $PWD/node_modules:/app/node_modules`) avoid overlap.
+- **Host-held open descendants on Windows**: An external Windows process holding a descendant open blocks guest directory rename with `EACCES`.
+- **Single-file mounts under Landlock and volatile metadata**: Linux Landlock pins the original inode descriptor across host atomic renames. Single-file mounts write no `.gvx_meta`, resetting mode, owner, and xattrs across restarts.
 
 ---
 
 ## 4. Implementation Map
 
+This table maps the `hostfs` package files and test suites.
+
 | Files in `pkg/sentry/fsimpl/hostfs/` | Role |
 | :--- | :--- |
-| `hostfs.go`, `workspace_*.go`, `vfs*.go`, `dirpin.go`, `handle_open.go`, `handle_registry.go` | VFS2 filesystem, pinned directory handle cache, lookup cache, Windows open-handle rename registry. |
+| `hostfs.go`, `workspace_*.go`, `vfs*.go`, `dirpin.go`, `handle_open.go`, `handle_registry.go` | VFS2 filesystem, pinned directory handle cache, lookup cache, Windows handle registry. |
 | `inode_*.go`, `openat_*.go`, `openfd_*.go`, `posix_rename_windows.go`, `rename_flags*.go`, `allocate*.go`, `punch_windows.go` | OS-specific handle-scoped open, rename (`RENAME_EXCHANGE`, `RENAME_WHITEOUT`), `fallocate`, hole punch. |
 | `codec.go`, `clutter.go`, `names.go`, `caps*.go`, `single_file*.go` | Volume probing, `~gvx~` name codec, clutter hiding, single-file bind mount mode. |
-| `meta_*.go`, `metastore*.go`, `durability.go`, `orphans.go`, `unlinked.go` | Format v4 identity-keyed `.gvx_meta` journal, legacy v3/JSON upgrade, multi-sandbox locking, collector. |
-| `watcher*.go`, `watchlimit*.go`, `special_node.go`, `xattr*.go`, `regular_file.go`, `save_restore.go` | Lockdown-safe `inotify` host bridge, process watch budget, special nodes, xattrs, `chunkcache` `mmap`, checkpointing. |
-| Tests | `pkg/sentry/fsimpl/hostfs/*_test.go`, `e2e/gate_m4_test.go`, `e2e/filemount_e2e_test.go`, `e2e/mounts_e2e_test.go`, and `scripts/pjdfstest`. |
+| `meta_*.go`, `metastore*.go`, `durability.go`, `orphans.go`, `unlinked.go` | Format v4 identity-keyed `.gvx_meta` journal, v3/JSON upgrade, multi-sandbox locking, collector. |
+| `watcher*.go`, `watchlimit*.go`, `special_node.go`, `xattr*.go`, `regular_file.go`, `save_restore.go` | Lockdown-safe `inotify` bridge, watch budget, special nodes, xattrs, `chunkcache` `mmap`, C/R. |
+| Tests | `pkg/sentry/fsimpl/hostfs/*_test.go`, `e2e/gate_m4_test.go`, `e2e/filemount_e2e_test.go`, `e2e/mounts_e2e_test.go`, `scripts/pjdfstest`. |

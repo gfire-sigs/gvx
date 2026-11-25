@@ -1,18 +1,22 @@
 # Pre-Execution Host Self-Lockdown: `pkg/hostlockdown`
 
-This specification describes `pkg/hostlockdown`, the third ring of `gvx`'s defense-in-depth architecture. Before a sandbox executes its first guest instruction, `hostlockdown.Apply()` seals the host process using OS-native confinement primitives so that even a hypothetical Sentry vulnerability cannot spawn host processes, read or write unbound host files, or open unauthorized sockets.
+This specification describes `pkg/hostlockdown`, the third defense boundary of `gvx`. Before guest instructions execute, `hostlockdown.Apply()` seals the host process using OS-native confinement primitives.
 
 ---
 
 ## 1. Purpose and Scope
 
-`gvx` enforces three concentric security boundaries:
+Running a sandbox inside one ordinary host process avoids VM setup, yet leaves host privileges reachable if Sentry is compromised. Without host containment, a Sentry flaw could spawn child processes, open arbitrary host paths, or open unauthorized sockets.
+
+`pkg/hostlockdown` strips OS privileges and seals forks, unbound file opens, and unauthorized sockets before guest code enters execution. Every platform translates sandbox mounts and listeners into native rules: Windows Untrusted/Restricted tokens and Job Objects, macOS Seatbelt, or Linux Landlock and `seccomp-bpf`.
+
+The ring summary and state diagram below define pre-lockdown ordering, OS sequences, and containment boundaries.
 
 | Ring | Owning Packages | Enforced Invariant |
 | :--- | :--- | :--- |
-| **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Confines guest machine code inside 4 KiB hardware page tables (`whpx`, `hvf`) or a `seccomp`-trapped Linux `systrap` stub. Untrusted Windows workloads require `whpx`. |
-| **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `hostfs`, `ext4lite`, `pkg/netbackend` | Serves ~250 Linux system calls in memory-safe Go, scopes workspace I/O to `os.Root`, and confines each volume to one pre-opened file. |
-| **Ring 3: Host OS Containment** | `pkg/hostlockdown` | Strips host privileges and blocks process creation, unbound file opens, and unauthorized sockets inside the host OS kernel before guest entry. |
+| **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Confines guest machine code in 4 KiB hardware page tables or Linux `seccomp` stubs. |
+| **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `hostfs`, `ext4lite`, `pkg/netbackend` | Serves Linux syscalls in Go, pins workspaces to `os.Root`, and confines volumes to open files. |
+| **Ring 3: Host OS Containment** | `pkg/hostlockdown` | Blocks child creation, unbound file opens, and unauthorized sockets inside the host OS kernel. |
 
 ![Host Self-Lockdown State Transition](../assets/host-lockdown.svg)
 
@@ -21,58 +25,64 @@ This specification describes `pkg/hostlockdown`, the third ring of `gvx`'s defen
 ## 2. Design and Pre-Lockdown Ordering
 
 > [!CAUTION]
-> Open every required host resource before calling `hostlockdown.Apply()`. This includes the hypervisor partition or `systrap` stub host, all `.erofs` layer handles, `.ext4` volume handles, `os.Root` workspace handles, `.gvx_meta.lock`, host CA roots, host DNS configuration, `-p` listeners, `-control-socket`, `-checkpoint-dir`, and the `-net=wg` UDP socket. Once `Apply()` returns, the host OS kernel rejects new process spawns and unbound file opens.
+> Open every host resource before calling `hostlockdown.Apply()`, including hypervisor partitions, `.erofs`/`.ext4` handles, `os.Root` mounts, DNS config, `-p` listeners, and control sockets. After `Apply()` returns, the host OS kernel rejects child process spawns and unbound file opens.
 
 ### 2.1 Windows (`lockdown_windows.go`, `broker_windows.go`, `netbroker_windows.go`)
 
-Windows applies `RestrictedSids` on thread impersonation tokens because `CreateProcessAsUser` cannot swap a running process's primary token. To defend against an attacker dropping thread impersonation (`SetThreadToken(nil, 0)`), `lockdown_windows.go` lowers the primary token itself to Untrusted integrity (`S-1-16-0`):
+Because `CreateProcessAsUser` cannot swap a running process primary token, Windows places `RestrictedSids` on thread impersonation tokens. To defend against `SetThreadToken(nil, 0)` dropping thread restrictions, `lockdown_windows.go` lowers the primary token itself to Untrusted integrity (`S-1-16-0`):
 
 1. Update `TokenDefaultDacl` on the primary token so unnamed kernel objects admit `NULL_SID`.
-2. Pin mounted directory and single-file handles in memory without modifying any host NTFS ACL or integrity label.
-3. Strip all privileges from the primary token (`AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED`).
-4. Start locked OS broker threads (`winMountBroker` and thread sweeper) before lowering the primary token.
+2. Pin mounted directory and single-file handles without modifying NTFS ACLs or labels.
+3. Strip all privileges from the primary token (`SE_PRIVILEGE_REMOVED`).
+4. Start locked `winMountBroker` and thread-sweeper OS threads before lowering the primary token.
 5. Start the locked Low-integrity `winNetBroker` worker pool when `-net=nat` or `--auto-publish` is active.
-6. Verify containment with an Untrusted restricted token containing `NULL_SID`.
+6. Verify containment using an Untrusted restricted token containing `NULL_SID`.
 7. Assign the process to a Job Object with `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1` and `JOB_OBJECT_UILIMIT_ALL`.
 8. Call `SetProcessMitigationPolicy` (`DisallowWin32kSystemCalls = 1`) to block `win32kfull.sys`.
-9. Lower the primary token to Untrusted integrity after binding pre-warmed Go runtime threads to the restricted token.
-10. Activate the background thread sweeper so newly created Go OS threads inherit the restricted token.
+9. Lower the primary token to Untrusted integrity after binding pre-warmed Go threads.
+10. Start the background sweeper so new Go OS threads inherit the restricted token.
 
 ### 2.2 macOS (`lockdown_darwin.go`)
 
-1. Pin `GOMAXPROCS` so Seatbelt denials on CPU `sysctl` queries cannot collapse runtime parallelism.
+1. Pin `GOMAXPROCS` so Seatbelt denials on CPU `sysctl` queries cannot shrink Go parallelism.
 2. Call `setrlimit(RLIMIT_NPROC, {0, 0})` to reject `fork()` at the XNU kernel boundary.
-3. Apply a `deny default` Seatbelt SBPL profile (`sandbox_init_with_parameters`) denying `process-fork`, `process-exec*`, unbound `file-*` operations, and unauthorized binds (admitting explicit mount paths, resolved targets, and `localhost:*` only when `--auto-publish` or `--dynamic-ports` is enabled).
-4. Execute denial self-probes for process creation, unbound files, and unbound sockets; fail initialization if any probe succeeds.
+3. Apply a `deny default` Seatbelt SBPL profile blocking forks, execs, unbound `file-*`, and unauthorized binds.
+4. Execute denial self-probes for forks, unbound files, and unbound sockets; fail startup if any succeeds.
+
+The Seatbelt profile permits only explicit mount paths, resolved targets, and `localhost:*` when `--auto-publish` or `--dynamic-ports` is active.
 
 ### 2.3 Linux and Android (`landlock_linux.go`, `lockdown_linux.go`, `pkg/gvx/syscallfilter_linux.go`)
 
-Because `pkg/hostlockdown` may not import Sentry packages, `pkg/gvx` compiles the `seccomp-bpf` allowlist (based on `runsc/boot/filter/config`) and passes it via `Options.InstallSyscallFilter`:
+Because `pkg/hostlockdown` forbids importing Sentry packages, `pkg/gvx` builds the `seccomp-bpf` allowlist (`runsc/boot/filter/config`) and passes `Options.InstallSyscallFilter`:
 
-1. Create a Landlock filesystem ruleset scoped to `Options.Mounts` (masked to the running kernel's Landlock ABI v1 through v5) and restrict all process threads before seccomp blocks Landlock syscalls.
-2. Build `config.Rules` for `systrap`, the chosen network mode, and host mounts; merge embedder rules (`fcntl`, `sched_getaffinity`, `renameat`, `openat2`, `flock`, loopback binds when `--auto-publish` or `--dynamic-ports` is set, and cgo thread calls).
-3. Append `EPERM` fallback rules for `execve`, `execveat`, `clone`, `openat`, and `socket` so callers in an embedding Go process receive Go errors rather than `SIGSYS` termination.
-4. Install the seccomp program across all threads with `SECCOMP_FILTER_FLAG_TSYNC` and run containment probes.
+1. Apply a Landlock ruleset scoped to `Options.Mounts` (ABI v1 through v5) across all threads.
+2. Build `config.Rules` for `systrap`, network mode, mounts, extension `RecvMsgFDs`, and loopback binds (`--auto-publish`/`--dynamic-ports`).
+3. Append `EPERM` rules for `execve`, `execveat`, `clone`, `openat`, and `socket` so embedders receive Go errors instead of `SIGSYS`.
+4. Install the seccomp filter across all threads (`SECCOMP_FILTER_FLAG_TSYNC`) and run containment probes.
 
-In cgo Linux builds, threads unregister their `rseq` area across `fork` (`rseq_xplat.go`) so child stubs do not fault when unmapping inherited memory. On Android, `pkg/hostlockdown` detects Zygote's existing `untrusted_app` seccomp filter (`PR_GET_SECCOMP == 2`), skips Landlock calls that Zygote traps with `SIGSYS`, and relies on Android's per-UID SELinux domain and mount namespace.
+In cgo builds, threads unregister `rseq` across `fork` (`rseq_xplat.go`) so child stubs avoid unmap faults. On Android, `pkg/hostlockdown` detects Zygote's seccomp filter (`PR_GET_SECCOMP == 2`), skips Landlock syscalls trapped with `SIGSYS`, and relies on per-UID SELinux domains.
 
 ---
 
-## 3. Known Limits
+## 3. Component Limits
 
-- **Windows primary-token revert**: Host code inside a compromised Sentry could call `SetThreadToken(nil, 0)` to drop its thread restricted SIDs, reverting to the Untrusted primary token (which still blocks raw sockets, `NO_READ_UP` reads, and Low/Medium writes).
-- **Linux seccomp socket addresses**: `seccomp-bpf` cannot inspect `sockaddr` pointers in memory, so Linux cannot pin a WireGuard peer UDP port at the syscall filter layer the way macOS Seatbelt does.
-- **Android host mounts**: Because Zygote blocks Landlock, `Status.UnboundFileOpenBlocked` stays false on Android whenever a host bind mount is attached; sandboxes using only `ext4lite` volumes keep `UnboundFileOpenBlocked` true.
+Consult [`../compatibility.md`](../compatibility.md) for host-wide limits; the invariants below apply specifically to `pkg/hostlockdown`:
+
+- **Windows primary-token revert**: Compromised host code could call `SetThreadToken(nil, 0)` to drop thread restricted SIDs. The Untrusted primary token still blocks raw sockets, `NO_READ_UP` reads, and Low/Medium writes.
+- **Linux seccomp socket addresses**: `seccomp-bpf` cannot inspect `sockaddr` pointers, so Linux cannot pin a WireGuard peer UDP endpoint like macOS Seatbelt.
+- **One-way process-wide lockdown**: `hostlockdown.Apply()` is process-global; a subsequent sandbox needing helper spawns or ungranted `RecvMsgFDs` fails with `ErrLockdownActive`.
 - **Opt-out flag**: `-lockdown=false` disables confinement for debugging and emits a stderr warning.
 
 ---
 
 ## 4. Implementation Map
 
+This table maps the host-lockdown source files and test suites.
+
 | Files | Role |
 | :--- | :--- |
 | `pkg/hostlockdown/lockdown.go`, `mountpaths.go`, `dial*.go`, `bind_other.go` | Shared `Options`, `Status`, mount path normalization, broker dispatch wrappers. |
-| `pkg/hostlockdown/lockdown_windows.go`, `token_windows.go`, `job_windows.go`, `broker_windows.go`, `netbroker_windows.go`, `workspace_windows.go`, `probe_windows.go` | Windows Untrusted/Restricted token setup, Job Object, Win32k block, file and socket brokers, containment probes. |
-| `pkg/hostlockdown/lockdown_darwin.go`, `lockdown_darwin_*.s`, `extension_darwin.go`, `probe_darwin.go` | macOS Seatbelt SBPL generator, `sandbox_init` assembly trampolines, file-extension tokens, probes. |
-| `pkg/hostlockdown/lockdown_linux.go`, `landlock*_linux.go`, `pkg/gvx/syscallfilter_linux.go` | Linux Landlock ABI v1-v5 rulesets, `seccomp-bpf` allowlist construction, `scripts/seccomp-audit.sh`. |
-| Tests | `pkg/hostlockdown/*_test.go`, `e2e/gate_m4_test.go`, `e2e/sandbox_e2e_test.go` (`TestE2EHostLockdown*`), `e2e/checkpoint_e2e_test.go`. |
+| `pkg/hostlockdown/lockdown_windows.go`, `token_windows.go`, `job_windows.go`, `broker_windows.go`, `netbroker_windows.go`, `workspace_windows.go`, `probe_windows.go` | Windows tokens, Job Object, Win32k block, file and socket brokers, probes. |
+| `pkg/hostlockdown/lockdown_darwin.go`, `lockdown_darwin_*.s`, `extension_darwin.go`, `probe_darwin.go` | macOS Seatbelt generator, `sandbox_init` trampolines, file-extension tokens, probes. |
+| `pkg/hostlockdown/lockdown_linux.go`, `landlock*_linux.go`, `pkg/gvx/syscallfilter_linux.go` | Linux Landlock ABI v1-v5 rulesets, `seccomp-bpf` allowlist, `scripts/seccomp-audit.sh`. |
+| Tests | `pkg/hostlockdown/*_test.go`, `e2e/gate_m4_test.go`, `e2e/sandbox_e2e_test.go`, `e2e/checkpoint_e2e_test.go`. |

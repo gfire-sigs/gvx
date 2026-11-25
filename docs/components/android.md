@@ -1,68 +1,76 @@
 # Android Host Runtime and Library Packaging: `android/` and `tools/androidprobe`
 
-This specification describes the Android runtime deliverable (`gvx-android.aar`), its Java entry point (`dev.gfire.gvx.Gvx`), its sample foreground service (`android/sample`), and the device capability probe (`tools/androidprobe`). Android runs `gvx` on `android/arm64` (and `android/amd64` in CI emulators) using the Linux `systrap` backend.
+This specification describes `gvx-android.aar`, its Java launcher (`dev.gfire.gvx.Gvx`), its sample service (`android/sample`), and the capability probe (`tools/androidprobe`). Android executes `gvx` on `android/arm64` (and `android/amd64` in CI emulators) using Linux `systrap`.
 
 ---
 
 ## 1. Purpose and Scope
 
-Unprivileged Android applications (`untrusted_app` SELinux domain) cannot open `/dev/kvm`, cannot execute binaries downloaded into writable app directories (`app_data_file`, enforced by Android 10+ SELinux W^X), and lack `/etc/resolv.conf`. Packaging `cmd/rungvx` as a native shared library (`librungvx.so`) inside an Android archive (`gvx-android.aar`) allows Android applications to launch isolated Linux containers and ELF64 binaries without root access.
+Unprivileged Android apps (`untrusted_app`) cannot open `/dev/kvm`, lack `/etc/resolv.conf`, and cannot execute binaries downloaded into writable app directories under SELinux W^X. Copying standard Linux CLI installers onto Android fails at `execve` or DNS resolution.
+
+`scripts/android/build-sdk.sh` compiles `cmd/rungvx` into `jni/arm64-v8a/librungvx.so` inside `gvx-android.aar`, so PackageManager extracts it into the executable `apk_data_file` library directory. The Java wrapper passes app-private storage directories and active `--host-dns` resolvers before Sentry self-lockdown begins.
+
+The sections below document library packaging, DNS injection, `systrap` adaptations, emulator verification, and Android-specific limits.
 
 ---
 
 ## 2. Design and Invariants
 
-Android packaging spans three layers: NDK compilation into a native library, Java process launching with DNS discovery, and kernel-level `systrap` adaptations.
+Android packaging spans three layers: NDK compilation into a native library, Java launching with DNS injection, and kernel-level `systrap` adaptations.
 
 ### 2.1 Library Packaging (`scripts/android/build-sdk.sh`)
 
-`scripts/android/build-sdk.sh` cross-compiles `cmd/rungvx` with the Android NDK (`GOOS=android`, `CGO_ENABLED=1`, `GOARM64=v8.0`, PIE mode) and packages two artifacts:
+`scripts/android/build-sdk.sh` cross-compiles `cmd/rungvx` with the Android NDK (`GOOS=android`, `CGO_ENABLED=1`, `GOARM64=v8.0`, PIE mode) and builds two artifacts:
 
-1. **`gvx-android.aar`** (`minSdkVersion 31`): Contains `AndroidManifest.xml` (requesting `INTERNET` and `ACCESS_NETWORK_STATE`), `classes.jar` (`dev.gfire.gvx.Gvx`), and `jni/arm64-v8a/librungvx.so`.
-2. **`gvx-sample.apk`**: A debug-signed sample application demonstrating foreground-service execution (`dev.gfire.gvx.sample.RunService`), aligned with `zipalign -P 16` and setting `android:extractNativeLibs="true"` so PackageManager extracts `librungvx.so` into the immutable, executable `ApplicationInfo.nativeLibraryDir` (`apk_data_file` SELinux label).
+1. **`gvx-android.aar`** (`minSdkVersion 31`): Bundles `AndroidManifest.xml` (`INTERNET`, `ACCESS_NETWORK_STATE`), `classes.jar` (`dev.gfire.gvx.Gvx`), and `jni/arm64-v8a/librungvx.so`.
+2. **`gvx-sample.apk`**: Debug-signed foreground-service demo (`RunService`) aligned with `zipalign -P 16`. Setting `android:extractNativeLibs="true"` extracts `librungvx.so` into the executable `ApplicationInfo.nativeLibraryDir`.
 
 ### 2.2 Java Launcher and DNS Injection (`dev.gfire.gvx.Gvx`)
 
-`Gvx.start(Context ctx, List<String> args)` constructs a `ProcessBuilder` targeting `<nativeLibraryDir>/librungvx.so`:
+`Gvx.start(Context ctx, List<String> args)` builds a `ProcessBuilder` targeting `<nativeLibraryDir>/librungvx.so`:
 
-- Sets `HOME` to `ctx.getFilesDir()` and both `XDG_CACHE_HOME` and `TMPDIR` to `ctx.getCacheDir()`.
-- For commands that resolve remote names (`run`, `pull`), queries `ConnectivityManager.getActiveNetwork()` and `LinkProperties.getDnsServers()`, skips link-local IPv6 addresses requiring zone IDs, and prepends `--host-dns <ip>` flags before passing remaining arguments.
-- Returns the running `java.lang.Process` so callers consume stdout, stderr, and the exit code directly while the child Sentry enforces host lockdown.
+- **App-private storage env**: Sets `HOME` to `ctx.getFilesDir()` and sets `XDG_CACHE_HOME` and `TMPDIR` to `ctx.getCacheDir()`.
+- **Active DNS injection**: For `run` and `pull`, reads `LinkProperties.getDnsServers()`, skips link-local IPv6 addresses, and prepends `--host-dns <ip>`.
+- **Process streaming**: Returns `java.lang.Process` so callers consume stdout, stderr, and exit codes while `librungvx.so` applies host lockdown.
 
-`android/sample/.../RunService.java` executes commands sequentially inside an Android 14+ `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` foreground service so Android does not throttle or kill long-running guest workloads when the user switches apps.
+`android/sample/.../RunService.java` executes commands sequentially inside an Android 14+ `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` foreground service to prevent background throttling.
 
 ### 2.3 Kernel and `systrap` Adaptations on Android
 
-Inside `librungvx.so`, four runtime adaptations accommodate Android kernel policies:
+Inside `librungvx.so`, four runtime adaptations accommodate Android kernel and SELinux policies:
 
 - **Executable stub memory**: Allocates stub memory with `memfd_create(MFD_EXEC)` and probes `vm.mmap_min_addr` (`0x8000`) via `MAP_FIXED_NOREPLACE`.
-- **16 KiB page support**: Activates `platform/systrap/subblock_xplat.go` automatically on 16 KiB ARM64 kernels, preserving 4 KiB Linux guest pages across 16 KiB host mappings.
-- **Process budget clamping**: Caps `idleStubLimit` and `maxSysmsgThreads` to `2` per stub so ordinary sandboxes stay well below Android 12+'s system-wide 32-child-process ceiling.
-- **Zygote seccomp compatibility**: `pkg/hostlockdown` detects `PR_GET_SECCOMP == 2`, skips Landlock syscalls trapped by Zygote with `SIGSYS`, and relies on per-UID SELinux and mount-namespace confinement.
+- **16 KiB page support**: Enables `platform/systrap/subblock_xplat.go` on 16 KiB ARM64 kernels, preserving 4 KiB guest pages over 16 KiB host mappings.
+- **Process budget clamping**: Caps `idleStubLimit` and `maxSysmsgThreads` at `2` per stub so sandboxes stay below Android's 32-child ceiling.
+- **Zygote seccomp compatibility**: `pkg/hostlockdown` detects `PR_GET_SECCOMP == 2`, skips Landlock calls trapped with `SIGSYS`, and relies on SELinux and mount namespaces.
 
 ---
 
 ## 3. Verification and Capability Probing
 
-`.github/workflows/android.yml` executes `scripts/android/emulator-smoke.sh` on an x86-64 Android 16 KVM emulator, running `tools/androidprobe` (reporting kernel page size, `memfd`, seccomp, and `systrap` readiness), unit tests for `systrap`, `hostfs`, and `ext4lite`, the offline `e2e/` suite, and an end-to-end launch of `gvx-sample.apk` via `adb shell am start-foreground-service`. Because hosted runners lack nested ARM64 virtualization, `arm64` emulator runs are executed manually on physical ARM64 hosts.
+`.github/workflows/android.yml` executes `scripts/android/emulator-smoke.sh` on an x86-64 Android 16 KVM emulator. It runs `tools/androidprobe`, unit tests for `systrap`, `hostfs`, and `ext4lite`, offline `e2e/`, and `gvx-sample.apk` via `adb shell am start-foreground-service`. Physical ARM64 hosts verify `arm64` emulator behavior manually because hosted runners lack nested ARM64 virtualization.
 
 ---
 
-## 4. Known Limits
+## 4. Component Limits
 
-- **32 phantom-process ceiling**: Android 12 and newer terminate the oldest child processes once total child processes across all apps exceed 32. Because each live guest address space uses one stub process plus up to two `sysmsg` processes, keep concurrent guest processes below 10 or disable child process restrictions (see [`../cli.md`](../cli.md#12-android-operation)).
+Consult [`../compatibility.md`](../compatibility.md) and [`../cli.md`](../cli.md#12-android-operation) for host-wide limits and `adb` overrides; Android-specific invariants follow:
+
+- **32 phantom-process ceiling**: Android 12+ terminates child processes when total app children exceed 32. Keep concurrent guest processes below 10 or disable child restrictions.
 - **Background CPU throttling**: Android kills background app child processes consuming sustained CPU; run long workloads from a foreground service.
-- **SELinux hard-link restriction**: `linkat` hard links fail with `EACCES` on app-data files under `hostfs`; use `ext4lite` volumes (`-v data:/data`) when guests require hard links.
-- **Landlock unavailable under Zygote**: `Status.UnboundFileOpenBlocked` remains false when a host bind mount is attached on Android (sandboxes using only `ext4lite` volumes keep it true).
+- **SELinux hard-link restriction**: `linkat` fails with `EACCES` on app-data files under `hostfs`; use `ext4lite` volumes (`-v data:/data`) for hard links.
+- **Landlock unavailable under Zygote**: `Status.UnboundFileOpenBlocked` stays false when attaching host bind mounts on Android (`ext4lite`-only runs keep it true).
 
 ---
 
 ## 5. Implementation Map
 
+This table maps the Android runtime, sample app, build scripts, and kernel probe files.
+
 | Files | Role |
 | :--- | :--- |
-| `android/library/src/dev/gfire/gvx/Gvx.java` | Java launcher locating `librungvx.so`, configuring app storage env vars, and injecting `--host-dns`. |
-| `android/sample/AndroidManifest.xml`, `android/sample/src/dev/gfire/gvx/sample/RunService.java` | Sample `specialUse` foreground service invoking `Gvx.start` and logging to `files/run.log` and logcat. |
-| `scripts/android/build-sdk.sh`, `scripts/android/lib.sh`, `scripts/android/emulator-smoke.sh` | NDK build scripts for `gvx-android.aar` and `gvx-sample.apk`, plus the CI emulator smoke runner. |
+| `android/library/src/dev/gfire/gvx/Gvx.java` | Java launcher locating `librungvx.so`, setting app storage vars, and injecting `--host-dns`. |
+| `android/sample/AndroidManifest.xml`, `android/sample/src/dev/gfire/gvx/sample/RunService.java` | Sample `specialUse` foreground service invoking `Gvx.start` and logging to `files/run.log`. |
+| `scripts/android/build-sdk.sh`, `scripts/android/lib.sh`, `scripts/android/emulator-smoke.sh` | NDK build scripts for `gvx-android.aar` and `gvx-sample.apk`, plus CI smoke runner. |
 | `tools/androidprobe/` | Standalone Android kernel page-size, `memfd`, seccomp, and `systrap` probe tool. |
 | `pkg/gvx/enginefault_android.go`, `pkg/sentry/platform/systrap/subblock_xplat.go`, `pkg/sentry/platform/systrap/hostpage_xplat.go` | Android diagnostic messages, 16 KiB sub-block paging, and 2-stub idle pool cap. |
