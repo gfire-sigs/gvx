@@ -27,22 +27,20 @@ import (
 )
 
 func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, error) {
-	var mounts []hostlockdown.HostMount
-	if dir != "" {
-		mounts = []hostlockdown.HostMount{{Path: dir, ReadOnly: readOnly}}
-	}
 	return hostlockdown.Apply(hostlockdown.Options{
-		Mounts: mounts,
+		Mounts: []hostlockdown.HostMount{
+			{Path: dir, ReadOnly: readOnly},
+		},
 		InstallSyscallFilter: func() error {
 			opt := config.Options{
 				Platform:       platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()},
-				HostFilesystem: dir != "",
+				HostFilesystem: true,
 				ControllerFD:   math.MaxUint32,
 				ProcSelfFD:     math.MaxUint32,
 				CgoEnabled:     cgoBuild,
 			}
 			rules, denyRules := config.Rules(opt)
-			rules.Merge(embedderRules(Config{}, dir != "", false))
+			rules.Merge(embedderRules(Config{}, true, false))
 			// Under -race, extra_filters_race.go widens SYS_CLONE to MatchAll{},
 			// which bypasses rejectedRules() for hostlockdown's clone(CLONE_THREAD)
 			// probe. Restrict SYS_CLONE to Go and libc thread creation flags so
@@ -90,10 +88,53 @@ func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, er
 	})
 }
 
-// applyExtensionTestLockdown applies the Linux Landlock and seccomp lockdown
-// with the race-safe SYS_CLONE rule so hostlockdown's clone probe returns
-// EPERM even when tests run under -race.
+// applyExtensionTestLockdown applies real Linux Landlock and seccomp lockdown
+// (blocking execve, execveat, non-thread clone, openat, and socket with EPERM)
+// while keeping DefaultAction Allow so the Go -race test runtime does not die
+// with SIGSYS during post-lockdown test assertions and teardown.
 func applyExtensionTestLockdown() (bool, error) {
-	_, err := applyHostfsTestLockdown("", true)
+	_, err := hostlockdown.Apply(hostlockdown.Options{
+		InstallSyscallFilter: func() error {
+			const runtimeThread = unix.CLONE_VM |
+				unix.CLONE_FS |
+				unix.CLONE_FILES |
+				unix.CLONE_SIGHAND |
+				unix.CLONE_SYSVSEM |
+				unix.CLONE_THREAD
+			const libcThread = runtimeThread |
+				unix.CLONE_SETTLS |
+				unix.CLONE_PARENT_SETTID |
+				unix.CLONE_CHILD_CLEARTID
+			rejected := seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+				unix.SYS_EXECVE:   seccomp.MatchAll{},
+				unix.SYS_EXECVEAT: seccomp.MatchAll{},
+				unix.SYS_CLONE:    seccomp.MatchAll{},
+				unix.SYS_SOCKET:   seccomp.MatchAll{},
+				unix.SYS_OPENAT:   seccomp.MatchAll{},
+			})
+			sets := []seccomp.RuleSet{
+				{
+					Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+						unix.SYS_CLONE: seccomp.Or{
+							seccomp.PerArg{seccomp.EqualTo(runtimeThread)},
+							seccomp.PerArg{seccomp.EqualTo(runtimeThread | unix.CLONE_SETTLS)},
+							seccomp.PerArg{seccomp.EqualTo(libcThread)},
+							seccomp.PerArg{seccomp.EqualTo(libcThread | unix.CLONE_DETACHED)},
+						},
+					}),
+					Action: seccomp.Allow,
+				},
+				{
+					Rules:  rejected,
+					Action: seccomp.ReturnError.Code(uint16(unix.EPERM)),
+				},
+			}
+			program := &seccomp.Program{
+				RuleSets: sets,
+				Options:  seccomp.ProgramOptions{DefaultAction: seccomp.Allow},
+			}
+			return program.Install(nil)
+		},
+	})
 	return true, err
 }
