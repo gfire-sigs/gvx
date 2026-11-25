@@ -38,6 +38,8 @@ go.work.sum
 # .vscode/
 /rungvx
 /rungvx.exe
+/licenses
+/licenses.exe
 
 # Renderer bundle and caches of scripts/gpu/build-renderer.sh
 /build/
