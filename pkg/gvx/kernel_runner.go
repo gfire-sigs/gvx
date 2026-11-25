@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -486,8 +487,12 @@ func (s *Sandbox) initialWorkingDir() string {
 	if (workDir == "" || workDir == "/") && s.resolvedImg != nil && s.resolvedImg.Config.WorkingDir != "" {
 		workDir = s.resolvedImg.Config.WorkingDir
 	}
+	workDir = strings.TrimSpace(workDir)
 	if workDir == "" {
 		return "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return "/" + workDir
 	}
 	return workDir
 }

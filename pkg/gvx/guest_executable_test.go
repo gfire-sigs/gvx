@@ -48,9 +48,28 @@ func TestResolveGuestExecutableUsesWorkingDirectory(t *testing.T) {
 	root := mntns.Root(sctx)
 	defer root.DecRef(sctx)
 
-	for _, file := range []string{"/qdrant/entrypoint.sh", "/opt/app/bin/tool", "/usr/bin/sh"} {
+	for _, file := range []string{
+		"/qdrant/entrypoint.sh",
+		"/opt/app/bin/tool",
+		"/opt/releases/v2/app/start.sh",
+		"/opt/releases/v2/shared/run.sh",
+		"/usr/bin/sh",
+	} {
 		if err := vfsEnsureEmptyFile(sctx, vfsObj, creds, root, file, 0o755); err != nil {
 			t.Fatalf("create %s: %v", file, err)
+		}
+	}
+	for _, link := range []struct {
+		path   string
+		target string
+	}{
+		{path: "/app", target: "/opt/releases/v2/app"},
+		{path: "/qdrant/run-link", target: "/opt/releases/v2/shared/run.sh"},
+		{path: "/qdrant/broken-link", target: "/no/such/file"},
+	} {
+		pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(link.path)}
+		if err := vfsObj.SymlinkAt(sctx, creds, &pop, link.target); err != nil {
+			t.Fatalf("symlink %s -> %s: %v", link.path, link.target, err)
 		}
 	}
 
@@ -69,8 +88,20 @@ func TestResolveGuestExecutableUsesWorkingDirectory(t *testing.T) {
 		{name: "bare name searches PATH", cmd: "sh", workDir: "/qdrant", path: "/usr/bin", want: "/usr/bin/sh"},
 		{name: "relative PATH entry", cmd: "tool", workDir: "/opt/app", path: "bin", want: "/opt/app/bin/tool"},
 		{name: "empty PATH entry is the workdir", cmd: "entrypoint.sh", workDir: "/qdrant", path: "/usr/bin:", want: "/qdrant/entrypoint.sh"},
+		{name: "symlinked workdir traverses real parent", cmd: "../shared/run.sh", workDir: "/app", want: "/opt/releases/v2/shared/run.sh"},
+		{name: "symlinked workdir with relative parent PATH", cmd: "run.sh", workDir: "/app", path: "../shared", want: "/opt/releases/v2/shared/run.sh"},
+		{name: "absolute path traverses symlink before parent", cmd: "/app/../shared/run.sh", workDir: "/", want: "/app/../shared/run.sh"},
+		{name: "relative symlink preserves link path", cmd: "./run-link", workDir: "/qdrant", want: "/qdrant/run-link"},
 		{name: "dot slash outside workdir", cmd: "./entrypoint.sh", workDir: "/"},
 		{name: "bare name does not search workdir", cmd: "entrypoint.sh", workDir: "/qdrant", path: "/usr/bin"},
+		{name: "trailing slash on relative regular file", cmd: "./entrypoint.sh/", workDir: "/qdrant"},
+		{name: "trailing slash on absolute regular file", cmd: "/usr/bin/sh/", workDir: "/"},
+		{name: "missing intermediate before parent", cmd: "./missing/../entrypoint.sh", workDir: "/qdrant"},
+		{name: "missing workdir rejects parent escape", cmd: "../usr/bin/sh", workDir: "/no-such-dir"},
+		{name: "non-directory workdir rejects relative lookup", cmd: "./sh", workDir: "/usr/bin/sh"},
+		{name: "non-directory workdir rejects dot in empty PATH", cmd: ".", workDir: "/usr/bin/sh", path: ":"},
+		{name: "directory is not executable", cmd: "./bin", workDir: "/opt/app"},
+		{name: "broken symlink is not executable", cmd: "./broken-link", workDir: "/qdrant"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

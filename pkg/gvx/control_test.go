@@ -354,6 +354,34 @@ func TestControlOpsPauseExecFSAndMounts(t *testing.T) {
 			t.Fatalf("exec42 = (out=%q, readErr=%v, exit=%+v, unmarshalErr=%v, err=%v)", out, readErr, exitEv, unmarshalErr, err)
 		}
 	}
+	// 3d: relative executable resolves against WorkDir and relative WorkDir fails with INVALID_ARGUMENT.
+	{
+		if err := rs.client.Call(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv:    []string{"./no-such-bin"},
+			WorkDir: "relative",
+		}, nil); !control.IsCode(err, control.CodeInvalidArgument) {
+			t.Fatalf("exec with relative workdir err = %v, want INVALID_ARGUMENT", err)
+		}
+
+		st, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv:    []string{"./exit42"},
+			WorkDir: "/bin",
+		})
+		if err != nil {
+			t.Fatalf("relative exec open: %v", err)
+		}
+		if err := st.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("relative exec wait: %v", err)
+		}
+		out, readErr := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
+		ev, err := st.RecvEvent(ctx)
+		st.Close()
+		var exitEv control.ExecExitEvent
+		unmarshalErr := json.Unmarshal(ev.Data, &exitEv)
+		if readErr != nil || err != nil || unmarshalErr != nil || exitEv.ExitCode != 42 || string(out) != "exit42-out\n" {
+			t.Fatalf("relative exec = (out=%q, readErr=%v, exit=%+v, unmarshalErr=%v, err=%v)", out, readErr, exitEv, unmarshalErr, err)
+		}
+	}
 
 	// 4. fs.import -> fs.stat -> fs.export (regular & upper_only)
 	{
