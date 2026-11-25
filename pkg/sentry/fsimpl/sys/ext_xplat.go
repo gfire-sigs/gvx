@@ -62,13 +62,15 @@ type NodeSpec struct {
 }
 
 // TopologyAddition contributes declarative entries into standard sysfs
-// subtrees (/sys/devices, /sys/class, /sys/bus/pci/devices,
+// subtrees (/sys/devices, /sys/class, /sys/bus, /sys/bus/pci/devices,
 // /sys/bus/pci/drivers, and /sys/dev/char).
 type TopologyAddition struct {
 	// Devices maps top-level names under /sys/devices (for example "pci0000:00").
 	Devices []NodeSpec
 	// Class maps subdirectories or entries under /sys/class (for example "drm").
 	Class []NodeSpec
+	// Bus maps top-level bus subdirectories under /sys/bus (for example "virtio").
+	Bus []NodeSpec
 	// BusPCIDevices maps entries under /sys/bus/pci/devices.
 	BusPCIDevices []NodeSpec
 	// BusPCIDrivers maps entries under /sys/bus/pci/drivers.
@@ -110,18 +112,24 @@ func (a *SlotAllocator) AllocateVirtioIndex() string {
 // VirtioPCIDeviceSpec describes one synthetic virtio-pci character device
 // registered into sysfs via VirtioPCIDeviceTopology.
 type VirtioPCIDeviceSpec struct {
-	PCISlot     string
-	VirtioName  string
-	VendorID    uint16
-	DeviceID    uint16
-	SubVendorID uint16
-	SubDeviceID uint16
-	ClassCode   uint32 // 24-bit PCI class/subclass/prog-if
-	ClassName   string // e.g. "drm"
-	NodeName    string // e.g. "renderD128"
-	Major       uint32
-	Minor       uint32
-	ExtraFiles  []NodeSpec
+	PCISlot        string
+	VirtioName     string
+	VendorID       uint16
+	DeviceID       uint16
+	SubVendorID    uint16
+	SubDeviceID    uint16
+	Revision       uint8
+	ClassCode      uint32 // 24-bit PCI class/subclass/prog-if
+	VirtioDeviceID uint16 // virtio device ID (for example 0x10 for virtio-gpu)
+	VirtioDriver   string // virtio driver name in uevent (for example "virtio_gpu")
+	ClassName      string // e.g. "drm"
+	NodeName       string // e.g. "renderD128"
+	DevName        string // optional DEVNAME in uevent (defaults to "<ClassName>/<NodeName>")
+	DevType        string // optional DEVTYPE in uevent (for example "drm_minor")
+	Major          uint32
+	Minor          uint32
+	ExtraFiles     []NodeSpec
+	ClassFiles     []NodeSpec // optional extra files under /sys/class/<ClassName>
 }
 
 // VirtioPCIDeviceTopology builds a Linux-compatible PCI + virtio + class +
@@ -140,43 +148,77 @@ func VirtioPCIDeviceTopology(spec VirtioPCIDeviceSpec) (TopologyAddition, error)
 		return TopologyAddition{}, fmt.Errorf("%w: node name %q: %v", ErrInvalidTopology, spec.NodeName, err)
 	}
 
-	cfgSpace := buildPCIConfigHeader(spec.VendorID, spec.DeviceID, spec.SubVendorID, spec.SubDeviceID, spec.ClassCode)
+	cfgSpace := buildPCIConfigHeader(spec.VendorID, spec.DeviceID, spec.SubVendorID, spec.SubDeviceID, spec.Revision, spec.ClassCode)
 	devNum := fmt.Sprintf("%d:%d", spec.Major, spec.Minor)
+	devName := spec.DevName
+	if devName == "" {
+		devName = spec.ClassName + "/" + spec.NodeName
+	}
+	nodeUevent := fmt.Sprintf("MAJOR=%d\nMINOR=%d\nDEVNAME=%s\n", spec.Major, spec.Minor, devName)
+	if spec.DevType != "" {
+		nodeUevent += fmt.Sprintf("DEVTYPE=%s\n", spec.DevType)
+	}
 	devNodeChildren := []NodeSpec{
 		{Name: "dev", Kind: NodeFile, Content: devNum + "\n"},
-		{Name: "uevent", Kind: NodeFile, Content: fmt.Sprintf("MAJOR=%d\nMINOR=%d\nDEVNAME=%s/%s\n", spec.Major, spec.Minor, spec.ClassName, spec.NodeName)},
-		{Name: "device", Kind: NodeSymlink, Target: "../../../" + spec.PCISlot},
+		{Name: "device", Kind: NodeSymlink, Target: "../.."},
+		{Name: "subsystem", Kind: NodeSymlink, Target: "../../../../../../class/" + spec.ClassName},
+		{Name: "uevent", Kind: NodeFile, Content: nodeUevent},
 	}
 	devNodeChildren = append(devNodeChildren, spec.ExtraFiles...)
 
+	virtioUevent := fmt.Sprintf("MODALIAS=virtio:d%08Xv%08X\n", spec.VirtioDeviceID, spec.VendorID)
+	if spec.VirtioDriver != "" {
+		virtioUevent = fmt.Sprintf("DRIVER=%s\n%s", spec.VirtioDriver, virtioUevent)
+	}
+	virtioChildren := []NodeSpec{
+		{Name: "device", Kind: NodeFile, Content: fmt.Sprintf("0x%04x\n", spec.VirtioDeviceID)},
+		{Name: "vendor", Kind: NodeFile, Content: fmt.Sprintf("0x%04x\n", spec.VendorID)},
+		{Name: "subsystem", Kind: NodeSymlink, Target: "../../../../bus/virtio"},
+		{Name: "uevent", Kind: NodeFile, Content: virtioUevent},
+		{
+			Name: spec.ClassName,
+			Kind: NodeDir,
+			Children: []NodeSpec{
+				{
+					Name:     spec.NodeName,
+					Kind:     NodeDir,
+					Children: devNodeChildren,
+				},
+			},
+		},
+	}
+
+	baseClass := (spec.ClassCode >> 16) & 0xff
+	subClass := (spec.ClassCode >> 8) & 0xff
+	progIF := spec.ClassCode & 0xff
+	pciUevent := fmt.Sprintf("DRIVER=virtio-pci\nPCI_CLASS=%X\nPCI_ID=%04X:%04X\nPCI_SUBSYS_ID=%04X:%04X\nPCI_SLOT_NAME=%s\nMODALIAS=pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n",
+		spec.ClassCode&0xffffff, spec.VendorID, spec.DeviceID, spec.SubVendorID, spec.SubDeviceID, spec.PCISlot,
+		spec.VendorID, spec.DeviceID, spec.SubVendorID, spec.SubDeviceID, baseClass, subClass, progIF)
 	pciChildren := []NodeSpec{
 		{Name: "vendor", Kind: NodeFile, Content: fmt.Sprintf("0x%04x\n", spec.VendorID)},
 		{Name: "device", Kind: NodeFile, Content: fmt.Sprintf("0x%04x\n", spec.DeviceID)},
 		{Name: "subsystem_vendor", Kind: NodeFile, Content: fmt.Sprintf("0x%04x\n", spec.SubVendorID)},
 		{Name: "subsystem_device", Kind: NodeFile, Content: fmt.Sprintf("0x%04x\n", spec.SubDeviceID)},
+		{Name: "revision", Kind: NodeFile, Content: fmt.Sprintf("0x%02x\n", spec.Revision)},
 		{Name: "class", Kind: NodeFile, Content: fmt.Sprintf("0x%06x\n", spec.ClassCode&0xffffff)},
 		{Name: "config", Kind: NodeBinaryFile, Binary: cfgSpace},
-		{Name: "uevent", Kind: NodeFile, Content: fmt.Sprintf("PCI_CLASS=%X\nPCI_ID=%04X:%04X\nPCI_SUBSYS_ID=%04X:%04X\nPCI_SLOT_NAME=%s\n",
-			spec.ClassCode&0xffffff, spec.VendorID, spec.DeviceID, spec.SubVendorID, spec.SubDeviceID, spec.PCISlot)},
+		{Name: "subsystem", Kind: NodeSymlink, Target: "../../../bus/pci"},
+		{Name: "uevent", Kind: NodeFile, Content: pciUevent},
 		{
-			Name: spec.VirtioName,
-			Kind: NodeDir,
-			Children: []NodeSpec{
-				{Name: "device", Kind: NodeSymlink, Target: "../" + spec.PCISlot},
-				{
-					Name: spec.ClassName,
-					Kind: NodeDir,
-					Children: []NodeSpec{
-						{
-							Name:     spec.NodeName,
-							Kind:     NodeDir,
-							Children: devNodeChildren,
-						},
-					},
-				},
-			},
+			Name:     spec.VirtioName,
+			Kind:     NodeDir,
+			Children: virtioChildren,
 		},
 	}
+
+	classChildren := []NodeSpec{
+		{
+			Name:   spec.NodeName,
+			Kind:   NodeSymlink,
+			Target: fmt.Sprintf("../../devices/pci0000:00/%s/%s/%s/%s", spec.PCISlot, spec.VirtioName, spec.ClassName, spec.NodeName),
+		},
+	}
+	classChildren = append(classChildren, spec.ClassFiles...)
 
 	return TopologyAddition{
 		Devices: []NodeSpec{
@@ -194,13 +236,26 @@ func VirtioPCIDeviceTopology(spec VirtioPCIDeviceSpec) (TopologyAddition, error)
 		},
 		Class: []NodeSpec{
 			{
-				Name: spec.ClassName,
+				Name:     spec.ClassName,
+				Kind:     NodeDir,
+				Children: classChildren,
+			},
+		},
+		Bus: []NodeSpec{
+			{
+				Name: "virtio",
 				Kind: NodeDir,
 				Children: []NodeSpec{
 					{
-						Name:   spec.NodeName,
-						Kind:   NodeSymlink,
-						Target: fmt.Sprintf("../../devices/pci0000:00/%s/%s/%s/%s", spec.PCISlot, spec.VirtioName, spec.ClassName, spec.NodeName),
+						Name: "devices",
+						Kind: NodeDir,
+						Children: []NodeSpec{
+							{
+								Name:   spec.VirtioName,
+								Kind:   NodeSymlink,
+								Target: fmt.Sprintf("../../../devices/pci0000:00/%s/%s", spec.PCISlot, spec.VirtioName),
+							},
+						},
 					},
 				},
 			},
@@ -224,10 +279,11 @@ func VirtioPCIDeviceTopology(spec VirtioPCIDeviceSpec) (TopologyAddition, error)
 
 // buildPCIConfigHeader constructs a standard 64-byte Type 0 PCI configuration
 // space header in little-endian byte order.
-func buildPCIConfigHeader(vendorID, deviceID, subVendorID, subDeviceID uint16, classCode uint32) []byte {
+func buildPCIConfigHeader(vendorID, deviceID, subVendorID, subDeviceID uint16, revision uint8, classCode uint32) []byte {
 	hdr := make([]byte, 64)
 	binary.LittleEndian.PutUint16(hdr[0x00:0x02], vendorID)
 	binary.LittleEndian.PutUint16(hdr[0x02:0x04], deviceID)
+	hdr[0x08] = revision
 	hdr[0x09] = byte(classCode & 0xff)
 	hdr[0x0a] = byte((classCode >> 8) & 0xff)
 	hdr[0x0b] = byte((classCode >> 16) & 0xff)
@@ -256,6 +312,7 @@ func ValidateTopologyAdditions(additions []TopologyAddition) error {
 type mergedTopology struct {
 	devices       map[string]*mergedNode
 	class         map[string]*mergedNode
+	bus           map[string]*mergedNode
 	busPCIDevices map[string]*mergedNode
 	busPCIDrivers map[string]*mergedNode
 	devChar       map[string]*mergedNode
@@ -265,6 +322,7 @@ func mergeTopologyAdditions(additions []TopologyAddition) (*mergedTopology, erro
 	mt := &mergedTopology{
 		devices:       make(map[string]*mergedNode),
 		class:         make(map[string]*mergedNode),
+		bus:           make(map[string]*mergedNode),
 		busPCIDevices: make(map[string]*mergedNode),
 		busPCIDrivers: make(map[string]*mergedNode),
 		devChar:       make(map[string]*mergedNode),
@@ -274,6 +332,9 @@ func mergeTopologyAdditions(additions []TopologyAddition) (*mergedTopology, erro
 			return nil, err
 		}
 		if err := mergeNodeSpecs(mt.class, "/sys/class", add.Class); err != nil {
+			return nil, err
+		}
+		if err := mergeNodeSpecs(mt.bus, "/sys/bus", add.Bus); err != nil {
 			return nil, err
 		}
 		if err := mergeNodeSpecs(mt.busPCIDevices, "/sys/bus/pci/devices", add.BusPCIDevices); err != nil {
@@ -378,7 +439,7 @@ func (fs *filesystem) applyTopologies(
 	ctx context.Context,
 	creds *auth.Credentials,
 	additions []TopologyAddition,
-	devicesSub, classSub, pciDevices, pciDrivers, charSub map[string]kernfs.Inode,
+	devicesSub, classSub, busSub, pciDevices, pciDrivers, charSub map[string]kernfs.Inode,
 ) error {
 	mt, err := mergeTopologyAdditions(additions)
 	if err != nil {
@@ -388,6 +449,9 @@ func (fs *filesystem) applyTopologies(
 		return err
 	}
 	if err := fs.mountMergedTree(ctx, creds, "/sys/class", classSub, mt.class); err != nil {
+		return err
+	}
+	if err := fs.mountMergedTree(ctx, creds, "/sys/bus", busSub, mt.bus); err != nil {
 		return err
 	}
 	if err := fs.mountMergedTree(ctx, creds, "/sys/bus/pci/devices", pciDevices, mt.busPCIDevices); err != nil {

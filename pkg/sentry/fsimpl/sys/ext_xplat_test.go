@@ -64,33 +64,44 @@ func TestVirtioPCIDeviceTopologyMergesTwoDevicesAndEncodesPCIConfig(t *testing.T
 	}
 
 	top1, err := VirtioPCIDeviceTopology(VirtioPCIDeviceSpec{
-		PCISlot:     slot1,
-		VirtioName:  alloc.AllocateVirtioIndex(),
-		VendorID:    0x1af4,
-		DeviceID:    0x1050,
-		SubVendorID: 0x1af4,
-		SubDeviceID: 0x1100,
-		ClassCode:   0x038000,
-		ClassName:   "drm",
-		NodeName:    "renderD128",
-		Major:       226,
-		Minor:       128,
+		PCISlot:        slot1,
+		VirtioName:     alloc.AllocateVirtioIndex(),
+		VendorID:       0x1af4,
+		DeviceID:       0x1050,
+		SubVendorID:    0x1af4,
+		SubDeviceID:    0x1100,
+		Revision:       0x01,
+		ClassCode:      0x038000,
+		VirtioDeviceID: 0x10,
+		VirtioDriver:   "virtio_gpu",
+		ClassName:      "drm",
+		NodeName:       "renderD128",
+		DevName:        "dri/renderD128",
+		DevType:        "drm_minor",
+		Major:          226,
+		Minor:          128,
+		ClassFiles: []NodeSpec{
+			{Name: "version", Kind: NodeFile, Content: "drm 1.1.0 20060810\n"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("VirtioPCIDeviceTopology 1: %v", err)
 	}
 	top2, err := VirtioPCIDeviceTopology(VirtioPCIDeviceSpec{
-		PCISlot:     slot2,
-		VirtioName:  alloc.AllocateVirtioIndex(),
-		VendorID:    0x1af4,
-		DeviceID:    0x1059,
-		SubVendorID: 0x1af4,
-		SubDeviceID: 0x1100,
-		ClassCode:   0x040100,
-		ClassName:   "drm",
-		NodeName:    "renderD129",
-		Major:       226,
-		Minor:       129,
+		PCISlot:        slot2,
+		VirtioName:     alloc.AllocateVirtioIndex(),
+		VendorID:       0x1af4,
+		DeviceID:       0x1059,
+		SubVendorID:    0x1af4,
+		SubDeviceID:    0x1100,
+		Revision:       0x01,
+		ClassCode:      0x040100,
+		VirtioDeviceID: 0x19,
+		VirtioDriver:   "virtio_snd",
+		ClassName:      "drm",
+		NodeName:       "renderD129",
+		Major:          226,
+		Minor:          129,
 	})
 	if err != nil {
 		t.Fatalf("VirtioPCIDeviceTopology 2: %v", err)
@@ -105,17 +116,22 @@ func TestVirtioPCIDeviceTopologyMergesTwoDevicesAndEncodesPCIConfig(t *testing.T
 	if pciBus == nil || len(pciBus.children) != 2 {
 		t.Fatalf("pci0000:00 children = %v, want 2 slots", pciBus)
 	}
-	// Shared class/drm directory must hold both render nodes.
+	// Shared bus/virtio/devices directory must hold both virtio devices.
+	virtioBus := merged.bus["virtio"]
+	if virtioBus == nil || virtioBus.children["devices"] == nil || len(virtioBus.children["devices"].children) != 2 {
+		t.Fatalf("bus/virtio/devices = %v, want virtio0 and virtio1", virtioBus)
+	}
+	// Shared class/drm directory must hold both render nodes plus version.
 	drmClass := merged.class["drm"]
-	if drmClass == nil || len(drmClass.children) != 2 {
-		t.Fatalf("class/drm children = %v, want 2 nodes", drmClass)
+	if drmClass == nil || len(drmClass.children) != 3 || drmClass.children["version"] == nil {
+		t.Fatalf("class/drm children = %v, want 2 nodes + version", drmClass)
 	}
 	// dev/char must hold both 226:128 and 226:129.
 	if len(merged.devChar) != 2 || merged.devChar["226:128"] == nil || merged.devChar["226:129"] == nil {
 		t.Fatalf("devChar = %v, want 226:128 and 226:129", merged.devChar)
 	}
 
-	// Verify 64-byte binary PCI config header payload.
+	// Verify 64-byte binary PCI config header payload including revision byte.
 	cfgNode := pciBus.children[slot1].children["config"]
 	if cfgNode == nil || cfgNode.kind != NodeBinaryFile {
 		t.Fatalf("config node = %+v, want NodeBinaryFile", cfgNode)
@@ -128,6 +144,9 @@ func TestVirtioPCIDeviceTopologyMergesTwoDevicesAndEncodesPCIConfig(t *testing.T
 	}
 	if got := binary.LittleEndian.Uint16(cfgNode.binary[2:4]); got != 0x1050 {
 		t.Fatalf("PCI device = %#x, want 0x1050", got)
+	}
+	if cfgNode.binary[0x08] != 0x01 {
+		t.Fatalf("PCI revision = %#x, want 0x01", cfgNode.binary[0x08])
 	}
 	if got := cfgNode.binary[0x09:0x0c]; !bytes.Equal(got, []byte{0x00, 0x80, 0x03}) {
 		t.Fatalf("PCI class bytes = %x, want 008003", got)

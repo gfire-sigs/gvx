@@ -18,6 +18,10 @@ package shm
 
 import "fmt"
 
+func statBackingFD(_ int) (uint64, error) {
+	return 0, fmt.Errorf("%w: windows section import arrives with the first Windows extension producer", ErrUnsupportedBackend)
+}
+
 func mapBackingFD(platformName string, _ int, _, _ uint64, _ bool) (backingView, error) {
 	return nil, fmt.Errorf("%w: windows section import for %q arrives with the first Windows extension producer", ErrUnsupportedBackend, platformName)
 }

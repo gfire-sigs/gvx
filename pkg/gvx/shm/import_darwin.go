@@ -38,6 +38,20 @@ func (b *darwinBacking) unmap() error {
 	return err
 }
 
+func statBackingFD(fd int) (uint64, error) {
+	if fd < 0 {
+		return 0, fmt.Errorf("%w: negative fd %d", ErrInvalidRange, fd)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, fmt.Errorf("shm: fstat fd %d: %w", fd, err)
+	}
+	if st.Size <= 0 {
+		return 0, fmt.Errorf("%w: backing size %d", ErrInvalidRange, st.Size)
+	}
+	return uint64(st.Size), nil
+}
+
 func mapBackingFD(platformName string, fd int, offset, size uint64, writable bool) (backingView, error) {
 	if platformName != "" && platformName != "hvf" {
 		return nil, fmt.Errorf("%w: darwin only supports hvf, got %q", ErrUnsupportedBackend, platformName)

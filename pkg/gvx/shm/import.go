@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -166,6 +167,74 @@ func (i *Importer) ImportFD(fd int, offset, size uint64, writable bool) (*Import
 		importer: i,
 		backing:  backing,
 		size:     size,
+		hostSize: size,
+		writable: writable,
+		claimed:  true,
+	}
+
+	i.mu.Lock()
+	if i.closed {
+		i.mu.Unlock()
+		r.Release()
+		return nil, ErrImporterClosed
+	}
+	i.everUsed = true
+	i.regions[r] = struct{}{}
+	i.mu.Unlock()
+	return r, nil
+}
+
+// ImportWholeFD validates an untrusted shared-memory descriptor whose host
+// backing size (hostSize) may be rounded up to HostMappingAlign above
+// guestSize (a multiple of hostarch.PageSize). It maps the entire hostSize
+// view, checks base alignment, charges hostSize against the sandbox quota, and
+// limits guest mappings to guestSize.
+func (i *Importer) ImportWholeFD(fd int, guestSize, maxHostSize uint64, writable bool) (*ImportedRegion, error) {
+	if guestSize == 0 || guestSize%uint64(hostarch.PageSize) != 0 {
+		return nil, fmt.Errorf("%w: guest size %d", ErrInvalidRange, guestSize)
+	}
+	hostSize, err := statBackingFD(fd)
+	if err != nil {
+		return nil, err
+	}
+	if hostSize == 0 || hostSize < guestSize || (maxHostSize > 0 && hostSize > maxHostSize) {
+		return nil, fmt.Errorf("%w: host size %d, guest size %d, max %d", ErrInvalidRange, hostSize, guestSize, maxHostSize)
+	}
+	if hostSize%i.align != 0 {
+		return nil, fmt.Errorf("%w: host size %#x align %#x", ErrMisaligned, hostSize, i.align)
+	}
+
+	i.mu.Lock()
+	if i.closed {
+		i.mu.Unlock()
+		return nil, ErrImporterClosed
+	}
+	if i.usedBytes+hostSize < i.usedBytes || i.usedBytes+hostSize > i.quotaBytes {
+		used := i.usedBytes
+		i.mu.Unlock()
+		return nil, fmt.Errorf("%w: requested=%d used=%d quota=%d", ErrQuotaExceeded, hostSize, used, i.quotaBytes)
+	}
+	i.usedBytes += hostSize
+	i.mu.Unlock()
+
+	backing, err := mapBackingFD(i.platformName, fd, 0, hostSize, writable)
+	if err != nil {
+		i.releaseCharge(hostSize)
+		return nil, err
+	}
+	if buf := backing.bytes(); len(buf) > 0 {
+		if base := uintptr(unsafe.Pointer(unsafe.SliceData(buf))); uint64(base)%i.align != 0 {
+			_ = backing.unmap()
+			i.releaseCharge(hostSize)
+			return nil, fmt.Errorf("%w: mapped base %#x align %#x", ErrMisaligned, base, i.align)
+		}
+	}
+
+	r := &ImportedRegion{
+		importer: i,
+		backing:  backing,
+		size:     guestSize,
+		hostSize: hostSize,
 		writable: writable,
 		claimed:  true,
 	}
@@ -232,6 +301,7 @@ type ImportedRegion struct {
 
 	importer *Importer
 	size     uint64
+	hostSize uint64
 	writable bool
 
 	mu          sync.Mutex
@@ -247,8 +317,16 @@ var (
 	_ memmap.Mappable = (*ImportedRegion)(nil)
 )
 
-// Size returns the byte length of the imported region.
+// Size returns the guest-visible byte length of the imported region.
 func (r *ImportedRegion) Size() uint64 {
+	return r.size
+}
+
+// HostSize returns the host backing byte length charged to the sandbox quota.
+func (r *ImportedRegion) HostSize() uint64 {
+	if r.hostSize > 0 {
+		return r.hostSize
+	}
 	return r.size
 }
 
@@ -303,7 +381,7 @@ func (r *ImportedRegion) maybeUnmapLocked() {
 	if b != nil {
 		_ = b.unmap()
 	}
-	r.importer.releaseCharge(r.size)
+	r.importer.releaseCharge(r.HostSize())
 }
 
 // IncRef implements memmap.File.IncRef.

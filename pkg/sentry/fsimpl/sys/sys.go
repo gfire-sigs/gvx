@@ -232,7 +232,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			systemSub["node"] = fs.buildNUMATopology(ctx, creds, k.ApplicationCores())
 		}
 		if len(idata.Topologies) > 0 {
-			if err := fs.applyTopologies(ctx, creds, idata.Topologies, devicesSub, classSub, pciDevices, pciDrivers, charSub); err != nil {
+			if err := fs.applyTopologies(ctx, creds, idata.Topologies, devicesSub, classSub, busSub, pciDevices, pciDrivers, charSub); err != nil {
 				return nil, nil, err
 			}
 		}

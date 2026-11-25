@@ -145,3 +145,43 @@ func TestLinuxImporterRejectsUnsealedFile(t *testing.T) {
 		t.Fatalf("ImportFD(unsealed regular file) err = %v, want ErrUnsealedMemory", err)
 	}
 }
+
+func TestImportWholeFDSeparatesGuestAndHostSize(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX FD shm mapping runs on Unix hosts")
+	}
+	fd, cleanup := createTestBackingFD(t, 16384)
+	defer cleanup()
+
+	imp := NewImporter(Options{
+		HostMappingAlign: 16384,
+		QuotaBytes:       32768,
+	})
+	guestSize := uint64(hostarch.PageSize) // 4096 < 16384 host alignment
+	reg, err := imp.ImportWholeFD(fd, guestSize, 1<<20, true)
+	if err != nil {
+		t.Fatalf("ImportWholeFD: %v", err)
+	}
+	if reg.Size() != guestSize {
+		t.Fatalf("Size() = %d, want %d", reg.Size(), guestSize)
+	}
+	if reg.HostSize() != 16384 {
+		t.Fatalf("HostSize() = %d, want 16384", reg.HostSize())
+	}
+	if imp.UsedBytes() != 16384 {
+		t.Fatalf("UsedBytes() = %d, want 16384", imp.UsedBytes())
+	}
+	// Guest mapping past guestSize must fault even though hostSize is 16384.
+	beyond := memmap.MappableRange{Start: guestSize, End: guestSize * 2}
+	if _, err := reg.Translate(nil, beyond, beyond, hostarch.Read); err == nil {
+		t.Fatal("Translate past guestSize succeeded, want error")
+	}
+	// Reject hostSize exceeding maxHostSize.
+	if _, err := imp.ImportWholeFD(fd, guestSize, 8192, true); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("ImportWholeFD(maxHostSize < hostSize) err = %v, want ErrInvalidRange", err)
+	}
+	reg.Release()
+	if !reg.Unmapped() || imp.UsedBytes() != 0 {
+		t.Fatalf("after Release: Unmapped=%v UsedBytes=%d", reg.Unmapped(), imp.UsedBytes())
+	}
+}
