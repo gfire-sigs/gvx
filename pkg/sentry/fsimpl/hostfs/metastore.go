@@ -269,16 +269,16 @@ func writeMetaLockSeqs(f *os.File, commitSeq, compactSeq uint64) {
 	_, _ = f.WriteAt(buf[:], 0)
 }
 
-// openMetaLock pre-opens .gvx_meta.lock inside the workspace root before
+// openMetaLock pre-opens .gvx_meta.lock inside the metadata directory before
 // hostlockdown.Apply() seals unbound opens. Read-only workspaces open an
 // existing lock file O_RDONLY without creating one when absent.
 func (w *Workspace) openMetaLock() error {
 	if w.single != "" {
 		return nil
 	}
-	rootDir := w.rawHost.rootDir()
+	metaDir := w.metaLockHost.rootDir()
 	if w.readOnly {
-		f, err := w.rawHost.openChildAt(rootDir, MetaLockFileName, os.O_RDONLY, 0)
+		f, err := w.metaLockHost.openChildAt(metaDir, MetaLockFileName, os.O_RDONLY, 0)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return nil
@@ -293,7 +293,7 @@ func (w *Workspace) openMetaLock() error {
 		err error
 	)
 	for attempt := range 4 {
-		f, err = w.rawHost.openChildAt(rootDir, MetaLockFileName, os.O_RDWR|os.O_CREATE, 0o600)
+		f, err = w.metaLockHost.openChildAt(metaDir, MetaLockFileName, os.O_RDWR|os.O_CREATE, 0o600)
 		if err == nil {
 			break
 		}
@@ -315,7 +315,7 @@ func (w *Workspace) tryOpenMetaLockReadOnlyLocked() *os.File {
 	if w.single != "" || w.closingAtomic.Load() {
 		return nil
 	}
-	f, err := w.rawHost.openChildAt(w.rawHost.rootDir(), MetaLockFileName, os.O_RDONLY, 0)
+	f, err := w.metaLockHost.openChildAt(w.metaLockHost.rootDir(), MetaLockFileName, os.O_RDONLY, 0)
 	if err != nil {
 		return nil
 	}
@@ -337,7 +337,7 @@ func (w *Workspace) recordMetaDiskState(info hostInfo) {
 	j.diskHostID = info.id
 	j.diskMtime = info.mtime.UnixNano()
 	if hasIdentity(info) {
-		j.diskFID = w.storedID(info.fid)
+		j.diskFID = w.storedMetaID(info.fid)
 		j.diskFIDOK = true
 	} else {
 		j.diskFID = fileKey{}
@@ -359,8 +359,8 @@ func (w *Workspace) sameMetaFile(info hostInfo, lockUnchanged bool) bool {
 	if !j.hasDiskFile {
 		return false
 	}
-	if w.caps.StableIDs && j.diskFIDOK && hasIdentity(info) {
-		return w.storedID(info.fid) == j.diskFID && info.id == j.diskHostID
+	if w.metaStableIDs && j.diskFIDOK && hasIdentity(info) {
+		return w.storedMetaID(info.fid) == j.diskFID && info.id == j.diskHostID
 	}
 	// Fallback when the volume lacks stable file identities: require matching
 	// lock sequence state, host (dev, ino), and modification timestamp.
@@ -388,7 +388,7 @@ func (w *Workspace) loadMeta() error {
 			w.updateLockSeqState(commitSeq, compactSeq)
 		}
 	}
-	f, err := w.host.open(MetaFileName, os.O_RDONLY, 0)
+	f, err := w.metaHost.open(MetaFileName, os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			w.journal.compact = true
@@ -397,7 +397,7 @@ func (w *Workspace) loadMeta() error {
 		}
 		return fmt.Errorf("hostfs: open %s: %w", MetaFileName, err)
 	}
-	fInfo, statErr := w.host.fstat(f)
+	fInfo, statErr := w.metaHost.fstat(f)
 	raw, err := io.ReadAll(f)
 	closeErr := f.Close()
 	if statErr != nil {
@@ -533,7 +533,7 @@ func (w *Workspace) syncMetaLocked(lf *os.File, forWrite bool) (forceCompact boo
 		diskCommit, diskCompact, hasLockSeq = readMetaLockSeqs(lf)
 	}
 
-	diskInfo, statErr := w.host.lstatAt(w.rootPin.h, MetaFileName)
+	diskInfo, statErr := w.metaHost.lstatAt(w.metaHost.rootDir(), MetaFileName)
 	if statErr != nil {
 		if isNotExist(statErr) {
 			if j.hasDiskFile {
@@ -589,7 +589,7 @@ func (w *Workspace) applyAppendedTailLocked(diskInfo hostInfo) (torn bool, err e
 	if delta <= 0 {
 		return false, nil
 	}
-	f, err := w.host.openChildAt(w.rootPin.h, MetaFileName, os.O_RDONLY, 0)
+	f, err := w.metaHost.openChildAt(w.metaHost.rootDir(), MetaFileName, os.O_RDONLY, 0)
 	if err != nil {
 		return false, err
 	}
@@ -631,7 +631,7 @@ func (w *Workspace) applyAppendedTailLocked(diskInfo hostInfo) (torn bool, err e
 func (w *Workspace) reloadMetaFromDiskLocked(forWrite bool) error {
 	j := &w.journal
 	_ = w.closeJournal()
-	f, err := w.host.openChildAt(w.rootPin.h, MetaFileName, os.O_RDONLY, 0)
+	f, err := w.metaHost.openChildAt(w.metaHost.rootDir(), MetaFileName, os.O_RDONLY, 0)
 	if err != nil {
 		if isNotExist(err) {
 			w.clearMetaDiskState()
@@ -644,7 +644,7 @@ func (w *Workspace) reloadMetaFromDiskLocked(forWrite bool) error {
 		}
 		return fmt.Errorf("hostfs: open %s: %w", MetaFileName, err)
 	}
-	fInfo, statErr := w.host.fstat(f)
+	fInfo, statErr := w.metaHost.fstat(f)
 	raw, readErr := io.ReadAll(f)
 	closeErr := f.Close()
 	if statErr != nil {
@@ -754,7 +754,7 @@ func (w *Workspace) appendMeta(ops []metaOp) error {
 	frame := appendFrame(make([]byte, 0, frameHeader+len(payload)), payload)
 	j := &w.journal
 	if j.f == nil {
-		f, err := w.host.openChildAt(w.rootPin.h, MetaFileName, os.O_WRONLY, 0)
+		f, err := w.metaHost.openChildAt(w.metaHost.rootDir(), MetaFileName, os.O_WRONLY, 0)
 		if err != nil {
 			j.compact = true
 			return fmt.Errorf("hostfs: open %s for append: %w", MetaFileName, err)
@@ -780,7 +780,7 @@ func (w *Workspace) appendMeta(ops []metaOp) error {
 	}
 	j.size += int64(len(frame))
 	j.ops += len(ops)
-	if info, statErr := w.host.fstat(j.f); statErr == nil {
+	if info, statErr := w.metaHost.fstat(j.f); statErr == nil {
 		w.recordMetaDiskState(info)
 	}
 	return nil
@@ -795,14 +795,15 @@ func (w *Workspace) compactMeta(ops []metaOp) (err error) {
 	if tempName == "" {
 		tempName = metaTempName
 	}
-	f, err := w.host.openChildAt(w.rootPin.h, tempName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	metaDir := w.metaHost.rootDir()
+	f, err := w.metaHost.openChildAt(metaDir, tempName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("hostfs: create %s: %w", tempName, err)
 	}
 	renamed := false
 	defer func() {
 		if !renamed {
-			_ = w.host.unlinkAt(w.rootPin.h, tempName)
+			_ = w.metaHost.unlinkAt(metaDir, tempName)
 		}
 	}()
 	size, werr := writeSnapshot(f, ops)
@@ -814,7 +815,7 @@ func (w *Workspace) compactMeta(ops []metaOp) (err error) {
 		_ = f.Close()
 		return fmt.Errorf("hostfs: sync %s: %w", tempName, serr)
 	}
-	fInfo, statErr := w.host.fstat(f)
+	fInfo, statErr := w.metaHost.fstat(f)
 	if cerr := f.Close(); cerr != nil {
 		return fmt.Errorf("hostfs: close %s: %w", tempName, cerr)
 	}
@@ -827,7 +828,7 @@ func (w *Workspace) compactMeta(ops []metaOp) (err error) {
 		}
 	}
 	_ = w.closeJournal()
-	if rerr := w.host.renameAt(w.rootPin.h, tempName, w.rootPin.h, MetaFileName); rerr != nil {
+	if rerr := w.metaHost.renameAt(metaDir, tempName, metaDir, MetaFileName); rerr != nil {
 		return fmt.Errorf("hostfs: replace %s: %w", MetaFileName, rerr)
 	}
 	renamed = true
@@ -843,25 +844,27 @@ func (w *Workspace) compactMeta(ops []metaOp) (err error) {
 	// writes the file again instead of appending to a name that a crash can
 	// still resolve to the old file.
 	w.journal.compact = true
-	if derr := w.host.syncDir("."); derr != nil {
-		return fmt.Errorf("hostfs: sync workspace directory: %w", derr)
+	if derr := w.metaHost.syncDir("."); derr != nil {
+		return fmt.Errorf("hostfs: sync metadata directory: %w", derr)
 	}
 	w.journal.compact = false
 	return nil
 }
 
-// sweepStaleMetaTempsLocked unlinks any orphaned .gvx_meta.tmp or
-// .gvx_meta.tmp.<hex> files left behind in the workspace root by a crashed
-// process. Callers hold the exclusive OS lock on .gvx_meta.lock, so no live
-// peer can be mid-compaction.
+// sweepStaleMetaTempsLocked unlinks orphaned .gvx_meta.tmp or
+// .gvx_meta.tmp.<hex> files left behind in the metadata directory by a crashed
+// process, plus any crashed probe temporaries when MetaDir is external. Callers
+// hold the exclusive OS lock on .gvx_meta.lock, so no live peer can be
+// mid-compaction.
 func (w *Workspace) sweepStaleMetaTempsLocked() {
-	entries, err := w.host.readDirAt(w.rootPin.h)
+	metaDir := w.metaHost.rootDir()
+	entries, err := w.metaHost.readDirAt(metaDir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if e.kind == hostKindRegular && isMetaTempName(e.name) {
-			_ = w.host.unlinkAt(w.rootPin.h, e.name)
+		if e.kind == hostKindRegular && (isMetaTempName(e.name) || (w.externalMeta && isEphemeralName(e.name))) {
+			_ = w.metaHost.unlinkAt(metaDir, e.name)
 		}
 	}
 }

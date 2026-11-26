@@ -23,6 +23,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -127,8 +128,19 @@ type Mount struct {
 	// CreateHostPathIfMissing creates the host directory of a bind mount when
 	// the path does not exist. New creates it before the host lockdown.
 	// Without it, a missing path is an error. It never creates a file, and it
-	// leaves an existing file or directory as it is.
+	// leaves an existing file or directory as it is. It does not create MetaDir.
 	CreateHostPathIfMissing bool
+
+	// MetaDir optionally stores hostfs .gvx_meta, .gvx_meta.lock, and staging
+	// files in an existing host directory outside the mounted workspace root.
+	// Valid only for directory bind mounts and DriverHostfs volumes. When empty
+	// or resolving to the mounted host directory itself, metadata lives in the
+	// workspace root. MetaDir must already exist as a directory and cannot be a
+	// filesystem root or overlap any mounted host path or another MetaDir.
+	// Multiple mounts of the same host directory (for example RO and RW) may
+	// share the same MetaDir; concurrent sandboxes sharing metadata for one
+	// host directory must supply the same MetaDir.
+	MetaDir string
 }
 
 type cappedVolumeBinding struct {
@@ -563,7 +575,15 @@ func parseVolumeSize(s string) (int64, error) {
 // ErrInvalidConfig.
 func (c *Config) validateMounts() error {
 	guestPaths := make(map[string]struct{}, len(c.Mounts)+1)
+	if c.WorkspaceMetaDir != "" && c.WorkspacePath == "" {
+		return fmt.Errorf("%w: WorkspaceMetaDir requires WorkspacePath", ErrInvalidConfig)
+	}
 	if c.WorkspacePath != "" {
+		if c.WorkspaceMetaDir != "" {
+			if err := validateMetaDir(c.WorkspaceMetaDir); err != nil {
+				return fmt.Errorf("%w: WorkspaceMetaDir: %w", ErrInvalidConfig, err)
+			}
+		}
 		guestPaths[workspaceGuestPath] = struct{}{}
 	}
 	hasCheckpointDir := strings.TrimSpace(c.CheckpointDir) != ""
@@ -699,6 +719,9 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 				}
 				continue
 			}
+			if m.MetaDir != "" {
+				return fmt.Errorf("%w: volume %s uses driver %q, which does not support MetaDir", ErrInvalidConfig, m.volumeLabel(), driver)
+			}
 			img, err := c.volumeImagePathWithMigrate(m, false)
 			if err != nil {
 				continue
@@ -776,6 +799,20 @@ func (m Mount) validate() error {
 	}
 	if m.CreateHostPathIfMissing && m.Kind != MountBind {
 		return errors.New("CreateHostPathIfMissing applies to bind mounts only")
+	}
+	if m.MetaDir != "" {
+		switch m.Kind {
+		case MountBind:
+		case MountVolume:
+			if m.Ephemeral || m.ImagePath != "" || (m.Driver != "" && m.Driver != DriverHostfs) {
+				return errors.New("MetaDir applies to directory bind mounts and hostfs volumes only")
+			}
+		default:
+			return errors.New("MetaDir applies to directory bind mounts and hostfs volumes only")
+		}
+		if err := validateMetaDir(m.MetaDir); err != nil {
+			return err
+		}
 	}
 	if m.hasOverlayUpper() && m.Kind != MountOverlay {
 		return errors.New("UpperVolumeName and UpperImagePath apply to overlay mounts only")
@@ -869,8 +906,97 @@ func (m Mount) validateBindSource() error {
 		return fmt.Errorf("bind source %q: %w", m.HostPath, err)
 	case kind == hostPathMissing && !m.CreateHostPathIfMissing:
 		return fmt.Errorf("bind source %q does not exist", m.HostPath)
+	case kind == hostPathFile && m.MetaDir != "":
+		return fmt.Errorf("bind source %q is a regular file: MetaDir applies to directory mounts only", m.HostPath)
 	}
 	return nil
+}
+
+func validateMetaDir(metaDir string) error {
+	abs, err := filepath.Abs(metaDir)
+	if err != nil {
+		return fmt.Errorf("resolve MetaDir %q: %w", metaDir, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("MetaDir %q: %w", metaDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("MetaDir %q must be a directory", metaDir)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return fmt.Errorf("resolve symlinks for MetaDir %q: %w", metaDir, err)
+	}
+	real = filepath.Clean(real)
+	if filepath.Dir(real) == real {
+		return fmt.Errorf("MetaDir %q must not be a filesystem root", metaDir)
+	}
+	return nil
+}
+
+func stripWindowsExtendedPrefix(p string) string {
+	if runtime.GOOS != "windows" {
+		return p
+	}
+	if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
+		return `\\` + rest
+	}
+	if rest, ok := strings.CutPrefix(p, `\\?\`); ok {
+		return rest
+	}
+	return p
+}
+
+func canonicalHostPath(p string) string {
+	resolved := stripWindowsExtendedPrefix(resolveSymlinkPrefix(filepath.Clean(p)))
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(resolved)
+	}
+	return resolved
+}
+
+func sameHostPath(a, b string) bool {
+	if ai, errA := os.Stat(a); errA == nil {
+		if bi, errB := os.Stat(b); errB == nil {
+			return os.SameFile(ai, bi)
+		}
+	}
+	return canonicalHostPath(a) == canonicalHostPath(b)
+}
+
+// hostPathContainsStrict reports whether child lies strictly beneath parent,
+// combining physical filesystem identity (os.SameFile ancestor walk) with
+// lexical containment for not-yet-created path tails.
+func hostPathContainsStrict(parent, child string) bool {
+	if sameHostPath(parent, child) {
+		return false
+	}
+	resolvedParent := resolveSymlinkPrefix(filepath.Clean(parent))
+	resolvedChild := resolveSymlinkPrefix(filepath.Clean(child))
+	if parentInfo, err := os.Stat(resolvedParent); err == nil {
+		cur := resolvedChild
+		for {
+			next := filepath.Dir(cur)
+			if next == cur {
+				break
+			}
+			cur = next
+			if curInfo, serr := os.Stat(cur); serr == nil && os.SameFile(parentInfo, curInfo) {
+				return true
+			}
+		}
+	}
+	p := canonicalHostPath(resolvedParent)
+	c := canonicalHostPath(resolvedChild)
+	if p == c {
+		return false
+	}
+	rel, err := filepath.Rel(p, c)
+	if err != nil || rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // hostPathKind is the type of a host path that a bind mount names.
@@ -973,7 +1099,13 @@ func IssueBindAttachToken(hostPath string, readOnly bool) (string, error) {
 func (c Config) mountList() []Mount {
 	list := make([]Mount, 0, len(c.Mounts)+1)
 	if c.WorkspacePath != "" {
-		list = append(list, Mount{Kind: MountBind, HostPath: c.WorkspacePath, GuestPath: workspaceGuestPath, ReadOnly: c.WorkspaceReadOnly})
+		list = append(list, Mount{
+			Kind:      MountBind,
+			HostPath:  c.WorkspacePath,
+			GuestPath: workspaceGuestPath,
+			ReadOnly:  c.WorkspaceReadOnly,
+			MetaDir:   c.WorkspaceMetaDir,
+		})
 	}
 	return append(list, c.Mounts...)
 }
@@ -1028,8 +1160,148 @@ func checkNoLegacyHostfsVolume(m Mount, image string) error {
 	return nil
 }
 
+func (s *Sandbox) resolveHostPathCandidate(m Mount) (string, bool, error) {
+	if m.Kind == MountVolume {
+		root, err := s.cfg.volumeRoot()
+		if err != nil {
+			return "", false, fmt.Errorf("gvx: locate the volume directory: %w", err)
+		}
+		return filepath.Join(root, m.VolumeName), false, nil
+	}
+	abs, err := filepath.Abs(m.HostPath)
+	if err != nil {
+		return "", false, fmt.Errorf("gvx: resolve bind source %q: %w", m.HostPath, err)
+	}
+	kind, err := classifyHostPath(abs)
+	if err != nil {
+		return "", false, fmt.Errorf("gvx: bind source %q: %w", abs, err)
+	}
+	if kind == hostPathFile {
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return "", false, fmt.Errorf("gvx: resolve bind source %q: %w", abs, err)
+		}
+		return resolved, true, nil
+	}
+	return abs, false, nil
+}
+
+// validateHostMountPlacements verifies all hostfs mounts and their MetaDir
+// placements before any missing host directory is created on disk. It returns
+// the normalized per-mount MetaDir (empty when default/same-dir) indexed by
+// mountList position.
+func (s *Sandbox) validateHostMountPlacements(mounts []Mount) (map[int]string, error) {
+	type hostMountPlacement struct {
+		guestPath string
+		hostPath  string
+		isFile    bool
+		metaPath  string // resolved external MetaDir, or "" when in-workspace
+		effMeta   string // metaPath when non-empty, else hostPath
+	}
+	var placements []hostMountPlacement
+	normMeta := make(map[int]string)
+
+	for i, m := range mounts {
+		switch {
+		case m.Kind == MountTmpfs, m.Kind == MountOverlay:
+			continue
+		case m.Kind == MountVolume:
+			driver, err := s.cfg.resolveVolumeDriverWithMigrate(m, false)
+			if err != nil {
+				return nil, err
+			}
+			if (m.SizeBytes > 0 || m.Ephemeral) && driver != DriverExt4lite {
+				return nil, fmt.Errorf("gvx: volume %s uses driver %q, which does not support size or ephemeral: %w", m.volumeLabel(), driver, ErrInvalidConfig)
+			}
+			if m.MetaDir != "" && driver != DriverHostfs {
+				return nil, fmt.Errorf("gvx: volume %s uses driver %q, which does not support MetaDir: %w", m.volumeLabel(), driver, ErrInvalidConfig)
+			}
+			if driver == DriverExt4lite {
+				continue
+			}
+		}
+
+		hostPath, isFile, err := s.resolveHostPathCandidate(m)
+		if err != nil {
+			return nil, err
+		}
+		if isFile && m.GuestPath == workspaceGuestPath && s.cfg.WorkspacePath != "" {
+			return nil, fmt.Errorf("gvx: WorkspacePath %q is a file: it must be a directory: %w", hostPath, ErrInvalidConfig)
+		}
+		if isFile && m.MetaDir != "" {
+			return nil, fmt.Errorf("gvx: mount %s is a regular file and does not support MetaDir: %w", m.GuestPath, ErrInvalidConfig)
+		}
+
+		metaPath := ""
+		if m.MetaDir != "" {
+			if err := validateMetaDir(m.MetaDir); err != nil {
+				return nil, fmt.Errorf("gvx: mount %s: %w: %w", m.GuestPath, err, ErrInvalidConfig)
+			}
+			absMeta, err := filepath.Abs(m.MetaDir)
+			if err != nil {
+				return nil, fmt.Errorf("gvx: mount %s: resolve MetaDir %q: %w: %w", m.GuestPath, m.MetaDir, err, ErrInvalidConfig)
+			}
+			candMeta := resolveSymlinkPrefix(filepath.Clean(absMeta))
+			if !sameHostPath(hostPath, candMeta) {
+				if hostPathContainsStrict(hostPath, candMeta) {
+					return nil, fmt.Errorf("gvx: mount %s: MetaDir %q must not lie inside host path %q: %w", m.GuestPath, m.MetaDir, hostPath, ErrInvalidConfig)
+				}
+				if hostPathContainsStrict(candMeta, hostPath) {
+					return nil, fmt.Errorf("gvx: mount %s: MetaDir %q must not be an ancestor of host path %q: %w", m.GuestPath, m.MetaDir, hostPath, ErrInvalidConfig)
+				}
+				metaPath = candMeta
+			}
+		}
+		effMeta := hostPath
+		if metaPath != "" {
+			effMeta = metaPath
+		}
+
+		for _, prev := range placements {
+			if !isFile && !prev.isFile {
+				sameHost := sameHostPath(hostPath, prev.hostPath)
+				sameEff := sameHostPath(effMeta, prev.effMeta)
+				if sameHost && !sameEff {
+					return nil, fmt.Errorf("gvx: mounts %s and %s share host path %q with conflicting MetaDir settings: %w", prev.guestPath, m.GuestPath, hostPath, ErrInvalidConfig)
+				}
+				if !sameHost && sameEff {
+					return nil, fmt.Errorf("gvx: mounts %s and %s target distinct host directories with the same metadata directory: %w", prev.guestPath, m.GuestPath, ErrInvalidConfig)
+				}
+			}
+			if metaPath != "" {
+				if sameHostPath(metaPath, prev.hostPath) || hostPathContainsStrict(prev.hostPath, metaPath) || hostPathContainsStrict(metaPath, prev.hostPath) {
+					return nil, fmt.Errorf("gvx: mount %s MetaDir %q overlaps mount %s host path: %w", m.GuestPath, m.MetaDir, prev.guestPath, ErrInvalidConfig)
+				}
+				if prev.metaPath != "" && (hostPathContainsStrict(prev.metaPath, metaPath) || hostPathContainsStrict(metaPath, prev.metaPath)) {
+					return nil, fmt.Errorf("gvx: mount %s MetaDir %q overlaps mount %s MetaDir: %w", m.GuestPath, m.MetaDir, prev.guestPath, ErrInvalidConfig)
+				}
+			}
+			if prev.metaPath != "" {
+				if sameHostPath(prev.metaPath, hostPath) || hostPathContainsStrict(hostPath, prev.metaPath) || hostPathContainsStrict(prev.metaPath, hostPath) {
+					return nil, fmt.Errorf("gvx: mount %s host path %q overlaps mount %s MetaDir: %w", m.GuestPath, hostPath, prev.guestPath, ErrInvalidConfig)
+				}
+			}
+		}
+
+		placements = append(placements, hostMountPlacement{
+			guestPath: m.GuestPath,
+			hostPath:  hostPath,
+			isFile:    isFile,
+			metaPath:  metaPath,
+			effMeta:   effMeta,
+		})
+		normMeta[i] = metaPath
+	}
+	return normMeta, nil
+}
+
 func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
+	mountList := s.cfg.mountList()
+	normMeta, err := s.validateHostMountPlacements(mountList)
+	if err != nil {
+		return err
+	}
 	rwVolumes := make(map[string]bool)
 	roVolumes := make(map[string]*ext4lite.Volume)
 	hasROLimit := make(map[string]bool)
@@ -1095,7 +1367,7 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 		}
 		s.rootVolume = vol
 	}
-	for _, m := range s.cfg.mountList() {
+	for idx, m := range mountList {
 		if m.Kind == MountVolume {
 			driver, err := s.cfg.resolveVolumeDriver(m)
 			if err != nil {
@@ -1103,6 +1375,9 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 			}
 			if (m.SizeBytes > 0 || m.Ephemeral) && driver != DriverExt4lite {
 				return fmt.Errorf("gvx: volume %s uses driver %q, which does not support size or ephemeral: %w", m.volumeLabel(), driver, ErrInvalidConfig)
+			}
+			if m.MetaDir != "" && driver != DriverHostfs {
+				return fmt.Errorf("gvx: volume %s uses driver %q, which does not support MetaDir: %w", m.volumeLabel(), driver, ErrInvalidConfig)
 			}
 			m.Driver = driver
 		}
@@ -1198,16 +1473,20 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 			if isFile && m.GuestPath == workspaceGuestPath && s.cfg.WorkspacePath != "" {
 				return fmt.Errorf("gvx: WorkspacePath %q is a file: it must be a directory: %w", hostPath, ErrInvalidConfig)
 			}
+			if isFile && m.MetaDir != "" {
+				return fmt.Errorf("gvx: mount %s is a regular file and does not support MetaDir: %w", m.GuestPath, ErrInvalidConfig)
+			}
+			metaDir := normMeta[idx]
 			sm.hostPath = hostPath
 			sm.hostFile = isFile
 			key := newWorkspaceKey(hostPath, isFile, m.ReadOnly)
 			ws, ok := shared[key]
 			if !ok {
-				if forRestore {
-					ws, err = hostfs.OpenWorkspaceForRestore(hostPath, m.ReadOnly)
-				} else {
-					ws, err = hostfs.OpenWorkspace(hostPath, m.ReadOnly)
-				}
+				ws, err = hostfs.OpenWorkspaceWithOptions(hostPath, hostfs.OpenOptions{
+					ReadOnly:    m.ReadOnly,
+					MetaDir:     metaDir,
+					RestoreMode: forRestore,
+				})
 				if err != nil {
 					return fmt.Errorf("gvx: open mount %s from %q: %w", m.GuestPath, hostPath, err)
 				}
@@ -1410,9 +1689,26 @@ func sortMountsByDepth(mounts []sandboxMount) {
 // the lockdown.
 func (s *Sandbox) hostMounts() []hostlockdown.HostMount {
 	var list []hostlockdown.HostMount
+	var metaIndices []int
 	for _, m := range s.mounts {
 		if m.Kind != MountTmpfs && m.Kind != MountOverlay && m.volume == nil {
 			list = append(list, hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly, File: m.hostFile})
+			if m.workspace != nil {
+				if metaDir := m.workspace.MetaDir(); metaDir != "" {
+					matched := false
+					for _, idx := range metaIndices {
+						if sameHostPath(list[idx].Path, metaDir) {
+							list[idx].ReadOnly = list[idx].ReadOnly && m.ReadOnly
+							matched = true
+							break
+						}
+					}
+					if !matched {
+						metaIndices = append(metaIndices, len(list))
+						list = append(list, hostlockdown.HostMount{Path: metaDir, ReadOnly: m.ReadOnly, File: false})
+					}
+				}
+			}
 		}
 	}
 	for _, sm := range s.serveMounts {
@@ -1443,11 +1739,27 @@ func (s *Sandbox) openServeMountsForRestore() error {
 	for _, sm := range s.cfg.ServeMounts {
 		entry := sandboxServeMount{ServeMount: sm}
 		if sm.Client == nil {
-			cli, absHost, singleFile, err := openLocalRPCFSClient(sm.HostPath, sm.ReadOnly)
+			absHost, err := filepath.Abs(sm.HostPath)
+			if err != nil {
+				return fmt.Errorf("gvx: resolve serve mount %s path %q: %w", sm.GuestPath, sm.HostPath, err)
+			}
+			for _, m := range s.mounts {
+				if m.workspace == nil {
+					continue
+				}
+				metaDir := m.workspace.MetaDir()
+				if metaDir == "" {
+					continue
+				}
+				if sameHostPath(absHost, metaDir) || hostPathContainsStrict(absHost, metaDir) || hostPathContainsStrict(metaDir, absHost) {
+					return fmt.Errorf("gvx: serve mount %s host path %q overlaps mount %s MetaDir: %w", sm.GuestPath, sm.HostPath, m.GuestPath, ErrInvalidConfig)
+				}
+			}
+			cli, openedHost, singleFile, err := openLocalRPCFSClient(sm.HostPath, sm.ReadOnly)
 			if err != nil {
 				return err
 			}
-			entry.hostPath = absHost
+			entry.hostPath = openedHost
 			entry.SingleFile = singleFile
 			entry.localClient = cli
 			entry.Client = cli

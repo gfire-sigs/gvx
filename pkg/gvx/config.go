@@ -375,6 +375,11 @@ type Config struct {
 	// WorkspaceReadOnly mounts /workspace in read-only mode.
 	WorkspaceReadOnly bool
 
+	// WorkspaceMetaDir overrides the host directory storing .gvx_meta and
+	// .gvx_meta.lock for WorkspacePath. Valid only when WorkspacePath is set.
+	// The directory must already exist and cannot overlap any mounted host path.
+	WorkspaceMetaDir string
+
 	// Mounts lists extra guest mounts: bind mounts of host directories, named
 	// volumes, and tmpfs mounts. WorkspacePath and WorkspaceReadOnly stay the
 	// shorthand for the bind mount at /workspace, so no entry of Mounts may use

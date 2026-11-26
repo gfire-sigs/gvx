@@ -833,7 +833,7 @@ func (e *watchEntry) readEntries(dirRel string) (dirInfo hostInfo, names []strin
 
 // visibleName decodes a host name and reports whether the guest sees it.
 func (e *watchEntry) visibleName(dirRel, name string, info hostInfo) (guest string, hidden bool) {
-	if info.kind == hostKindOther || (dirRel == "." && isReservedPath(name)) {
+	if info.kind == hostKindOther || (dirRel == "." && e.ws.isReservedPath(name)) {
 		return name, true
 	}
 	guest, ok := e.ws.hostVisibleName(dirRel, name, info)

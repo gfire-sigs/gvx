@@ -37,7 +37,7 @@ func (w *Workspace) checkWritableLocked(rels ...string) error {
 		return os.ErrClosed
 	}
 	for _, rel := range rels {
-		if isReservedPath(rel) {
+		if w.isReservedPath(rel) {
 			return errReservedName
 		}
 		if w.single != "" && rel != "." {
