@@ -39,6 +39,14 @@ func (s *Sandbox) stackOptions() netbackend.StackOptions {
 // initNetstack builds the Netstack for the configured mode and pre-binds
 // every host socket that must outlive the lockdown.
 func (s *Sandbox) initNetstack() error {
+	return s.initNetstackWithMode(false)
+}
+
+func (s *Sandbox) initNetstackForRestore() error {
+	return s.initNetstackWithMode(true)
+}
+
+func (s *Sandbox) initNetstackWithMode(forRestore bool) error {
 	switch s.cfg.NetworkMode {
 	case NetModeNone:
 		st, err := netbackend.NewLoopbackStack(s.stackOptions())
@@ -53,6 +61,9 @@ func (s *Sandbox) initNetstack() error {
 
 	case NetModeWireGuard:
 		return s.initWireGuardStack()
+
+	case NetModeLink:
+		return s.initPacketLinkStack(forRestore)
 
 	default:
 		return fmt.Errorf("gvx: unsupported network mode %q", s.cfg.NetworkMode)

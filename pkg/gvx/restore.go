@@ -66,8 +66,8 @@ func (nopCloseReaderAt) Close() error {
 
 type restoreNetworkArgs struct {
 	sb *Sandbox
-	// eth0 holds the eth0 settings that the checkpoint recorded in NAT mode.
-	// It is nil when the manifest has none.
+	// eth0 holds the eth0 settings that the checkpoint recorded in NAT or link
+	// mode. It is nil when the manifest has none.
 	eth0 *netbackend.Eth0Config
 }
 
@@ -101,6 +101,13 @@ func (r restoreNetworkArgs) ConfigureNetwork(st inet.Stack) error {
 		}
 		if err := r.sb.wgEndpoint.AttachRestoredStack(restored); err != nil {
 			return fmt.Errorf("gvx: attach restored WireGuard stack: %w", err)
+		}
+	case NetModeLink:
+		if r.sb.packetLink == nil {
+			return errors.New("gvx: packet link is nil during restore")
+		}
+		if err := r.sb.packetLink.AttachRestoredStackWithConfig(restored, r.eth0); err != nil {
+			return fmt.Errorf("gvx: attach restored packet link stack: %w", err)
 		}
 	case NetModeNone:
 		if r.sb.netStack != nil && r.sb.netStack != restored {
@@ -528,10 +535,18 @@ func restorePlatform(goos string, requested PlatformType, manifestPlatform strin
 // opens all host handles, validates manifest.json, and applies hostlockdown
 // before loading untrusted checkpoint pages and kernel state.
 //
-// Restore takes ownership of Config.CheckpointListener on every call. When
-// Restore fails, it closes the listener.
+// Restore takes ownership of Config.CheckpointListener, Config.ControlListener,
+// and Config.LinkConn on every call. When Restore fails, it closes them.
 func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
+	var sb *Sandbox
+	if linkConn := cfg.LinkConn; linkConn != nil {
+		defer func() {
+			if retErr != nil && (sb == nil || !sb.linkConnTransferred) {
+				_ = linkConn.Close()
+			}
+		}()
+	}
 	if ln := cfg.ControlListener; ln != nil {
 		defer func() {
 			if retErr != nil {
@@ -595,7 +610,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 	applyHostMemoryDefaults()
 
-	sb := &Sandbox{
+	sb = &Sandbox{
 		cfg:              cfg,
 		restoreBackingRO: restoreBackingRO,
 		kernelReady:      make(chan struct{}),
@@ -680,7 +695,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		return cleanup(err)
 	}
 
-	if err := sb.initNetstack(); err != nil {
+	if err := sb.initNetstackForRestore(); err != nil {
 		return cleanup(err)
 	}
 

@@ -132,7 +132,7 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	if err := initBoundTLSSlot(); err != nil {
 		return Status{}, err
 	}
-	if opts.AllowOutboundNet {
+	if opts.AllowOutboundNet || opts.PrewarmNetwork {
 		prewarmWinsock()
 	}
 	primary, err := openPrimaryToken()

@@ -702,11 +702,14 @@ func SnapshotEth0Config(s *stack.Stack) (Eth0Config, bool) {
 // joins each setting that is invalid or that Netstack rejected. A setting
 // that fails does not stop the others.
 func (cfg Eth0Config) apply(s *stack.Stack) error {
+	return cfg.applyWithDefault(s, tcpip.AddrFrom4([4]byte{10, 0, 2, 15}))
+}
+
+func (cfg Eth0Config) applyWithDefault(s *stack.Stack, defaultAddr tcpip.Address) error {
 	if len(cfg.Addresses) > maxEth0Addresses || len(cfg.Routes) > maxEth0Routes {
 		return fmt.Errorf("netbackend: eth0 config has %d addresses and %d routes, above the limits %d and %d", len(cfg.Addresses), len(cfg.Routes), maxEth0Addresses, maxEth0Routes)
 	}
 	var errs []error
-	defaultAddr := tcpip.AddrFrom4([4]byte{10, 0, 2, 15})
 	haveDefault := false
 	for _, text := range cfg.Addresses {
 		prefix, err := netip.ParsePrefix(text)

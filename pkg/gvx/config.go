@@ -68,6 +68,10 @@ const (
 	NetModeWireGuard NetworkMode = "wg"
 	// NetModeNone disables external network egress (loopback only).
 	NetModeNone NetworkMode = "none"
+	// NetModeLink attaches guest eth0 to a caller-supplied pre-connected
+	// length-prefixed L3 IP packet stream (Config.LinkConn) with outbound host
+	// networking blocked under host lockdown.
+	NetModeLink NetworkMode = "link"
 
 	// NetworkNAT is an alias for NetModeNAT.
 	NetworkNAT = NetModeNAT
@@ -75,6 +79,8 @@ const (
 	NetworkWireGuard = NetModeWireGuard
 	// NetworkNone is an alias for NetModeNone.
 	NetworkNone = NetModeNone
+	// NetworkLink is an alias for NetModeLink.
+	NetworkLink = NetModeLink
 )
 
 // UnixForward specifies a reverse Unix stream socket forward from a listening
@@ -266,8 +272,17 @@ type Config struct {
 	// syscall trap for stub processes, so untrusted workloads require whpx.
 	AllowUnconfinedSystrap bool
 
-	// NetworkMode selects the network backend ("nat", "wg", or "none").
+	// NetworkMode selects the network backend ("nat", "wg", "none", or "link").
 	NetworkMode NetworkMode
+
+	// LinkConn is the pre-connected stream carrying 4-byte big-endian
+	// length-prefixed L3 IP packets when NetworkMode is NetModeLink. New and
+	// Restore take ownership of LinkConn and close it on error or Sandbox.Close.
+	LinkConn net.Conn
+
+	// LinkMTU sets the initial L3 MTU of eth0 in NetModeLink (68..65535). Zero
+	// selects netbackend.DefaultPacketLinkMTU (1500).
+	LinkMTU uint32
 
 	// NetworkBandwidth limits guest transmit and receive in NAT mode. A zero
 	// rate leaves that direction unlimited.
@@ -631,9 +646,36 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 		c.NetworkMode = NetModeNAT
 	}
 	switch c.NetworkMode {
-	case NetModeNAT, NetModeWireGuard, NetModeNone:
+	case NetModeNAT, NetModeWireGuard, NetModeNone, NetModeLink:
 	default:
 		return fmt.Errorf("%w: unsupported network mode %q", ErrInvalidConfig, c.NetworkMode)
+	}
+	if c.NetworkMode == NetModeLink {
+		if c.LinkConn == nil {
+			return fmt.Errorf("%w: network mode %q requires LinkConn", ErrInvalidConfig, NetModeLink)
+		}
+		if err := netbackend.ValidatePacketLinkConn(c.LinkConn); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		}
+		if c.LinkMTU != 0 && (c.LinkMTU < netbackend.PacketLinkMinMTU || c.LinkMTU > netbackend.PacketLinkMaxMTU) {
+			return fmt.Errorf("%w: LinkMTU %d out of range [%d, %d]", ErrInvalidConfig, c.LinkMTU, netbackend.PacketLinkMinMTU, netbackend.PacketLinkMaxMTU)
+		}
+		if c.IsolateLAN {
+			return fmt.Errorf("%w: IsolateLAN requires network mode %q", ErrInvalidConfig, NetModeNAT)
+		}
+		if c.StreamInterceptor != nil {
+			return fmt.Errorf("%w: StreamInterceptor requires network mode %q", ErrInvalidConfig, NetModeNAT)
+		}
+		if c.WireGuardConfig != nil || c.WireGuardConfigPath != "" {
+			return fmt.Errorf("%w: WireGuardConfig requires network mode %q", ErrInvalidConfig, NetModeWireGuard)
+		}
+	} else {
+		if c.LinkConn != nil {
+			return fmt.Errorf("%w: LinkConn requires network mode %q", ErrInvalidConfig, NetModeLink)
+		}
+		if c.LinkMTU != 0 {
+			return fmt.Errorf("%w: LinkMTU requires network mode %q", ErrInvalidConfig, NetModeLink)
+		}
 	}
 	if err := c.NetworkBandwidth.Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)

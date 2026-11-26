@@ -490,6 +490,18 @@ func (s *Sandbox) closeWithExtensions(done chan struct{}, stopTimeout time.Durat
 		s.wgEndpoint = nil
 		s.netStack = nil
 	}
+	if s.packetLink != nil {
+		pl := s.packetLink
+		s.packetLink = nil
+		if s.netStack == pl.Stack() {
+			s.netStack = nil
+		}
+		s.mu.Unlock()
+		if err := pl.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.mu.Lock()
+	}
 	if s.netStack != nil {
 		s.netStack.Close()
 		s.netStack = nil

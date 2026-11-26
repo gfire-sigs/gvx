@@ -288,6 +288,35 @@ func (s *Sandbox) initWireGuardStack() error {
 	return nil
 }
 
+// initPacketLinkStack attaches guest eth0 to Config.LinkConn before lockdown.
+func (s *Sandbox) initPacketLinkStack(forRestore bool) error {
+	plCfg := netbackend.PacketLinkConfig{
+		Conn:   s.cfg.LinkConn,
+		MTU:    s.cfg.LinkMTU,
+		Stack:  s.stackOptions(),
+		Tuning: s.cfg.Tuning,
+	}
+	// Ownership transfers unconditionally to netbackend, which closes Conn on error.
+	s.linkConnTransferred = true
+	if forRestore {
+		pl, err := netbackend.NewPacketLinkForRestore(plCfg)
+		if err != nil {
+			return err
+		}
+		s.packetLink = pl
+		s.guestResolvConf = pl.GuestResolvConf()
+		return nil
+	}
+	st, pl, err := netbackend.NewPacketLinkStack(plCfg)
+	if err != nil {
+		return err
+	}
+	s.packetLink = pl
+	s.netStack = st
+	s.guestResolvConf = pl.GuestResolvConf()
+	return nil
+}
+
 // kernelLogFunc returns the log function of the LOG rules of the root network
 // stack. The function holds the kernel weakly. The registry of the log
 // functions is global and the network stack, its key, is reachable from the

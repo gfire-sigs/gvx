@@ -74,6 +74,11 @@ type Options struct {
 	// OutboundUDPPorts is empty.
 	AllowOutboundNet bool
 
+	// PrewarmNetwork initializes host networking libraries before lockdown even
+	// when AllowOutboundNet is false, so pre-connected stream sockets passed
+	// into the sandbox (such as NetModeLink) remain usable after Apply.
+	PrewarmNetwork bool
+
 	// PreboundListeners counts pre-bound stream listeners that call
 	// AcceptListener while AllowOutboundNet is true. Windows pre-warms at
 	// least this many locked accept-broker threads before closing the broker
