@@ -476,7 +476,7 @@ func (s *Sandbox) openManifestLayers(digests []string) (err error) {
 	if len(digests) == 0 {
 		return nil
 	}
-	cache, err := NewLayerCacheWithTuning(s.cfg.OCICacheDir, s.cfg.Tuning)
+	cache, err := s.layerCache()
 	if err != nil {
 		return err
 	}

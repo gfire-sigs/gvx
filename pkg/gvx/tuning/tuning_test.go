@@ -282,3 +282,27 @@ func TestDocsMatchRegistry(t *testing.T) {
 		t.Errorf("the tunables table in %s differs from the registry; run: go test ./pkg/gvx/tuning -run TestDocsMatchRegistry -update", path)
 	}
 }
+
+func TestValuesHasPrefix(t *testing.T) {
+	var zero Values
+	if zero.HasPrefix("oci.") {
+		t.Error("zero Values.HasPrefix(\"oci.\") = true, want false")
+	}
+	netOnly, err := zero.Set("net.nat.mtu", "1400")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if netOnly.HasPrefix("oci.") {
+		t.Error("net-only Values.HasPrefix(\"oci.\") = true, want false")
+	}
+	if !netOnly.HasPrefix("net.") {
+		t.Error("net-only Values.HasPrefix(\"net.\") = false, want true")
+	}
+	withOCI, err := netOnly.Set("oci.max_blob_bytes", "64MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !withOCI.HasPrefix("oci.") {
+		t.Error("oci Values.HasPrefix(\"oci.\") = false, want true")
+	}
+}

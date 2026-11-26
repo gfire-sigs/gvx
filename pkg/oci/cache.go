@@ -60,26 +60,63 @@ var (
 )
 
 // LayerCache stores compiled <sha256>.erofs layer images in a non-TCC host
-// cache directory.
+// cache directory. A LayerCache is safe for concurrent use by multiple
+// goroutines and sandboxes.
 type LayerCache struct {
-	dir       string
+	dir          string
+	blockSize    int
+	alwaysVerify bool
+
+	mu        sync.Mutex
 	limits    Limits
-	blockSize int
 	keepBlobs bool
 	// dnsServers are the resolvers of the registry requests that a pull or a
 	// save sends with its default HTTP client. Empty selects the host resolver.
-	dnsServers []netip.AddrPort
-
-	mu            sync.Mutex
+	dnsServers    []netip.AddrPort
 	verified      map[string]verifiedLayer
 	verifiedBlobs map[string]verifiedLayer
 }
 
-// verifiedLayer records a layer that passed its integrity verification in this
-// process. The recorded size and modification time detect later replacement.
+const (
+	// maxVerifiedCacheEntries bounds the in-memory verification maps in
+	// long-lived processes.
+	maxVerifiedCacheEntries = 4096
+
+	// racyCleanWindow prevents trusting whole-second coarse filesystem
+	// timestamps that were modified within the current wall-clock window.
+	racyCleanWindow = 2 * time.Second
+)
+
+// fileID holds platform-specific metadata that identifies an open regular file
+// and detects in-place modification, replacement, or metadata changes.
+type fileID struct {
+	token      string
+	handleKey  string
+	writeStamp string
+	coarse     bool
+	changeTime time.Time
+}
+
+func (id fileID) trustableAt(now time.Time) bool {
+	if id.token == "" {
+		return false
+	}
+	if !id.coarse {
+		return true
+	}
+	diff := now.Sub(id.changeTime)
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff >= racyCleanWindow
+}
+
+// verifiedLayer records a layer or blob that passed integrity verification in
+// this LayerCache instance.
 type verifiedLayer struct {
 	size    int64
 	modTime time.Time
+	idToken string
 }
 
 // DefaultCacheDir returns the platform-native non-TCC layer cache directory:
@@ -117,6 +154,15 @@ type CacheOptions struct {
 	// <cacheDir>/blobs/sha256/<hex> during pulls and archive loads so offline
 	// SaveImages and PushImage work with original digests.
 	KeepBlobs bool
+	// AlwaysVerify disables the cross-process file-identity sidecar fast path
+	// in openVerifiedLayer and hashes each unverified layer file in full once
+	// per LayerCache instance.
+	AlwaysVerify bool
+	// Limits sets optional parsing and decompression caps. Zero selects
+	// DefaultLimits().
+	Limits Limits
+	// DNSServers sets optional custom DNS resolvers for registry requests.
+	DNSServers []netip.AddrPort
 }
 
 // NewLayerCache creates or opens a LayerCache at dir (or DefaultCacheDir when
@@ -131,6 +177,13 @@ func NewLayerCacheWithOptions(dir string, opts CacheOptions) (*LayerCache, error
 	if err != nil {
 		return nil, err
 	}
+	limits := DefaultLimits()
+	if opts.Limits != (Limits{}) {
+		if err := opts.Limits.validate(); err != nil {
+			return nil, err
+		}
+		limits = opts.Limits
+	}
 	if strings.TrimSpace(dir) == "" {
 		var err error
 		dir, err = DefaultCacheDir()
@@ -143,9 +196,11 @@ func NewLayerCacheWithOptions(dir string, opts CacheOptions) (*LayerCache, error
 	}
 	return &LayerCache{
 		dir:           dir,
-		limits:        DefaultLimits(),
+		limits:        limits,
 		blockSize:     bs,
 		keepBlobs:     opts.KeepBlobs,
+		alwaysVerify:  opts.AlwaysVerify,
+		dnsServers:    slices.Clone(opts.DNSServers),
 		verified:      make(map[string]verifiedLayer),
 		verifiedBlobs: make(map[string]verifiedLayer),
 	}, nil
@@ -157,6 +212,12 @@ func (c *LayerCache) KeepBlobs() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.keepBlobs
+}
+
+// AlwaysVerify reports whether this cache disables the cross-process
+// file-identity fast path and hashes each layer once per LayerCache instance.
+func (c *LayerCache) AlwaysVerify() bool {
+	return c.alwaysVerify
 }
 
 // SetKeepBlobs enables or disables keeping original layer blobs under
@@ -179,6 +240,7 @@ func (c *LayerCache) format() string {
 
 func (c *LayerCache) layerSuffix() string { return "." + c.format() + ".erofs" }
 func (c *LayerCache) sumSuffix() string   { return c.layerSuffix() + ".sum" }
+func (c *LayerCache) idSuffix() string    { return c.layerSuffix() + ".id" }
 
 // SetLimits replaces the size budgets that the cache applies to pulls and
 // layer compilation.
@@ -186,8 +248,16 @@ func (c *LayerCache) SetLimits(l Limits) error {
 	if err := l.validate(); err != nil {
 		return err
 	}
+	c.mu.Lock()
 	c.limits = l
+	c.mu.Unlock()
 	return nil
+}
+
+func (c *LayerCache) getLimits() Limits {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.limits
 }
 
 // SetDNSServers makes the registry requests of this cache resolve names
@@ -196,7 +266,16 @@ func (c *LayerCache) SetLimits(l Limits) error {
 // resolver configuration, such as Android, needs it. Empty servers select the
 // resolver of the host again.
 func (c *LayerCache) SetDNSServers(servers []netip.AddrPort) {
-	c.dnsServers = slices.Clone(servers)
+	cp := slices.Clone(servers)
+	c.mu.Lock()
+	c.dnsServers = cp
+	c.mu.Unlock()
+}
+
+func (c *LayerCache) getDNSServers() []netip.AddrPort {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.dnsServers)
 }
 
 // Dir returns the backing directory path of the LayerCache.
@@ -217,9 +296,12 @@ func (c *LayerCache) sumPath(hexStr string) string {
 	return filepath.Join(c.dir, hexStr+c.sumSuffix())
 }
 
+func (c *LayerCache) idPath(hexStr string) string {
+	return filepath.Join(c.dir, hexStr+c.idSuffix())
+}
+
 // HasLayer reports whether the compiled <digestHex>.erofs layer exists in the
-// cache directory and matches its integrity record. The first verification of a
-// layer in each process hashes the whole file.
+// cache directory and matches its integrity record.
 func (c *LayerCache) HasLayer(dgst string) (string, bool) {
 	p, err := c.LayerPath(dgst)
 	if err != nil {
@@ -236,56 +318,87 @@ func (c *LayerCache) HasLayer(dgst string) (string, bool) {
 }
 
 // openVerifiedLayer opens a cached layer read-only and verifies it against its
-// integrity record, unless this process already verified the same file.
+// integrity record, using the in-memory verification cache and the sibling .id
+// file-identity sidecar (unless AlwaysVerify is set) to skip redundant full
+// SHA-256 hashing of unchanged files.
 func (c *LayerCache) openVerifiedLayer(hexStr string) (*os.File, error) {
 	p := filepath.Join(c.dir, hexStr+c.layerSuffix())
 	f, err := openShared(p)
 	if err != nil {
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("oci: open cached EROFS layer %q: %w", p, err)
 	}
 	info, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("oci: stat cached EROFS layer %q: %w", p, err)
 	}
 	if !info.Mode().IsRegular() || info.Size() < int64(c.blockSize) {
 		_ = f.Close()
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("%w: %q is not a layer image", ErrCacheCorrupt, p)
 	}
+
+	id, hasID := fileIdentity(f)
+	now := time.Now()
 
 	c.mu.Lock()
 	v, ok := c.verified[hexStr]
 	c.mu.Unlock()
-	if ok && v.size == info.Size() && v.modTime.Equal(info.ModTime()) {
-		return f, nil
+	if ok && v.size == info.Size() {
+		if hasID && v.idToken != "" {
+			if v.idToken == id.token && id.trustableAt(now) {
+				return f, nil
+			}
+		} else if !hasID && v.idToken == "" && v.modTime.Equal(info.ModTime()) {
+			return f, nil
+		}
 	}
 
 	record, err := readFileShared(c.sumPath(hexStr))
 	if err != nil {
 		_ = f.Close()
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("%w: read integrity record of %q: %w", ErrCacheCorrupt, p, err)
 	}
 	wantSize, wantSum, err := c.parseSumRecord(record)
 	if err != nil {
 		_ = f.Close()
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("%w: %q: %w", ErrCacheCorrupt, p, err)
 	}
 	if wantSize != info.Size() {
 		_ = f.Close()
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("%w: %q has %d bytes, want %d", ErrCacheCorrupt, p, info.Size(), wantSize)
 	}
+
+	if !c.alwaysVerify && hasID && id.trustableAt(now) {
+		if idRaw, idErr := readFileShared(c.idPath(hexStr)); idErr == nil {
+			if idSize, idSum, idToken, parseErr := c.parseIDRecord(idRaw); parseErr == nil &&
+				idSize == wantSize && idSum == wantSum && idToken == id.token {
+				c.recordVerified(hexStr, info.Size(), info.ModTime(), id)
+				return f, nil
+			}
+		}
+	}
+
 	digester := digest.SHA256.Digester()
 	if _, err := io.Copy(digester.Hash(), io.NewSectionReader(f, 0, info.Size())); err != nil {
 		_ = f.Close()
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("oci: hash cached EROFS layer %q: %w", p, err)
 	}
 	if got := digester.Digest().Encoded(); got != wantSum {
 		_ = f.Close()
+		c.forgetVerified(hexStr)
 		return nil, fmt.Errorf("%w: %q has sha256 %s, want %s", ErrCacheCorrupt, p, got, wantSum)
 	}
-	c.mu.Lock()
-	c.verified[hexStr] = verifiedLayer{size: info.Size(), modTime: info.ModTime()}
-	c.mu.Unlock()
+	c.recordVerified(hexStr, info.Size(), info.ModTime(), id)
+	if hasID {
+		c.writeIDBestEffort(hexStr, info.Size(), wantSum, id)
+	}
 	return f, nil
 }
 
@@ -306,6 +419,35 @@ func (c *LayerCache) parseSumRecord(raw []byte) (size int64, sum string, err err
 		return 0, "", errors.New("integrity record has an invalid digest")
 	}
 	return size, fields[2], nil
+}
+
+func (c *LayerCache) formatIDRecord(size int64, sum, token string) []byte {
+	return []byte(c.format() + " " + strconv.FormatInt(size, 10) + " " + sum + " " + token + "\n")
+}
+
+func (c *LayerCache) parseIDRecord(raw []byte) (size int64, sum, token string, err error) {
+	fields := strings.Fields(string(raw))
+	if len(fields) != 4 || fields[0] != c.format() {
+		return 0, "", "", fmt.Errorf("identity record is not in format %s", c.format())
+	}
+	size, err = strconv.ParseInt(fields[1], 10, 64)
+	if err != nil || size < 0 {
+		return 0, "", "", errors.New("identity record has an invalid size")
+	}
+	if digest.SHA256.Validate(fields[2]) != nil {
+		return 0, "", "", errors.New("identity record has an invalid digest")
+	}
+	if fields[3] == "" {
+		return 0, "", "", errors.New("identity record has an empty token")
+	}
+	return size, fields[2], fields[3], nil
+}
+
+func (c *LayerCache) writeIDBestEffort(hexKey string, size int64, sum string, id fileID) {
+	if id.token == "" {
+		return
+	}
+	_ = writeFileAtomic(c.dir, hexKey+c.idSuffix(), c.formatIDRecord(size, sum, id.token))
 }
 
 // CompileAndStore compiles a layer stream into an EROFS image and atomically
@@ -371,8 +513,10 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 	tmpPath := tmp.Name()
 	committed := false
 	defer func() {
-		if !committed {
+		if tmp != nil {
 			_ = tmp.Close()
+		}
+		if !committed {
 			_ = os.Remove(tmpPath)
 		}
 	}()
@@ -402,17 +546,18 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 
 	// The hash covers every byte that the compiler and the final drain read,
 	// so it equals the hash of the whole stream.
+	limits := c.getLimits()
 	digester := digest.SHA256.Digester()
 	var tee io.Writer
 	if blobTmp != nil {
 		tee = blobTmp
 	}
-	in := &hashingReader{r: newBoundedReader(src, "compressed layer size", c.limits.MaxBlobBytes, nil), h: digester.Hash(), w: tee}
+	in := &hashingReader{r: newBoundedReader(src, "compressed layer size", limits.MaxBlobBytes, nil), h: digester.Hash(), w: tee}
 	var diff *diffVerifier
 	if spec.diffID != "" {
 		diff = newDiffVerifier(spec.diffID)
 	}
-	stats, err := compileLayer(in, tmp, c.limits, c.blockSize, spec.image, diff)
+	stats, err := compileLayer(in, tmp, limits, c.blockSize, spec.image, diff)
 	if err != nil {
 		return "", CompileStats{}, err
 	}
@@ -453,13 +598,10 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 	if err != nil {
 		return "", CompileStats{}, fmt.Errorf("oci: stat layer file: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return "", CompileStats{}, fmt.Errorf("oci: close layer file: %w", err)
-	}
 
 	// Publish the compiled image without replacing a valid layer file that a
 	// concurrent writer already published at target.
-	target, err := c.publishCompiledLayer(tmpPath, hexKey, info, stats, &committed)
+	target, err := c.publishCompiledLayer(&tmp, tmpPath, hexKey, info, stats.TotalBytes, stats.SHA256Hex, &committed)
 	if err != nil {
 		return "", CompileStats{}, err
 	}
@@ -469,24 +611,65 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 // publishCompiledLayer publishes tmpPath at the cache path for hexKey while
 // preserving the file identity of an already-valid cached layer so concurrent
 // openers never observe an inode swap between verification and HostHandle open.
-func (c *LayerCache) publishCompiledLayer(tmpPath, hexKey string, tmpInfo os.FileInfo, stats CompileStats, committed *bool) (string, error) {
+// On Unix, tmp stays open across link/unlink or rename so the post-publish .id
+// sidecar stamps the exact verified inode with zero TOCTOU. On Windows, tmp is
+// closed before link/rename and target is verified against the pre-close file
+// ID and write timestamp before stamping .id.
+func (c *LayerCache) publishCompiledLayer(tmpPtr **os.File, tmpPath, hexKey string, tmpInfo os.FileInfo, wantSize int64, wantSum string, committed *bool) (string, error) {
 	target := filepath.Join(c.dir, hexKey+c.layerSuffix())
-	if info, ok := c.verifyLayerOnDisk(hexKey, stats.TotalBytes, stats.SHA256Hex); ok {
-		c.recordVerified(hexKey, info)
+	if existingInfo, existingID, ok := c.verifyLayerOnDisk(hexKey, wantSize, wantSum); ok {
+		c.recordVerified(hexKey, existingInfo.Size(), existingInfo.ModTime(), existingID)
+		c.writeIDBestEffort(hexKey, existingInfo.Size(), wantSum, existingID)
 		return target, nil
 	}
 
-	// Write the integrity record first, so that a published image always has one.
-	if err := writeFileAtomic(c.dir, hexKey+c.sumSuffix(), c.formatSumRecord(stats.TotalBytes, stats.SHA256Hex)); err != nil {
+	preID, preHasID := fileIdentity(*tmpPtr)
+	if !publishViaOpenTempHandle {
+		if err := (*tmpPtr).Close(); err != nil {
+			*tmpPtr = nil
+			return "", fmt.Errorf("oci: close layer file: %w", err)
+		}
+		*tmpPtr = nil
+	}
+
+	// Write the 3-field integrity record first, so a published image always has one.
+	if err := writeFileAtomic(c.dir, hexKey+c.sumSuffix(), c.formatSumRecord(wantSize, wantSum)); err != nil {
 		return "", err
 	}
 
-	if err := os.Link(tmpPath, target); err == nil {
-		c.recordVerified(hexKey, tmpInfo)
+	finishPublished := func() (string, error) {
+		if publishViaOpenTempHandle {
+			f := *tmpPtr
+			*tmpPtr = nil
+			postInfo, statErr := f.Stat()
+			postID, postOK := fileIdentity(f)
+			if closeErr := f.Close(); closeErr != nil {
+				return "", fmt.Errorf("oci: close layer file: %w", closeErr)
+			}
+			if statErr == nil && postInfo.Mode().IsRegular() && postInfo.Size() == wantSize {
+				if postOK {
+					if preHasID && postID.handleKey == preID.handleKey && postID.writeStamp == preID.writeStamp {
+						c.recordVerified(hexKey, postInfo.Size(), postInfo.ModTime(), postID)
+						c.writeIDBestEffort(hexKey, postInfo.Size(), wantSum, postID)
+					}
+				} else if !preHasID && postInfo.ModTime().Equal(tmpInfo.ModTime()) {
+					c.recordVerified(hexKey, postInfo.Size(), postInfo.ModTime(), fileID{})
+				}
+			}
+			return target, nil
+		}
+		c.stampPublishedTarget(target, hexKey, wantSize, wantSum, preID, preHasID)
 		return target, nil
 	}
-	if info, ok := c.verifyLayerOnDisk(hexKey, stats.TotalBytes, stats.SHA256Hex); ok {
-		c.recordVerified(hexKey, info)
+
+	if err := os.Link(tmpPath, target); err == nil {
+		_ = os.Remove(tmpPath)
+		*committed = true
+		return finishPublished()
+	}
+	if existingInfo, existingID, ok := c.verifyLayerOnDisk(hexKey, wantSize, wantSum); ok {
+		c.recordVerified(hexKey, existingInfo.Size(), existingInfo.ModTime(), existingID)
+		c.writeIDBestEffort(hexKey, existingInfo.Size(), wantSum, existingID)
 		return target, nil
 	}
 
@@ -494,47 +677,79 @@ func (c *LayerCache) publishCompiledLayer(tmpPath, hexKey string, tmpInfo os.Fil
 		return "", fmt.Errorf("oci: rename cached layer %q: %w", target, err)
 	}
 	*committed = true
-	c.recordVerified(hexKey, tmpInfo)
-	return target, nil
+	return finishPublished()
 }
 
-func (c *LayerCache) recordVerified(hexKey string, info os.FileInfo) {
+func (c *LayerCache) stampPublishedTarget(target, hexKey string, wantSize int64, wantSum string, preID fileID, preHasID bool) {
+	if !preHasID {
+		return
+	}
+	f, err := openShared(target)
+	if err != nil {
+		return
+	}
+	postInfo, statErr := f.Stat()
+	postID, postOK := fileIdentity(f)
+	_ = f.Close()
+	if statErr != nil || !postOK || !postInfo.Mode().IsRegular() || postInfo.Size() != wantSize {
+		return
+	}
+	if postID.handleKey != preID.handleKey || postID.writeStamp != preID.writeStamp {
+		return
+	}
+	c.recordVerified(hexKey, postInfo.Size(), postInfo.ModTime(), postID)
+	c.writeIDBestEffort(hexKey, postInfo.Size(), wantSum, postID)
+}
+
+func (c *LayerCache) recordVerified(hexKey string, size int64, modTime time.Time, id fileID) {
 	c.mu.Lock()
-	c.verified[hexKey] = verifiedLayer{size: info.Size(), modTime: info.ModTime()}
+	if len(c.verified) >= maxVerifiedCacheEntries {
+		clear(c.verified)
+	}
+	c.verified[hexKey] = verifiedLayer{size: size, modTime: modTime, idToken: id.token}
+	c.mu.Unlock()
+}
+
+func (c *LayerCache) forgetVerified(hexKey string) {
+	c.mu.Lock()
+	delete(c.verified, hexKey)
 	c.mu.Unlock()
 }
 
 // verifyLayerOnDisk checks whether the on-disk layer and integrity record for
 // hexKey already exist and match wantSize and wantSum.
-func (c *LayerCache) verifyLayerOnDisk(hexKey string, wantSize int64, wantSum string) (os.FileInfo, bool) {
+func (c *LayerCache) verifyLayerOnDisk(hexKey string, wantSize int64, wantSum string) (os.FileInfo, fileID, bool) {
 	record, err := readFileShared(c.sumPath(hexKey))
 	if err != nil {
-		return nil, false
+		return nil, fileID{}, false
 	}
 	recSize, recSum, err := c.parseSumRecord(record)
 	if err != nil || recSize != wantSize || recSum != wantSum {
-		return nil, false
+		return nil, fileID{}, false
 	}
 	p := filepath.Join(c.dir, hexKey+c.layerSuffix())
 	f, err := openShared(p)
 	if err != nil {
-		return nil, false
+		return nil, fileID{}, false
 	}
 	defer func() {
 		_ = f.Close()
 	}()
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != wantSize {
-		return nil, false
+		return nil, fileID{}, false
 	}
+	// Capture file identity before hashing so a concurrent in-place write
+	// during io.Copy cannot pair post-tamper timestamps with the old digest.
+	id, _ := fileIdentity(f)
 	digester := digest.SHA256.Digester()
 	if _, err := io.Copy(digester.Hash(), io.NewSectionReader(f, 0, info.Size())); err != nil {
-		return nil, false
+		return nil, fileID{}, false
 	}
 	if digester.Digest().Encoded() != wantSum {
-		return nil, false
+		return nil, fileID{}, false
 	}
-	return info, true
+	return info, id, true
 }
 
 // writeFileAtomic writes data to dir/name through a synced temporary file.
@@ -877,7 +1092,8 @@ func (c *LayerCache) ImportCachedImage(src *LayerCache, baseURL, repository, ref
 	return c.LoadCachedImage(baseURL, repository, reference, targetArch)
 }
 
-// importLayer copies one verified layer image and its integrity record.
+// importLayer copies one verified layer image and publishes a fresh integrity
+// record and sibling .id sidecar for this cache's published file.
 func (c *LayerCache) importLayer(src *LayerCache, hexStr string) error {
 	in, err := src.openVerifiedLayer(hexStr)
 	if err != nil {
@@ -900,30 +1116,30 @@ func (c *LayerCache) importLayer(src *LayerCache, hexStr string) error {
 	tmpPath := tmp.Name()
 	committed := false
 	defer func() {
-		if !committed {
+		if tmp != nil {
 			_ = tmp.Close()
+		}
+		if !committed {
 			_ = os.Remove(tmpPath)
 		}
 	}()
 	digester := digest.SHA256.Digester()
-	if _, err := io.Copy(io.MultiWriter(tmp, digester.Hash()), io.NewSectionReader(in, 0, size)); err != nil {
+	n, err := io.Copy(io.MultiWriter(tmp, digester.Hash()), io.NewSectionReader(in, 0, size))
+	if err != nil {
 		return fmt.Errorf("oci: copy layer %s: %w", hexStr, err)
 	}
-	if got := digester.Digest().Encoded(); got != sum {
+	if n != size || digester.Digest().Encoded() != sum {
 		return fmt.Errorf("%w: layer %s changed while it was copied", ErrCacheCorrupt, hexStr)
 	}
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("oci: sync layer file: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("oci: close layer file: %w", err)
+	info, err := tmp.Stat()
+	if err != nil {
+		return fmt.Errorf("oci: stat layer file: %w", err)
 	}
-	if err := writeFileAtomic(c.dir, hexStr+c.sumSuffix(), record); err != nil {
-		return err
-	}
-	if err := replaceFile(tmpPath, filepath.Join(c.dir, hexStr+c.layerSuffix())); err != nil {
+	if _, err := c.publishCompiledLayer(&tmp, tmpPath, hexStr, info, size, sum, &committed); err != nil {
 		return fmt.Errorf("oci: publish layer %s: %w", hexStr, err)
 	}
-	committed = true
 	return nil
 }

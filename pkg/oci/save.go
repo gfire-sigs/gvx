@@ -86,7 +86,7 @@ func (c *LayerCache) SaveImages(ctx context.Context, w io.Writer, client *http.C
 		if rc, ok := clients[key]; ok {
 			return rc, nil
 		}
-		rc, err := newRegistryClient(client, p.baseURL, p.repo, c.limits, c.dnsServers)
+		rc, err := newRegistryClient(client, p.baseURL, p.repo, c.getLimits(), c.getDNSServers())
 		if err != nil {
 			return nil, err
 		}
@@ -207,8 +207,9 @@ func (c *LayerCache) prepareSave(targets []SaveTarget) ([]preparedSave, error) {
 		if err != nil {
 			return nil, fmt.Errorf("oci: cannot save %s: %w", label, err)
 		}
+		limits := c.getLimits()
 		for _, l := range dec.manifest.Layers {
-			if err := checkLayerDescriptor(l, c.limits); err != nil {
+			if err := checkLayerDescriptor(l, limits); err != nil {
 				return nil, fmt.Errorf("oci: cannot save %s: %w", label, err)
 			}
 		}

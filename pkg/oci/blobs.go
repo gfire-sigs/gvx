@@ -126,6 +126,9 @@ func (c *LayerCache) openVerifiedBlob(d digest.Digest, wantSize int64) (*os.File
 
 func (c *LayerCache) recordVerifiedBlob(hexStr string, info os.FileInfo) {
 	c.mu.Lock()
+	if len(c.verifiedBlobs) >= maxVerifiedCacheEntries {
+		clear(c.verifiedBlobs)
+	}
 	c.verifiedBlobs[hexStr] = verifiedLayer{size: info.Size(), modTime: info.ModTime()}
 	c.mu.Unlock()
 }
@@ -166,7 +169,7 @@ func (c *LayerCache) storeBlobFromReader(d digest.Digest, wantSize int64, src io
 	}()
 
 	digester := digest.SHA256.Digester()
-	bounded := newBoundedReader(src, fmt.Sprintf("blob %s size", d), c.limits.MaxBlobBytes, nil)
+	bounded := newBoundedReader(src, fmt.Sprintf("blob %s size", d), c.getLimits().MaxBlobBytes, nil)
 	n, err := io.Copy(io.MultiWriter(tmp, digester.Hash()), bounded)
 	if err != nil {
 		return "", 0, fmt.Errorf("oci: store blob %s: %w", d, err)

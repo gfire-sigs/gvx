@@ -430,7 +430,8 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		}
 	}
 
-	rc, err := newRegistryClient(client, baseURL, repository, cache.limits, cache.dnsServers)
+	limits := cache.getLimits()
+	rc, err := newRegistryClient(client, baseURL, repository, limits, cache.getDNSServers())
 	if err != nil {
 		return nil, err
 	}
@@ -483,14 +484,14 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		return nil, err
 	}
 
-	image := newByteBudget("decompressed image size", cache.limits.MaxImageBytes)
+	image := newByteBudget("decompressed image size", limits.MaxImageBytes)
 	digests := make([]string, 0, len(res.Manifest.Layers))
 	for _, l := range res.Manifest.Layers {
 		if err := validateSHA256(l.Digest); err != nil {
 			return nil, err
 		}
 		hexStr := l.Digest.Encoded()
-		if err := checkLayerDescriptor(l, cache.limits); err != nil {
+		if err := checkLayerDescriptor(l, limits); err != nil {
 			return nil, err
 		}
 		_, hasLayer := cache.HasLayer(hexStr)

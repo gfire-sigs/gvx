@@ -560,7 +560,7 @@ func (c *LayerCache) removeUnusedLayers(candidates []string) error {
 		c.mu.Lock()
 		delete(c.verified, hexStr)
 		c.mu.Unlock()
-		for _, p := range []string{filepath.Join(c.dir, hexStr+c.layerSuffix()), c.sumPath(hexStr)} {
+		for _, p := range []string{filepath.Join(c.dir, hexStr+c.layerSuffix()), c.sumPath(hexStr), c.idPath(hexStr)} {
 			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 				errs = append(errs, fmt.Errorf("oci: remove unused layer file: %w", err))
 			}
