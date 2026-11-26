@@ -160,3 +160,54 @@ func TestAllocSlotFailsWhenAFullQuarantineStaysInUse(t *testing.T) {
 		t.Fatalf("allocSlot with a full quarantine = %v, want errSlotsQuarantined", err)
 	}
 }
+
+func TestAllocSlotExcludingSkipsExcludedIslandAndReclaimsQuarantine(t *testing.T) {
+	const (
+		site     = uint64(0x1000_0560)
+		sitePage = site &^ (blockSize - 1)
+		goodBase = sitePage + 0x10000
+		badBase  = sitePage + 0x20000
+	)
+	as := newIslandOnlyAddressSpace(goodBase)
+	fillQuarantine(t, as)
+	// Add an empty excluded island after filling goodBase's quarantine.
+	badIsl := &island{base: badBase}
+	as.islands[badBase] = badIsl
+
+	skip := map[*island]struct{}{badIsl: {}}
+	isl, off, err := as.allocSlotExcluding(context.Background(), nil, site, winSlotSize, skip)
+	if err != nil {
+		t.Fatalf("allocSlotExcluding: %v", err)
+	}
+	if isl != as.islands[goodBase] || off != 0 {
+		t.Fatalf("allocSlotExcluding = (island %#x, offset %#x), want reclaimed slot in %#x", isl.base, off, goodBase)
+	}
+}
+
+func TestAllocSlotSkipsPoisonedAMD64IslandsAndReclaimsQuarantine(t *testing.T) {
+	const (
+		site     = uint64(0x1000_0560)
+		sitePage = site &^ (blockSize - 1)
+		goodBase = sitePage + 0x10000
+		badBelow = sitePage - 0x050f_0000
+		badAbove = sitePage + 0x050f_0000
+	)
+	if islandBaseSafe(site, badBelow) {
+		t.Skip("host architecture has no poisoned rel32 island offsets")
+	}
+	as := newIslandOnlyAddressSpace(goodBase)
+	fillQuarantine(t, as)
+	// Add empty poisoned islands above and below site. Without islandBaseSafe,
+	// allocNearLocked would repeatedly hand out slots from a poisoned island
+	// and never reclaim goodBase's quarantine.
+	as.islands[badBelow] = &island{base: badBelow}
+	as.islands[badAbove] = &island{base: badAbove}
+
+	isl, off, err := as.allocSlot(context.Background(), nil, site, winSlotSize)
+	if err != nil {
+		t.Fatalf("allocSlot: %v", err)
+	}
+	if isl != as.islands[goodBase] || off != 0 {
+		t.Fatalf("allocSlot = (island %#x, offset %#x), want reclaimed slot in %#x", isl.base, off, goodBase)
+	}
+}

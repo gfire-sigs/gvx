@@ -1056,3 +1056,89 @@ func TestPlanGuardedScratchInsnSanitizesVectorAndAtomicOps(t *testing.T) {
 		}
 	}
 }
+
+func TestAMD64IslandBaseSafe(t *testing.T) {
+	const (
+		codePage = uint64(0x5555_2000_0000)
+		reach    = uint64(120 << 20)
+	)
+
+	// Poisoned 0x050F_xxxx, 0x2ECD_xxxx, and 0x340F_xxxx displacement windows
+	// above and below codePage, including boundary pages that can carry or
+	// borrow into the poisoned upper halfword.
+	for _, delta := range []int64{
+		-0x050f_0000,
+		-0x050f_8000,
+		-0x050f_f000,
+		-0x050e_f000,
+		-0x0510_0000,
+		+0x050f_0000,
+		+0x050f_8000,
+		+0x050f_f000,
+		+0x050e_f000,
+		+0x0510_0000,
+		-0x2ecd_0000,
+		+0x2ecd_0000,
+		-0x340f_0000,
+		+0x340f_0000,
+	} {
+		cand := uint64(int64(codePage) + delta)
+		if amd64IslandBaseSafeForPage(codePage, cand) {
+			t.Errorf("amd64IslandBaseSafeForPage(%#x, %#x) [delta %#x] = true, want false", codePage, cand, delta)
+		}
+	}
+	if !rel32UpperHalfPoisoned(-winIslandReach32, 0) || !rel32UpperHalfPoisoned(0, winIslandReach32) || !rel32UpperHalfPoisoned(10, 5) {
+		t.Error("rel32UpperHalfPoisoned accepted out-of-range or inverted bounds")
+	}
+	if amd64IslandBaseSafe(codePage, codePage+winIslandReach32) || amd64IslandBaseSafeForPage(codePage, codePage+winIslandReach32) {
+		t.Error("island at rel32 limit was accepted")
+	}
+	for _, delta := range []int64{
+		-0x050f_0000,
+		-0x050f_8000,
+		+0x050f_0000,
+		+0x050f_8000,
+	} {
+		site := codePage + 0x123
+		cand := uint64(int64(codePage) + delta)
+		if amd64IslandBaseSafe(site, cand) {
+			t.Errorf("amd64IslandBaseSafe(%#x, %#x) [delta %#x] = true, want false", site, cand, delta)
+		}
+	}
+
+	// Exhaustively verify every 4 KiB page across [-120 MiB, +120 MiB].
+	var total, rejected int
+	for off := -int64(reach); off <= int64(reach); off += winIslandBytes {
+		cand := uint64(int64(codePage) + off)
+		total++
+		if !amd64IslandBaseSafeForPage(codePage, cand) {
+			rejected++
+			continue
+		}
+		// Page safety must imply site safety across the entire code page.
+		for _, siteOff := range []uint64{0, 0x17, winIslandBytes / 2, winIslandBytes - 1} {
+			site := codePage + siteOff
+			if !amd64IslandBaseSafe(site, cand) {
+				t.Fatalf("page-safe island %#x rejected by amd64IslandBaseSafe for site %#x", cand, site)
+			}
+			// Neither forward (post-window or pre-window jmpVA = site-9) nor
+			// reverse rel32 jumps may produce a raw kernel-exit byte pair in
+			// their upper 16 bits across 64-byte and 32-byte slot offsets.
+			for _, slotOff := range []uint64{0, winIslandBytes - 64, winIslandBytes - 32} {
+				slotVA := cand + slotOff
+				fwd := uint32(int32(int64(slotVA) - int64(site+5)))
+				fwdPre := uint32(int32(int64(slotVA) - int64(site-9+5)))
+				rev := uint32(int32(int64(site+2) - int64(slotVA+45)))
+				if isRawKernelExitPair(byte(fwd>>16), byte(fwd>>24)) || isRawKernelExitPair(byte(fwdPre>>16), byte(fwdPre>>24)) {
+					t.Fatalf("accepted island %#x produced poisoned forward rel32 (%#x / %#x) for site %#x", cand, fwd, fwdPre, site)
+				}
+				if isRawKernelExitPair(byte(rev>>16), byte(rev>>24)) {
+					t.Fatalf("accepted island %#x produced poisoned reverse rel32 %#x for site %#x", cand, rev, site)
+				}
+			}
+		}
+	}
+	if rejected == 0 || rejected*100 >= total {
+		t.Fatalf("rejected %d of %d pages in +/-120 MiB, want a small non-zero exclusion window", rejected, total)
+	}
+}

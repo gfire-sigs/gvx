@@ -1294,6 +1294,14 @@ func initIslandBytes(b []byte) {
 	}
 }
 
+func islandBaseSafe(site, islandBase uint64) bool {
+	return amd64IslandBaseSafe(site, islandBase)
+}
+
+func islandBaseSafeForPage(codePage, islandBase uint64) bool {
+	return amd64IslandBaseSafeForPage(codePage, islandBase)
+}
+
 func slotSeamSafe(page []byte, off, size uint32) bool {
 	lo := int(off)
 	if lo > 0 {

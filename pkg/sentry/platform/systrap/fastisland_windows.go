@@ -272,6 +272,19 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 	return p.layout.contains(va, blockSize)
 }
 
+const (
+	// maxInstallSlotAttempts bounds retries inside installSlot across candidate
+	// slots and islands when encode or slotSeamSafe rejects a slot address.
+	maxInstallSlotAttempts = 20
+
+	// maxPerIslandRejects is the number of encode or seam rejections from one
+	// island before installSlot excludes that island for the remaining attempts.
+	// A single 256-byte (b1, b2) bad-displacement band spans at most 9
+	// consecutive 32-byte slots, so 10 rejections cross any partial band while
+	// excluding an unusable island in time to reclaim or create another.
+	maxPerIslandRejects = 10
+)
+
 // installSlot allocates a slot of rec.size bytes within reach of rec.site, lets
 // encode write the slot code, records rec for the slot, and returns the address
 // and reference of the slot. The page of the slot is the private page that the
@@ -280,7 +293,11 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 // so a failure frees the slot at once.
 func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManager, rec islandSlot, encode func(buf []byte, slotVA uint64) error) (uint64, winSlotRef, error) {
 	site, size := rec.site, rec.size
-	var rejected []winSlotRef
+	var (
+		rejected []winSlotRef
+		rejects  map[*island]int
+		skip     map[*island]struct{}
+	)
 	defer func() {
 		if len(rejected) == 0 {
 			return
@@ -291,9 +308,22 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 		}
 		as.mu.Unlock()
 	}()
+	noteReject := func(ref winSlotRef) {
+		rejected = append(rejected, ref)
+		if rejects == nil {
+			rejects = make(map[*island]int)
+		}
+		rejects[ref.isl]++
+		if rejects[ref.isl] >= maxPerIslandRejects {
+			if skip == nil {
+				skip = make(map[*island]struct{})
+			}
+			skip[ref.isl] = struct{}{}
+		}
+	}
 	var lastErr error
-	for range 12 {
-		isl, off, err := as.allocSlot(ctx, mm, site, size)
+	for range maxInstallSlotAttempts {
+		isl, off, err := as.allocSlotExcluding(ctx, mm, site, size, skip)
 		if err != nil {
 			return 0, winSlotRef{}, err
 		}
@@ -302,12 +332,12 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 		slotBuf := isl.page.bytes()[off : off+size]
 		if err := encode(slotBuf, slotVA); err != nil {
 			initIslandBytes(slotBuf)
-			rejected = append(rejected, ref)
+			noteReject(ref)
 			lastErr = err
 			continue
 		}
 		if !slotSeamSafe(isl.page.bytes(), off, size) {
-			rejected = append(rejected, ref)
+			noteReject(ref)
 			lastErr = errors.New("island slot forms a raw kernel opcode")
 			continue
 		}
@@ -330,11 +360,15 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 // through the memory manager when that is not enough. It fails with
 // errSlotsQuarantined when the quarantine is full.
 func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager, site uint64, size uint32) (*island, uint32, error) {
+	return as.allocSlotExcluding(ctx, mm, site, size, nil)
+}
+
+func (as *addressSpace) allocSlotExcluding(ctx context.Context, mm platform.MemoryManager, site uint64, size uint32, skip map[*island]struct{}) (*island, uint32, error) {
 	for range 3 {
 		as.mu.Lock()
-		isl, off, ok := as.allocNearLocked(site, size)
+		isl, off, ok := as.allocNearLocked(site, size, skip)
 		if !ok && as.reclaimSlotsLocked() > 0 {
-			isl, off, ok = as.allocNearLocked(site, size)
+			isl, off, ok = as.allocNearLocked(site, size, skip)
 		}
 		full := as.quarantineUnitsLocked() >= winQuarantineLimit
 		as.mu.Unlock()
@@ -353,9 +387,12 @@ func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager
 
 // allocNearLocked allocates size bytes in an island within reach of site.
 // Callers hold as.mu.
-func (as *addressSpace) allocNearLocked(site uint64, size uint32) (*island, uint32, bool) {
+func (as *addressSpace) allocNearLocked(site uint64, size uint32, skip map[*island]struct{}) (*island, uint32, bool) {
 	for _, isl := range as.islands {
-		if absDiff(isl.base, site) < winIslandReach {
+		if _, excluded := skip[isl]; excluded {
+			continue
+		}
+		if absDiff(isl.base, site) < winIslandReach && islandBaseSafe(site, isl.base) {
 			if off, ok := isl.alloc(size); ok {
 				return isl, off, true
 			}
@@ -367,8 +404,9 @@ func (as *addressSpace) allocNearLocked(site uint64, size uint32) (*island, uint
 // newIsland reserves a sealed mapping within reach of near through the memory
 // manager and maps a private page of slots there.
 func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager, near uint64) error {
+	nearPage := blockRound(near)
 	return as.newIslandAt(ctx, mm, near, func(cand uint64) (uint64, bool) {
-		return cand, as.guestPageOK(cand)
+		return cand, as.guestPageOK(cand) && islandBaseSafeForPage(nearPage, cand)
 	})
 }
 
