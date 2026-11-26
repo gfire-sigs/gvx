@@ -421,3 +421,16 @@ seam pkg/sentry/kernel/shm/shm_state_autogen.go
 # ioctls to pkg/sentry/fsimpl/devpts/vmin_xplat.go.
 seam pkg/sentry/fsimpl/devpts/master.go
 seam pkg/sentry/fsimpl/devpts/replica.go
+
+# Content seams: containerd v2.4 API renames (TTRPCTaskService,
+# TTRPCSandboxService with UpdateSandbox, context-aware Process.Wait) and
+# runtime-spec v1.3 optional pids limit, required by the upgrade to
+# containerd/v2 v2.4.2 and runtime-spec v1.3.0.
+seam pkg/shim/v1/extension/extension.go
+seam pkg/shim/v1/proc/exec.go
+seam pkg/shim/v1/proc/init.go
+seam pkg/shim/v1/runsc/service.go
+seam pkg/shim/v1/service.go
+seam runsc/cgroup/cgroup.go
+seam runsc/cgroup/cgroup_v2.go
+seam runsc/cmd/update.go
