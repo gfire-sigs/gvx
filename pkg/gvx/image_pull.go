@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strings"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/oci"
 )
 
@@ -130,7 +131,10 @@ func loadCachedReference(cache *oci.LayerCache, req registryRequest) (*oci.Resol
 	if !errors.Is(err, oci.ErrNotCached) || req.explicitRegistry {
 		return cached, err
 	}
-	defaultCache, err := NewLayerCache("")
+	defaultCache, err := NewLayerCacheWithOptions("", oci.CacheOptions{
+		BlockSize:    cache.BlockSize(),
+		AlwaysVerify: cache.AlwaysVerify(),
+	}, tuning.Values{})
 	if err != nil {
 		return nil, err
 	}

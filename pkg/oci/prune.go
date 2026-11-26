@@ -119,6 +119,7 @@ func (c *LayerCache) sweepOrphanedCacheFiles() error {
 	}
 	layerSuffix := c.layerSuffix()
 	sumSuffix := c.sumSuffix()
+	idSuffix := c.idSuffix()
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -130,6 +131,14 @@ func (c *LayerCache) sweepOrphanedCacheFiles() error {
 			if !used[hexStr] {
 				if rmErr := os.Remove(filepath.Join(c.dir, name)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 					errs = append(errs, fmt.Errorf("oci: remove orphaned layer sum: %w", rmErr))
+				}
+			}
+		case strings.HasSuffix(name, idSuffix):
+			hexStr := strings.TrimSuffix(name, idSuffix)
+			_, layerStatErr := os.Stat(filepath.Join(c.dir, hexStr+layerSuffix))
+			if !used[hexStr] || errors.Is(layerStatErr, os.ErrNotExist) {
+				if rmErr := os.Remove(filepath.Join(c.dir, name)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+					errs = append(errs, fmt.Errorf("oci: remove orphaned layer identity record: %w", rmErr))
 				}
 			}
 		case strings.HasSuffix(name, layerSuffix):
@@ -157,7 +166,7 @@ func (c *LayerCache) isOwnedCacheFile(name string) bool {
 	if strings.HasPrefix(name, tagPrefix) && strings.HasSuffix(name, cacheJSONSuffix) {
 		return true
 	}
-	return strings.HasSuffix(name, c.layerSuffix()) || strings.HasSuffix(name, c.sumSuffix())
+	return strings.HasSuffix(name, c.layerSuffix()) || strings.HasSuffix(name, c.sumSuffix()) || strings.HasSuffix(name, c.idSuffix())
 }
 
 func (c *LayerCache) cacheFileBytes() (int64, error) {
@@ -237,6 +246,7 @@ func (c *LayerCache) DiskUsage() (CacheDiskUsage, error) {
 	}
 	layerSuffix := c.layerSuffix()
 	sumSuffix := c.sumSuffix()
+	idSuffix := c.idSuffix()
 	var totalBytes, reclaimableBytes int64
 	for _, e := range entries {
 		if e.IsDir() || !c.isOwnedCacheFile(e.Name()) {
@@ -252,6 +262,12 @@ func (c *LayerCache) DiskUsage() (CacheDiskUsage, error) {
 		switch {
 		case strings.HasSuffix(name, sumSuffix):
 			if !activeLayers[strings.TrimSuffix(name, sumSuffix)] {
+				reclaimableBytes += sz
+			}
+		case strings.HasSuffix(name, idSuffix):
+			hexStr := strings.TrimSuffix(name, idSuffix)
+			_, layerStatErr := os.Stat(filepath.Join(c.dir, hexStr+layerSuffix))
+			if !activeLayers[hexStr] || errors.Is(layerStatErr, os.ErrNotExist) {
 				reclaimableBytes += sz
 			}
 		case strings.HasSuffix(name, layerSuffix):

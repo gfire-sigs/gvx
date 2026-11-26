@@ -185,6 +185,17 @@ func (v Values) Get(name string) (int64, bool) {
 	return v.get(i), true
 }
 
+// HasPrefix reports whether v explicitly sets any tunable whose key starts
+// with prefix.
+func (v Values) HasPrefix(prefix string) bool {
+	for name := range v.set {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // Set returns a copy of v with the tunable name set to the value that text
 // holds. It rejects an unknown name, a text that does not parse, and a value
 // outside the range of the entry. The error names the key. On an error, Set

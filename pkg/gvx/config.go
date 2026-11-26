@@ -33,7 +33,9 @@ import (
 
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/netbackend"
+	"z.gfire.dev/gvx/pkg/oci"
 )
 
 // PlatformType selects the guest execution backend.
@@ -337,6 +339,16 @@ type Config struct {
 	// <OCICacheDir>/volumes.
 	OCICacheDir string
 
+	// LayerCache supplies a caller-owned oci.LayerCache reused across Sandbox
+	// creations and Restores in one process. Callers retain ownership; Sandbox
+	// never closes or mutates LayerCache. Cannot be combined with OCICacheDir,
+	// OCIKeepBlobs, or explicit oci.* tunables in Tuning. HostDNSServers
+	// configures only the guest DNS relay and does not mutate LayerCache; pass
+	// oci.CacheOptions.DNSServers or call SetDNSServers on the cache instead.
+	// VolumeDir does not inherit LayerCache.Dir() because a shared layer cache
+	// may be read-only.
+	LayerCache *oci.LayerCache
+
 	// VolumeDir overrides the host directory storing named volumes. It takes
 	// precedence over OCICacheDir and VolumeDirEnv (GVX_VOLUME_DIR).
 	VolumeDir string
@@ -605,6 +617,24 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	c.HostDNSServers = nil
 	for _, ap := range hostDNS {
 		c.HostDNSServers = append(c.HostDNSServers, ap.String())
+	}
+	if c.LayerCache != nil {
+		if strings.TrimSpace(c.LayerCache.Dir()) == "" {
+			return fmt.Errorf("%w: LayerCache must be constructed via NewLayerCache, NewLayerCacheWithOptions, or oci.NewLayerCacheWithOptions", ErrInvalidConfig)
+		}
+		bs := c.LayerCache.BlockSize()
+		if bs <= 0 || bs%int(hostarch.PageSize) != 0 {
+			return fmt.Errorf("%w: LayerCache block size %d must be a positive multiple of Sentry page size %d", ErrInvalidConfig, bs, hostarch.PageSize)
+		}
+		if c.OCICacheDir != "" {
+			return fmt.Errorf("%w: LayerCache cannot be combined with OCICacheDir", ErrInvalidConfig)
+		}
+		if c.OCIKeepBlobs {
+			return fmt.Errorf("%w: LayerCache cannot be combined with OCIKeepBlobs; set oci.CacheOptions.KeepBlobs on the cache instead", ErrInvalidConfig)
+		}
+		if c.Tuning.HasPrefix("oci.") {
+			return fmt.Errorf("%w: LayerCache cannot be combined with oci.* tunables in Tuning; pass tuning values to NewLayerCacheWithOptions instead", ErrInvalidConfig)
+		}
 	}
 	switch c.Platform {
 	case PlatformAuto, PlatformWHPX, PlatformHVF, PlatformSystrap:

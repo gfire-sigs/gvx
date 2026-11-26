@@ -46,14 +46,21 @@ func NewLayerCache(dir string) (*oci.LayerCache, error) {
 // NewLayerCacheWithTuning is NewLayerCache with the oci.* tunables of t. They
 // set the size budgets that a pull and a layer compilation obey.
 func NewLayerCacheWithTuning(dir string, t tuning.Values) (*oci.LayerCache, error) {
-	cache, err := oci.NewLayerCacheWithOptions(dir, oci.CacheOptions{BlockSize: int(hostarch.PageSize)})
-	if err != nil {
-		return nil, err
+	return NewLayerCacheWithOptions(dir, oci.CacheOptions{}, t)
+}
+
+// NewLayerCacheWithOptions opens the EROFS layer cache at dir (or the default
+// host cache directory when dir is empty) with explicit oci.CacheOptions and
+// tuning values. When opts.BlockSize is zero, it defaults to
+// int(hostarch.PageSize). When opts.Limits is zero, it derives limits from t.
+func NewLayerCacheWithOptions(dir string, opts oci.CacheOptions, t tuning.Values) (*oci.LayerCache, error) {
+	if opts.BlockSize == 0 {
+		opts.BlockSize = int(hostarch.PageSize)
 	}
-	if err := cache.SetLimits(limitsFromTuning(t)); err != nil {
-		return nil, err
+	if opts.Limits == (oci.Limits{}) {
+		opts.Limits = limitsFromTuning(t)
 	}
-	return cache, nil
+	return oci.NewLayerCacheWithOptions(dir, opts)
 }
 
 // limitsFromTuning returns the size budgets that the oci.* tunables of t set.
@@ -127,6 +134,25 @@ func elfLayerTar(elfData []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func (s *Sandbox) layerCache() (*oci.LayerCache, error) {
+	if s.cfg.LayerCache != nil {
+		return s.cfg.LayerCache, nil
+	}
+	cache, err := NewLayerCacheWithTuning(s.cfg.OCICacheDir, s.cfg.Tuning)
+	if err != nil {
+		return nil, err
+	}
+	if s.cfg.OCIKeepBlobs {
+		cache.SetKeepBlobs(true)
+	}
+	hostDNS, err := ParseHostDNSServers(s.cfg.HostDNSServers)
+	if err != nil {
+		return nil, err
+	}
+	cache.SetDNSServers(hostDNS)
+	return cache, nil
+}
+
 // initOCILayers compiles every layer source into the cache and opens one
 // read-only HostHandle per layer, ordered from the lowest layer to the
 // highest. The cache verifies each layer file on open. The HostHandle then
@@ -141,18 +167,10 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		}
 		return nil
 	}
-	cache, err := NewLayerCacheWithTuning(s.cfg.OCICacheDir, s.cfg.Tuning)
+	cache, err := s.layerCache()
 	if err != nil {
 		return err
 	}
-	if s.cfg.OCIKeepBlobs {
-		cache.SetKeepBlobs(true)
-	}
-	hostDNS, err := ParseHostDNSServers(s.cfg.HostDNSServers)
-	if err != nil {
-		return err
-	}
-	cache.SetDNSServers(hostDNS)
 
 	var layerFiles []*os.File
 	defer func() {

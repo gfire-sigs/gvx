@@ -33,14 +33,15 @@ For every resolved manifest matching the target architecture (`linux/amd64` or `
 3. Stream `.tar`, `.tar.gz`, or `.tar.zst` layers through `tar2erofs.go` without extracting onto host disks.
 4. Deduplicate 4 KiB blocks with `InodeDataLayoutChunkBased`, and inline short symlinks and tails with `InodeDataLayoutFlatInline`.
 5. Convert `.wh.<name>` and `.wh..wh..opq` whiteouts into `0:0` character nodes and `trusted.overlay.opaque` xattrs.
-6. Write `<sha256>.gvx-erofs-v3-b4096.erofs` and `.sum` sidecars to the platform cache (`%LOCALAPPDATA%\gvx\cache\layers`, `~/Library/Caches/gvx/layers`, `~/.cache/gvx/layers`).
+6. Write `<sha256>.gvx-erofs-v3-b4096.erofs`, a 3-field `.sum` record, and a sibling `.id` file-identity sidecar to the platform cache (`%LOCALAPPDATA%\gvx\cache\layers`, `~/Library/Caches/gvx/layers`, `~/.cache/gvx/layers`).
 7. Enforce all `oci.*` ceilings from `pkg/gvx/tuning` (`max_json_bytes`, `max_blob_bytes`, `max_layer_bytes`, `max_zstd_window_bytes`, `registry_idle_timeout`).
 
 At runtime, `pkg/gvx` opens read-only `HostHandle` descriptors for all lower `.erofs` layers before lockdown. It mounts them under `fsimpl/overlay` beneath either an ephemeral `tmpfs` upper layer or a persistent `ext4lite` `-rootfs-volume`.
 
-### 2.3 Cache Operations, Blob Retention, Push, Save, and Load
+### 2.3 Cache Operations, Verification Fast Path, Blob Retention, Push, Save, and Load
 
 - **Pull policies**: `missing` (default), `always` (falling back to cache on unreachable registry or HTTP 401/403/404 for locally loaded images), and `never` (strictly offline).
+- **Layer verification and shared `LayerCache`**: `openVerifiedLayer` avoids redundant SHA-256 hashing across starts using a bounded in-process map and a sibling `.id` sidecar. The `.id` sidecar records platform file identity (`dev`/`ino`/`mtime`/`ctime` on Unix; volume serial, 128-bit file ID, write time, and change time on Windows). Older runtimes ignore `.id` files while reading the immutable 3-field `.sum` record. Missing, stale, malformed, or recently modified coarse-timestamp `.id` records fall back to full SHA-256 verification. Set `oci.CacheOptions.AlwaysVerify` to hash each layer once per cache instance, or share one cache via `gvx.NewLayerCacheWithOptions` and `Config.LayerCache`.
 - **Blob retention (`-keep-blobs` / `GVX_KEEP_BLOBS=1`)**: Retains compressed blobs under `blobs/sha256/<hex>` so `rungvx save` and `rungvx push` run offline.
 - **OCI Distribution v1.1 push (`push.go`)**: Probes existing blobs via `HEAD`, attempts cross-repository mounts, and uploads exact manifest bytes.
 - **Archives (`save.go`, `load.go`)**: Read and write dual OCI-layout and `docker save` tar archives.
@@ -70,6 +71,6 @@ This table maps the OCI compiler, cache, and host certificate package files.
 | :--- | :--- |
 | `pkg/oci/reference.go`, `registry.go`, `credentials.go`, `resolver.go`, `pull.go`, `push.go` | Reference parser, OCI Distribution v1.1 client, Docker credential helpers, pull/push. |
 | `pkg/oci/tar2erofs.go`, `erofs_layout.go`, `compress.go`, `limits.go` | Streaming Tar-to-EROFS compiler, 4 KiB deduplication, whiteouts, decompression caps. |
-| `pkg/oci/cache.go`, `store.go`, `blobs.go`, `archive.go`, `save.go`, `load.go`, `prune.go` | Layer cache index, blob store, OCI/Docker tar save and load, pruning. |
+| `pkg/oci/cache.go`, `fileid_*.go`, `store.go`, `blobs.go`, `archive.go`, `save.go`, `load.go`, `prune.go` | Layer cache index, file-identity verification, blob store, OCI/Docker tar save and load, pruning. |
 | `pkg/gvx/hostcerts/` & `pkg/gvx/hostcacerts.go` | Cross-platform trust-store reader and upper-layer PEM injector. |
 | Tests | `pkg/oci/*_test.go`, `pkg/gvx/hostcerts/*_test.go`, `e2e/gate_m3_test.go`, `e2e/hostcacerts_e2e_test.go`. |

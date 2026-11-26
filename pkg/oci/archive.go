@@ -107,7 +107,8 @@ func (c *LayerCache) openArchive(r io.Reader) (*archive, func() error, error) {
 		}
 	}
 
-	dec, err := openDecompressed(src, c.limits)
+	limits := c.getLimits()
+	dec, err := openDecompressed(src, limits)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -123,7 +124,7 @@ func (c *LayerCache) openArchive(r io.Reader) (*archive, func() error, error) {
 		}
 		return closeErr
 	}
-	n, err := io.Copy(tmp, newBoundedReader(dec, "decompressed archive size", c.limits.MaxImageBytes, nil))
+	n, err := io.Copy(tmp, newBoundedReader(dec, "decompressed archive size", limits.MaxImageBytes, nil))
 	if err != nil {
 		_ = cleanup()
 		return nil, nil, fmt.Errorf("oci: spool archive: %w", err)
@@ -133,6 +134,7 @@ func (c *LayerCache) openArchive(r io.Reader) (*archive, func() error, error) {
 
 // index records the offset and size of every regular file of the archive.
 func (a *archive) index() error {
+	limits := a.cache.getLimits()
 	a.members = make(map[string]archiveMember)
 	pr := &posReader{ra: a.ra, size: a.size}
 	tr := tar.NewReader(pr)
@@ -145,8 +147,8 @@ func (a *archive) index() error {
 		if err != nil {
 			return fmt.Errorf("oci: read archive tar: %w", err)
 		}
-		if entries++; entries > a.cache.limits.MaxArchiveEntries {
-			return &LimitError{What: "archive member count", Limit: a.cache.limits.MaxArchiveEntries}
+		if entries++; entries > limits.MaxArchiveEntries {
+			return &LimitError{What: "archive member count", Limit: limits.MaxArchiveEntries}
 		}
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			continue
@@ -176,7 +178,7 @@ func (a *archive) readJSON(name string) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("oci: %q is missing from the archive", name)
 	}
-	return readAllBounded(sr, "size of "+name, a.cache.limits.MaxJSONBytes)
+	return readAllBounded(sr, "size of "+name, a.cache.getLimits().MaxJSONBytes)
 }
 
 func blobMemberName(d digest.Digest) (string, error) {
@@ -290,10 +292,11 @@ func (a *archive) loadOCILayout(indexJSON []byte, targetArch string) (*ResolvedI
 // into the cache and returns their cache keys. It skips a layer that the cache
 // already holds, unless KeepBlobs is enabled and the original blob is missing.
 func (a *archive) compileOCILayers(layers []ocispec.Descriptor) ([]string, error) {
-	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
+	limits := a.cache.getLimits()
+	image := newByteBudget("decompressed image size", limits.MaxImageBytes)
 	digests := make([]string, 0, len(layers))
 	for _, l := range layers {
-		if err := checkLayerDescriptor(l, a.cache.limits); err != nil {
+		if err := checkLayerDescriptor(l, limits); err != nil {
 			return nil, err
 		}
 		name, err := blobMemberName(l.Digest)
@@ -415,7 +418,7 @@ func (a *archive) dockerSaveLayerDescriptor(name string, diffID digest.Digest) (
 		return "", "", 0, fmt.Errorf("oci: layer %q uses an unsupported compression format", name)
 	}
 	digester := digest.SHA256.Digester()
-	bounded := newBoundedReader(io.NewSectionReader(a.ra, member.off, member.size), fmt.Sprintf("layer %q size", name), a.cache.limits.MaxBlobBytes, nil)
+	bounded := newBoundedReader(io.NewSectionReader(a.ra, member.off, member.size), fmt.Sprintf("layer %q size", name), a.cache.getLimits().MaxBlobBytes, nil)
 	if _, err := io.Copy(digester.Hash(), bounded); err != nil {
 		return "", "", 0, fmt.Errorf("oci: hash compressed layer %q: %w", name, err)
 	}
@@ -427,13 +430,14 @@ func (a *archive) verifyCompressedDiffID(name string, diffID digest.Digest, imag
 	if !ok {
 		return fmt.Errorf("oci: layer %q is missing from the archive", name)
 	}
-	dec, err := openDecompressed(sr, a.cache.limits)
+	limits := a.cache.getLimits()
+	dec, err := openDecompressed(sr, limits)
 	if err != nil {
 		return err
 	}
 	defer dec.Close()
 	digester := digest.SHA256.Digester()
-	bounded := newBoundedReader(dec, fmt.Sprintf("decompressed layer %q size", name), a.cache.limits.MaxLayerBytes, image)
+	bounded := newBoundedReader(dec, fmt.Sprintf("decompressed layer %q size", name), limits.MaxLayerBytes, image)
 	if _, err := io.Copy(digester.Hash(), bounded); err != nil {
 		return fmt.Errorf("oci: verify decompressed layer %q: %w", name, err)
 	}
@@ -462,7 +466,7 @@ func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (
 		return nil, false, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", len(parsed.RootFS.DiffIDs), len(e.Layers))
 	}
 
-	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
+	image := newByteBudget("decompressed image size", a.cache.getLimits().MaxImageBytes)
 	out := &dockerSaveImage{cfgBytes: cfgBytes, cfg: cfg, diffIDs: parsed.RootFS.DiffIDs}
 	for i, layer := range e.Layers {
 		diffID := parsed.RootFS.DiffIDs[i]
@@ -514,7 +518,7 @@ func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (
 
 // loadRootfs compiles an archive that is itself a root filesystem tarball.
 func (a *archive) loadRootfs(targetArch string) (*ResolvedImage, error) {
-	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
+	image := newByteBudget("decompressed image size", a.cache.getLimits().MaxImageBytes)
 	_, stats, err := a.cache.compileAndStore(layerSpec{blobSize: -1, image: image}, io.NewSectionReader(a.ra, 0, a.size))
 	if err != nil {
 		return nil, err

@@ -408,8 +408,10 @@ func (c *LayerCache) PushImage(ctx context.Context, img Image, target Reference,
 	if err != nil {
 		return PushResult{}, fmt.Errorf("oci: cannot push %s: %w", label, err)
 	}
+	limits := c.getLimits()
+	dnsServers := c.getDNSServers()
 	for _, l := range dec.manifest.Layers {
-		if err := checkLayerDescriptor(l, c.limits); err != nil {
+		if err := checkLayerDescriptor(l, limits); err != nil {
 			return PushResult{}, fmt.Errorf("oci: cannot push %s: %w", label, err)
 		}
 	}
@@ -438,7 +440,7 @@ func (c *LayerCache) PushImage(ctx context.Context, img Image, target Reference,
 	if targetBaseURL == "" {
 		targetBaseURL = target.BaseURL()
 	}
-	dstRC, err := newRegistryClient(opts.Client, targetBaseURL, target.Repository, c.limits, c.dnsServers)
+	dstRC, err := newRegistryClient(opts.Client, targetBaseURL, target.Repository, limits, dnsServers)
 	if err != nil {
 		return PushResult{}, err
 	}
@@ -459,7 +461,7 @@ func (c *LayerCache) PushImage(ctx context.Context, img Image, target Reference,
 		if srcErr != nil {
 			return nil, fmt.Errorf("oci: cannot push %s: %w", label, srcErr)
 		}
-		rc, err := newRegistryClient(opts.Client, srcBaseURL, srcRepo, c.limits, c.dnsServers)
+		rc, err := newRegistryClient(opts.Client, srcBaseURL, srcRepo, limits, dnsServers)
 		if err != nil {
 			return nil, err
 		}
