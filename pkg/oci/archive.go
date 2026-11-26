@@ -283,7 +283,7 @@ func (a *archive) loadOCILayout(indexJSON []byte, targetArch string) (*ResolvedI
 	if err != nil {
 		return nil, err
 	}
-	return a.cache.finishImage(targetArch, cfg, "", digests)
+	return a.cache.finishImage(targetArch, cfg, "", res.Manifest.Config.Digest.String(), digests)
 }
 
 // compileOCILayers compiles the layer blobs of an OCI manifest from the archive
@@ -353,7 +353,7 @@ func (a *archive) loadDockerSave(targetArch string) (*ResolvedImage, error) {
 		if err != nil {
 			return nil, err
 		}
-		return a.cache.finishImage(targetArch, img.cfg, "", img.digests)
+		return a.cache.finishImage(targetArch, img.cfg, "", digest.FromBytes(img.cfgBytes).String(), img.digests)
 	}
 	if firstErr != nil {
 		return nil, firstErr
@@ -519,5 +519,5 @@ func (a *archive) loadRootfs(targetArch string) (*ResolvedImage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return a.cache.finishImage(targetArch, RuntimeConfig{WorkingDir: "/"}, "", []string{stats.SHA256Hex})
+	return a.cache.finishImage(targetArch, RuntimeConfig{WorkingDir: "/"}, "", "", []string{stats.SHA256Hex})
 }

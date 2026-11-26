@@ -29,7 +29,7 @@ Credentials load from `$DOCKER_CONFIG/config.json` in order: `credHelpers`, `cre
 For every resolved manifest matching the target architecture (`linux/amd64` or `linux/arm64`), `pkg/oci` executes these steps before host lockdown:
 
 1. Verify the manifest digest and compressed blob SHA-256 digests (rejecting Docker manifest schema 1).
-2. Parse `Entrypoint`, `Cmd`, `Env`, `WorkingDir`, `User`, and `ExposedPorts` from image config JSON.
+2. Parse `Entrypoint`, `Cmd`, `Env`, `WorkingDir`, `User`, `ExposedPorts`, and `Labels` from image config JSON.
 3. Stream `.tar`, `.tar.gz`, or `.tar.zst` layers through `tar2erofs.go` without extracting onto host disks.
 4. Deduplicate 4 KiB blocks with `InodeDataLayoutChunkBased`, and inline short symlinks and tails with `InodeDataLayoutFlatInline`.
 5. Convert `.wh.<name>` and `.wh..wh..opq` whiteouts into `0:0` character nodes and `trusted.overlay.opaque` xattrs.
@@ -57,7 +57,7 @@ Consult [`../compatibility.md`](../compatibility.md) for host-wide limits; the i
 
 - **Docker manifest schema 1**: Rejected with an error (matching Docker 28+).
 - **Offline `save` / `push` without `-keep-blobs`**: Requires registry network access unless original compressed blobs were retained when pulling or loading.
-- **Ignored image directives**: `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, and image labels are ignored by `rungvx run`.
+- **Ignored image directives**: `VOLUME`, `HEALTHCHECK`, and `STOPSIGNAL` are ignored; `pkg/oci` exposes `Labels` on `RuntimeConfig`, while `rungvx run` does not interpret them.
 - **Nested container CA roots**: `--host-ca-certs` modifies the direct guest rootfs only; nested `dockerd` containers require mounting `/etc/ssl/certs/ca-certificates.crt` explicitly.
 
 ---
