@@ -421,3 +421,9 @@ seam pkg/sentry/kernel/shm/shm_state_autogen.go
 # ioctls to pkg/sentry/fsimpl/devpts/vmin_xplat.go.
 seam pkg/sentry/fsimpl/devpts/master.go
 seam pkg/sentry/fsimpl/devpts/replica.go
+
+# Host NVIDIA GPU proxy files require Linux kernel driver ioctls. Non-Linux hosts use
+# nvproxy_nonlinux_xplat.go and hostdriver_nonlinux_xplat.go so nvproxy and abi/nvgpu are
+# not linked into Windows or macOS binaries.
+linux-only pkg/sentry/fsimpl/proc/nvproxy.go
+linux-only pkg/sentry/devices/nvproxy/nvconf/hostdriver_unsafe.go
