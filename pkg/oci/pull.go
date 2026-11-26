@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"runtime"
@@ -87,6 +88,9 @@ type RuntimeConfig struct {
 	// ExposedPorts holds the keys of the image ExposedPorts map, such as
 	// "80/tcp". ExposedPortList parses them.
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	// Labels holds the Labels map from the OCI image config, or nil when absent
+	// or empty.
+	Labels map[string]string `json:"Labels,omitempty"`
 }
 
 // ExposedPort is one port that an image declares with EXPOSE.
@@ -128,9 +132,13 @@ type ResolvedImage struct {
 	// ManifestDigest is the digest of the manifest or index that named the
 	// image. It is empty for images that come from an archive without one.
 	ManifestDigest string
-	LayerDigests   []string
-	LayerPaths     []string
-	LayerFiles     []*os.File
+	// ConfigDigest is the SHA-256 digest ("sha256:<hex>") for the JSON blob of
+	// the image configuration (matching Image.ID and LoadedImage.ID). It is
+	// empty for plain rootfs tarballs that carry no image config.
+	ConfigDigest string
+	LayerDigests []string
+	LayerPaths   []string
+	LayerFiles   []*os.File
 }
 
 // Close closes all pre-opened .erofs layer file handles.
@@ -186,8 +194,8 @@ func normalizeArch(arch string) string {
 	}
 }
 
-// ParseRuntimeConfig parses Entrypoint, Cmd, Env, WorkingDir, and User from an
-// OCI Image Configuration JSON payload.
+// ParseRuntimeConfig parses Entrypoint, Cmd, Env, WorkingDir, User,
+// ExposedPorts, and Labels from an OCI Image Configuration JSON payload.
 func ParseRuntimeConfig(configJSON []byte) (RuntimeConfig, error) {
 	_, cfg, err := parseImageConfigFile(configJSON, "", -1)
 	if err != nil {
@@ -240,6 +248,9 @@ func parseImageConfigFile(raw []byte, arch string, layers int) (ocispec.Image, R
 		WorkingDir:   parsed.Config.WorkingDir,
 		User:         parsed.Config.User,
 		ExposedPorts: parsed.Config.ExposedPorts,
+	}
+	if len(parsed.Config.Labels) > 0 {
+		cfg.Labels = maps.Clone(parsed.Config.Labels)
 	}
 	if cfg.WorkingDir == "" {
 		cfg.WorkingDir = "/"
@@ -527,11 +538,11 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 	if err := cache.storeTag(baseURL, repository, reference, targetArch, dgstStr); err != nil {
 		return nil, err
 	}
-	return cache.finishImage(targetArch, cfg, dgstStr, digests)
+	return cache.finishImage(targetArch, cfg, dgstStr, res.Manifest.Config.Digest.String(), digests)
 }
 
 // finishImage opens the verified layer handles of a finished image.
-func (c *LayerCache) finishImage(arch string, cfg RuntimeConfig, manifestDigest string, digests []string) (*ResolvedImage, error) {
+func (c *LayerCache) finishImage(arch string, cfg RuntimeConfig, manifestDigest, configDigest string, digests []string) (*ResolvedImage, error) {
 	paths := make([]string, len(digests))
 	for i, d := range digests {
 		p, err := c.LayerPath(d)
@@ -548,6 +559,7 @@ func (c *LayerCache) finishImage(arch string, cfg RuntimeConfig, manifestDigest 
 		Architecture:   arch,
 		Config:         cfg,
 		ManifestDigest: manifestDigest,
+		ConfigDigest:   configDigest,
 		LayerDigests:   digests,
 		LayerPaths:     paths,
 		LayerFiles:     handles,

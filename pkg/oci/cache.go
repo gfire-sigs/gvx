@@ -821,26 +821,11 @@ func (c *LayerCache) loadImageByDigest(baseURL, repository, dgst, arch string) (
 		return nil, err
 	}
 
-	paths := make([]string, 0, len(dec.layerHex))
-	for _, hexStr := range dec.layerHex {
-		p, ok := c.HasLayer(hexStr)
-		if !ok {
-			return nil, ErrNotCached
-		}
-		paths = append(paths, p)
-	}
-	handles, err := c.OpenLayerHandles(dec.layerHex)
+	img, err := c.finishImage(arch, dec.cfg, dgst, dec.manifest.Config.Digest.String(), dec.layerHex)
 	if err != nil {
 		return nil, ErrNotCached
 	}
-	return &ResolvedImage{
-		Architecture:   arch,
-		Config:         dec.cfg,
-		ManifestDigest: dgst,
-		LayerDigests:   dec.layerHex,
-		LayerPaths:     paths,
-		LayerFiles:     handles,
-	}, nil
+	return img, nil
 }
 
 // ImportCachedImage copies the cached image of reference from src into this

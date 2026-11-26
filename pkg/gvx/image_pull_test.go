@@ -226,6 +226,10 @@ func TestResolveImageWithPolicyUsesALoadedImageWhenTheRegistryDeniesIt(t *testin
 				t.Fatalf("seed ResolveImage failed: %v", err)
 			}
 			want := seed.ManifestDigest
+			wantConfigDigest := seed.ConfigDigest
+			if !strings.HasPrefix(wantConfigDigest, "sha256:") || wantConfigDigest == want {
+				t.Fatalf("seed ConfigDigest = %q (ManifestDigest = %q), want distinct sha256: digest", wantConfigDigest, want)
+			}
 			_ = seed.Close()
 			deny.Store(true)
 
@@ -237,6 +241,9 @@ func TestResolveImageWithPolicyUsesALoadedImageWhenTheRegistryDeniesIt(t *testin
 			defer img.Close()
 			if img.ManifestDigest != want {
 				t.Errorf("digest = %q, want the cached %q", img.ManifestDigest, want)
+			}
+			if img.ConfigDigest != wantConfigDigest {
+				t.Errorf("ConfigDigest = %q, want the cached %q", img.ConfigDigest, wantConfigDigest)
 			}
 			if got := warnings.String(); strings.Count(got, "\n") != 1 || !strings.Contains(got, "using the cached image") {
 				t.Errorf("warnings = %q, want one line", got)
