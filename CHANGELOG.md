@@ -2,6 +2,25 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.26.10002026112300] - 2026-11-26
+
+This release adds opt-in contained host symbolic links for `hostfs` bind mounts, enforces symlink containment across mutating directory and link operations, and adds APIs to inspect virtual symbolic links.
+
+### Features
+
+- **Opt-in contained host symbolic links for `hostfs` (`pkg/sentry/fsimpl/hostfs`, `pkg/gvx`, `pkg/rungvx`)** (#267, #278):
+  - Adds `hostfs.SymlinkMode` (`SymlinkVirtual` default, `SymlinkContained` opt-in), `OpenOptions.SymlinkMode`, `Config.WorkspaceSymlinkMode`, `Mount.SymlinkMode`, and `--mount ...,symlinks=virtual|contained`.
+  - Materializes eligible contained relative guest symbolic links on Linux and macOS via `symlinkat(2)` on verified parent directory handles; falls back transparently to `.gvx_meta` for non-eligible targets and on Windows.
+  - Persists optional `UID`, `GID`, and extended attributes for native host symbolic links in identity-keyed `.gvx_meta` records while reading target strings from the host OS.
+  - Adds `Workspace.VirtualSymlinks()` and `hostfs.VirtualSymlinksAt(metaPath, workspaceDir)` to list guest symbolic links stored in `.gvx_meta`.
+
+### Reliability and Containment
+
+- **Serialized containment enforcement across `rename`, `RENAME_EXCHANGE`, `RENAME_WHITEOUT`, and `link` (`pkg/sentry/fsimpl/hostfs`)** (#278):
+  - Serializes non-virtual host mutations under `.gvx_meta.lock` with fresh parent pin verification and live entry checks while preserving same-parent O(1) syscall budgets.
+  - Durably demotes visible host symbolic links to `.gvx_meta` before unlinking when a move or exchange would break containment, keeping open `O_PATH` descriptors and VFS dentries live.
+  - Rejects directory moves and exchanges with `EACCES` when hidden or shadowed subtrees contain unsafe host symbolic links.
+
 ## [v0.25.10002026112300] - 2026-11-26
 
 This release adds embedder-supplied L3 packet links, external `hostfs` metadata directories, image label metadata, and persistent EROFS layer verification caching. It also fixes a memory-manager closure escape under `-race` and a Windows `systrap` poisoned-island stall.
