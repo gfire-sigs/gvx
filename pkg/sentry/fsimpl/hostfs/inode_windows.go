@@ -869,6 +869,10 @@ func parseSymlinkReparse(data []byte) (string, error) {
 	return strings.ReplaceAll(target, `\`, "/"), nil
 }
 
+func (h *hostRoot) symlinkAt(hostDirHandle, string, string) error {
+	return errHostUnsupported
+}
+
 func (h *hostRoot) readlink(rel string) (string, error) {
 	if rel == "." {
 		return "", hostError("readlink", rel, windows.ERROR_NOT_A_REPARSE_POINT)
@@ -881,6 +885,22 @@ func (h *hostRoot) readlink(rel string) (string, error) {
 		return "", err
 	}
 	defer closeHandle(handle)
+	return readlinkHandle(handle, rel)
+}
+
+func (h *hostRoot) readlinkAt(dir hostDirHandle, name string) (string, error) {
+	if err := validateWindowsName(name); err != nil {
+		return "", hostError("readlink", name, err)
+	}
+	handle, err := openAt(windows.Handle(dir), name, windows.FILE_READ_ATTRIBUTES, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
+	if err != nil {
+		return "", hostError("readlink", name, err)
+	}
+	defer closeHandle(handle)
+	return readlinkHandle(handle, name)
+}
+
+func readlinkHandle(handle windows.Handle, rel string) (string, error) {
 	buf := make([]byte, windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
 	var returned uint32
 	if err := windows.DeviceIoControl(handle, windows.FSCTL_GET_REPARSE_POINT, nil, 0,

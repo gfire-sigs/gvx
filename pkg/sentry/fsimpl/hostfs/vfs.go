@@ -17,6 +17,7 @@ package hostfs
 import (
 	"errors"
 	"hash/fnv"
+	"strings"
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -462,16 +463,107 @@ func (i *inode) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) e
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(e.attr.Mode), nil, auth.KUID(e.attr.UID), auth.KGID(e.attr.GID))
 }
 
+func (i *inode) isVirtual() bool {
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	return i.virtual
+}
+
+func (i *inode) identity() (virtual bool, id hostID) {
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	return i.virtual, i.id
+}
+
+func (i *inode) inoNum() uint64 {
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	return i.ino
+}
+
 func (i *inode) matches(e entry) bool {
 	if i.fs.ws.single != "" {
 		// The only inode is the root, which stands for the name of the bound
 		// file. A host editor can replace the file under that name.
 		return !e.virtual && e.info.kind == i.kind
 	}
-	if i.virtual != e.virtual {
+	virtual, id := i.identity()
+	if virtual != e.virtual {
 		return false
 	}
-	return i.virtual || (i.id == e.info.id && i.kind == e.info.kind)
+	return virtual || (id == e.info.id && i.kind == e.info.kind)
+}
+
+// demoteToVirtualLocked converts a live host-symlink inode into a virtual
+// symlink inode in place without detaching its dentry. Callers hold fs.mu.
+func (fs *filesystem) demoteToVirtualLocked(ino *inode, rel string, e entry) {
+	virtual, oldID := ino.identity()
+	if !virtual && fs.inodes[oldID] == ino {
+		delete(fs.inodes, oldID)
+	}
+	ino.attrMu.Lock()
+	ino.virtual = true
+	ino.id = hostID{}
+	ino.ino = virtualInoFor(rel)
+	ino.cur = e
+	ino.metaValid = false
+	ino.metaSeq++
+	ino.attrMu.Unlock()
+}
+
+// rebindHostSymlinkLocked updates a cached host-symlink inode after rollback
+// re-materialized the link with a new host inode identity. Callers hold fs.mu.
+func (fs *filesystem) rebindHostSymlinkLocked(ino *inode, e entry) {
+	virtual, oldID := ino.identity()
+	if !virtual && fs.inodes[oldID] == ino {
+		delete(fs.inodes, oldID)
+	}
+	ino.attrMu.Lock()
+	ino.virtual = false
+	ino.id = e.info.id
+	ino.ino = e.info.id.ino
+	ino.cur = e
+	ino.metaValid = false
+	ino.metaSeq++
+	ino.attrMu.Unlock()
+}
+
+// applyDemotedSymlinksLocked updates any cached symlink dentry/inode whose
+// backing representation changed during a rename or exchange. Callers hold fs.mu.
+func (fs *filesystem) applyDemotedSymlinksLocked(demoted []demotedSymlink) {
+	for _, ds := range demoted {
+		d := fs.findCachedDentryLocked(ds.rel)
+		if d == nil || !d.inode.isSymlink() {
+			continue
+		}
+		if ds.entry.virtual {
+			fs.demoteToVirtualLocked(d.inode, ds.rel, ds.entry)
+		} else {
+			fs.rebindHostSymlinkLocked(d.inode, ds.entry)
+		}
+	}
+}
+
+// findCachedDentryLocked walks cached children from fs.root to rel without
+// making any host call. Callers hold fs.mu.
+func (fs *filesystem) findCachedDentryLocked(rel string) *dentry {
+	if fs.root == nil || rel == "" {
+		return nil
+	}
+	if rel == "." {
+		return fs.root
+	}
+	d := fs.root
+	for _, part := range strings.Split(rel, "/") {
+		if d.children == nil {
+			return nil
+		}
+		d = d.children[part]
+		if d == nil {
+			return nil
+		}
+	}
+	return d
 }
 
 // syncData writes back mapped file data and reports any earlier write-back
@@ -502,7 +594,10 @@ func virtualInoFor(rel string) uint64 {
 // inodeForLocked returns the inode for e, creating it when no dentry names
 // the host file yet.
 func (fs *filesystem) inodeForLocked(e entry, rel string) *inode {
-	if !e.virtual {
+	// Symbolic links do not share file data, locks, or mappings, and keeping
+	// one inode per symlink dentry prevents a demotion from mutating a
+	// pre-existing hard-linked sibling symlink.
+	if !e.virtual && e.info.kind != hostKindSymlink {
 		// An unlinked inode never names a file of the host again. The host
 		// can reuse its inode number once nothing holds the file open.
 		if ino, ok := fs.inodes[e.info.id]; ok && ino.kind == e.info.kind && !ino.unlinked.Load() {
@@ -520,7 +615,7 @@ func (fs *filesystem) inodeForLocked(e entry, rel string) *inode {
 	}
 	if e.virtual {
 		ino.ino = virtualInoFor(rel)
-	} else {
+	} else if e.info.kind != hostKindSymlink {
 		fs.inodes[e.info.id] = ino
 	}
 	if fs.liveInodes == nil {
@@ -626,8 +721,9 @@ func (fs *filesystem) destroyLocked(d *dentry) {
 	ino.refs--
 	if ino.refs == 0 {
 		delete(fs.liveInodes, ino)
-		if !ino.virtual && fs.inodes[ino.id] == ino {
-			delete(fs.inodes, ino.id)
+		virtual, id := ino.identity()
+		if !virtual && fs.inodes[id] == ino {
+			delete(fs.inodes, id)
 		}
 		ino.destroy()
 	}

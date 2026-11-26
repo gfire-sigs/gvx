@@ -545,7 +545,9 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 		}
 		ino.id = e.info.id
 		ino.update(e)
-		refreshedInodes[ino.id] = ino
+		if ino.kind != hostKindSymlink {
+			refreshedInodes[ino.id] = ino
+		}
 	}
 	fs.mu.Lock()
 	fs.inodes = refreshedInodes

@@ -133,8 +133,9 @@ type entry struct {
 	info hostInfo
 	// virtual marks a symlink that exists only in .gvx_meta.
 	virtual bool
-	// key is the key under which a record of the entry lives, whether or not
-	// one exists. It is zero for a host symbolic link, which has no record.
+	// key is the metadata key under which a record of the entry lives, whether
+	// or not one exists. Host symlinks use their identity or path key so
+	// UID, GID, and xattrs persist while targets come from the host OS.
 	key recKey
 }
 
@@ -167,8 +168,9 @@ type dirNames struct {
 // symlink-safe traversal and POSIX metadata persistence.
 type Workspace struct {
 	// mu protects closed and orders the guest calls. Lock order:
-	// Workspace.mu, then pinMu, then nameMu. filesystem.mu is always taken
-	// before Workspace.mu. The metaTable has its own lock, which is a leaf.
+	// filesystem.mu, then Workspace.mu, then Workspace.flushMu, then
+	// .gvx_meta.lock, then pinMu, then nameMu. The metaTable has its own lock,
+	// which is a leaf.
 	mu            sync.RWMutex
 	rootPath      string
 	root          *os.Root
@@ -285,6 +287,9 @@ type Workspace struct {
 	// for a directory workspace. It never changes after openWorkspace
 	// returns. See single_file.go.
 	single string
+	// symlinkMode selects whether eligible guest symlinks materialize on the
+	// host filesystem. Never changes after initWorkspace returns.
+	symlinkMode SymlinkMode
 }
 
 type workspaceOptions struct {
@@ -327,6 +332,8 @@ type workspaceOptions struct {
 	metaDir string
 	// metaDirResolved reports that metaDir was already validated by openWorkspace.
 	metaDirResolved bool
+	// symlinkMode configures how guest-created symbolic links are stored.
+	symlinkMode SymlinkMode
 }
 
 // OpenOptions configures OpenWorkspaceWithOptions.
@@ -342,6 +349,12 @@ type OpenOptions struct {
 	// When MetaDir resolves to an external directory, .gvx_meta* names are not
 	// hidden inside the workspace namespace.
 	MetaDir string
+
+	// SymlinkMode selects how guest-created symbolic links are stored. Empty
+	// defaults to SymlinkVirtual. SymlinkContained materializes eligible
+	// relative symlinks on Unix hosts and falls back to virtual records for
+	// non-eligible targets and on Windows. Unsupported for single-file mounts.
+	SymlinkMode SymlinkMode
 
 	// RestoreMode preserves unlinked ephemeral backing files during startup so
 	// CompleteRestore can reattach open unlinked inodes.
@@ -384,6 +397,7 @@ func OpenWorkspaceWithOptions(hostPath string, opts OpenOptions) (*Workspace, er
 		coalesce:    defaultCoalesceWindow,
 		restoreMode: opts.RestoreMode,
 		metaDir:     opts.MetaDir,
+		symlinkMode: opts.SymlinkMode,
 	})
 }
 
@@ -506,6 +520,9 @@ func resolveExternalMetaDir(hostAbs, metaDir string) (string, error) {
 }
 
 func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Workspace, error) {
+	if _, err := parseSymlinkMode(opts.symlinkMode); err != nil {
+		return nil, err
+	}
 	absPath, err := filepath.Abs(hostPath)
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: resolve workspace path %q: %w", hostPath, err)
@@ -516,6 +533,9 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	if fi, serr := os.Stat(absPath); serr == nil && fi.Mode().IsRegular() {
 		if opts.metaDir != "" {
 			return nil, fmt.Errorf("hostfs: MetaDir is unsupported for single-file mount %q", hostPath)
+		}
+		if opts.symlinkMode != "" {
+			return nil, fmt.Errorf("hostfs: SymlinkMode is unsupported for single-file mount %q", hostPath)
 		}
 		if pinDir, single, err = splitSingleFile(absPath); err != nil {
 			return nil, err
@@ -599,6 +619,13 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 	if hostOS == "" {
 		hostOS = runtime.GOOS
 	}
+	symlinkMode, err := parseSymlinkMode(opts.symlinkMode)
+	if err != nil {
+		return nil, err
+	}
+	if single != "" && opts.symlinkMode != "" {
+		return nil, fmt.Errorf("hostfs: SymlinkMode is unsupported for single-file mount %q", absPath)
+	}
 	w := &Workspace{
 		rootPath:         absPath,
 		root:             root,
@@ -627,6 +654,7 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 		journal:          metaJournal{slack: opts.journalSlack, tempName: newMetaTempName()},
 		dirTimes:         make(map[recKey]int64),
 		single:           single,
+		symlinkMode:      symlinkMode,
 		orphans:          orphanCollector{dirsPerStep: opts.orphanDirsPerStep},
 	}
 	if opts.metaDir != "" {
@@ -735,6 +763,11 @@ func (w *Workspace) HostPath() string {
 // metadata lives in the workspace root directory.
 func (w *Workspace) MetaDir() string {
 	return w.metaDirPath
+}
+
+// SymlinkMode returns the effective symbolic link storage mode of the workspace.
+func (w *Workspace) SymlinkMode() SymlinkMode {
+	return w.symlinkMode
 }
 
 // ReadOnly reports whether the workspace mount disallows mutations.

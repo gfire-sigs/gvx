@@ -305,9 +305,34 @@ func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 	return e, p, err
 }
 
+// effectiveSymlinkAttr layers virtual ownership, change time, and xattrs from
+// .gvx_meta over a host symbolic link while always keeping S_IFLNK | 0777 and
+// the target string read from the host OS.
+func (w *Workspace) effectiveSymlinkAttr(rel string, info hostInfo, target string) POSIXAttr {
+	a := POSIXAttr{
+		Mode:    linux.S_IFLNK | 0o777,
+		Symlink: target,
+	}
+	if r := w.recOf(rel, info); r != nil {
+		m := r.attr
+		a.UID = m.UID
+		a.GID = m.GID
+		a.Ctime = m.Ctime
+		a.Xattrs = m.Xattrs
+	}
+	return a
+}
+
 // entryFromInfo builds the effective state of rel from its host metadata.
 // Callers hold w.mu.
 func (w *Workspace) entryFromInfo(rel string, info hostInfo) (entry, error) {
+	return w.entryFromInfoAt(rel, "", nil, info)
+}
+
+// entryFromInfoAt builds the effective state of rel from its host metadata,
+// reading symbolic links through pin when non-nil to avoid a path walk.
+// Callers hold w.mu.
+func (w *Workspace) entryFromInfoAt(rel, leaf string, pin *dirPin, info hostInfo) (entry, error) {
 	switch info.kind {
 	case hostKindDir, hostKindRegular:
 		attr := w.effectiveAttr(rel, info)
@@ -316,18 +341,27 @@ func (w *Workspace) entryFromInfo(rel string, info hostInfo) (entry, error) {
 		}
 		return entry{attr: attr, info: info, key: w.keyOf(rel, info)}, nil
 	case hostKindSymlink:
-		hostRel, err := w.hostPath(rel)
-		if err != nil {
-			return entry{}, err
+		var (
+			target string
+			err    error
+		)
+		if pin != nil && leaf != "" {
+			target, err = w.host.readlinkAt(pin.h, leaf)
+		} else {
+			var hostRel string
+			hostRel, err = w.hostPath(rel)
+			if err == nil {
+				target, err = w.host.readlink(hostRel)
+			}
 		}
-		target, err := w.host.readlink(hostRel)
 		if err != nil {
 			return entry{}, err
 		}
 		if validateSymlinkTarget(rel, target) != nil {
 			return entry{}, ErrPathTraversal
 		}
-		return entry{attr: POSIXAttr{Mode: linux.S_IFLNK | 0o777, Symlink: target}, info: info}, nil
+		attr := w.effectiveSymlinkAttr(rel, info, target)
+		return entry{attr: attr, info: info, key: w.keyOf(rel, info)}, nil
 	default:
 		return entry{}, ErrPathTraversal
 	}
@@ -501,7 +535,7 @@ func (w *Workspace) classifyDirEntryLocked(pin *dirPin, rel, hostDir string, dir
 		if w.meta.has(dirKey.withName(guest)) {
 			return dirListing{}, false, false
 		}
-		target, err := w.host.readlink(hostChild(hostDir, e.name))
+		target, err := w.host.readlinkAt(pin.h, e.name)
 		if err != nil || validateSymlinkTarget(full, target) != nil {
 			return dirListing{}, false, false
 		}

@@ -63,9 +63,16 @@ Flushes batch every 250 ms (or immediately on `fsync`/`O_SYNC`), compacting abov
 
 Callers can isolate `.gvx_meta`, `.gvx_meta.lock`, and staging files outside the workspace directory via `OpenOptions.MetaDir` (`Mount.MetaDir` or `Config.WorkspaceMetaDir`). `MetaDir` must already exist as a non-root directory disjoint from every mounted host path, and `hostlockdown` authorizes it before lockdown. When `MetaDir` is external, `.gvx_meta*` names stay ordinary workspace files, and `ReadMetaAt(metaPath, workspaceDir)` resolves identity-keyed records against the workspace tree.
 
-### 2.6 Special Files, Extended Attributes, and Overlay Support
+### 2.6 Special Files, Symbolic Links, Extended Attributes, and Overlay Support
 
 Sockets, FIFOs, and device nodes create empty host placeholders with `.gvx_meta` records; active socket endpoints stay in Sentry memory. On Linux, `user.*` xattrs write to host files while `trusted.*`, `security.*`, and macOS/Windows xattrs stay in `.gvx_meta` (`4 KiB`/inode, `64 KiB`/value max). Both `hostfs` and `ext4lite` act as overlay upper/lower layers, and `fallocate` supports `0`, `KEEP_SIZE`, and `PUNCH_HOLE` (`FSCTL_SET_ZERO_DATA` with zero-fill fallback).
+
+`OpenOptions.SymlinkMode` (`Mount.SymlinkMode`, `Config.WorkspaceSymlinkMode`, or `--mount ...,symlinks=virtual|contained`) controls how guest-created symbolic links are persisted:
+
+- **`SymlinkVirtual` (default)**: Stores every guest-created symbolic link only in `.gvx_meta`. The host filesystem receives no link entry.
+- **`SymlinkContained` (opt-in)**: Materializes relative guest symbolic links on Linux and macOS via `symlinkat(2)` on a verified parent directory handle. Eligible targets must be non-empty, avoid NUL, backslashes, and colons, and place every `..` before ordinary components. Ordinary components must strictly outnumber leading `..` segments and stay within parent depth. Targets must avoid reserved metadata or internal names, uncontained host symlinks, and `NameCodec` escapes or case-folding collisions. Non-eligible targets and Windows hosts fall back transparently to `.gvx_meta`.
+- **Containment across `rename` and `RENAME_EXCHANGE`**: `hostfs` verifies host symlinks and directories under `.gvx_meta.lock` before moving them. Directories holding unsafe hidden or shadowed host symlinks fail with `EACCES`. Visible host symlinks that cannot stay contained at the destination demote durably to `.gvx_meta` before unlinking the host link.
+- **Metadata and inspection**: Host symlinks store optional `uid`, `gid`, and extended attributes in identity-keyed `.gvx_meta` records while reading target strings from the host OS. `Workspace.VirtualSymlinks()` and `VirtualSymlinksAt(metaPath, workspaceDir)` return the sorted virtual symbolic links in `.gvx_meta`.
 
 ---
 
@@ -88,7 +95,7 @@ This table maps the `hostfs` package files and test suites.
 | :--- | :--- |
 | `hostfs.go`, `workspace_*.go`, `vfs*.go`, `dirpin.go`, `handle_open.go`, `handle_registry.go` | VFS2 filesystem, pinned directory handle cache, lookup cache, Windows handle registry. |
 | `inode_*.go`, `openat_*.go`, `openfd_*.go`, `posix_rename_windows.go`, `rename_flags*.go`, `allocate*.go`, `punch_windows.go` | OS-specific handle-scoped open, rename (`RENAME_EXCHANGE`, `RENAME_WHITEOUT`), `fallocate`, hole punch. |
-| `codec.go`, `clutter.go`, `names.go`, `caps*.go`, `single_file*.go` | Volume probing, `~gvx~` name codec, clutter hiding, single-file bind mount mode. |
+| `codec.go`, `clutter.go`, `names.go`, `caps*.go`, `single_file*.go`, `symlink_rules.go`, `symlink_demote.go` | Volume probing, `~gvx~` name codec, clutter hiding, single-file bind mode, symlink containment and demotion. |
 | `meta_*.go`, `metastore*.go`, `durability.go`, `orphans.go`, `unlinked.go` | Format v4 identity-keyed `.gvx_meta` journal, v3/JSON upgrade, multi-sandbox locking, collector. |
 | `watcher*.go`, `watchlimit*.go`, `special_node.go`, `xattr*.go`, `regular_file.go`, `save_restore.go` | Lockdown-safe `inotify` bridge, watch budget, special nodes, xattrs, `chunkcache` `mmap`, C/R. |
 | Tests | `pkg/sentry/fsimpl/hostfs/*_test.go`, `e2e/gate_m4_test.go`, `e2e/filemount_e2e_test.go`, `e2e/mounts_e2e_test.go`, `scripts/pjdfstest`. |

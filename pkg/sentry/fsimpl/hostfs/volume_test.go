@@ -404,6 +404,22 @@ func (v *volumeHost) linkAt(oldDir hostDirHandle, oldName string, newDir hostDir
 	return v.hostBackend.linkAt(oldDir, oldStored, newDir, newStored)
 }
 
+func (v *volumeHost) symlinkAt(dir hostDirHandle, name, target string) error {
+	_, s, err := v.storedIn(dir, name, true)
+	if err != nil {
+		return err
+	}
+	return v.hostBackend.symlinkAt(dir, s, target)
+}
+
+func (v *volumeHost) readlinkAt(dir hostDirHandle, name string) (string, error) {
+	_, s, err := v.storedIn(dir, name, false)
+	if err != nil {
+		return "", err
+	}
+	return v.hostBackend.readlinkAt(dir, s)
+}
+
 // volumeOptions builds the options of a workspace on a modeled volume.
 func volumeOptions(caps WorkspaceCaps, fold, verified, win bool) workspaceOptions {
 	return workspaceOptions{

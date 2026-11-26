@@ -137,7 +137,7 @@ These flags match standard Docker CLI options where `rungvx`'s single-process mo
 | `--auto-publish` | Publish guest TCP listeners and NAT `DNAT` ports on `127.0.0.1` (or `--auto-publish-addr`). Static `-p` keeps precedence. |
 | `--auto-publish-addr IP` | Override the host bind IP literal for `--auto-publish` (requires NAT mode). |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, single regular file, or named volume. Creates missing host directories before lockdown. |
-| `--mount type=bind\|volume\|tmpfs\|overlay,...` | Docker mount syntax (`src`, `dst`, `readonly`, `driver`, `size`, `ephemeral`, `upper`, `tmpfs-size`). A `src` with a path separator names a `.ext4` file. |
+| `--mount type=bind\|volume\|tmpfs\|overlay,...` | Docker mount syntax (`src`, `dst`, `readonly`, `symlinks`, `driver`, `size`, `ephemeral`, `upper`, `tmpfs-size`). A `src` with a path separator names a `.ext4` file. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount an in-memory `tmpfs` directory. |
 | `--read-only` | Mount the guest root filesystem read-only (incompatible with `-rootfs-volume`). |
 | `-m`, `--memory SIZE` | Cap guest memory (`b`, `k`, `m`, `g`, `t`; minimum `6m`). |

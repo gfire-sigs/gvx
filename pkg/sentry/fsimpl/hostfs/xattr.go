@@ -100,7 +100,7 @@ func (w *Workspace) nativeXattrFor(ino *inode, name string) bool {
 // nativeXattrKind reports whether the native store can hold the attributes of
 // ino: a regular file or a directory of a host that supports them.
 func (w *Workspace) nativeXattrKind(ino *inode) bool {
-	return w.caps.NativeXattr && !ino.virtual && (ino.kind == hostKindRegular || ino.kind == hostKindDir)
+	return w.caps.NativeXattr && !ino.isVirtual() && (ino.kind == hostKindRegular || ino.kind == hostKindDir)
 }
 
 // metaXattrsLocked returns the attributes that the meta store holds for t.
@@ -120,7 +120,7 @@ func (w *Workspace) metaXattrsLocked(t xattrTarget) map[string][]byte {
 // symbolic link and an object that keys on its path read the path of the call.
 // Callers hold w.mu.
 func (w *Workspace) targetKeyLocked(t xattrTarget) recKey {
-	if t.ino.virtual {
+	if t.ino.isVirtual() {
 		k, _ := w.nameKeyLocked(t.rel)
 		return k
 	}
@@ -155,10 +155,6 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 	if err != nil {
 		return translateLookupError(err)
 	}
-	if e.isSymlink() && !e.virtual {
-		// A host symbolic link has no record, and a record would hide it.
-		return linuxerr.EOPNOTSUPP
-	}
 	if err := w.checkMetaRoom(e.key); err != nil {
 		return translateHostError(err)
 	}
@@ -166,6 +162,11 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 	attr := e.attr
 	attr.Xattrs = next
 	attr.Ctime = now
+	if e.isSymlink() && !e.virtual {
+		// Host symlink metadata records keep Symlink empty so the link target
+		// always comes from the host OS rather than .gvx_meta.
+		attr.Symlink = ""
+	}
 	w.putRec(e.key, attr, t.rel)
 	// The snapshot of the inode follows the record, so an open descriptor of
 	// a file that the guest unlinks later still sees the attributes.

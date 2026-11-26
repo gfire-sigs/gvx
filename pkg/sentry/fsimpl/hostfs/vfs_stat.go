@@ -262,7 +262,7 @@ func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 		UID:       e.attr.UID,
 		GID:       e.attr.GID,
 		Mode:      uint16(e.attr.Mode),
-		Ino:       i.ino,
+		Ino:       i.inoNum(),
 		Size:      uint64(info.size),
 		Blocks:    blocks,
 		Atime:     statxTimestamp(info.atime),

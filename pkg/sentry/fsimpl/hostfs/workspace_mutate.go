@@ -34,46 +34,59 @@ func (w *Workspace) Rename(oldRel, newRel string) error {
 	if err != nil {
 		return err
 	}
-	return w.rename(cleanOld, cleanNew)
+	_, err = w.rename(cleanOld, cleanNew)
+	return err
 }
 
-// rename moves oldRel to newRel with POSIX semantics.
-func (w *Workspace) rename(oldRel, newRel string) error {
+// rename moves oldRel to newRel with POSIX semantics and returns any host
+// symbolic links that were demoted to virtual entries (including on partial
+// rollback errors).
+func (w *Workspace) rename(oldRel, newRel string) ([]demotedSymlink, error) {
 	w.maybeRefreshMeta(false)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.renameLocked(oldRel, newRel)
+	return w.renameLocked(oldRel, newRel, false, nil, 0)
 }
 
-// renameLocked is rename for a caller that holds w.mu for writing.
-func (w *Workspace) renameLocked(oldRel, newRel string) error {
+// renameLocked is rename for a caller that holds w.mu for writing. When
+// haveLock is true, the caller already holds w.flushMu and an exclusive lock
+// on lf. extraMetaBytes reserves room for caller-owned metadata writes (such
+// as a RENAME_WHITEOUT device record).
+func (w *Workspace) renameLocked(oldRel, newRel string, haveLock bool, lf *os.File, extraMetaBytes int64) ([]demotedSymlink, error) {
 	if err := w.checkWritableLocked(oldRel, newRel); err != nil {
-		return err
+		return nil, err
 	}
 	if oldRel == "." || newRel == "." {
-		return fs.ErrInvalid
-	}
-	src, err := w.lookupLocked(oldRel)
-	if err != nil {
-		return err
+		return nil, fs.ErrInvalid
 	}
 	if oldRel == newRel {
-		return nil
+		if _, err := w.lookupLocked(oldRel); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
-	if src.isDir() && strings.HasPrefix(newRel, oldRel+"/") {
-		return errInvalidMove
+	// Fast path for renaming a virtual symlink without taking .gvx_meta.lock:
+	// moving a virtual record never creates or moves a host symlink or host dir.
+	if w.meta.hasNames() {
+		if k, r := w.virtualAtLocked(oldRel); r != nil {
+			return nil, w.renameVirtualSrcLocked(oldRel, newRel, virtualEntry(k, r))
+		}
 	}
+	return w.renameHostEntryLocked(oldRel, newRel, haveLock, lf, extraMetaBytes)
+}
+
+// renameVirtualSrcLocked renames a virtual symlink src from oldRel to newRel.
+// Callers hold w.mu for writing.
+func (w *Workspace) renameVirtualSrcLocked(oldRel, newRel string, src entry) error {
 	if err := w.checkParentDirLocked(newRel); err != nil {
 		return err
 	}
-
 	dst, dstProbe, dstErr := w.lookupProbeLocked(newRel)
 	dstExists := dstErr == nil
 	if dstErr != nil && !errors.Is(dstErr, fs.ErrNotExist) {
 		return dstErr
 	}
-
-	srcPath, dstPath, dstLeaf, err := w.resolveRenameHostPathsLocked(oldRel, newRel, src, dstProbe, dstExists)
+	_, dstPath, dstLeaf, err := w.resolveRenameHostPathsLocked(oldRel, newRel, src, dstProbe, dstExists)
 	if err != nil {
 		return err
 	}
@@ -81,22 +94,266 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 	if err != nil || noop {
 		return err
 	}
-
-	if err := w.executeRenameOnHostLocked(oldRel, newRel, srcPath, dstPath, dstLeaf, src, dst, dstExists); err != nil {
-		return err
+	oldParent, oldName := splitParent(oldRel)
+	newParent, newName := splitParent(newRel)
+	if dstExists && !dst.virtual {
+		if err := w.host.unlink(dstPath); err != nil {
+			return err
+		}
+		w.removeDirNameLocked(newParent, newName, dstLeaf)
 	}
+	w.dropAltTree(newRel)
+	w.moveAltTree(oldRel, newRel)
+	w.dropAlt(oldParent, oldName)
 
 	now := time.Now().UnixNano()
 	w.moveRecordLocked(src, dst, dstExists, oldRel, newRel, now)
-	if src.virtual {
-		oldParent, _ := splitParent(oldRel)
-		newParent, _ := splitParent(newRel)
-		w.touchDirLocked(oldParent, now)
-		if !dstExists || dst.virtual {
-			w.touchDirLocked(newParent, now)
-		}
+	w.touchDirLocked(oldParent, now)
+	if !dstExists || dst.virtual {
+		w.touchDirLocked(newParent, now)
 	}
 	return nil
+}
+
+// probeRenameSourceLocked resolves oldRel through pin and constructs the live
+// entry via entryFromInfoAt (rejecting hostKindOther, handling hostKindSpecial,
+// and validating host symlink targets). Callers hold w.mu and .gvx_meta.lock.
+func (w *Workspace) probeRenameSourceLocked(oldParent, oldName, oldRel string, pin *dirPin) (entry, string, error) {
+	probe, err := w.locateIn(oldParent, oldName, pin, func(leaf string) (hostInfo, error) {
+		return w.host.lstatAt(pin.h, leaf)
+	})
+	if err != nil {
+		return entry{}, "", err
+	}
+	if !probe.found || probe.hidden {
+		return entry{}, "", probe.missingError(oldRel)
+	}
+	src, err := w.entryFromInfoAt(oldRel, probe.leaf, pin, probe.info)
+	if err != nil {
+		return entry{}, "", err
+	}
+	return src, probe.leaf, nil
+}
+
+// renameHostEntryLocked executes every non-virtual rename under the
+// cross-sandbox metadata lock, holding one parent pin across lstatAt and
+// renameAt so concurrent peer sandboxes or pin sweeps cannot swap a regular
+// file into a host symlink or directory between lookup and renameAt.
+func (w *Workspace) renameHostEntryLocked(oldRel, newRel string, haveLock bool, lockedLF *os.File, extraMetaBytes int64) ([]demotedSymlink, error) {
+	var demoted []demotedSymlink
+	err := w.withMetaExclusiveOrReuseLocked(haveLock, lockedLF, func(lf *os.File) error {
+		if serr := w.syncMetaIfChangedLocked(lf); serr != nil {
+			return serr
+		}
+		if w.meta.hasNames() {
+			if k, r := w.virtualAtLocked(oldRel); r != nil {
+				if verr := w.renameVirtualSrcLocked(oldRel, newRel, virtualEntry(k, r)); verr != nil {
+					return verr
+				}
+				_ = w.flushMetaLocked(lf)
+				return nil
+			}
+		}
+
+		oldParent, oldName := splitParent(oldRel)
+		newParent, newName := splitParent(newRel)
+
+		var oldPin *dirPin
+		var perr error
+		if oldParent == newParent {
+			oldPin, perr = w.acquirePin(oldParent)
+		} else {
+			oldPin, perr = w.acquireFreshPin(oldParent)
+		}
+		if perr != nil {
+			return perr
+		}
+		defer func() {
+			if oldPin != nil {
+				w.releasePin(oldPin)
+			}
+		}()
+
+		src, srcLeaf, err := w.probeRenameSourceLocked(oldParent, oldName, oldRel, oldPin)
+		if err != nil {
+			return err
+		}
+
+		// When a same-parent rename turns out to target a host symlink or
+		// directory, upgrade to a freshly verified parent pin from root and
+		// re-probe before checking containment.
+		if oldParent == newParent && (src.isSymlink() || src.isDir()) {
+			w.releasePin(oldPin)
+			oldPin = nil
+			oldPin, perr = w.acquireFreshPin(oldParent)
+			if perr != nil {
+				return perr
+			}
+			src, srcLeaf, err = w.probeRenameSourceLocked(oldParent, oldName, oldRel, oldPin)
+			if err != nil {
+				return err
+			}
+		}
+
+		if src.isDir() && strings.HasPrefix(newRel, oldRel+"/") {
+			return errInvalidMove
+		}
+		if oldParent != newParent {
+			if err := w.checkParentDirLocked(newRel); err != nil {
+				return err
+			}
+		}
+
+		dst, dstProbe, dstErr := w.lookupProbeLocked(newRel)
+		dstExists := dstErr == nil
+		if dstErr != nil && !errors.Is(dstErr, fs.ErrNotExist) {
+			return dstErr
+		}
+		srcPath, dstPath, dstLeaf, err := w.resolveRenameHostPathsLocked(oldRel, newRel, src, dstProbe, dstExists)
+		if err != nil {
+			return err
+		}
+		noop, err := w.validateRenameDestinationLocked(newRel, dstPath, src, dst, dstExists)
+		if err != nil || noop {
+			return err
+		}
+
+		// Fast O(1) path for same-parent non-symlink, non-directory renames:
+		// oldPin was held continuously from probeRenameSourceLocked through
+		// renameAt under .gvx_meta.lock.
+		if oldParent == newParent && !src.isSymlink() && !src.isDir() {
+			if rerr := w.host.renameAt(oldPin.h, srcLeaf, oldPin.h, dstLeaf); rerr != nil {
+				return rerr
+			}
+			w.finishNonDirHostRenameLocked(oldParent, oldName, newParent, newName, oldRel, newRel, srcLeaf, dstLeaf, src, dst, dstExists)
+			if dstExists && dst.virtual {
+				_ = w.flushMetaLocked(lf)
+			}
+			return nil
+		}
+
+		var badDstLeaf map[string]struct{}
+		if dstLeaf != newName {
+			badDstLeaf = map[string]struct{}{newRel: {}}
+		}
+
+		switch src.info.kind {
+		case hostKindSymlink:
+			safe := !(dstExists && dst.virtual && w.dstVirtualHostCollidesLocked(newRel))
+			if safe {
+				_, safe = w.hostSymlinkSafeAtLocked(newRel, dstLeaf, src.attr.Symlink, nil, badDstLeaf)
+			}
+			if !safe {
+				var derr error
+				demoted, derr = w.demoteSingleSymlinkRenameLocked(lf, oldRel, newRel, srcPath, dstLeaf, src, dst, dstExists, extraMetaBytes)
+				return derr
+			}
+			newPin, perr := w.acquireFreshPin(newParent)
+			if perr != nil {
+				return perr
+			}
+			defer w.releasePin(newPin)
+			if rerr := w.host.renameAt(oldPin.h, srcLeaf, newPin.h, dstLeaf); rerr != nil {
+				return rerr
+			}
+			w.finishNonDirHostRenameLocked(oldParent, oldName, newParent, newName, oldRel, newRel, srcLeaf, dstLeaf, src, dst, dstExists)
+			if dstExists && dst.virtual {
+				_ = w.flushMetaLocked(lf)
+			}
+			return nil
+
+		case hostKindDir:
+			overrides := map[string]string{newRel: oldRel, oldRel: ""}
+			cands, serr := w.scanDirHostSymlinksLocked(oldRel, newRel, overrides, badDstLeaf)
+			if serr != nil {
+				return serr
+			}
+			demotedRecs, partial, derr := w.demoteCandidatesInPlaceLocked(lf, cands, extraMetaBytes)
+			if derr != nil {
+				demoted = partial
+				return derr
+			}
+
+			w.closeSubtreeHandlesLocked(oldRel)
+			if dstExists && dst.isDir() && !dst.virtual {
+				w.closeSubtreeHandlesLocked(newRel)
+			}
+			newPin, perr := w.acquireFreshPin(newParent)
+			if perr != nil {
+				demoted = w.rollbackDemotedLocked(lf, demotedRecs)
+				return perr
+			}
+			defer w.releasePin(newPin)
+
+			if dstExists && dst.isDir() && !dst.virtual && !hostRenameReplacesDir {
+				if rerr := w.host.rmdirAt(newPin.h, dstLeaf); rerr != nil {
+					demoted = w.rollbackDemotedLocked(lf, demotedRecs)
+					return rerr
+				}
+			}
+			quiesced := w.handles.quiesce(oldRel)
+			if rerr := w.host.renameAt(oldPin.h, srcLeaf, newPin.h, dstLeaf); rerr != nil {
+				_ = quiesced.finish(false, "")
+				demoted = w.rollbackDemotedLocked(lf, demotedRecs)
+				return rerr
+			}
+			w.removeDirNameLocked(oldParent, oldName, srcLeaf)
+			w.addDirNameLocked(newParent, newName, dstLeaf)
+			w.dropDirNamesLocked(oldRel)
+			if dstExists && dst.isDir() {
+				w.dropDirNamesLocked(newRel)
+			}
+			w.dropAltTree(newRel)
+			w.moveAltTree(oldRel, newRel)
+			w.dropAlt(oldParent, oldName)
+			w.setAlt(newParent, newName, dstLeaf)
+			_ = quiesced.finish(true, newRel)
+
+			w.moveRecordLocked(src, dst, dstExists, oldRel, newRel, time.Now().UnixNano())
+			if len(demotedRecs) > 0 || (dstExists && dst.virtual) {
+				_ = w.flushMetaLocked(lf)
+			}
+			if len(demotedRecs) > 0 {
+				demoted = w.finalizeDemotedLocked(demotedRecs)
+			}
+			return nil
+
+		case hostKindRegular, hostKindSpecial:
+			newPin, perr := w.acquireFreshPin(newParent)
+			if perr != nil {
+				return perr
+			}
+			defer w.releasePin(newPin)
+			if rerr := w.host.renameAt(oldPin.h, srcLeaf, newPin.h, dstLeaf); rerr != nil {
+				return rerr
+			}
+			w.finishNonDirHostRenameLocked(oldParent, oldName, newParent, newName, oldRel, newRel, srcLeaf, dstLeaf, src, dst, dstExists)
+			if dstExists && dst.virtual {
+				_ = w.flushMetaLocked(lf)
+			}
+			return nil
+
+		default:
+			return ErrPathTraversal
+		}
+	})
+	return demoted, err
+}
+
+// finishNonDirHostRenameLocked updates caches, handles, and metadata after a
+// non-directory host rename succeeds. Callers hold w.mu for writing.
+func (w *Workspace) finishNonDirHostRenameLocked(oldParent, oldName, newParent, newName, oldRel, newRel, srcLeaf, dstLeaf string, src, dst entry, dstExists bool) {
+	w.removeDirNameLocked(oldParent, oldName, srcLeaf)
+	w.addDirNameLocked(newParent, newName, dstLeaf)
+	w.dropAltTree(newRel)
+	w.moveAltTree(oldRel, newRel)
+	w.dropAlt(oldParent, oldName)
+	w.setAlt(newParent, newName, dstLeaf)
+	if dstExists {
+		w.handles.detach(newRel)
+	}
+	w.handles.moveFile(oldRel, newRel)
+	w.moveRecordLocked(src, dst, dstExists, oldRel, newRel, time.Now().UnixNano())
 }
 
 // resolveRenameHostPathsLocked computes the host paths and destination leaf for a rename.
@@ -150,66 +407,6 @@ func (w *Workspace) validateRenameDestinationLocked(newRel, dstPath string, src,
 	return false, nil
 }
 
-// executeRenameOnHostLocked performs the host rename or unlink and updates directory name caches and handles.
-func (w *Workspace) executeRenameOnHostLocked(oldRel, newRel, srcPath, dstPath, dstLeaf string, src, dst entry, dstExists bool) error {
-	oldParent, oldName := splitParent(oldRel)
-	newParent, newName := splitParent(newRel)
-	var quiesced *quiescedTree
-
-	if src.virtual {
-		if dstExists && !dst.virtual {
-			if err := w.host.unlink(dstPath); err != nil {
-				return err
-			}
-			w.removeDirNameLocked(newParent, newName, dstLeaf)
-		}
-	} else {
-		if src.isDir() {
-			w.closeSubtreeHandlesLocked(oldRel)
-		}
-		if dstExists && dst.isDir() && !dst.virtual {
-			w.closeSubtreeHandlesLocked(newRel)
-		}
-		if dstExists && dst.isDir() && !dst.virtual && !hostRenameReplacesDir {
-			if err := w.host.rmdir(dstPath); err != nil {
-				return err
-			}
-		}
-		if src.isDir() {
-			quiesced = w.handles.quiesce(oldRel)
-		}
-		srcLeaf := leafOf(srcPath)
-		if err := w.renameHostLocked(oldRel, newRel, srcLeaf, dstLeaf); err != nil {
-			_ = quiesced.finish(false, "")
-			return err
-		}
-		w.removeDirNameLocked(oldParent, oldName, srcLeaf)
-		w.addDirNameLocked(newParent, newName, dstLeaf)
-		if src.isDir() {
-			w.dropDirNamesLocked(oldRel)
-		}
-		if dstExists && dst.isDir() {
-			w.dropDirNamesLocked(newRel)
-		}
-	}
-
-	w.dropAltTree(newRel)
-	w.moveAltTree(oldRel, newRel)
-	w.dropAlt(oldParent, oldName)
-	if !src.virtual {
-		w.setAlt(newParent, newName, dstLeaf)
-		if src.isDir() {
-			_ = quiesced.finish(true, newRel)
-		} else {
-			if dstExists {
-				w.handles.detach(newRel)
-			}
-			w.handles.moveFile(oldRel, newRel)
-		}
-	}
-	return nil
-}
-
 // moveRecordLocked updates the metadata table after a rename. Callers hold w.mu for writing.
 func (w *Workspace) moveRecordLocked(src, dst entry, dstExists bool, oldRel, newRel string, now int64) {
 	if dstExists {
@@ -246,50 +443,99 @@ func (w *Workspace) moveRecordLocked(src, dst entry, dstExists bool, oldRel, new
 	}
 }
 
-// link creates a hard link. The new path shares the host file and its
-// attributes with oldRel.
+// link creates a hard link under the cross-sandbox metadata lock, verifying
+// the live source entry through a continuously held parent pin so a peer
+// sandbox cannot replace oldRel with a host symlink before linkAt executes.
 func (w *Workspace) link(oldRel, newRel string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.checkWritableLocked(oldRel, newRel); err != nil {
 		return err
 	}
-	src, err := w.lookupLocked(oldRel)
-	if err != nil {
-		return err
-	}
-	if src.isDir() || src.virtual || src.isSymlink() {
+	if oldRel == "." {
 		return errNotPermitted
 	}
-	if err := w.checkParentDirLocked(newRel); err != nil {
-		return err
+	if newRel == "." {
+		return fs.ErrExist
 	}
-	oldParent, oldName := splitParent(oldRel)
-	srcLeaf, err := w.hostLeaf(oldParent, oldName)
-	if err != nil {
-		return err
-	}
-	if src.key.isPath() {
-		if err := w.checkMetaRoom(recKey{}); err != nil {
+	return w.withMetaExclusiveLocked(func(lf *os.File) error {
+		if serr := w.syncMetaIfChangedLocked(lf); serr != nil {
+			return serr
+		}
+		if w.meta.hasNames() {
+			if _, vr := w.virtualAtLocked(oldRel); vr != nil {
+				return errNotPermitted
+			}
+		}
+		oldParent, oldName := splitParent(oldRel)
+		newParent, newName := splitParent(newRel)
+
+		var oldPin *dirPin
+		var err error
+		if oldParent == newParent {
+			oldPin, err = w.acquirePin(oldParent)
+		} else {
+			oldPin, err = w.acquireFreshPin(oldParent)
+		}
+		if err != nil {
 			return err
 		}
-	}
-	_, leaf, err := w.createTargetLocked(newRel)
-	if err != nil {
-		return err
-	}
-	if err := w.pinnedPairLocked(oldRel, newRel, func(oldDir, newDir hostDirHandle) error {
-		return w.host.linkAt(oldDir, srcLeaf, newDir, leaf)
-	}); err != nil {
-		return err
-	}
-	if src.key.isPath() {
-		w.putRec(recKey{kind: kindPath, path: newRel}, src.attr, newRel)
-	}
-	parent, name := splitParent(newRel)
-	w.setAlt(parent, name, leaf)
-	w.addDirNameLocked(parent, name, leaf)
-	return nil
+		defer w.releasePin(oldPin)
+
+		probe, err := w.locateIn(oldParent, oldName, oldPin, func(leaf string) (hostInfo, error) {
+			return w.host.lstatAt(oldPin.h, leaf)
+		})
+		if err != nil {
+			return err
+		}
+		if !probe.found || probe.hidden {
+			return probe.missingError(oldRel)
+		}
+		if probe.info.kind == hostKindOther {
+			return ErrPathTraversal
+		}
+		if probe.info.kind != hostKindRegular {
+			return errNotPermitted
+		}
+		src, err := w.entryFromInfoAt(oldRel, probe.leaf, oldPin, probe.info)
+		if err != nil {
+			return err
+		}
+		if src.isDir() || src.virtual || src.isSymlink() {
+			return errNotPermitted
+		}
+		srcLeaf := probe.leaf
+
+		newPin := oldPin
+		if oldParent != newParent {
+			if err := w.checkParentDirLocked(newRel); err != nil {
+				return err
+			}
+			newPin, err = w.acquireFreshPin(newParent)
+			if err != nil {
+				return err
+			}
+			defer w.releasePin(newPin)
+		}
+		if src.key.isPath() {
+			if err := w.checkMetaRoom(recKey{}); err != nil {
+				return err
+			}
+		}
+		_, leaf, err := w.createTargetLocked(newRel)
+		if err != nil {
+			return err
+		}
+		if err := w.host.linkAt(oldPin.h, srcLeaf, newPin.h, leaf); err != nil {
+			return err
+		}
+		if src.key.isPath() {
+			w.putRec(recKey{kind: kindPath, path: newRel}, src.attr, newRel)
+		}
+		w.setAlt(newParent, newName, leaf)
+		w.addDirNameLocked(newParent, newName, leaf)
+		return nil
+	})
 }
 
 // Unlink removes a non-directory from the workspace using POSIX delete
@@ -478,31 +724,6 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 		}
 	}
 	return nil
-}
-
-// renameHostLocked renames the stored entry srcLeaf of the guest path oldRel
-// to dstLeaf below the directory of newRel, through the pinned handles of
-// both directories. Callers hold w.mu for writing.
-func (w *Workspace) renameHostLocked(oldRel, newRel, srcLeaf, dstLeaf string) error {
-	return w.pinnedPairLocked(oldRel, newRel, func(oldDir, newDir hostDirHandle) error {
-		return w.host.renameAt(oldDir, srcLeaf, newDir, dstLeaf)
-	})
-}
-
-// pinnedPairLocked runs fn with the pinned handles of the directories that
-// hold oldRel and newRel. Callers hold w.mu.
-func (w *Workspace) pinnedPairLocked(oldRel, newRel string, fn func(oldDir, newDir hostDirHandle) error) error {
-	oldPin, err := w.parentPinLocked(oldRel)
-	if err != nil {
-		return err
-	}
-	defer w.releasePin(oldPin)
-	newPin, err := w.parentPinLocked(newRel)
-	if err != nil {
-		return err
-	}
-	defer w.releasePin(newPin)
-	return fn(oldPin.h, newPin.h)
 }
 
 // unlinkHostLocked removes the stored entry leaf of the guest path rel from

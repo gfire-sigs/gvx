@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
 
 // checkWritableLocked rejects mutations of read-only workspaces and of the
@@ -33,7 +34,7 @@ func (w *Workspace) checkWritableLocked(rels ...string) error {
 	if w.readOnly {
 		return ErrReadOnly
 	}
-	if w.closed {
+	if w.closed || w.closing {
 		return os.ErrClosed
 	}
 	for _, rel := range rels {
@@ -382,8 +383,23 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 		return nil
 	}
 	if e.isSymlink() {
-		// A host symlink has no record to hold ownership.
-		return errNotPermitted
+		// Symbolic links always report mode 0777 on Linux; ignore mode
+		// (including ClearPrivs masks from lchown) and keep Symlink empty in
+		// host-symlink records so the target always comes from the host OS.
+		if uid != nil {
+			cur.UID = *uid
+		}
+		if gid != nil {
+			cur.GID = *gid
+		}
+		cur.Mode = linux.S_IFLNK | 0o777
+		cur.Symlink = ""
+		cur.Ctime = now
+		if err := w.checkMetaRoom(e.key); err != nil {
+			return err
+		}
+		w.putRec(e.key, cur, rel)
+		return nil
 	}
 	if mode != nil {
 		cur.Mode = cur.Mode&linux.S_IFMT | *mode&0o7777
@@ -435,10 +451,23 @@ func (w *Workspace) propagateLinkAttrLocked(skip string, id hostID, attr POSIXAt
 	return nil
 }
 
-// Symlink records a guest symbolic link in .gvx_meta. The host never receives
-// a link. The target may be absolute or climb above the workspace, because the
-// Sentry VFS resolves it in the guest namespace. Only an empty target and a
-// target with a NUL byte fail.
+// isSymlinkFallbackError reports whether a symlinkAt error means the host
+// cannot store target natively and hostfs should fall back to a virtual record.
+func isSymlinkFallbackError(err error) bool {
+	if errors.Is(err, errHostUnsupported) {
+		return true
+	}
+	errno, ok := hostErrno(err)
+	if !ok {
+		return false
+	}
+	return errno == linuxerr.ENAMETOOLONG || errno == linuxerr.EILSEQ || errno == linuxerr.EOPNOTSUPP
+}
+
+// Symlink creates a guest symbolic link at linkRelPath. In default
+// SymlinkVirtual mode, the link lives only in .gvx_meta. In SymlinkContained
+// mode on Unix hosts, eligible contained targets materialize via symlinkat(2),
+// while all other targets and Windows hosts fall back to .gvx_meta.
 func (w *Workspace) Symlink(target, linkRelPath string) error {
 	cleanLink, err := CleanRelativePath(linkRelPath)
 	if err != nil {
@@ -463,10 +492,18 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 	if err := w.checkParentDirLocked(rel); err != nil {
 		return err
 	}
-	if err := w.checkMetaRoom(recKey{}); err != nil {
+	_, leaf, err := w.createTargetLocked(rel)
+	if err != nil {
 		return err
 	}
-	if _, _, err := w.createTargetLocked(rel); err != nil {
+	if _, ok := w.canMaterializeSymlinkLocked(rel, leaf, target); ok {
+		if err := w.materializeSymlinkLocked(target, rel, leaf, uid, gid); err == nil {
+			return nil
+		} else if !errors.Is(err, errFallbackVirtual) {
+			return err
+		}
+	}
+	if err := w.checkMetaRoom(recKey{}); err != nil {
 		return err
 	}
 	key, err := w.nameKeyLocked(rel)
@@ -486,6 +523,56 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 	parent, _ := splitParent(rel)
 	w.touchDirLocked(parent, now)
 	return nil
+}
+
+// materializeSymlinkLocked creates a contained host symbolic link under the
+// cross-sandbox metadata lock using a freshly validated parent directory pin.
+// Callers hold w.mu for writing.
+func (w *Workspace) materializeSymlinkLocked(target, rel, leaf string, uid, gid uint32) error {
+	if uid != 0 || gid != 0 {
+		if err := w.checkMetaRoom(recKey{}); err != nil {
+			return err
+		}
+	}
+	return w.withMetaExclusiveLocked(func(lf *os.File) error {
+		if err := w.syncMetaIfChangedLocked(lf); err != nil {
+			return err
+		}
+		if _, r := w.virtualAtLocked(rel); r != nil {
+			return fs.ErrExist
+		}
+		if _, ok := w.canMaterializeSymlinkLocked(rel, leaf, target); !ok {
+			return errFallbackVirtual
+		}
+		pin, err := w.parentFreshPinLocked(rel)
+		if err != nil {
+			return err
+		}
+		defer w.releasePin(pin)
+		if err := w.host.symlinkAt(pin.h, leaf, target); err != nil {
+			if isSymlinkFallbackError(err) && len(leaf) <= maxFilenameLen {
+				return errFallbackVirtual
+			}
+			return err
+		}
+		if uid != 0 || gid != 0 {
+			info, lerr := w.host.lstatAt(pin.h, leaf)
+			if lerr != nil {
+				_ = w.host.unlinkAt(pin.h, leaf)
+				return lerr
+			}
+			key := w.keyOf(rel, info)
+			w.putRec(key, POSIXAttr{
+				Mode: linux.S_IFLNK | 0o777,
+				UID:  uid,
+				GID:  gid,
+			}, rel)
+		}
+		parent, name := splitParent(rel)
+		w.setAlt(parent, name, leaf)
+		w.addDirNameLocked(parent, name, leaf)
+		return nil
+	})
 }
 
 func validateSymlinkTarget(linkRelPath, target string) error {

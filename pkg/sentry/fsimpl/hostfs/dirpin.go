@@ -80,11 +80,23 @@ type dirPin struct {
 func (w *Workspace) acquirePin(rel string) (*dirPin, error) {
 	w.pinMu.Lock()
 	defer w.pinMu.Unlock()
-	return w.acquirePinLocked(rel)
+	return w.acquirePinLocked(rel, false)
 }
 
-// acquirePinLocked is acquirePin for a caller that holds w.pinMu.
-func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
+// acquireFreshPin walks and verifies every ancestor from the workspace root to
+// rel without relying on cacheTTL. Callers that serialize cross-sandbox
+// symlink or rename containment checks use it so a peer sandbox's directory
+// rename cannot redirect a cached directory descriptor to a shallower depth.
+// The caller MUST call releasePin.
+func (w *Workspace) acquireFreshPin(rel string) (*dirPin, error) {
+	w.pinMu.Lock()
+	defer w.pinMu.Unlock()
+	return w.acquirePinLocked(rel, true)
+}
+
+// acquirePinLocked is acquirePin for a caller that holds w.pinMu. When fresh
+// is true, every ancestor is validated against its parent on disk.
+func (w *Workspace) acquirePinLocked(rel string, fresh bool) (*dirPin, error) {
 	if w.pinsClosed {
 		return nil, os.ErrClosed
 	}
@@ -93,13 +105,13 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 	}
 	now := w.nowNano()
 	p := w.pins[rel]
-	if p != nil && now-p.checkedAt < int64(cacheTTL) {
+	if !fresh && p != nil && now-p.checkedAt < int64(cacheTTL) {
 		p.refs++
 		p.lastUse = now
 		return p, nil
 	}
 	parentRel, name := splitParent(rel)
-	parent, err := w.acquirePinLocked(parentRel)
+	parent, err := w.acquirePinLocked(parentRel, fresh)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +375,7 @@ func (w *Workspace) lookupIn(parentRel, name string) (entry, error) {
 		return entry{}, p.missingError(rel)
 	}
 	w.checkPin(rel, p.info.id, p.info.kind == hostKindDir)
-	return w.entryFromInfo(rel, p.info)
+	return w.entryFromInfoAt(rel, p.leaf, pin, p.info)
 }
 
 // lookupPath is lookup through pinned handles. The path "." names the
@@ -451,4 +463,11 @@ func (w *Workspace) locateLocked(rel string) (hostProbe, error) {
 func (w *Workspace) parentPinLocked(rel string) (*dirPin, error) {
 	parent, _ := splitParent(rel)
 	return w.acquirePin(parent)
+}
+
+// parentFreshPinLocked returns a freshly verified pinned handle of the
+// directory that holds rel. The caller MUST call releasePin and holds w.mu.
+func (w *Workspace) parentFreshPinLocked(rel string) (*dirPin, error) {
+	parent, _ := splitParent(rel)
+	return w.acquireFreshPin(parent)
 }
