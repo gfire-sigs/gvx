@@ -6,10 +6,10 @@ require (
 	cloud.google.com/go/auth v0.24.5
 	cloud.google.com/go/auth/oauth2adapt v0.3.1
 	cloud.google.com/go/storage v1.71.1
-	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c
-	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29
+	github.com/BurntSushi/toml v1.6.0
+	github.com/Microsoft/go-winio v0.6.4
 	github.com/cenkalti/backoff v2.2.1+incompatible
-	github.com/cilium/ebpf v0.17.3
+	github.com/cilium/ebpf v0.22.0
 	github.com/containerd/cgroups/v3 v3.1.3
 	github.com/containerd/console v1.0.5
 	github.com/containerd/containerd/api v1.12.0
@@ -25,15 +25,15 @@ require (
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/creack/pty v1.1.24
 	github.com/distribution/reference v0.6.0
-	github.com/godbus/dbus/v5 v5.1.0
-	github.com/gofrs/flock v0.8.0
+	github.com/godbus/dbus/v5 v5.2.4
+	github.com/gofrs/flock v0.13.2
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/btree v1.1.3
-	github.com/google/subcommands v1.0.2-0.20190508160503-636abe8753b8
+	github.com/google/subcommands v1.2.0
 	github.com/klauspost/compress v1.20.5
-	github.com/mattbaird/jsonpatch v0.0.0-20171005235357-81af80346b1a
-	github.com/moby/sys/capability v0.4.0
-	github.com/mohae/deepcopy v0.0.0-20170308212314-bb9b5e7adda9
+	github.com/mattbaird/jsonpatch v0.0.0-20240118010651-0ba75a80ca38
+	github.com/moby/sys/capability v0.5.0
+	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.3.0
@@ -49,7 +49,7 @@ require (
 	golang.org/x/text v0.44.0
 	golang.org/x/time v0.16.0
 	golang.org/x/tools v0.53.0
-	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
+	golang.zx2c4.com/wireguard v0.0.0-20261024220952-b3bc704ef0ee
 	google.golang.org/api v0.317.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
@@ -78,6 +78,7 @@ require (
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.39.1-0.20260819172001-e6e3fd93e4be // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
+	github.com/evanphx/json-patch v0.5.2 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.4 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
