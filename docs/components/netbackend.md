@@ -8,16 +8,16 @@ This specification describes `pkg/netbackend` alongside guest overlay packages `
 
 Guest containers expect full Linux networking, including raw sockets, bridges, legacy `iptables`, VXLAN, and WireGuard interfaces. Standard host virtual-network drivers require administrator rights or kernel extensions that break single-process sandboxing.
 
-`pkg/netbackend` attaches gVisor's pure-Go `pkg/tcpip` (Netstack) directly to unprivileged host sockets or an in-memory `wireguard-go` endpoint. All guest packet switching, NAT state tracking, and netfilter chains execute inside Go memory without host TUN devices.
+`pkg/netbackend` attaches gVisor's pure-Go `pkg/tcpip` (Netstack) directly to unprivileged host sockets, an in-memory `wireguard-go` endpoint, or a caller-supplied framed packet stream. All guest packet switching, NAT state tracking, and netfilter chains execute inside Go memory without host TUN devices.
 
-The table below contrasts the two driverless attachment tracks supported by `netbackend`.
+The table below contrasts the three driverless attachment tracks supported by `netbackend`.
 
-| Attribute | Track A: NAT and Port Forwarder (`-net=nat`, default) | Track B: In-Memory WireGuard (`-net=wg`) |
-| :--- | :--- | :--- |
-| **Attachment layer** | L2 in-memory `pipe` link to a peer host Netstack (`tcp.NewForwarder`, `udp.NewForwarder`) | L3 `wgtun.Endpoint` directly attached to `wireguard-go` in memory |
-| **Host transport** | Unprivileged host Go `net` sockets (IOCP, `kqueue`, `epoll`) | One pre-bound unprivileged host UDP socket (`:0`) |
-| **Host/LAN reachability** | Permitted by default (`10.0.2.2` maps to `127.0.0.1`; optional `-isolate-lan`) | Cryptographically isolated; all egress exits via WireGuard |
-| **Inbound exposure** | Static `-p` (TCP, UDP, ranges up to 1,024, `unix:`), `--auto-publish`, `port add`, `port-forward` | Tunnel peers only |
+| Attribute | Track A: NAT and Port Forwarder (`-net=nat`, default) | Track B: In-Memory WireGuard (`-net=wg`) | Track C: Embedder Packet Link (`NetModeLink`) |
+| :--- | :--- | :--- | :--- |
+| **Attachment layer** | L2 in-memory `pipe` link to a peer host Netstack (`tcp.NewForwarder`, `udp.NewForwarder`) | L3 `wgtun.Endpoint` directly attached to `wireguard-go` in memory | L3 `channel.Endpoint` bridged over a caller-supplied framed stream (`Config.LinkConn`) |
+| **Host transport** | Unprivileged host Go `net` sockets (IOCP, `kqueue`, `epoll`) | One pre-bound unprivileged host UDP socket (`:0`) | One pre-connected stream (`net.Conn`) carrying 4-byte length-prefixed IP packets |
+| **Host/LAN reachability** | Permitted by default (`10.0.2.2` maps to `127.0.0.1`; optional `-isolate-lan`) | Cryptographically isolated; all egress exits via WireGuard | Blocked by `hostlockdown` (`AllowOutboundNet: false`); peer controls all routing |
+| **Inbound exposure** | Static `-p` (TCP, UDP, ranges up to 1,024, `unix:`), `--auto-publish`, `port add`, `port-forward` | Tunnel peers only | External link peer only |
 
 ---
 
@@ -54,6 +54,12 @@ Inside the guest kernel, `gvx` implements the full overlay stack required by `do
 - **In-guest `vxlan` links (`pkg/tcpip/link/vxlan`)**: RFC 7348 Ethernet encapsulation with flow-hashed UDP source ports, FDB learning (300 s ageing), `IFLA_VXLAN_LIMIT` (`maxaddr`), and `AF_BRIDGE` netlink FDB control.
 - **IP sets (`pkg/ipset`)**: Implements `hash:ip`, `hash:net`, `hash:ip,port`, `hash:net,port`, `hash:ip,port,ip`, `hash:ip,port,net`, `hash:net,net`, `bitmap:port`, and `list:set` over `NETLINK_NETFILTER` plus `-m set`/`-j SET`.
 
+### 2.5 Track C: Embedder Packet Link (`NetModeLink`)
+
+In `NetModeLink` mode, `packet_link.go` attaches guest `eth0` (`channel.Endpoint` with `stack.CapabilityNone` so transport checksums stay valid on the wire) to a pre-connected caller-supplied stream (`Config.LinkConn`). Frames carry a 4-byte big-endian length prefix followed by one raw IPv4 or IPv6 packet up to `65,535` bytes (`net.link.queue_length` defaults to `512`).
+
+Before `hostlockdown.Apply()`, `NewPacketLinkStack` validates that the connection is not a datagram socket, probes descending socket buffers, and sets `TCP_NODELAY` when supported. `hostlockdown` runs with `AllowOutboundNet: false`, blocking arbitrary host sockets while allowing the pre-connected stream. `QuiesceForSave` stops inbound injection, stops the `channel.Endpoint` reader, and drains queued outbound packets without interrupting an active stream write. `AttachRestoredStackWithConfig` reapplies saved `eth0` settings onto a new `LinkConn` during `Restore`.
+
 ---
 
 ## 3. Component Limits
@@ -78,5 +84,6 @@ This table maps the networking packages, implementation files, and test suites.
 | `pkg/netbackend/` (`port_forwarder.go`, `dynamic_forwarder.go`, `dynamic_control.go`, `dns_relay.go`, `dns_servers_*.go`) | Static `-p`, `--auto-publish`, runtime `port add/rm`, DNS relay and resolver discovery. |
 | `pkg/netbackend/` (`bandwidth.go`, `nat_bandwidth_packets.go`, `nat_policy.go`, `nat_policy_packets.go`) | Per-sandbox token buckets and immutable host NAT firewall policy. |
 | `pkg/netbackend/` (`wireguard_endpoint.go`, `wireguard_bind.go`, `wireguard_tun.go`) & `pkg/tcpip/link/wgtun/` | Track B `-net=wg` tunnel and shared `wireguard-go` link endpoint. |
+| `pkg/netbackend/` (`packet_link.go`, `packet_link_sock_*.go`) | Track C `NetModeLink` length-prefixed L3 packet stream bridge. |
 | `pkg/tcpip/link/vxlan/`, `pkg/ipset/`, `pkg/sentry/socket/netlink/genetlink/` | Guest VXLAN device, IP sets, Generic Netlink router, and in-guest WireGuard family. |
 | Tests | `pkg/netbackend/*_test.go`, `pkg/ipset/*_test.go`, `e2e/nat_*`, `e2e/wireguard_*`, `e2e/vxlan_*`, `e2e/ipset_*`. |

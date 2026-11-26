@@ -223,6 +223,7 @@ Durations follow Go syntax (`250ms`, `30s`); sizes accept byte counts or binary 
 | `net.forward.dynamic_poll_interval` | duration | 200ms | 20ms to 10s | time | Pause between two scans of guest listeners and iptables NAT rules when auto-publish is on. |
 | `net.wg.queue_length` | int | 512 | 1 to 1048576 | packets | Number of packets that the eth0 queue holds in the wg network mode. |
 | `net.wg.resolve_timeout` | duration | 10s | 100ms to 10m | time | Time that the sandbox waits to resolve the host name of the WireGuard peer endpoint. |
+| `net.link.queue_length` | int | 512 | 16 to 65536 | packets | Number of packets that the eth0 queue holds in the link network mode. |
 | `memory.guard.poll_interval` | duration | 5ms | 1ms to 10s | time | Time between two readings of the guest memory use when the sandbox has a memory limit. |
 | `memory.guard.host_poll_interval` | duration | 100ms | 1ms to 10s | time | Time between two readings of the guest memory use when the limit is the RAM of the host. |
 | `memory.cgroup.poll_interval` | duration | 5ms | 1ms to 10s | time | Shortest time between two checks of memory.max while a cgroup uses half of its limit. |

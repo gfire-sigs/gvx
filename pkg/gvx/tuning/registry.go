@@ -76,6 +76,9 @@ var (
 	// WGResolveTimeout bounds the lookup of the peer endpoint.
 	WGResolveTimeout = defineDuration("net.wg.resolve_timeout", 10*time.Second, 100*time.Millisecond, 10*time.Minute,
 		"Time that the sandbox waits to resolve the host name of the WireGuard peer endpoint.")
+	// LinkQueueLength is the length of the packet queue of eth0 in the network mode "link".
+	LinkQueueLength = defineInt("net.link.queue_length", 512, 16, 65536, "packets",
+		"Number of packets that the eth0 queue holds in the link network mode.")
 
 	// MemoryGuardPollInterval is the poll interval of the memory limit of the sandbox.
 	MemoryGuardPollInterval = defineMutableDuration("memory.guard.poll_interval", 5*time.Millisecond, time.Millisecond, 10*time.Second,

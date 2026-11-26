@@ -61,31 +61,33 @@ type Sandbox struct {
 	fallbackFrom error
 	memFile      *pgalloc.MemoryFile
 	// runMemFile retains consumed backing memory until the platform closes.
-	runMemFile         *pgalloc.MemoryFile
-	resolvedImg        *oci.ResolvedImage
-	layerHandles       []*fd.HostHandle
-	layerDigests       []string
-	layerBytes         uint64
-	workspace          *hostfs.Workspace
-	workspaces         []*hostfs.Workspace
-	volumes            []*ext4lite.Volume
-	rootVolume         *ext4lite.Volume
-	rootUpperExisting  bool
-	hasEphemeralVolume bool
-	cappedVolumes      []cappedVolumeBinding
-	restoreBackingRO   map[string]bool
-	mounts             []sandboxMount
-	sandboxExtHandles  []int64
-	serveMounts        []sandboxServeMount
-	netStack           *stack.Stack
-	natForwarder       *netbackend.NATForwarder
-	portForwarder      *netbackend.PortForwarder
-	bandwidth          *netbackend.BandwidthShaper
-	natPolicy          *netbackend.NATPolicy
-	natTunnelGroup     *natTunnelGroup // protected by mu
-	shapedNATTunnels   int             // protected by mu
-	wgEndpoint         *netbackend.WireGuardEndpoint
-	wgPeerPort         uint16
+	runMemFile          *pgalloc.MemoryFile
+	resolvedImg         *oci.ResolvedImage
+	layerHandles        []*fd.HostHandle
+	layerDigests        []string
+	layerBytes          uint64
+	workspace           *hostfs.Workspace
+	workspaces          []*hostfs.Workspace
+	volumes             []*ext4lite.Volume
+	rootVolume          *ext4lite.Volume
+	rootUpperExisting   bool
+	hasEphemeralVolume  bool
+	cappedVolumes       []cappedVolumeBinding
+	restoreBackingRO    map[string]bool
+	mounts              []sandboxMount
+	sandboxExtHandles   []int64
+	serveMounts         []sandboxServeMount
+	netStack            *stack.Stack
+	natForwarder        *netbackend.NATForwarder
+	portForwarder       *netbackend.PortForwarder
+	bandwidth           *netbackend.BandwidthShaper
+	natPolicy           *netbackend.NATPolicy
+	natTunnelGroup      *natTunnelGroup // protected by mu
+	shapedNATTunnels    int             // protected by mu
+	wgEndpoint          *netbackend.WireGuardEndpoint
+	wgPeerPort          uint16
+	packetLink          *netbackend.PacketLink
+	linkConnTransferred bool
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
 	// host resolver before hostlockdown.Apply runs.
 	guestResolvConf string
@@ -198,10 +200,18 @@ func (s *Sandbox) validateCheckpointDir(reqDir string) error {
 // Config.DisableHostLockdown is set. Every host handle exists before the
 // lockdown call because the lockdown denies new host file opens.
 //
-// New takes ownership of Config.CheckpointListener on every call. When New
-// fails, it closes the listener.
+// New takes ownership of Config.CheckpointListener, Config.ControlListener, and
+// Config.LinkConn on every call. When New fails, it closes them.
 func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
+	var sb *Sandbox
+	if linkConn := cfg.LinkConn; linkConn != nil {
+		defer func() {
+			if retErr != nil && (sb == nil || !sb.linkConnTransferred) {
+				_ = linkConn.Close()
+			}
+		}()
+	}
 	if ln := cfg.ControlListener; ln != nil {
 		defer func() {
 			if retErr != nil {
@@ -227,7 +237,7 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	}
 	applyHostMemoryDefaults()
 
-	sb := &Sandbox{
+	sb = &Sandbox{
 		cfg:            cfg,
 		kernelReady:    make(chan struct{}),
 		runDone:        make(chan struct{}),
@@ -417,6 +427,7 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 		CPUQuotaMillis:       s.cfg.Resources.CPUMillis,
 		Mounts:               s.hostMounts(),
 		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
+		PrewarmNetwork:       s.cfg.NetworkMode == NetModeLink,
 		AllowBindAttach:      s.cfg.AllowBindAttach,
 		TTYPath:              ttyPath,
 		InstallSyscallFilter: s.syscallFilter(),
@@ -802,6 +813,19 @@ func (s *Sandbox) Close() error {
 		}
 		s.wgEndpoint = nil
 		s.netStack = nil
+	}
+
+	if s.packetLink != nil {
+		pl := s.packetLink
+		s.packetLink = nil
+		if s.netStack == pl.Stack() {
+			s.netStack = nil
+		}
+		s.mu.Unlock()
+		if err := pl.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.mu.Lock()
 	}
 
 	if s.netStack != nil {

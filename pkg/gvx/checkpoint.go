@@ -129,8 +129,8 @@ type CheckpointManifest struct {
 	NetMode           NetMode         `json:"net_mode"`
 	NATPolicyRequired bool            `json:"nat_policy_required,omitempty"`
 	// Eth0 records the addresses, MTU, and routes that the guest set on eth0
-	// in NAT mode. A restore applies them again. The field is absent in other
-	// network modes and in bundles of older runtimes.
+	// in NAT and link modes. A restore applies them again. The field is absent
+	// in other network modes and in bundles of older runtimes.
 	Eth0 *netbackend.Eth0Config `json:"eth0,omitempty"`
 	// MemoryLimitBytes is the memory limit that the guard of the saving
 	// sandbox enforced: the configured limit, or the RAM of the host without
@@ -550,6 +550,9 @@ func (s *Sandbox) saveQuiescersLocked() []saveQuiescer {
 	if s.portForwarder != nil {
 		out = append(out, s.portForwarder)
 	}
+	if s.packetLink != nil {
+		out = append(out, s.packetLink)
+	}
 	return out
 }
 
@@ -564,10 +567,11 @@ func (s *Sandbox) guestNICCount() int {
 	return len(st.NICInfo())
 }
 
-// snapshotEth0 returns the eth0 settings of the guest in NAT mode, or nil in
-// every other mode. The guest must be paused: a running guest can change them.
+// snapshotEth0 returns the eth0 settings of the guest in NAT or link mode, or
+// nil in every other mode. The guest must be paused: a running guest can change
+// them.
 func (s *Sandbox) snapshotEth0() *netbackend.Eth0Config {
-	if s.cfg.NetworkMode != NetModeNAT {
+	if s.cfg.NetworkMode != NetModeNAT && s.cfg.NetworkMode != NetModeLink {
 		return nil
 	}
 	s.mu.Lock()
