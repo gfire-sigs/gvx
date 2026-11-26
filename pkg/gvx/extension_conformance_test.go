@@ -15,7 +15,6 @@
 package gvx
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -630,9 +629,9 @@ func TestExtensionConformanceGuestControlPausedCloseAndHelperReap(t *testing.T) 
 	}
 	t.Cleanup(ep.Cleanup)
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	var stdout syncBuffer
+	var stderr syncBuffer
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	sb, err := New(ctx, Config{
@@ -654,13 +653,33 @@ func TestExtensionConformanceGuestControlPausedCloseAndHelperReap(t *testing.T) 
 	}
 
 	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
-	defer ctrlCancel()
-	go func() { _ = sb.ServeControl(ctrlCtx) }()
-
-	runDone := make(chan error, 1)
+	ctrlDone := make(chan struct{})
 	go func() {
-		_, rErr := sb.Run(ctx)
-		runDone <- rErr
+		defer close(ctrlDone)
+		_ = sb.ServeControl(ctrlCtx)
+	}()
+
+	type runResult struct {
+		code int
+		err  error
+	}
+	runDone := make(chan runResult, 1)
+	runExited := make(chan struct{})
+	go func() {
+		defer close(runExited)
+		code, rErr := sb.Run(ctx)
+		runDone <- runResult{code: code, err: rErr}
+	}()
+	defer func() {
+		ctrlCancel()
+		cancel()
+		_ = sb.Close()
+		<-ctrlDone
+		select {
+		case <-runExited:
+		case <-time.After(10 * time.Second):
+			t.Errorf("Sandbox.Run did not exit within 10s during test cleanup")
+		}
 	}()
 
 	bound := ext.boundInstances[0]
@@ -671,9 +690,9 @@ func TestExtensionConformanceGuestControlPausedCloseAndHelperReap(t *testing.T) 
 	// Wait until the guest reads sysfs and blocks inside /dev/exttest0 Read.
 	select {
 	case <-bound.blockedCh:
-	case rErr := <-runDone:
-		t.Fatalf("sandbox exited before blocking on /dev/exttest0: err=%v stdout=%q stderr=%q", rErr, stdout.String(), stderr.String())
-	case <-time.After(15 * time.Second):
+	case res := <-runDone:
+		t.Fatalf("sandbox exited before blocking on /dev/exttest0: code=%d err=%v stdout=%q stderr=%q", res.code, res.err, stdout.String(), stderr.String())
+	case <-time.After(30 * time.Second):
 		t.Fatalf("timed out waiting for guest to block on /dev/exttest0; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 

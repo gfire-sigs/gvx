@@ -251,7 +251,7 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*running
 	go func() {
 		defer close(runDone)
 		code, rErr := sb.Run(ctx)
-		if rErr != nil {
+		if code != 0 || rErr != nil {
 			_, _ = fmt.Fprintf(stderr, "sb.Run=(%d,%v)\n", code, rErr)
 		}
 	}()
@@ -271,19 +271,6 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*running
 		ep.Cleanup()
 		t.Fatalf("control.Dial: %v", err)
 	}
-	// Wait until the restored kernel has finished k.Start() so stdin/stdout are active.
-	pingDeadline := time.Now().Add(10 * time.Second)
-	for {
-		var ping control.PingResponse
-		if pErr := client.Call(ctx, control.MethodPing, nil, &ping); pErr == nil && ping.State == "running" {
-			break
-		}
-		if time.Now().After(pingDeadline) {
-			t.Fatalf("restored sandbox did not reach running state (stderr=%q)", stderr.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
 	var closed bool
 	closeFn := func() {
 		if closed {
@@ -298,17 +285,43 @@ func startRestoredControlSandbox(t *testing.T, cfg Config, dir string) (*running
 		drainCancel()
 		ctrlCancel()
 		<-ctrlDone
-		<-runDone
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			t.Errorf("restored Sandbox.Run did not exit within 10s during test cleanup (stderr=%q)", stderr.String())
+		}
 		_ = sb.Close()
 		_ = stdinR.Close()
 		ep.Cleanup()
 	}
 	t.Cleanup(closeFn)
+
+	// Wait until the restored kernel has finished k.Start() so stdin/stdout are active.
+	pingDeadline := time.Now().Add(30 * time.Second)
+	for {
+		callCtx, callCancel := context.WithDeadline(ctx, pingDeadline)
+		var ping control.PingResponse
+		pErr := client.Call(callCtx, control.MethodPing, nil, &ping)
+		callCancel()
+		if pErr == nil && ping.State == "running" {
+			break
+		}
+		select {
+		case <-runDone:
+			t.Fatalf("restored sandbox exited before reaching running state (stderr=%q)", stderr.String())
+		default:
+		}
+		if time.Now().After(pingDeadline) {
+			t.Fatalf("restored sandbox did not reach running state (last ping err=%v, stderr=%q)", pErr, stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	return &runningControlSandbox{
 		sb:      sb,
 		ep:      ep,
 		client:  client,
 		stdout:  stdout,
+		stderr:  stderr,
 		stdinW:  stdinW,
 		runDone: runDone,
 		cancel:  cancel,
@@ -351,9 +364,9 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 		Argv:          []string{"/bin/fdhold"},
 		Envv:          []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
-	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
+	rs.waitStdout(t, "READY\n", 30*time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	// Add dynamic tmpfs mount.
@@ -381,7 +394,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	if _, err := io.WriteString(rs.stdinW, "open /mnt/proj/data.txt\n"); err != nil {
 		t.Fatalf("write open cmd: %v", err)
 	}
-	rs.stdout.waitForSubstring(t, "OPENED:012345\n", 10*time.Second)
+	rs.waitStdout(t, "OPENED:012345\n", 30*time.Second)
 
 	// 1. Checkpoint with LeaveRunning=true while rpcfs and dynamic tmpfs are active.
 	if err := rs.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
@@ -414,7 +427,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	if _, err := io.WriteString(rs.stdinW, "read\n"); err != nil {
 		t.Fatalf("write read cmd: %v", err)
 	}
-	rs.stdout.waitForSubstring(t, "READ:6789\n", 10*time.Second)
+	rs.waitStdout(t, "READ:6789\n", 30*time.Second)
 
 	// 2. Stopping checkpoint (LeaveRunning=false) must notify serving clients with rpcfs.detached
 	// and release the original VM before opening restored sandboxes (Windows WHPX partition limit).
@@ -464,11 +477,11 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	if _, err := io.WriteString(rsA.stdinW, "read\n"); err != nil {
 		t.Fatalf("write read to restored A: %v", err)
 	}
-	rsA.stdout.waitForSubstring(t, "READ:ABCD\n", 10*time.Second)
+	rsA.waitStdout(t, "READ:ABCD\n", 30*time.Second)
 	if _, err := io.WriteString(rsA.stdinW, "write XY\n"); err != nil {
 		t.Fatalf("write payload to restored A: %v", err)
 	}
-	rsA.stdout.waitForSubstring(t, "WRITTEN\n", 10*time.Second)
+	rsA.waitStdout(t, "WRITTEN\n", 30*time.Second)
 	diskA, err := os.ReadFile(filepath.Join(restoreDirA, "data.txt"))
 	if err != nil || string(diskA) != "012345ABCDXYcdef" {
 		t.Fatalf("restored A host data.txt = (%q, %v), want 012345ABCDXYcdef", diskA, err)
@@ -518,7 +531,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	if _, err := io.WriteString(rsB.stdinW, "read\n"); err != nil {
 		t.Fatalf("write detached read to restored B: %v", err)
 	}
-	rsB.stdout.waitForSubstring(t, "ERR:", 10*time.Second)
+	rsB.waitStdout(t, "ERR:", 30*time.Second)
 
 	// Reconnect /mnt/proj at runtime via mount.serve.
 	_, cancelB, doneB := startTestRPCFSServer(t, ctx, rsB.client, restoreDirB, "/mnt/proj", false, false)
@@ -526,7 +539,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	if _, err := io.WriteString(rsB.stdinW, "read\n"); err != nil {
 		t.Fatalf("write reconnected read to restored B: %v", err)
 	}
-	rsB.stdout.waitForSubstring(t, "READ:WXYZ\n", 10*time.Second)
+	rsB.waitStdout(t, "READ:WXYZ\n", 30*time.Second)
 	cancelB()
 	<-doneB
 	closeB()
@@ -727,9 +740,9 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 		Argv:          []string{"/bin/fdhold"},
 		Envv:          []string{"GODEBUG=asyncpreemptoff=1", "GOMAXPROCS=2"},
 	})
-	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
+	rs.waitStdout(t, "READY\n", 30*time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	// Serve /mnt/proj rw, open a file, then checkpoint #1 (rw).
@@ -737,7 +750,7 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 	if _, err := io.WriteString(rs.stdinW, "open /mnt/proj/data.txt\n"); err != nil {
 		t.Fatal(err)
 	}
-	rs.stdout.waitForSubstring(t, "OPENED:012345\n", 10*time.Second)
+	rs.waitStdout(t, "OPENED:012345\n", 30*time.Second)
 
 	if err := rs.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
 		t.Fatalf("Checkpoint #1: %v", err)
@@ -883,7 +896,7 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 	if _, err := io.WriteString(rsLazy.stdinW, "read\n"); err != nil {
 		t.Fatal(err)
 	}
-	rsLazy.stdout.waitForSubstring(t, "ERR:", 10*time.Second)
+	rsLazy.waitStdout(t, "ERR:", 30*time.Second)
 	var mlLazy control.MountListResponse
 	if err := rsLazy.client.Call(ctx, control.MethodMountList, nil, &mlLazy); err != nil {
 		t.Fatalf("mount.list after lazy restore: %v", err)

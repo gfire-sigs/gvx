@@ -86,19 +86,27 @@ func (b *notifyBuffer) String() string {
 	return b.buf.String()
 }
 
-func (b *notifyBuffer) waitForSubstring(t *testing.T, want string, timeout time.Duration) {
-	t.Helper()
+func (b *notifyBuffer) waitForSubstringResult(want string, timeout time.Duration, done <-chan struct{}) (matched, exited bool) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
 		if strings.Contains(b.String(), want) {
-			return
+			return true, false
 		}
 		select {
 		case <-b.changed:
+		case <-done:
+			return strings.Contains(b.String(), want), true
 		case <-deadline.C:
-			t.Fatalf("timed out waiting for stdout %q (got %q)", want, b.String())
+			return strings.Contains(b.String(), want), false
 		}
+	}
+}
+
+func (b *notifyBuffer) waitForSubstring(t *testing.T, want string, timeout time.Duration) {
+	t.Helper()
+	if matched, _ := b.waitForSubstringResult(want, timeout, nil); !matched {
+		t.Fatalf("timed out waiting for stdout %q (got %q)", want, b.String())
 	}
 }
 

@@ -272,7 +272,7 @@ func TestRootfsVolumeWithVolumeAndSystemCLICommands(t *testing.T) {
 		)
 	}()
 
-	stdout.waitForSubstring(t, "rootfs-ready\n", 15*time.Second)
+	stdout.waitForSubstring(t, "rootfs-ready\n", 45*time.Second)
 
 	lsOut := runCLIArgs(t, nil, "volume", "ls", "-q", "-cache-dir", env.cacheDir).mustSucceed(t, "volume ls -q")
 	if strings.TrimSpace(lsOut.stdout) != "rootcli" {

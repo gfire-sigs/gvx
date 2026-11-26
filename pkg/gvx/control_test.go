@@ -61,9 +61,33 @@ type runningControlSandbox struct {
 	ep      *control.Endpoint
 	client  *control.Client
 	stdout  *notifyBuffer
+	stderr  *notifyBuffer
 	stdinW  io.WriteCloser
 	runDone chan struct{}
 	cancel  context.CancelFunc
+}
+
+func (rs *runningControlSandbox) waitStdout(t *testing.T, want string, timeout time.Duration) {
+	t.Helper()
+	matched, exited := rs.stdout.waitForSubstringResult(want, timeout, rs.runDone)
+	if matched {
+		return
+	}
+	if !exited {
+		select {
+		case <-rs.runDone:
+			exited = true
+		default:
+		}
+	}
+	var stderrOut string
+	if rs.stderr != nil {
+		stderrOut = rs.stderr.String()
+	}
+	if exited {
+		t.Fatalf("sandbox exited before emitting stdout %q; stdout=%q stderr=%q", want, rs.stdout.String(), stderrOut)
+	}
+	t.Fatalf("timed out after %v waiting for stdout %q; stdout=%q stderr=%q exited=%v", timeout, want, rs.stdout.String(), stderrOut, exited)
 }
 
 func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
@@ -79,6 +103,7 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 
 	stdinR, stdinW := net.Pipe()
 	stdout := newNotifyBuffer()
+	stderr := newNotifyBuffer()
 
 	if cfg.Platform == "" {
 		cfg.Platform = PlatformAuto
@@ -95,7 +120,7 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 	cfg.ControlToken = ep.Token
 	cfg.Stdin = stdinR
 	cfg.Stdout = stdout
-	cfg.Stderr = io.Discard
+	cfg.Stderr = stderr
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sb, err := New(ctx, cfg)
@@ -117,7 +142,10 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 	runDone := make(chan struct{})
 	go func() {
 		defer close(runDone)
-		_, _ = sb.Run(ctx)
+		code, rErr := sb.Run(ctx)
+		if code != 0 || rErr != nil {
+			_, _ = fmt.Fprintf(stderr, "sb.Run=(%d,%v)\n", code, rErr)
+		}
 	}()
 
 	client, err := control.Dial(ctx, control.DialOptions{
@@ -158,6 +186,7 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 		ep:      ep,
 		client:  client,
 		stdout:  stdout,
+		stderr:  stderr,
 		stdinW:  stdinW,
 		runDone: runDone,
 		cancel:  cancel,
