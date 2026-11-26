@@ -2,6 +2,39 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.25.10002026112300] - 2026-11-26
+
+This release adds embedder-supplied L3 packet links, external `hostfs` metadata directories, image label metadata, and persistent EROFS layer verification caching. It also fixes a memory-manager closure escape under `-race` and a Windows `systrap` poisoned-island stall.
+
+### Features
+
+- **Image labels and config digest on resolved OCI images (`pkg/oci`, `pkg/gvx`)** (#265, #270):
+  - Exposes `Labels` on `oci.RuntimeConfig` and `ConfigDigest` on `oci.ResolvedImage` across registry pulls, cache loads, OCI layouts, and Docker archives.
+  - Keeps `ConfigDigest` empty and `Labels` nil for plain rootfs tarballs, unifying cached loads through `finishImage`.
+- **External metadata directories for `hostfs` workspaces (`pkg/sentry/fsimpl/hostfs`, `pkg/gvx`)** (#266, #271):
+  - Adds `OpenOptions.MetaDir`, `OpenWorkspaceWithOptions`, `Workspace.MetaDir`, `ReadMetaAt`, `Mount.MetaDir`, and `Config.WorkspaceMetaDir` to relocate `.gvx_meta` journals and locks outside workspaces.
+  - Isolates journal operations on a dedicated pinned directory handle, enforces physical and lexical disjointness checks, and authorizes external directories under `hostlockdown`.
+- **Embedder-supplied L3 packet stream networking (`pkg/netbackend`, `pkg/gvx`, `pkg/hostlockdown`)** (#269, #272):
+  - Adds `NetModeLink` (`"link"`), `Config.LinkConn`, `Config.LinkMTU`, `netbackend.PacketLink`, and the `net.link.queue_length` tunable for length-prefixed L3 IPv4 and IPv6 streams.
+  - Validates stream sockets on Unix and Windows, keeps outbound host networking disabled under `hostlockdown`, and preserves `Eth0Config` across checkpoint and restore.
+
+### Performance
+
+- **Persistent EROFS layer verification cache and shared `LayerCache` (`pkg/oci`, `pkg/gvx`)** (#268, #273):
+  - Stores platform file identity in sibling `.erofs.id` sidecars while keeping `.sum` integrity files compatible with `v0.24` binaries, skipping redundant layer re-hashing across starts.
+  - Adds `AlwaysVerify`, `Limits`, and `DNSServers` to `oci.CacheOptions`, plus `gvx.NewLayerCacheWithOptions` and `Config.LayerCache` for shared caches across `New` and `Restore`.
+
+### Reliability and Bug Fixes
+
+- **Non-escaping `MemoryManager` internal-mapping callbacks (`pkg/sentry/mm`)** (#274):
+  - Replaces `hostWriteWrap` and `hostWriteWrapVec` with direct `noteHostWrite` and `noteHostWriteVec` calls inside `withInternalMappings` and `withVecInternalMappings`.
+  - Prevents `-race` instrumentation from escaping callbacks holding `gohacks.Noescape` stack slices to the heap across goroutine stack growth on Linux and Windows.
+- **Windows `systrap` poisoned jump-offset islands (`pkg/sentry/platform/systrap`)** (#275):
+  - Rejects `windows/amd64` trampoline island candidates whose forward or reverse `rel32` upper 16 bits form raw kernel-exit byte pairs (`0F 05`, `CD 2E`, or `0F 34`).
+  - Filters poisoned existing islands in `allocNearLocked` and excludes repeatedly rejected islands in `installSlot` so quarantine reclaim and new island allocation do not stall.
+- **Checkpoint, extension, and CLI test hardening (`pkg/gvx`, `pkg/rungvx`)** (#276):
+  - Raises Windows `-race` timeout budgets, replaces unsynchronized `bytes.Buffer` streams with `syncBuffer`, guarantees sandbox teardown on early failure, and reports guest exit codes and `stderr`.
+
 ## [v0.24.10012026112300] - 2026-11-25
 
 This release adds Tier 2 allocation statistics and releaser synchronization helpers to `pgalloc`. It also fixes external `shmem` scan interference in the Linux `systrap` idle-stub leak test.
