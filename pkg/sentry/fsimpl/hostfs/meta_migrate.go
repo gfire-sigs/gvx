@@ -142,7 +142,7 @@ func (w *Workspace) convertPaths(paths map[string]POSIXAttr, keepLost bool) map[
 			continue
 		}
 		info, err := w.statGuestPath(p)
-		if err == nil && info.kind != hostKindRegular && info.kind != hostKindDir {
+		if err == nil && info.kind != hostKindRegular && info.kind != hostKindDir && info.kind != hostKindSymlink {
 			err = errNotDir
 		}
 		if err != nil {

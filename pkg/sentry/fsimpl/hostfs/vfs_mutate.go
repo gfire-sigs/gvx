@@ -138,9 +138,9 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	})
 }
 
-// SymlinkAt implements vfs.FilesystemImpl.SymlinkAt. Symbolic links live in
-// .gvx_meta: the host never receives a link, so no host link can leave the
-// workspace.
+// SymlinkAt implements vfs.FilesystemImpl.SymlinkAt. In default SymlinkVirtual
+// mode, guest symlinks live only in .gvx_meta. In opt-in SymlinkContained mode
+// on Unix hosts, eligible relative targets materialize via symlinkat(2).
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
 	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name, rel string) error {
 		uid, gid, _ := newOwner(parent.inode, rp.Credentials())
@@ -307,13 +307,17 @@ func (fs *filesystem) executeRenameAtLocked(ctx context.Context, rp *vfs.Resolvi
 		replacedLinks = fs.specialLinksLocked(replaced)
 	}
 	whiteout := opts.Flags&linux.RENAME_WHITEOUT != 0
-	var renameErr error
+	var (
+		demoted   []demotedSymlink
+		renameErr error
+	)
 	if whiteout {
-		renameErr = fs.ws.renameWhiteout(oldRel, newRel)
+		demoted, renameErr = fs.ws.renameWhiteout(oldRel, newRel)
 	} else {
-		renameErr = fs.ws.rename(oldRel, newRel)
+		demoted, renameErr = fs.ws.rename(oldRel, newRel)
 	}
 	if renameErr != nil {
+		fs.applyDemotedSymlinksLocked(demoted)
 		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 		return translateHostError(renameErr)
 	}
@@ -334,6 +338,7 @@ func (fs *filesystem) executeRenameAtLocked(ctx context.Context, rp *vfs.Resolvi
 		fs.detachLocked(replaced)
 	}
 	fs.moveLocked(renamed, newParent, newName, newRel)
+	fs.applyDemotedSymlinksLocked(demoted)
 	fs.ws.watchNoteInode(renamed.inode)
 	deferDecRef(fs, vfsObj.CommitRenameReplaceDentry(ctx, &handle, &renamed.vfsd, replacedVFSD))
 	vfs.InotifyRename(ctx, &renamed.inode.watches, &oldParent.inode.watches, &newParent.inode.watches, oldName, newName, renamed.inode.isDir())

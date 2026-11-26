@@ -70,6 +70,8 @@ type dirAux struct {
 type hostProbe struct {
 	// found reports that the host holds an entry for the guest name.
 	found bool
+	// leaf is the stored host name when found is true.
+	leaf string
 	// info is the host metadata of that entry.
 	info hostInfo
 	// hidden reports that the guest must not see the entry.
@@ -338,7 +340,7 @@ func (w *Workspace) locateIn(parentRel, name string, pin *dirPin, stat statLeaf)
 
 // foundProbe builds the probe of an entry that the host holds under leaf.
 func (w *Workspace) foundProbe(parentRel, leaf string, info hostInfo) hostProbe {
-	p := hostProbe{found: true, info: info}
+	p := hostProbe{found: true, leaf: leaf, info: info}
 	switch {
 	case w.hiddenByName(leaf):
 		p.hidden = true

@@ -297,7 +297,7 @@ func (w *Workspace) visitDir(c *orphanCollector, rel string) {
 		return
 	}
 	for _, e := range entries {
-		if e.kind != hostKindRegular && e.kind != hostKindDir {
+		if e.kind != hostKindRegular && e.kind != hostKindDir && e.kind != hostKindSymlink {
 			continue
 		}
 		if (rel == "." && w.isReservedPath(e.name)) || w.hiddenByName(e.name) {

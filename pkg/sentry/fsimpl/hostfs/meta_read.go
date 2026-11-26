@@ -156,7 +156,7 @@ func (t *treeReader) walk(hostDir, guestDir string) error {
 				continue
 			}
 		}
-		if e.kind != hostKindRegular && e.kind != hostKindDir {
+		if e.kind != hostKindRegular && e.kind != hostKindDir && e.kind != hostKindSymlink {
 			continue
 		}
 		hostRel := hostChild(hostDir, e.name)
@@ -166,7 +166,11 @@ func (t *treeReader) walk(hostDir, guestDir string) error {
 			continue
 		}
 		if r := t.byID[t.stored(info.fid)]; r != nil {
-			t.out[guest] = r.attr
+			// A virtual symlink record placed by placeKids shadows any host
+			// entry at the same guest path.
+			if existing, ok := t.out[guest]; !ok || existing.Symlink == "" {
+				t.out[guest] = r.attr
+			}
 		}
 		if info.kind != hostKindDir {
 			continue

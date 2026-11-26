@@ -497,6 +497,16 @@ func pinnedTwoNames(op, prep, oldName, newName string, call func() error) error 
 	return nil
 }
 
+func (h *hostRoot) symlinkAt(dir hostDirHandle, name, target string) error {
+	if err := checkChildName(name); err != nil {
+		return err
+	}
+	if err := retryEINTR(func() error { return unix.Symlinkat(target, int(dir), name) }); err != nil {
+		return fmt.Errorf("hostfs: symlink %q: %w", name, err)
+	}
+	return nil
+}
+
 func (h *hostRoot) readlink(rel string) (string, error) {
 	if rel == "." {
 		return "", fmt.Errorf("hostfs: readlink %q: %w", rel, unix.EINVAL)
@@ -506,6 +516,17 @@ func (h *hostRoot) readlink(rel string) (string, error) {
 		return "", err
 	}
 	defer release()
+	return readlinkIn(parent, name, rel)
+}
+
+func (h *hostRoot) readlinkAt(dir hostDirHandle, name string) (string, error) {
+	if err := checkChildName(name); err != nil {
+		return "", err
+	}
+	return readlinkIn(int(dir), name, name)
+}
+
+func readlinkIn(parent int, name, rel string) (string, error) {
 	for size := 256; ; size *= 2 {
 		buf := make([]byte, size)
 		var n int

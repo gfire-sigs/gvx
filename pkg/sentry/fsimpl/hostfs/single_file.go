@@ -16,6 +16,7 @@ package hostfs
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,6 +93,16 @@ func (s *singleHost) readDir(rel string) ([]hostDirEntry, error) {
 // the mount shows no sibling.
 func (s *singleHost) readDirAt(hostDirHandle) ([]hostDirEntry, error) {
 	return nil, nil
+}
+
+// symlinkAt refuses symlink creation in the bound file's parent directory.
+func (s *singleHost) symlinkAt(hostDirHandle, string, string) error {
+	return errNotPermitted
+}
+
+// readlinkAt refuses reading links in the bound file's parent directory.
+func (s *singleHost) readlinkAt(hostDirHandle, string) (string, error) {
+	return "", fs.ErrNotExist
 }
 
 // syncDirAt does nothing, because the parent directory is not part of the

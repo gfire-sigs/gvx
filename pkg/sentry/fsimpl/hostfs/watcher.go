@@ -242,7 +242,7 @@ func (hw *hostWatcher) rescanEntries(list []*watchEntry, stop <-chan struct{}) {
 // error when the backend cannot watch it.
 func (w *Workspace) watchDentry(d *dentry) error {
 	ino := d.inode
-	if ino.virtual || (ino.kind != hostKindDir && ino.kind != hostKindRegular) {
+	if ino.isVirtual() || (ino.kind != hostKindDir && ino.kind != hostKindRegular) {
 		return nil
 	}
 	hw := &w.watch

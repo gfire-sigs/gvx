@@ -216,12 +216,13 @@ func (fd *dirFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 // object as i: the same kind and the same inode number. A listing that carries
 // no inode number matches on the kind alone.
 func (i *inode) matchesListing(l dirListing) bool {
-	if i.virtual || l.virtual {
-		return i.virtual == l.virtual
+	virtual, id := i.identity()
+	if virtual || l.virtual {
+		return virtual == l.virtual
 	}
 	kind := l.kind
 	if l.special != 0 {
 		kind = hostKindSpecial
 	}
-	return i.kind == kind && (l.ino == 0 || l.ino == i.id.ino)
+	return i.kind == kind && (l.ino == 0 || l.ino == id.ino)
 }

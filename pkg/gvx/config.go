@@ -407,6 +407,11 @@ type Config struct {
 	// The directory must already exist and cannot overlap any mounted host path.
 	WorkspaceMetaDir string
 
+	// WorkspaceSymlinkMode selects how hostfs stores guest-created symbolic
+	// links inside WorkspacePath. Valid only when WorkspacePath is set. Empty
+	// defaults to SymlinkVirtual.
+	WorkspaceSymlinkMode SymlinkMode
+
 	// Mounts lists extra guest mounts: bind mounts of host directories, named
 	// volumes, and tmpfs mounts. WorkspacePath and WorkspaceReadOnly stay the
 	// shorthand for the bind mount at /workspace, so no entry of Mounts may use

@@ -326,7 +326,7 @@ func TestExchangeThenHostEditorSaveKeepsBothRecords(t *testing.T) {
 	if err := ws.Chown("b/y", 9, 8); err != nil {
 		t.Fatal(err)
 	}
-	if err := ws.exchange("a/x", "b/y"); err != nil {
+	if _, err := ws.exchange("a/x", "b/y"); err != nil {
 		t.Fatal(err)
 	}
 	requireMode(t, ws, "a/x", 0o640, 9)

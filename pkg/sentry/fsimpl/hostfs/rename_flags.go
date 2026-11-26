@@ -76,99 +76,308 @@ func checkRenameFlags(flags uint32) error {
 // renameWhiteout moves oldRel to newRel and leaves a whiteout at oldRel, in
 // one critical section of w.mu. A failure to create the whiteout moves the
 // source back.
-func (w *Workspace) renameWhiteout(oldRel, newRel string) error {
+func (w *Workspace) renameWhiteout(oldRel, newRel string) ([]demotedSymlink, error) {
+	w.maybeRefreshMeta(false)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.checkWritableLocked(oldRel, newRel); err != nil {
-		return err
+		return nil, err
 	}
-	if err := w.checkMetaRoom(recKey{}); err != nil {
-		return err
+	whiteoutBytes := int64(recOverhead + len(oldRel)*2)
+	if err := w.checkMetaRoomBytes(whiteoutBytes); err != nil {
+		return nil, err
 	}
-	if err := w.renameLocked(oldRel, newRel); err != nil {
-		return err
+	demoted, err := w.renameLocked(oldRel, newRel, false, nil, whiteoutBytes)
+	if err != nil {
+		return demoted, err
 	}
 	if err := w.createWhiteoutLocked(oldRel); err != nil {
-		if back := w.renameLocked(newRel, oldRel); back != nil {
-			return errors.Join(err, back)
+		backDemoted, backErr := w.renameLocked(newRel, oldRel, false, nil, 0)
+		if backErr != nil {
+			// Rollback failed; do not emit newRel-anchored demotions against a
+			// VFS tree that will abort back to oldRel.
+			return nil, errors.Join(err, backErr)
 		}
-		return err
+		// Remap demoted entries back to oldRel and refresh their live metadata
+		// keys under oldRel's parent directory.
+		for i := range demoted {
+			if demoted[i].rel == newRel {
+				demoted[i].rel = oldRel
+			} else if strings.HasPrefix(demoted[i].rel, newRel+"/") {
+				demoted[i].rel = oldRel + strings.TrimPrefix(demoted[i].rel, newRel)
+			}
+			if vk, vr := w.virtualAtLocked(demoted[i].rel); vr != nil {
+				demoted[i].entry = virtualEntry(vk, vr)
+			}
+		}
+		return append(demoted, backDemoted...), err
 	}
-	return nil
+	return demoted, nil
 }
 
 // exchange swaps the entries aRel and bRel. Both must exist.
-func (w *Workspace) exchange(aRel, bRel string) error {
+func (w *Workspace) exchange(aRel, bRel string) ([]demotedSymlink, error) {
+	w.maybeRefreshMeta(false)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.exchangeLocked(aRel, bRel)
 }
 
+// refreshExchangeEntryLocked resolves rel live under the cross-sandbox
+// metadata lock using a freshly verified parent pin, returning the live entry
+// and its current host leaf (empty for virtual symlinks).
+func (w *Workspace) refreshExchangeEntryLocked(rel string) (entry, string, error) {
+	if w.meta.hasNames() {
+		if vkey, vr := w.virtualAtLocked(rel); vr != nil {
+			return virtualEntry(vkey, vr), "", nil
+		}
+	}
+	parent, name := splitParent(rel)
+	pin, err := w.acquireFreshPin(parent)
+	if err != nil {
+		return entry{}, "", err
+	}
+	defer w.releasePin(pin)
+	probe, err := w.locateIn(parent, name, pin, func(leaf string) (hostInfo, error) {
+		return w.host.lstatAt(pin.h, leaf)
+	})
+	if err != nil {
+		return entry{}, "", err
+	}
+	if !probe.found || probe.hidden {
+		return entry{}, "", probe.missingError(rel)
+	}
+	e, err := w.entryFromInfoAt(rel, probe.leaf, pin, probe.info)
+	if err != nil {
+		return entry{}, "", err
+	}
+	return e, probe.leaf, nil
+}
+
 // exchangeLocked is exchange for a caller that holds w.mu for writing.
-func (w *Workspace) exchangeLocked(aRel, bRel string) error {
+func (w *Workspace) exchangeLocked(aRel, bRel string) ([]demotedSymlink, error) {
 	if err := w.checkWritableLocked(aRel, bRel); err != nil {
-		return err
+		return nil, err
 	}
 	if aRel == "." || bRel == "." {
-		return fs.ErrInvalid
+		return nil, fs.ErrInvalid
 	}
 	a, err := w.lookupLocked(aRel)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	b, err := w.lookupLocked(bRel)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if aRel == bRel {
-		return nil
+		return nil, nil
 	}
 	if a.isDir() && strings.HasPrefix(bRel, aRel+"/") || b.isDir() && strings.HasPrefix(aRel, bRel+"/") {
-		return errInvalidMove
+		return nil, errInvalidMove
 	}
 	if !a.virtual && !b.virtual && a.info.id == b.info.id && !a.isDir() {
 		// Two names of one file: the swap changes nothing.
-		return nil
+		return nil, nil
 	}
-	switch {
-	case a.virtual && b.virtual:
+	if a.virtual && b.virtual {
 		w.swapVirtualLocked(a, b, aRel, bRel)
-	case a.virtual:
-		if err := w.exchangeVirtualLocked(bRel, aRel); err != nil {
-			return err
-		}
-	case b.virtual:
-		if err := w.exchangeVirtualLocked(aRel, bRel); err != nil {
-			return err
-		}
-	default:
-		if err := w.exchangeHostLocked(a, b, aRel, bRel); err != nil {
-			return err
-		}
+		return nil, nil
 	}
-	return nil
+
+	var demoted []demotedSymlink
+	err = w.withMetaExclusiveLocked(func(lf *os.File) error {
+		if serr := w.syncMetaIfChangedLocked(lf); serr != nil {
+			return serr
+		}
+		var aLeaf, bLeaf string
+		var rerr error
+		a, aLeaf, rerr = w.refreshExchangeEntryLocked(aRel)
+		if rerr != nil {
+			return rerr
+		}
+		b, bLeaf, rerr = w.refreshExchangeEntryLocked(bRel)
+		if rerr != nil {
+			return rerr
+		}
+		if a.isDir() && strings.HasPrefix(bRel, aRel+"/") || b.isDir() && strings.HasPrefix(aRel, bRel+"/") {
+			return errInvalidMove
+		}
+		if !a.virtual && !b.virtual && a.info.id == b.info.id && !a.isDir() {
+			return nil
+		}
+		if a.virtual && b.virtual {
+			w.swapVirtualLocked(a, b, aRel, bRel)
+			_ = w.flushMetaLocked(lf)
+			return nil
+		}
+
+		aParent, aName := splitParent(aRel)
+		bParent, bName := splitParent(bRel)
+		bDestLeaf, bDestOK := w.exchangeDestLeafLocked(bRel, b, bLeaf)
+		aDestLeaf, aDestOK := w.exchangeDestLeafLocked(aRel, a, aLeaf)
+		var badDstLeaf map[string]struct{}
+		if !bDestOK || bDestLeaf != bName {
+			badDstLeaf = map[string]struct{}{bRel: {}}
+		}
+		if !aDestOK || aDestLeaf != aName {
+			if badDstLeaf == nil {
+				badDstLeaf = map[string]struct{}{}
+			}
+			badDstLeaf[aRel] = struct{}{}
+		}
+
+		overrides := map[string]string{bRel: aRel, aRel: bRel}
+		var preCands []hostSymlinkCandidate
+		demoteA := false
+		demoteB := false
+
+		if !a.virtual && a.isSymlink() {
+			if !bDestOK {
+				demoteA = true
+			} else if _, safe := w.hostSymlinkSafeAtLocked(bRel, bDestLeaf, a.attr.Symlink, overrides, badDstLeaf); !safe {
+				demoteA = true
+			}
+			if demoteA {
+				preCands = append(preCands, hostSymlinkCandidate{
+					srcRel:    aRel,
+					destRel:   bRel,
+					parentRel: aParent,
+					guestName: aName,
+					leaf:      aLeaf,
+					target:    a.attr.Symlink,
+					info:      a.info,
+					attr:      a.attr,
+					oldKey:    a.key,
+				})
+			}
+		}
+		if !b.virtual && b.isSymlink() {
+			if !aDestOK {
+				demoteB = true
+			} else if _, safe := w.hostSymlinkSafeAtLocked(aRel, aDestLeaf, b.attr.Symlink, overrides, badDstLeaf); !safe {
+				demoteB = true
+			}
+			if demoteB {
+				preCands = append(preCands, hostSymlinkCandidate{
+					srcRel:    bRel,
+					destRel:   aRel,
+					parentRel: bParent,
+					guestName: bName,
+					leaf:      bLeaf,
+					target:    b.attr.Symlink,
+					info:      b.info,
+					attr:      b.attr,
+					oldKey:    b.key,
+				})
+			}
+		}
+
+		// Scan any host directories being swapped before mutating anything.
+		if !a.virtual && a.isDir() {
+			cands, serr := w.scanDirHostSymlinksLocked(aRel, bRel, overrides, badDstLeaf)
+			if serr != nil {
+				return serr
+			}
+			preCands = append(preCands, cands...)
+		}
+		if !b.virtual && b.isDir() {
+			cands, serr := w.scanDirHostSymlinksLocked(bRel, aRel, overrides, badDstLeaf)
+			if serr != nil {
+				return serr
+			}
+			preCands = append(preCands, cands...)
+		}
+
+		demotedRecs, partial, derr := w.demoteCandidatesInPlaceLocked(lf, preCands, 0)
+		if derr != nil {
+			demoted = partial
+			return derr
+		}
+
+		// Refresh a and b entries if either top-level symlink was demoted.
+		if demoteA {
+			fresh, ferr := w.lookupLocked(aRel)
+			if ferr != nil {
+				demoted = w.rollbackDemotedLocked(lf, demotedRecs)
+				return ferr
+			}
+			a = fresh
+		}
+		if demoteB {
+			fresh, ferr := w.lookupLocked(bRel)
+			if ferr != nil {
+				demoted = w.rollbackDemotedLocked(lf, demotedRecs)
+				return ferr
+			}
+			b = fresh
+		}
+
+		var swapErr error
+		var innerDemoted []demotedSymlink
+		switch {
+		case a.virtual && b.virtual:
+			w.swapVirtualLocked(a, b, aRel, bRel)
+		case a.virtual:
+			innerDemoted, swapErr = w.exchangeVirtualLocked(bRel, aRel, true, lf)
+		case b.virtual:
+			innerDemoted, swapErr = w.exchangeVirtualLocked(aRel, bRel, true, lf)
+		default:
+			swapErr = w.exchangeHostLocked(a, b, aRel, bRel)
+		}
+		if swapErr != nil {
+			rolled := w.rollbackDemotedLocked(lf, demotedRecs)
+			demoted = append(rolled, innerDemoted...)
+			return swapErr
+		}
+		if len(demotedRecs) > 0 || a.virtual || b.virtual {
+			_ = w.flushMetaLocked(lf)
+		}
+		if len(demotedRecs) > 0 {
+			demoted = w.finalizeDemotedLocked(demotedRecs)
+		}
+		demoted = append(demoted, innerDemoted...)
+		return nil
+	})
+	return demoted, err
+}
+
+// exchangeDestLeafLocked returns the stored host leaf a host symlink will
+// occupy after swapping into destRel (currently holding dest). It returns
+// false when dest is virtual and a host entry collides with destRel.
+func (w *Workspace) exchangeDestLeafLocked(destRel string, dest entry, destLiveLeaf string) (string, bool) {
+	_, destName := splitParent(destRel)
+	if dest.virtual {
+		if w.dstVirtualHostCollidesLocked(destRel) {
+			return "", false
+		}
+		leaf, err := w.codec.leafForm(destName)
+		return leaf, err == nil
+	}
+	return destLiveLeaf, destLiveLeaf != ""
 }
 
 // exchangeVirtualLocked swaps the host entry hostRel with the virtual symbolic
 // link virtRel. The link exists only in .gvx_meta, so no host call can swap
 // the two. The host entry moves to the name of the link, and the link takes the
 // old name of the host entry.
-func (w *Workspace) exchangeVirtualLocked(hostRel, virtRel string) error {
+func (w *Workspace) exchangeVirtualLocked(hostRel, virtRel string, haveLock bool, lf *os.File) ([]demotedSymlink, error) {
 	virtKey, saved := w.virtualAtLocked(virtRel)
 	if saved == nil {
-		return fs.ErrNotExist
+		return nil, fs.ErrNotExist
+	}
+	hostVirtKey, err := w.nameKeyLocked(hostRel)
+	if err != nil {
+		return nil, err
 	}
 	w.meta.del(virtKey)
-	if err := w.renameLocked(hostRel, virtRel); err != nil {
-		w.meta.put(virtKey, saved)
-		return err
-	}
-	key, err := w.nameKeyLocked(hostRel)
+	demoted, err := w.renameLocked(hostRel, virtRel, haveLock, lf, 0)
 	if err != nil {
-		return err
+		w.meta.put(virtKey, saved)
+		return demoted, err
 	}
-	w.putRec(key, saved.attr, hostRel)
-	return nil
+	w.putRec(hostVirtKey, saved.attr, hostRel)
+	return demoted, nil
 }
 
 // swapVirtualLocked swaps two virtual symbolic links. A link is a record, so
@@ -364,7 +573,9 @@ func (fs *filesystem) exchangeAt(ctx context.Context, rp *vfs.ResolvingPath, new
 		return err
 	}
 	vfsObj.RenameBegin(&handle)
-	if err := fs.ws.exchange(oldRel, newRel); err != nil {
+	demoted, err := fs.ws.exchange(oldRel, newRel)
+	if err != nil {
+		fs.applyDemotedSymlinksLocked(demoted)
 		vfsObj.AbortRenameDentry(&handle, &a.vfsd, &b.vfsd)
 		return translateHostError(err)
 	}
@@ -374,6 +585,7 @@ func (fs *filesystem) exchangeAt(ctx context.Context, rp *vfs.ResolvingPath, new
 	oldParent.inode.invalidateMeta()
 	newParent.inode.invalidateMeta()
 	fs.exchangeDentriesLocked(a, b, oldRel, newRel)
+	fs.applyDemotedSymlinksLocked(demoted)
 	fs.ws.watchNoteInode(a.inode)
 	fs.ws.watchNoteInode(b.inode)
 	vfsObj.CommitRenameExchangeDentry(&handle, &a.vfsd, &b.vfsd)

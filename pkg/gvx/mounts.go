@@ -68,6 +68,39 @@ const (
 	DriverHostfs MountDriver = "hostfs"
 )
 
+// SymlinkMode selects how hostfs stores guest-created symbolic links for a
+// host directory mount.
+type SymlinkMode string
+
+const (
+	// SymlinkVirtual stores every guest-created symbolic link only in
+	// .gvx_meta. It is the default when SymlinkMode is empty.
+	SymlinkVirtual SymlinkMode = "virtual"
+
+	// SymlinkContained materializes contained relative guest symbolic links on
+	// Unix hosts via symlinkat(2). Non-eligible targets and Windows hosts fall
+	// back to virtual entries in .gvx_meta.
+	SymlinkContained SymlinkMode = "contained"
+)
+
+func parseSymlinkMode(mode SymlinkMode) (SymlinkMode, error) {
+	switch mode {
+	case "", SymlinkVirtual:
+		return SymlinkVirtual, nil
+	case SymlinkContained:
+		return SymlinkContained, nil
+	default:
+		return "", fmt.Errorf("unsupported SymlinkMode %q (use %q or %q)", mode, SymlinkVirtual, SymlinkContained)
+	}
+}
+
+func hostfsSymlinkMode(mode SymlinkMode) hostfs.SymlinkMode {
+	if mode == SymlinkContained {
+		return hostfs.SymlinkContained
+	}
+	return hostfs.SymlinkVirtual
+}
+
 // Mount describes one extra guest mount. New opens the host directory or the
 // host file of a bind mount, or the image of a volume mount, before the host
 // lockdown.
@@ -141,6 +174,12 @@ type Mount struct {
 	// share the same MetaDir; concurrent sandboxes sharing metadata for one
 	// host directory must supply the same MetaDir.
 	MetaDir string
+
+	// SymlinkMode selects how hostfs stores guest-created symbolic links for
+	// directory bind mounts and DriverHostfs volumes. Empty defaults to
+	// SymlinkVirtual. Multiple mounts of the same host directory must agree on
+	// their effective SymlinkMode.
+	SymlinkMode SymlinkMode
 }
 
 type cappedVolumeBinding struct {
@@ -288,6 +327,8 @@ func ParseMount(spec string) (Mount, error) {
 		ephemeral     bool
 		seenEphemeral bool
 		driver        string
+		symlinks      string
+		hasSymlinks   bool
 		readOnly      bool
 	)
 	for _, field := range fields {
@@ -333,6 +374,19 @@ func ParseMount(spec string) (Mount, error) {
 			tmpfsSize = value
 		case "driver":
 			driver = strings.ToLower(strings.TrimSpace(value))
+		case "symlinks":
+			if hasSymlinks {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: duplicate symlinks option", spec)
+			}
+			val := strings.ToLower(strings.TrimSpace(value))
+			if !hasValue || val == "" {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: symlinks requires a value", spec)
+			}
+			if _, serr := parseSymlinkMode(SymlinkMode(val)); serr != nil {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: %w", spec, serr)
+			}
+			hasSymlinks = true
+			symlinks = val
 		default:
 			return Mount{}, fmt.Errorf("gvx: invalid mount %q: unsupported key %q", spec, key)
 		}
@@ -360,7 +414,18 @@ func ParseMount(spec string) (Mount, error) {
 	if (hasVolSize || ephemeral) && MountDriver(driver) == DriverHostfs {
 		return Mount{}, fmt.Errorf("gvx: invalid mount %q: size and ephemeral require driver=ext4lite", spec)
 	}
-	m := Mount{Kind: kind, GuestPath: dst, ReadOnly: readOnly, Driver: MountDriver(driver), Ephemeral: ephemeral}
+	if hasSymlinks {
+		switch kind {
+		case MountBind:
+		case MountVolume:
+			if ephemeral || hasVolSize || (driver != "" && MountDriver(driver) != DriverHostfs) {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: symlinks applies to directory bind mounts and hostfs volumes only", spec)
+			}
+		default:
+			return Mount{}, fmt.Errorf("gvx: invalid mount %q: symlinks applies to directory bind mounts and hostfs volumes only", spec)
+		}
+	}
+	m := Mount{Kind: kind, GuestPath: dst, ReadOnly: readOnly, Driver: MountDriver(driver), Ephemeral: ephemeral, SymlinkMode: SymlinkMode(symlinks)}
 	if hasVolSize {
 		sz, sizeErr := parseVolumeSize(volSize)
 		if sizeErr != nil {
@@ -395,6 +460,9 @@ func ParseMount(spec string) (Mount, error) {
 		if isHostPathSource(src) {
 			if m.Driver == DriverHostfs {
 				return Mount{}, fmt.Errorf("gvx: invalid mount %q: driver=hostfs needs a volume name; use type=bind for a host directory", spec)
+			}
+			if hasSymlinks {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: symlinks applies to directory bind mounts and hostfs volumes only", spec)
 			}
 			m.ImagePath = src
 			return m, nil
@@ -578,6 +646,14 @@ func (c *Config) validateMounts() error {
 	if c.WorkspaceMetaDir != "" && c.WorkspacePath == "" {
 		return fmt.Errorf("%w: WorkspaceMetaDir requires WorkspacePath", ErrInvalidConfig)
 	}
+	if c.WorkspaceSymlinkMode != "" {
+		if c.WorkspacePath == "" {
+			return fmt.Errorf("%w: WorkspaceSymlinkMode requires WorkspacePath", ErrInvalidConfig)
+		}
+		if _, err := parseSymlinkMode(c.WorkspaceSymlinkMode); err != nil {
+			return fmt.Errorf("%w: WorkspaceSymlinkMode: %w", ErrInvalidConfig, err)
+		}
+	}
 	if c.WorkspacePath != "" {
 		if c.WorkspaceMetaDir != "" {
 			if err := validateMetaDir(c.WorkspaceMetaDir); err != nil {
@@ -722,6 +798,9 @@ func (c *Config) validateVolumeConflicts(rootImg string) error {
 			if m.MetaDir != "" {
 				return fmt.Errorf("%w: volume %s uses driver %q, which does not support MetaDir", ErrInvalidConfig, m.volumeLabel(), driver)
 			}
+			if m.SymlinkMode != "" {
+				return fmt.Errorf("%w: volume %s uses driver %q, which does not support SymlinkMode", ErrInvalidConfig, m.volumeLabel(), driver)
+			}
 			img, err := c.volumeImagePathWithMigrate(m, false)
 			if err != nil {
 				continue
@@ -812,6 +891,20 @@ func (m Mount) validate() error {
 		}
 		if err := validateMetaDir(m.MetaDir); err != nil {
 			return err
+		}
+	}
+	if m.SymlinkMode != "" {
+		if _, err := parseSymlinkMode(m.SymlinkMode); err != nil {
+			return err
+		}
+		switch m.Kind {
+		case MountBind:
+		case MountVolume:
+			if m.Ephemeral || m.ImagePath != "" || (m.Driver != "" && m.Driver != DriverHostfs) {
+				return errors.New("SymlinkMode applies to directory bind mounts and hostfs volumes only")
+			}
+		default:
+			return errors.New("SymlinkMode applies to directory bind mounts and hostfs volumes only")
 		}
 	}
 	if m.hasOverlayUpper() && m.Kind != MountOverlay {
@@ -908,6 +1001,8 @@ func (m Mount) validateBindSource() error {
 		return fmt.Errorf("bind source %q does not exist", m.HostPath)
 	case kind == hostPathFile && m.MetaDir != "":
 		return fmt.Errorf("bind source %q is a regular file: MetaDir applies to directory mounts only", m.HostPath)
+	case kind == hostPathFile && m.SymlinkMode != "":
+		return fmt.Errorf("bind source %q is a regular file: SymlinkMode applies to directory mounts only", m.HostPath)
 	}
 	return nil
 }
@@ -1100,11 +1195,12 @@ func (c Config) mountList() []Mount {
 	list := make([]Mount, 0, len(c.Mounts)+1)
 	if c.WorkspacePath != "" {
 		list = append(list, Mount{
-			Kind:      MountBind,
-			HostPath:  c.WorkspacePath,
-			GuestPath: workspaceGuestPath,
-			ReadOnly:  c.WorkspaceReadOnly,
-			MetaDir:   c.WorkspaceMetaDir,
+			Kind:        MountBind,
+			HostPath:    c.WorkspacePath,
+			GuestPath:   workspaceGuestPath,
+			ReadOnly:    c.WorkspaceReadOnly,
+			MetaDir:     c.WorkspaceMetaDir,
+			SymlinkMode: c.WorkspaceSymlinkMode,
 		})
 	}
 	return append(list, c.Mounts...)
@@ -1192,11 +1288,12 @@ func (s *Sandbox) resolveHostPathCandidate(m Mount) (string, bool, error) {
 // mountList position.
 func (s *Sandbox) validateHostMountPlacements(mounts []Mount) (map[int]string, error) {
 	type hostMountPlacement struct {
-		guestPath string
-		hostPath  string
-		isFile    bool
-		metaPath  string // resolved external MetaDir, or "" when in-workspace
-		effMeta   string // metaPath when non-empty, else hostPath
+		guestPath   string
+		hostPath    string
+		isFile      bool
+		metaPath    string // resolved external MetaDir, or "" when in-workspace
+		effMeta     string // metaPath when non-empty, else hostPath
+		symlinkMode SymlinkMode
 	}
 	var placements []hostMountPlacement
 	normMeta := make(map[int]string)
@@ -1216,6 +1313,9 @@ func (s *Sandbox) validateHostMountPlacements(mounts []Mount) (map[int]string, e
 			if m.MetaDir != "" && driver != DriverHostfs {
 				return nil, fmt.Errorf("gvx: volume %s uses driver %q, which does not support MetaDir: %w", m.volumeLabel(), driver, ErrInvalidConfig)
 			}
+			if m.SymlinkMode != "" && driver != DriverHostfs {
+				return nil, fmt.Errorf("gvx: volume %s uses driver %q, which does not support SymlinkMode: %w", m.volumeLabel(), driver, ErrInvalidConfig)
+			}
 			if driver == DriverExt4lite {
 				continue
 			}
@@ -1230,6 +1330,13 @@ func (s *Sandbox) validateHostMountPlacements(mounts []Mount) (map[int]string, e
 		}
 		if isFile && m.MetaDir != "" {
 			return nil, fmt.Errorf("gvx: mount %s is a regular file and does not support MetaDir: %w", m.GuestPath, ErrInvalidConfig)
+		}
+		if isFile && m.SymlinkMode != "" {
+			return nil, fmt.Errorf("gvx: mount %s is a regular file and does not support SymlinkMode: %w", m.GuestPath, ErrInvalidConfig)
+		}
+		effSymlinkMode, err := parseSymlinkMode(m.SymlinkMode)
+		if err != nil {
+			return nil, fmt.Errorf("gvx: mount %s: %w: %w", m.GuestPath, err, ErrInvalidConfig)
 		}
 
 		metaPath := ""
@@ -1264,6 +1371,9 @@ func (s *Sandbox) validateHostMountPlacements(mounts []Mount) (map[int]string, e
 				if sameHost && !sameEff {
 					return nil, fmt.Errorf("gvx: mounts %s and %s share host path %q with conflicting MetaDir settings: %w", prev.guestPath, m.GuestPath, hostPath, ErrInvalidConfig)
 				}
+				if sameHost && effSymlinkMode != prev.symlinkMode {
+					return nil, fmt.Errorf("gvx: mounts %s and %s share host path %q with conflicting SymlinkMode settings: %w", prev.guestPath, m.GuestPath, hostPath, ErrInvalidConfig)
+				}
 				if !sameHost && sameEff {
 					return nil, fmt.Errorf("gvx: mounts %s and %s target distinct host directories with the same metadata directory: %w", prev.guestPath, m.GuestPath, ErrInvalidConfig)
 				}
@@ -1284,11 +1394,12 @@ func (s *Sandbox) validateHostMountPlacements(mounts []Mount) (map[int]string, e
 		}
 
 		placements = append(placements, hostMountPlacement{
-			guestPath: m.GuestPath,
-			hostPath:  hostPath,
-			isFile:    isFile,
-			metaPath:  metaPath,
-			effMeta:   effMeta,
+			guestPath:   m.GuestPath,
+			hostPath:    hostPath,
+			isFile:      isFile,
+			metaPath:    metaPath,
+			effMeta:     effMeta,
+			symlinkMode: effSymlinkMode,
 		})
 		normMeta[i] = metaPath
 	}
@@ -1378,6 +1489,9 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 			}
 			if m.MetaDir != "" && driver != DriverHostfs {
 				return fmt.Errorf("gvx: volume %s uses driver %q, which does not support MetaDir: %w", m.volumeLabel(), driver, ErrInvalidConfig)
+			}
+			if m.SymlinkMode != "" && driver != DriverHostfs {
+				return fmt.Errorf("gvx: volume %s uses driver %q, which does not support SymlinkMode: %w", m.volumeLabel(), driver, ErrInvalidConfig)
 			}
 			m.Driver = driver
 		}
@@ -1476,15 +1590,23 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 			if isFile && m.MetaDir != "" {
 				return fmt.Errorf("gvx: mount %s is a regular file and does not support MetaDir: %w", m.GuestPath, ErrInvalidConfig)
 			}
+			if isFile && m.SymlinkMode != "" {
+				return fmt.Errorf("gvx: mount %s is a regular file and does not support SymlinkMode: %w", m.GuestPath, ErrInvalidConfig)
+			}
 			metaDir := normMeta[idx]
 			sm.hostPath = hostPath
 			sm.hostFile = isFile
 			key := newWorkspaceKey(hostPath, isFile, m.ReadOnly)
 			ws, ok := shared[key]
 			if !ok {
+				var openSymMode hostfs.SymlinkMode
+				if !isFile {
+					openSymMode = hostfsSymlinkMode(m.SymlinkMode)
+				}
 				ws, err = hostfs.OpenWorkspaceWithOptions(hostPath, hostfs.OpenOptions{
 					ReadOnly:    m.ReadOnly,
 					MetaDir:     metaDir,
+					SymlinkMode: openSymMode,
 					RestoreMode: forRestore,
 				})
 				if err != nil {

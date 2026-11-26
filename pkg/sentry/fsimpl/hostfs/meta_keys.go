@@ -334,6 +334,18 @@ func (w *Workspace) checkMetaRoom(k recKey) error {
 	return errMetaFull
 }
 
+// checkMetaRoomBytes fails with errMetaFull when adding extra bytes of new
+// records would exceed maxMetaBytes.
+func (w *Workspace) checkMetaRoomBytes(extra int64) error {
+	if extra <= 0 {
+		return nil
+	}
+	if w.meta.memBytes()+extra <= w.maxMetaBytes {
+		return nil
+	}
+	return errMetaFull
+}
+
 // pinKey returns the stored identity for a pinned directory, or zero when the
 // directory has no trustworthy identity.
 func (w *Workspace) pinKey(info hostInfo) fileKey {

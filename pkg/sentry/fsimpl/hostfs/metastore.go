@@ -474,6 +474,64 @@ func (w *Workspace) flushMeta() error {
 		}
 		defer func() { _ = unlockMeta(lf) }()
 	}
+	return w.flushMetaLocked(lf)
+}
+
+// withMetaExclusiveLocked runs fn while holding w.flushMu and an exclusive OS
+// lock on .gvx_meta.lock. Callers hold w.mu for writing.
+// Lock order: fs.mu, then w.mu, then w.flushMu, then .gvx_meta.lock, then
+// pinMu, then nameMu, then meta.mu.
+func (w *Workspace) withMetaExclusiveLocked(fn func(lf *os.File) error) error {
+	if w.closed || w.closing {
+		return os.ErrClosed
+	}
+	w.flushMu.Lock()
+	defer w.flushMu.Unlock()
+	if w.closingAtomic.Load() {
+		return os.ErrClosed
+	}
+	lf := w.metaLock.Load()
+	if !w.readOnly && w.single == "" && lf == nil {
+		return os.ErrClosed
+	}
+	if lf != nil {
+		if err := lockMetaExclusive(lf); err != nil {
+			return fmt.Errorf("hostfs: lock %s: %w", MetaLockFileName, err)
+		}
+		defer func() { _ = unlockMeta(lf) }()
+	}
+	return fn(lf)
+}
+
+// syncMetaIfChangedLocked merges any .gvx_meta commit written by a peer
+// workspace while issuing no hostBackend calls when the lock sequence header
+// is unchanged. Callers hold w.flushMu and an exclusive lock on lf.
+func (w *Workspace) syncMetaIfChangedLocked(lf *os.File) error {
+	if w.single != "" {
+		return nil
+	}
+	if lf != nil {
+		if commitSeq, compactSeq, ok := readMetaLockSeqs(lf); ok &&
+			commitSeq == w.journal.lockCommitSeq && compactSeq == w.journal.lockCompactSeq {
+			return nil
+		}
+	}
+	_, diskCommit, diskCompact, err := w.syncMetaLocked(lf, false)
+	if err == nil && lf != nil {
+		w.updateLockSeqState(diskCommit, diskCompact)
+	}
+	return err
+}
+
+// flushMetaLocked persists pending metadata mutations to disk. Callers hold
+// w.flushMu and an exclusive lock on lf (when lf != nil).
+func (w *Workspace) flushMetaLocked(lf *os.File) error {
+	if w.readOnly || w.single != "" {
+		return nil
+	}
+	if w.meta.pending() == 0 {
+		return nil
+	}
 
 	forceCompact, diskCommit, diskCompact, syncErr := w.syncMetaLocked(lf, true)
 	if syncErr != nil {

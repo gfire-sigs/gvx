@@ -301,6 +301,16 @@ func (c *countingHost) linkAt(oldDir hostDirHandle, oldName string, newDir hostD
 	return c.hostBackend.linkAt(oldDir, oldName, newDir, newName)
 }
 
+func (c *countingHost) symlinkAt(dir hostDirHandle, name, target string) error {
+	c.count("symlinkAt")
+	return c.hostBackend.symlinkAt(dir, name, target)
+}
+
+func (c *countingHost) readlinkAt(dir hostDirHandle, name string) (string, error) {
+	c.count("readlinkAt")
+	return c.hostBackend.readlinkAt(dir, name)
+}
+
 func (c *countingHost) chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error {
 	c.count("chtimesAt")
 	return c.hostBackend.chtimesAt(dir, name, atime, mtime)
