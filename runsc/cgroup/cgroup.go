@@ -1142,22 +1142,30 @@ func (*networkPrio) skip(spec *specs.LinuxResources) error {
 
 type pids struct{}
 
+// pidsLimit returns the pids limit, or 0 when the spec sets no limit.
+func pidsLimit(spec *specs.LinuxResources) int64 {
+	if spec == nil || spec.Pids == nil || spec.Pids.Limit == nil {
+		return 0
+	}
+	return *spec.Pids.Limit
+}
+
 func (*pids) optional() bool {
 	return true
 }
 
 func (*pids) skip(spec *specs.LinuxResources) error {
-	if spec != nil && spec.Pids != nil && spec.Pids.Limit > 0 {
+	if spec != nil && spec.Pids != nil && pidsLimit(spec) > 0 {
 		return fmt.Errorf("Pids.Limit set but pids cgroup controller not found")
 	}
 	return nil
 }
 
 func (*pids) set(spec *specs.LinuxResources, path string) error {
-	if spec == nil || spec.Pids == nil || spec.Pids.Limit <= 0 {
+	if spec == nil || spec.Pids == nil || pidsLimit(spec) <= 0 {
 		return nil
 	}
-	val := strconv.FormatInt(spec.Pids.Limit, 10)
+	val := strconv.FormatInt(pidsLimit(spec), 10)
 	return setValue(path, "pids.max", val)
 }
 

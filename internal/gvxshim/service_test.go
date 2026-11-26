@@ -216,7 +216,7 @@ func TestUnavailableWorkloadsReturnWireUnimplemented(t *testing.T) {
 	requireWireCode(t, err, codes.Unimplemented)
 	_, err = f.sandbox.SandboxStatus(f.namespaced(), &sandbox.SandboxStatusRequest{SandboxID: "test-id"})
 	requireWireCode(t, err, codes.Unimplemented)
-	_, err = taskv2.NewTaskClient(f.client).Connect(f.namespaced(), &taskv2.ConnectRequest{ID: "test-id"})
+	_, err = taskv2.NewTTRPCTaskClient(f.client).Connect(f.namespaced(), &taskv2.ConnectRequest{ID: "test-id"})
 	requireWireCode(t, err, codes.Unimplemented)
 	requireUnattached(t, f.state)
 	_, err = f.sandbox.CreateSandbox(f.namespaced(), &sandbox.CreateSandboxRequest{SandboxID: "test-id"})
