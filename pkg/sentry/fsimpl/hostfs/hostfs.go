@@ -173,7 +173,13 @@ type Workspace struct {
 	rootPath      string
 	root          *os.Root
 	host          hostBackend
-	rawHost       hostBackend
+	metaRoot      *os.Root
+	metaHost      hostBackend
+	metaLockHost  hostBackend
+	metaDirPath   string
+	metaDev       uint64
+	metaStableIDs bool
+	externalMeta  bool
 	readOnly      bool
 	closed        bool
 	closing       bool
@@ -317,6 +323,29 @@ type workspaceOptions struct {
 	// restoreMode skips ephemeral file sweeping during OpenWorkspaceForRestore
 	// so CompleteRestore can reattach unlinked backing files first.
 	restoreMode bool
+	// metaDir overrides the host directory storing .gvx_meta and .gvx_meta.lock.
+	metaDir string
+	// metaDirResolved reports that metaDir was already validated by openWorkspace.
+	metaDirResolved bool
+}
+
+// OpenOptions configures OpenWorkspaceWithOptions.
+type OpenOptions struct {
+	// ReadOnly mounts the workspace read-only without writing metadata.
+	ReadOnly bool
+
+	// MetaDir overrides the host directory storing .gvx_meta, .gvx_meta.lock,
+	// and .gvx_meta.tmp.* staging files. When empty or resolving to the
+	// workspace root itself, metadata lives in the workspace root directory.
+	// MetaDir must already exist as a directory and cannot be a filesystem root
+	// or strictly contain or lie inside the workspace directory.
+	// When MetaDir resolves to an external directory, .gvx_meta* names are not
+	// hidden inside the workspace namespace.
+	MetaDir string
+
+	// RestoreMode preserves unlinked ephemeral backing files during startup so
+	// CompleteRestore can reattach open unlinked inodes.
+	RestoreMode bool
 }
 
 // ChunkMemory supplies the memory for the chunks of mapped files.
@@ -348,6 +377,134 @@ func OpenWorkspace(hostPath string, readOnly bool) (*Workspace, error) {
 	return openWorkspace(hostPath, readOnly, workspaceOptions{coalesce: defaultCoalesceWindow})
 }
 
+// OpenWorkspaceWithOptions opens hostPath with explicit options prior to
+// hostlockdown.Apply().
+func OpenWorkspaceWithOptions(hostPath string, opts OpenOptions) (*Workspace, error) {
+	return openWorkspace(hostPath, opts.ReadOnly, workspaceOptions{
+		coalesce:    defaultCoalesceWindow,
+		restoreMode: opts.RestoreMode,
+		metaDir:     opts.MetaDir,
+	})
+}
+
+func stripWindowsExtendedPrefix(p string) string {
+	if runtime.GOOS != "windows" {
+		return p
+	}
+	if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
+		return `\\` + rest
+	}
+	if rest, ok := strings.CutPrefix(p, `\\?\`); ok {
+		return rest
+	}
+	return p
+}
+
+func evalSymlinksOrClean(p string) string {
+	cur := filepath.Clean(p)
+	var tail []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return filepath.Clean(p)
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+}
+
+func canonicalPathForCompare(p string) string {
+	cleaned := filepath.Clean(stripWindowsExtendedPrefix(p))
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
+}
+
+func sameHostPath(a, b string) bool {
+	if ai, errA := os.Stat(a); errA == nil {
+		if bi, errB := os.Stat(b); errB == nil {
+			return os.SameFile(ai, bi)
+		}
+	}
+	return canonicalPathForCompare(evalSymlinksOrClean(a)) == canonicalPathForCompare(evalSymlinksOrClean(b))
+}
+
+// pathContainsStrict reports whether child lies strictly beneath parent using
+// both physical filesystem identity (catching case-insensitive volumes,
+// symlinks, and Windows extended-length prefixes) and lexical checks.
+func pathContainsStrict(parent, child string) bool {
+	if sameHostPath(parent, child) {
+		return false
+	}
+	resolvedParent := evalSymlinksOrClean(parent)
+	resolvedChild := evalSymlinksOrClean(child)
+	if parentInfo, err := os.Stat(resolvedParent); err == nil {
+		cur := resolvedChild
+		for {
+			next := filepath.Dir(cur)
+			if next == cur {
+				break
+			}
+			cur = next
+			if curInfo, serr := os.Stat(cur); serr == nil && os.SameFile(parentInfo, curInfo) {
+				return true
+			}
+		}
+	}
+	p := canonicalPathForCompare(resolvedParent)
+	c := canonicalPathForCompare(resolvedChild)
+	if p == c {
+		return false
+	}
+	rel, err := filepath.Rel(p, c)
+	if err != nil || rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveExternalMetaDir validates metaDir relative to hostAbs and returns the
+// symlink-resolved path of metaDir, or "" when metaDir resolves to hostAbs.
+func resolveExternalMetaDir(hostAbs, metaDir string) (string, error) {
+	absMeta, err := filepath.Abs(metaDir)
+	if err != nil {
+		return "", fmt.Errorf("hostfs: resolve MetaDir %q: %w", metaDir, err)
+	}
+	metaFI, err := os.Stat(absMeta)
+	if err != nil {
+		return "", fmt.Errorf("hostfs: stat MetaDir %q: %w", metaDir, err)
+	}
+	if !metaFI.IsDir() {
+		return "", fmt.Errorf("hostfs: MetaDir %q must be a directory", metaDir)
+	}
+	realMeta, err := filepath.EvalSymlinks(absMeta)
+	if err != nil {
+		return "", fmt.Errorf("hostfs: resolve symlinks for MetaDir %q: %w", metaDir, err)
+	}
+	realMeta = filepath.Clean(realMeta)
+	if filepath.Dir(realMeta) == realMeta {
+		return "", fmt.Errorf("hostfs: MetaDir %q must not be a filesystem root", metaDir)
+	}
+	realHost := evalSymlinksOrClean(hostAbs)
+	if sameHostPath(realHost, realMeta) {
+		return "", nil
+	}
+	if pathContainsStrict(realHost, realMeta) {
+		return "", fmt.Errorf("hostfs: MetaDir %q must not lie inside workspace %q", metaDir, hostAbs)
+	}
+	if pathContainsStrict(realMeta, realHost) {
+		return "", fmt.Errorf("hostfs: MetaDir %q must not be an ancestor of workspace %q", metaDir, hostAbs)
+	}
+	return realMeta, nil
+}
+
 func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Workspace, error) {
 	absPath, err := filepath.Abs(hostPath)
 	if err != nil {
@@ -357,9 +514,20 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	// parent of the file, and the stored name of the file is remembered.
 	pinDir, single := absPath, ""
 	if fi, serr := os.Stat(absPath); serr == nil && fi.Mode().IsRegular() {
+		if opts.metaDir != "" {
+			return nil, fmt.Errorf("hostfs: MetaDir is unsupported for single-file mount %q", hostPath)
+		}
 		if pinDir, single, err = splitSingleFile(absPath); err != nil {
 			return nil, err
 		}
+	}
+	if opts.metaDir != "" {
+		realMeta, err := resolveExternalMetaDir(absPath, opts.metaDir)
+		if err != nil {
+			return nil, err
+		}
+		opts.metaDir = realMeta
+		opts.metaDirResolved = true
 	}
 	root, err := os.OpenRoot(pinDir)
 	if err != nil {
@@ -374,11 +542,6 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 }
 
 func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single string, readOnly bool, opts workspaceOptions) (*Workspace, error) {
-	closeRoot := func() {
-		if root != nil {
-			_ = root.Close()
-		}
-	}
 	var host hostBackend = backend
 	if single != "" {
 		host = &singleHost{hostBackend: host, bound: backend, name: single}
@@ -386,6 +549,30 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 	if opts.wrapHost != nil {
 		host = opts.wrapHost(host)
 	}
+	var (
+		metaRoot    *os.Root
+		metaBackend *hostRoot
+		metaLockRef *Workspace
+		committed   bool
+	)
+	defer func() {
+		if committed {
+			return
+		}
+		if metaLockRef != nil {
+			_ = metaLockRef.closeMetaLock()
+		}
+		if metaBackend != nil {
+			_ = metaBackend.close()
+		}
+		if metaRoot != nil {
+			_ = metaRoot.Close()
+		}
+		_ = host.close()
+		if root != nil {
+			_ = root.Close()
+		}
+	}()
 	clock := opts.clock
 	if clock == nil {
 		start := time.Now()
@@ -393,8 +580,6 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 	}
 	rootInfo, err := host.lstat(".")
 	if err != nil {
-		_ = host.close()
-		closeRoot()
 		return nil, fmt.Errorf("hostfs: stat workspace root %q: %w", absPath, err)
 	}
 	var caps WorkspaceCaps
@@ -418,7 +603,10 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 		rootPath:         absPath,
 		root:             root,
 		host:             host,
-		rawHost:          backend,
+		metaHost:         host,
+		metaLockHost:     backend,
+		metaDev:          rootInfo.fid.dev,
+		metaStableIDs:    caps.StableIDs,
 		readOnly:         readOnly,
 		meta:             newMetaTable(),
 		pathKeys:         opts.pathKeys || !caps.StableIDs || single != "",
@@ -441,6 +629,50 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 		single:           single,
 		orphans:          orphanCollector{dirsPerStep: opts.orphanDirsPerStep},
 	}
+	if opts.metaDir != "" {
+		if single != "" {
+			return nil, fmt.Errorf("hostfs: MetaDir is unsupported for single-file mount %q", absPath)
+		}
+		realMeta := opts.metaDir
+		if !opts.metaDirResolved {
+			realMeta, err = resolveExternalMetaDir(absPath, opts.metaDir)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if realMeta != "" {
+			metaRoot, err = os.OpenRoot(realMeta)
+			if err != nil {
+				return nil, fmt.Errorf("hostfs: os.OpenRoot(MetaDir %q): %w", realMeta, err)
+			}
+			metaBackend, err = newHostRoot(metaRoot)
+			if err != nil {
+				return nil, fmt.Errorf("hostfs: open MetaDir backend %q: %w", realMeta, err)
+			}
+			metaInfo, err := metaBackend.lstat(".")
+			if err != nil {
+				return nil, fmt.Errorf("hostfs: stat MetaDir %q: %w", realMeta, err)
+			}
+			sameDir := (metaInfo.fidOK && rootInfo.fidOK && metaInfo.fid == rootInfo.fid) ||
+				(metaInfo.id != (hostID{}) && metaInfo.id == rootInfo.id)
+			if sameDir {
+				_ = metaBackend.close()
+				_ = metaRoot.Close()
+				metaBackend = nil
+				metaRoot = nil
+			} else {
+				var metaCaps WorkspaceCaps
+				probeFileIDs(metaBackend, metaInfo, readOnly, &metaCaps)
+				w.externalMeta = true
+				w.metaDirPath = realMeta
+				w.metaRoot = metaRoot
+				w.metaHost = metaBackend
+				w.metaLockHost = metaBackend
+				w.metaDev = metaInfo.fid.dev
+				w.metaStableIDs = metaCaps.StableIDs
+			}
+		}
+	}
 	// Reuse the pre-lockdown cached watch limit when set because the Linux
 	// seccomp filter forbids getrlimit after lockdown.
 	if cached := processWatches.limit.Load(); cached > 0 {
@@ -462,17 +694,14 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 		// Every host change reaches the guest through the poll backend, which
 		// reads the one file by name.
 		w.watch.factory = func(hw *hostWatcher) (watchBackend, error) { return newPollBackend(hw), nil }
+		committed = true
 		return w, nil
 	}
+	metaLockRef = w
 	if err := w.openMetaLock(); err != nil {
-		_ = host.close()
-		closeRoot()
 		return nil, err
 	}
 	if err := w.loadMeta(); err != nil {
-		_ = w.closeMetaLock()
-		_ = host.close()
-		closeRoot()
 		return nil, err
 	}
 	if !readOnly && !opts.restoreMode {
@@ -488,6 +717,7 @@ func initWorkspace(absPath string, root *os.Root, backend *hostRoot, single stri
 	if !readOnly && !opts.noOrphanGC {
 		w.startOrphanGC()
 	}
+	committed = true
 	return w, nil
 }
 
@@ -499,6 +729,12 @@ func (w *Workspace) Root() *os.Root {
 // HostPath returns the absolute host directory path of the workspace.
 func (w *Workspace) HostPath() string {
 	return w.rootPath
+}
+
+// MetaDir returns the resolved external metadata directory path, or empty when
+// metadata lives in the workspace root directory.
+func (w *Workspace) MetaDir() string {
+	return w.metaDirPath
 }
 
 // ReadOnly reports whether the workspace mount disallows mutations.
@@ -535,11 +771,19 @@ func (w *Workspace) Close() error {
 	w.mu.Unlock()
 	pinErr := w.closePins()
 	hostErr := w.host.close()
-	var rootErr error
+	var rootErr, metaHostErr, metaRootErr error
 	if w.root != nil {
 		rootErr = w.root.Close()
 	}
-	return errors.Join(flushErr, journalErr, lockErr, pinErr, hostErr, rootErr)
+	if w.externalMeta {
+		if w.metaHost != nil {
+			metaHostErr = w.metaHost.close()
+		}
+		if w.metaRoot != nil {
+			metaRootErr = w.metaRoot.Close()
+		}
+	}
+	return errors.Join(flushErr, journalErr, lockErr, pinErr, hostErr, rootErr, metaHostErr, metaRootErr)
 }
 
 // Sync writes every pending metadata mutation to stable storage. After Sync
@@ -604,6 +848,13 @@ func isReservedPath(rel string) bool {
 	return strings.EqualFold(rel, MetaFileName) ||
 		strings.EqualFold(rel, MetaLockFileName) ||
 		isMetaTempName(rel)
+}
+
+// isReservedPath reports whether rel is hidden as a metadata file inside this
+// workspace. External MetaDir workspaces store no metadata inside the workspace
+// root, so no metadata names are reserved there.
+func (w *Workspace) isReservedPath(rel string) bool {
+	return !w.externalMeta && isReservedPath(rel)
 }
 
 // nowNano returns monotonic nanoseconds for cache expiry.

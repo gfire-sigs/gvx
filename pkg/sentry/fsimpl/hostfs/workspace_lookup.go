@@ -280,7 +280,7 @@ func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 	if w.closed {
 		return entry{}, hostProbe{}, os.ErrClosed
 	}
-	if isReservedPath(rel) || (w.single != "" && rel != ".") {
+	if w.isReservedPath(rel) || (w.single != "" && rel != ".") {
 		return entry{}, hostProbe{}, fs.ErrNotExist
 	}
 	if k, r := w.virtualAtLocked(rel); r != nil {
@@ -474,7 +474,7 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 // classifyDirEntryLocked evaluates one raw host directory entry and returns its
 // guest listing, whether it is removable clutter, and whether it is visible.
 func (w *Workspace) classifyDirEntryLocked(pin *dirPin, rel, hostDir string, dirKey recKey, e hostDirEntry) (listing dirListing, isClutter, keep bool) {
-	if rel == "." && isReservedPath(e.name) {
+	if rel == "." && w.isReservedPath(e.name) {
 		return dirListing{}, false, false
 	}
 	if e.kind == hostKindOther || w.hiddenByName(e.name) {

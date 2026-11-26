@@ -61,6 +61,8 @@ Exceeding the process budget returns `ENOSPC` to `inotify_add_watch(2)`.
 
 Flushes batch every 250 ms (or immediately on `fsync`/`O_SYNC`), compacting above 64 MiB or `2 * live + 1,024` operations. Table memory caps at 512 MiB (~1,100,000 records, returning `ENOSPC` above), and a sweeper reaps deleted entries after two passes. Concurrent sandboxes sharing a host directory synchronize reads and flushes via `.gvx_meta.lock` opened before lockdown.
 
+Callers can isolate `.gvx_meta`, `.gvx_meta.lock`, and staging files outside the workspace directory via `OpenOptions.MetaDir` (`Mount.MetaDir` or `Config.WorkspaceMetaDir`). `MetaDir` must already exist as a non-root directory disjoint from every mounted host path, and `hostlockdown` authorizes it before lockdown. When `MetaDir` is external, `.gvx_meta*` names stay ordinary workspace files, and `ReadMetaAt(metaPath, workspaceDir)` resolves identity-keyed records against the workspace tree.
+
 ### 2.6 Special Files, Extended Attributes, and Overlay Support
 
 Sockets, FIFOs, and device nodes create empty host placeholders with `.gvx_meta` records; active socket endpoints stay in Sentry memory. On Linux, `user.*` xattrs write to host files while `trusted.*`, `security.*`, and macOS/Windows xattrs stay in `.gvx_meta` (`4 KiB`/inode, `64 KiB`/value max). Both `hostfs` and `ext4lite` act as overlay upper/lower layers, and `fallocate` supports `0`, `KEEP_SIZE`, and `PUNCH_HOLE` (`FSCTL_SET_ZERO_DATA` with zero-fill fallback).

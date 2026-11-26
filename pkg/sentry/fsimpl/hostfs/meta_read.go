@@ -34,9 +34,16 @@ import (
 // and so is the record of the workspace root. A virtual symbolic link appears
 // when its parent directory exists.
 func ReadMeta(path string) (map[string]POSIXAttr, error) {
-	raw, err := os.ReadFile(path)
+	return ReadMetaAt(path, filepath.Dir(path))
+}
+
+// ReadMetaAt reads the .gvx_meta file at metaPath and resolves identity-keyed
+// records against workspaceDir. Use ReadMetaAt when the workspace was opened
+// with an external OpenOptions.MetaDir.
+func ReadMetaAt(metaPath, workspaceDir string) (map[string]POSIXAttr, error) {
+	raw, err := os.ReadFile(metaPath)
 	if err != nil {
-		return nil, fmt.Errorf("hostfs: read %s: %w", path, err)
+		return nil, fmt.Errorf("hostfs: read %s: %w", metaPath, err)
 	}
 	img, err := parseMeta(raw)
 	if err != nil {
@@ -63,9 +70,16 @@ func ReadMeta(path string) (map[string]POSIXAttr, error) {
 	if len(byID) == 0 && len(kids) == 0 {
 		return out, nil
 	}
-	r := treeReader{dir: filepath.Dir(path), out: out, byID: byID, kids: kids}
+	externalMeta := !sameHostPath(filepath.Dir(metaPath), workspaceDir)
+	r := treeReader{
+		dir:          workspaceDir,
+		externalMeta: externalMeta,
+		out:          out,
+		byID:         byID,
+		kids:         kids,
+	}
 	if err := r.read(); err != nil {
-		return nil, fmt.Errorf("hostfs: resolve the records of %s: %w", path, err)
+		return nil, fmt.Errorf("hostfs: resolve the records of %s: %w", metaPath, err)
 	}
 	return out, nil
 }
@@ -73,10 +87,11 @@ func ReadMeta(path string) (map[string]POSIXAttr, error) {
 // treeReader names the identity-keyed records of one table by walking the host
 // directory.
 type treeReader struct {
-	dir  string
-	out  map[string]POSIXAttr
-	byID map[fileKey]*rec
-	kids map[fileKey][]namedRec
+	dir          string
+	externalMeta bool
+	out          map[string]POSIXAttr
+	byID         map[fileKey]*rec
+	kids         map[fileKey][]namedRec
 
 	host    hostBackend
 	codec   NameCodec
@@ -133,7 +148,7 @@ func (t *treeReader) walk(hostDir, guestDir string) error {
 		return err
 	}
 	for _, e := range entries {
-		if (hostDir == "." && isReservedPath(e.name)) || isEphemeralName(e.name) {
+		if (hostDir == "." && !t.externalMeta && isReservedPath(e.name)) || isEphemeralName(e.name) {
 			continue
 		}
 		if t.codec.active && strings.HasPrefix(e.name, codecPrefix) {

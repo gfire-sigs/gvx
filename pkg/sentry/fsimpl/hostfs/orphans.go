@@ -300,7 +300,7 @@ func (w *Workspace) visitDir(c *orphanCollector, rel string) {
 		if e.kind != hostKindRegular && e.kind != hostKindDir {
 			continue
 		}
-		if (rel == "." && isReservedPath(e.name)) || w.hiddenByName(e.name) {
+		if (rel == "." && w.isReservedPath(e.name)) || w.hiddenByName(e.name) {
 			continue
 		}
 		child := joinRelPath(rel, w.codec.ToGuest(e.name))

@@ -340,7 +340,7 @@ func (w *Workspace) lookupIn(parentRel, name string) (entry, error) {
 		return entry{}, os.ErrClosed
 	}
 	rel := joinRelPath(parentRel, name)
-	if isReservedPath(rel) {
+	if w.isReservedPath(rel) {
 		return entry{}, fs.ErrNotExist
 	}
 	pin, err := w.acquirePin(parentRel)

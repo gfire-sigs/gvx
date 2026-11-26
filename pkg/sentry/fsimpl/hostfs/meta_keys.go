@@ -35,6 +35,16 @@ func (w *Workspace) storedID(k fileKey) fileKey {
 	return k
 }
 
+// storedMetaID normalizes a file identity from the metadata directory by
+// masking w.metaDev instead of w.rootDev, so cross-volume external MetaDir
+// setups track .gvx_meta swaps independently from the workspace volume.
+func (w *Workspace) storedMetaID(k fileKey) fileKey {
+	if k.dev == w.metaDev {
+		k.dev = 0
+	}
+	return k
+}
+
 // rawID returns the identity as the host backend reports it.
 func (w *Workspace) rawID(k fileKey) fileKey {
 	if k.dev == 0 {
