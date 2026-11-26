@@ -195,3 +195,47 @@ func TestHotResumeRunsTheTailOfAQuarantinedSlot(t *testing.T) {
 		t.Errorf("the thread resumed cold %d times, want none", got-colds)
 	}
 }
+
+// TestInstallSlotExcludesUnusableIsland verifies that installSlot excludes an
+// island whose slots repeatedly fail encoding and falls through to a fresh
+// island instead of stalling forever on the empty rejected island.
+func TestInstallSlotExcludesUnusableIsland(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	if err := r.as.newIsland(r.rctx, r.mm, dataVA); err != nil {
+		t.Fatalf("newIsland: %v", err)
+	}
+	r.as.mu.Lock()
+	if len(r.as.islands) != 1 {
+		r.as.mu.Unlock()
+		t.Fatalf("initial islands = %d, want 1", len(r.as.islands))
+	}
+	var badBase uint64
+	var badIsl *island
+	for base, isl := range r.as.islands {
+		badBase = base
+		badIsl = isl
+	}
+	r.as.mu.Unlock()
+
+	slotVA, ref, err := r.as.installSlot(r.rctx, r.mm, plainSlot(dataVA, winSlotSize), func(_ []byte, va uint64) error {
+		if blockRound(va) == badBase {
+			return errors.New("synthetic island encoding rejection")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("installSlot: %v", err)
+	}
+	if ref.isl == badIsl || blockRound(slotVA) == badBase {
+		t.Fatalf("installSlot returned slot %#x in rejected island %#x", slotVA, badBase)
+	}
+	// Rejected slots from badIsl must have been discarded on return.
+	r.as.mu.Lock()
+	used := badIsl.used
+	r.as.mu.Unlock()
+	for i, word := range used {
+		if word != 0 {
+			t.Fatalf("rejected island %#x retained used bits[%d] = %#x", badBase, i, word)
+		}
+	}
+}

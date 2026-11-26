@@ -463,6 +463,82 @@ func hasRawKernelExit(b []byte) bool {
 	return false
 }
 
+const (
+	// winIslandReach32 is the signed 32-bit reach of an amd64 rel32 jump.
+	winIslandReach32 = 1 << 31
+
+	// amd64IslandRelMargin bounds the per-site and per-slot offset adjustments
+	// between a site address and a trampoline slot address across all amd64
+	// forward and reverse rel32 jumps (winSlotSize = 64).
+	amd64IslandRelMargin = 64
+)
+
+// rel32UpperHalfPoisoned reports whether any signed 32-bit displacement in
+// [lo, hi] has an upper 16-bit halfword (bytes 2 and 3 in little-endian order)
+// that forms a raw kernel-entry byte pair (0F 05, CD 2E, or 0F 34).
+func rel32UpperHalfPoisoned(lo, hi int64) bool {
+	if lo > hi || lo <= -winIslandReach32 || hi >= winIslandReach32 {
+		return true
+	}
+	hiLo := uint16(uint32(int32(lo)) >> 16)
+	hiHi := uint16(uint32(int32(hi)) >> 16)
+	for h := hiLo; ; h++ {
+		if isRawKernelExitPair(byte(h), byte(h>>8)) {
+			return true
+		}
+		if h == hiHi {
+			return false
+		}
+	}
+}
+
+// amd64IslandBaseSafe reports whether a 4 KiB island at islandBase can hold
+// rel32 forward and reverse trampoline jumps for site without forming a raw
+// kernel-exit byte pair in the upper 16 bits of the displacement.
+func amd64IslandBaseSafe(site, islandBase uint64) bool {
+	islandBase &^= winIslandBytes - 1
+	const maxDist = winIslandReach32 - winIslandBytes - amd64IslandRelMargin
+	var d int64
+	if islandBase >= site {
+		if islandBase-site >= maxDist {
+			return false
+		}
+		d = int64(islandBase - site)
+	} else {
+		if site-islandBase >= maxDist {
+			return false
+		}
+		d = -int64(site - islandBase)
+	}
+	fwdLo := d - amd64IslandRelMargin
+	fwdHi := d + winIslandBytes + amd64IslandRelMargin
+	revLo := -d - winIslandBytes - amd64IslandRelMargin
+	revHi := -d + amd64IslandRelMargin
+	return !rel32UpperHalfPoisoned(fwdLo, fwdHi) && !rel32UpperHalfPoisoned(revLo, revHi)
+}
+
+// amd64IslandBaseSafeForPage reports whether a 4 KiB island at islandBase is
+// safe for every site on the 4 KiB code page containing codePage.
+func amd64IslandBaseSafeForPage(codePage, islandBase uint64) bool {
+	codePage &^= winIslandBytes - 1
+	islandBase &^= winIslandBytes - 1
+	const maxDist = winIslandReach32 - 2*winIslandBytes - amd64IslandRelMargin
+	var d int64
+	if islandBase >= codePage {
+		if islandBase-codePage >= maxDist {
+			return false
+		}
+		d = int64(islandBase - codePage)
+	} else {
+		if codePage-islandBase >= maxDist {
+			return false
+		}
+		d = -int64(codePage - islandBase)
+	}
+	const span = winIslandBytes + amd64IslandRelMargin
+	return !rel32UpperHalfPoisoned(d-span, d+span) && !rel32UpperHalfPoisoned(-d-span, -d+span)
+}
+
 // hasRemainingKernelExit reports whether patchedPage, its single-byte seam with
 // before or after, or after itself still contains a raw kernel-entry byte pair.
 func hasRemainingKernelExit(before, patchedPage, after []byte) bool {

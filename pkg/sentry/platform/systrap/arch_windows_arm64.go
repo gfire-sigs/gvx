@@ -484,4 +484,8 @@ func (th *thread) archFastGetFP(f *fastThread, ac *arch.Context64) error {
 
 func initIslandBytes([]byte) {}
 
+func islandBaseSafe(uint64, uint64) bool { return true }
+
+func islandBaseSafeForPage(uint64, uint64) bool { return true }
+
 func slotSeamSafe([]byte, uint32, uint32) bool { return true }

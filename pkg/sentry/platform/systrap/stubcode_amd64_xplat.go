@@ -93,10 +93,6 @@ const (
 	// the SYSCALL.
 	winMinRelocated = winJmpLen - 2
 
-	// winIslandReach32 is the reach of a rel32 jump. The island allocator keeps
-	// far below it.
-	winIslandReach32 = 1 << 31
-
 	// winJmpNeighborLen is the number of bytes on each side of a page that
 	// jmpPlanner scans for relative branches into a patched site.
 	winJmpNeighborLen = 256
