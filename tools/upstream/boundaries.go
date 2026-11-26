@@ -1047,7 +1047,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/sys"}, "pkg/syserr", "sysfs unit tests compare syserr error codes"},
 	{[]string{"pkg/sentry/mm", "pkg/sentry/loader", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/devpts"}, "pkg/sentry/arch", "unit tests construct arch.Context64 address spaces or syscall tables"},
 	{[]string{"pkg/sentry/loader", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/devpts"}, "pkg/abi", "unit tests pass abi.Linux to arch or syscall table registration"},
-	{[]string{"pkg/sentry/loader"}, "pkg/abi/linux", "loader tests construct ELF program headers with Linux ABI constants"},
+	{[]string{"pkg/sentry/loader", "pkg/sentry/mm"}, "pkg/abi/linux", "unit tests construct Linux ABI headers and exercise marshal CopyIn/CopyOut paths"},
 	{[]string{"pkg/sentry/fsimpl/overlay", "pkg/sentry/loader"}, "pkg/sentry/kernel/auth", "unit tests supply auth.NewRootCredentials to VFS"},
 	{[]string{"pkg/sentry/loader", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/devpts"}, "pkg/sentry/platform", "unit tests provide a minimal platform.Platform stub"},
 	{[]string{"pkg/sentry/fsimpl/devpts"}, "pkg/sentry/fsimpl/cgroup2fs", "devpts VFS unit tests pass cgroup2fs.NewFilesystem to Kernel.Init"},

@@ -42,48 +42,50 @@ func mapInternalOf(file memmap.File, fr memmap.FileRange, perms hostarch.AccessT
 	return file.MapInternal(fr, perms)
 }
 
-// The Windows systrap engine runs guest code from patched copies of memory-file
-// pages, and it cannot see a write that the Sentry makes through an internal
-// mapping. The wrappers below tell the memory file about each such write after
-// it completes, so that the engine drops the copies of the written frames.
-// The calls run inside withInternalMappings, where activeMu is held for
-// reading and the pmas cannot change.
+// The Windows systrap engine and Linux 16 KiB sub-block layer run guest code
+// from copies of memory-file pages, so they cannot see a Sentry write made
+// through an internal mapping. The helpers below run directly inside
+// withInternalMappings and withVecInternalMappings after each write completes
+// while mm.activeMu is held for reading. Avoiding a wrapper closure keeps the
+// callback argument of withInternalMappings non-escaping, which generated
+// gohacks.Noescape callers require for stack-growth safety.
 
-// hostWriteWrap returns f, or a function that calls f and then reports the
-// write to ar. It returns f while no memory file has an observer.
-func (mm *MemoryManager) hostWriteWrap(ar hostarch.AddrRange, f func(safemem.BlockSeq) (uint64, error)) func(safemem.BlockSeq) (uint64, error) {
-	if !pgalloc.HostWritesObserved() {
-		return f
-	}
-	return func(bs safemem.BlockSeq) (uint64, error) {
-		n, err := f(bs)
-		mm.noteHostWrite(ar) // +checklocksforce: withInternalMappings holds mm.activeMu while f runs
-		return n, err
-	}
-}
-
-// hostWriteWrapVec is hostWriteWrap for a sequence of ranges.
-func (mm *MemoryManager) hostWriteWrapVec(ars hostarch.AddrRangeSeq, f func(safemem.BlockSeq) (uint64, error)) func(safemem.BlockSeq) (uint64, error) {
-	if !pgalloc.HostWritesObserved() {
-		return f
-	}
-	return func(bs safemem.BlockSeq) (uint64, error) {
-		n, err := f(bs)
-		for rest := ars; !rest.IsEmpty(); rest = rest.Tail() {
-			if ar := rest.Head(); ar.Length() != 0 {
-				mm.noteHostWrite(ar) // +checklocksforce: withInternalMappings holds mm.activeMu while f runs
-			}
-		}
-		return n, err
-	}
-}
-
-// noteHostWrite reports ar to the memory file of every pma that overlaps it.
+// noteHostWrite reports ar to the memory file of every overlapping pma while at
+// least one host-write observer is registered.
 //
 // Preconditions: mm.activeMu is locked for reading or writing.
 //
 // +checklocksread:mm.activeMu
 func (mm *MemoryManager) noteHostWrite(ar hostarch.AddrRange) {
+	if !pgalloc.HostWritesObserved() {
+		return
+	}
+	mm.noteHostWriteLocked(ar)
+}
+
+// noteHostWriteVec is noteHostWrite for a sequence of ranges.
+//
+// Preconditions: mm.activeMu is locked for reading or writing.
+//
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) noteHostWriteVec(ars hostarch.AddrRangeSeq) {
+	if !pgalloc.HostWritesObserved() {
+		return
+	}
+	for rest := ars; !rest.IsEmpty(); rest = rest.Tail() {
+		if ar := rest.Head(); ar.Length() != 0 {
+			mm.noteHostWriteLocked(ar)
+		}
+	}
+}
+
+// noteHostWriteLocked reports ar to the memory file of every pma that overlaps
+// it.
+//
+// Preconditions: mm.activeMu is locked for reading or writing.
+//
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) noteHostWriteLocked(ar hostarch.AddrRange) {
 	for pseg := mm.pmas.LowerBoundSegment(ar.Start); pseg.Ok() && pseg.Start() < ar.End; pseg = pseg.NextSegment() {
 		if n, ok := pseg.ValuePtr().file.(hostWriteNoter); ok {
 			n.NoteHostWrite(pseg.fileRangeOf(pseg.Range().Intersect(ar)))
