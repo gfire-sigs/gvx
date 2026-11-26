@@ -23,15 +23,13 @@ import (
 )
 
 // The macOS platforms map the same pages that the Sentry writes, so these
-// functions return f unchanged and cost nothing.
+// functions do nothing and inline away.
 
-func (mm *MemoryManager) hostWriteWrap(_ hostarch.AddrRange, f func(safemem.BlockSeq) (uint64, error)) func(safemem.BlockSeq) (uint64, error) {
-	return f
-}
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) noteHostWrite(hostarch.AddrRange) {}
 
-func (mm *MemoryManager) hostWriteWrapVec(_ hostarch.AddrRangeSeq, f func(safemem.BlockSeq) (uint64, error)) func(safemem.BlockSeq) (uint64, error) {
-	return f
-}
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) noteHostWriteVec(hostarch.AddrRangeSeq) {}
 
 func mapInternalOf(file memmap.File, fr memmap.FileRange, perms hostarch.AccessType) (safemem.BlockSeq, error) {
 	return file.MapInternal(fr, perms)

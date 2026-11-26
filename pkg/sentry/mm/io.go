@@ -631,9 +631,6 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 // +checklocksexclude:mm.mappingMu
 // +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
-	if at.Write {
-		f = mm.hostWriteWrap(ar, f)
-	}
 	// If pmas are already available, we can do IO without touching mm.vmas or
 	// mm.mappingMu.
 	mm.activeMu.RLock()
@@ -643,6 +640,9 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 		if ims, err := mm.internalMappingsLocked(pseg, ar); err == nil {
 			defer mm.activeMu.RUnlock()
 			n, err := f(ims)
+			if at.Write {
+				mm.noteHostWrite(ar)
+			}
 			// Do not convert errors returned by f to EFAULT.
 			return int64(n), err
 		}
@@ -684,6 +684,9 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 
 	// Do I/O.
 	un, err := t.flush(f(imbs))
+	if at.Write {
+		mm.noteHostWrite(ar)
+	}
 	n := int64(un)
 
 	// Return the first error in order of progress through ar.
@@ -719,9 +722,6 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	if ars.NumRanges() == 1 {
 		return mm.withInternalMappings(ctx, ars.Head(), at, ignorePermissions, f)
 	}
-	if at.Write {
-		f = mm.hostWriteWrapVec(ars, f)
-	}
 
 	// If pmas are already available, we can do IO without touching mm.vmas or
 	// mm.mappingMu.
@@ -732,6 +732,9 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 		if ims, err := mm.vecInternalMappingsLocked(ars); err == nil {
 			defer mm.activeMu.RUnlock()
 			n, err := f(ims)
+			if at.Write {
+				mm.noteHostWriteVec(ars)
+			}
 			// Do not convert errors returned by f to EFAULT.
 			return int64(n), err
 		}
@@ -757,13 +760,17 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	imbs, t, imerr := mm.getVecIOMappingsLocked(pars, at)
 	mm.activeMu.DowngradeLock()
 	defer mm.activeMu.RUnlock()
-	if imbs.NumBytes() == 0 {
+	imlen := imbs.NumBytes()
+	if imlen == 0 {
 		t.flush(0, nil)
 		return 0, translateIOError(ctx, imerr)
 	}
 
 	// Do I/O.
 	un, err := t.flush(f(imbs))
+	if at.Write {
+		mm.noteHostWriteVec(pars.TakeFirst64(int64(imlen)))
+	}
 	n := int64(un)
 
 	// Return the first error in order of progress through ars.
