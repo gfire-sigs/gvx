@@ -21,38 +21,11 @@ import (
 	"io"
 	"strings"
 	"text/tabwriter"
-	"text/template"
 
 	"z.gfire.dev/gvx/pkg/oci"
 )
 
-var formatFuncMap = template.FuncMap{
-	"json": func(v any) (string, error) {
-		var buf bytes.Buffer
-		enc := json.NewEncoder(&buf)
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(v); err != nil {
-			return "", err
-		}
-		return strings.TrimSuffix(buf.String(), "\n"), nil
-	},
-	"lower": strings.ToLower,
-	"upper": strings.ToUpper,
-	"join":  strings.Join,
-	"split": strings.Split,
-	"truncate": func(s string, maxLen int) string {
-		if maxLen <= 0 {
-			return ""
-		}
-		runes := []rune(s)
-		if len(runes) <= maxLen {
-			return s
-		}
-		return string(runes[:maxLen])
-	},
-}
-
-func compileFormatTemplate(raw string) (*template.Template, bool, error) {
+func compileFormatTemplate(raw string) (*formatTemplate, bool, error) {
 	spec := strings.TrimSpace(raw)
 	isTable := false
 	if spec == "table" {
@@ -63,7 +36,7 @@ func compileFormatTemplate(raw string) (*template.Template, bool, error) {
 		spec = strings.TrimSpace(spec[len("table"):])
 	}
 	spec = unescapeOutsideActions(spec)
-	tmpl, err := template.New("format").Funcs(formatFuncMap).Option("missingkey=error").Parse(spec)
+	tmpl, err := parseFormatTemplate(spec)
 	if err != nil {
 		return nil, false, err
 	}
