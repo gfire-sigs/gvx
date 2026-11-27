@@ -10,6 +10,7 @@ target_goamd64=${GOAMD64:-}
 target_goarm64=${GOARM64:-}
 target_tags=${GVX_BUILD_TAGS:-}
 pkg=${GVX_REPRO_PKG:-./cmd/rungvx}
+build_script=${GVX_REPRO_BUILD_SCRIPT:-scripts/repro-build.sh}
 go_ver=$(awk '$1 == "go" { print $2; exit }' "$repo_root/go.mod")
 image=${GVX_REPRO_IMAGE:-golang:${go_ver}-bookworm}
 platform=${GVX_REPRO_PLATFORM:-auto}
@@ -48,14 +49,14 @@ go -C "$repo_root" mod download
 
 host_out="$work/host/rungvx"
 GOOS="$target_os" GOARCH="$target_arch" GOAMD64="$target_goamd64" GOARM64="$target_goarm64" GVX_BUILD_TAGS="$target_tags" \
-	"$repo_root/scripts/repro-build.sh" "$host_out" "$pkg"
+	"$repo_root/$build_script" "$host_out" "$pkg"
 host_sha=$(sha256_file "$host_out")
 
 runner_bin="$host_out"
 if [ "$host_os/$host_arch" != "$target_os/$target_arch" ] || [ "$pkg" != "./cmd/rungvx" ] || [ -n "$target_goamd64$target_goarm64$target_tags" ]; then
 	runner_bin="$work/runner/rungvx"
 	GOOS="$host_os" GOARCH="$host_arch" GOAMD64=v1 GOARM64=v8.0 GVX_BUILD_TAGS="" \
-		"$repo_root/scripts/repro-build.sh" "$runner_bin" ./cmd/rungvx
+		"$repo_root/$build_script" "$runner_bin" ./cmd/rungvx
 elif [ "$host_os" = "darwin" ]; then
 	mkdir -p -- "$work/runner"
 	runner_bin="$work/runner/rungvx"
@@ -83,9 +84,9 @@ mkdir -p -- "$work/guest"
 		git clone --local --no-hardlinks --no-checkout --quiet /src /tmp/src
 		git -C /tmp/src fetch --tags --quiet /src
 		git -C /tmp/src checkout --detach --quiet "$head_sha"
-		GOOS="$1" GOARCH="$2" GOAMD64="$4" GOARM64="$5" GVX_BUILD_TAGS="$6" GOMODCACHE=/gomodcache GOCACHE=/tmp/gocache \
-			/tmp/src/scripts/repro-build.sh /out/rungvx "$3"
-	' sh "$target_os" "$target_arch" "$pkg" "$target_goamd64" "$target_goarm64" "$target_tags"
+		GOOS="$1" GOARCH="$2" GOAMD64="$4" GOARM64="$5" GVX_BUILD_TAGS="$6" GOMODCACHE=/gomodcache GOCACHE=/tmp/gocache GVX_SLIM_CACHE_DIR=/tmp/slimcache \
+			"/tmp/src/$7" /out/rungvx "$3"
+	' sh "$target_os" "$target_arch" "$pkg" "$target_goamd64" "$target_goarm64" "$target_tags" "$build_script"
 
 guest_out="$work/guest/rungvx"
 guest_sha=$(sha256_file "$guest_out")

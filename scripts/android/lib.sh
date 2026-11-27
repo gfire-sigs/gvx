@@ -47,7 +47,7 @@ android_go_lib() {
 	android_go_env
 	mkdir -p "$1/lib/$android_abi"
 	if [ "$android_abi" = "arm64-v8a" ]; then
-		GOOS=android GOARCH=arm64 "$android_root/scripts/repro-build.sh" "$1/lib/$android_abi/$2" "$3"
+		GOOS=android GOARCH=arm64 "$android_root/scripts/slim-build.sh" "$1/lib/$android_abi/$2" "$3"
 	else
 		(cd "$android_root" && env "${android_env[@]}" \
 			go build -mod=readonly -pgo=off -trimpath -ldflags="-s -w -buildid=" -o "$1/lib/$android_abi/$2" "$3")
