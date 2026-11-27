@@ -893,6 +893,14 @@ var boundaryRules = []importRule{
 		allowed:   []string{"pkg/state"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
+
+	// Linux runsc Tier 2 packages.
+	{
+		pkg:       "runsc/boot/filter/config",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/seccomp", "pkg/sentry/devices/nvproxy", "pkg/sentry/devices/nvproxy/nvconf"},
+		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
+	},
 }
 
 func without(list []string, drop string) []string {

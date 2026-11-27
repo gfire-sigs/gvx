@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux
+//go:build !linux || !nvproxy
 
-package proc
+package nvconf
 
-import (
-	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/sentry/fsimpl/kernfs"
-	"z.gfire.dev/gvx/pkg/sentry/kernel"
-	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
-)
+import "errors"
 
-func (fs *filesystem) addNvproxyFiles(_ context.Context, _ *auth.Credentials, _ *kernel.Kernel, _ map[string]kernfs.Inode) {
+// HostDriverVersion reports that Linux host NVIDIA driver probing is disabled
+// unless built on Linux with the nvproxy build tag.
+func HostDriverVersion() (string, error) {
+	return "", errors.New("nvproxy host driver is disabled in this build")
 }

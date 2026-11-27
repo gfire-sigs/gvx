@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux
+//go:build linux && !nvproxy
 
-package nvconf
+package config
 
-import "errors"
+import (
+	"z.gfire.dev/gvx/pkg/seccomp"
+	"z.gfire.dev/gvx/pkg/sentry/devices/nvproxy/nvconf"
+)
 
-// HostDriverVersion reports that Linux host NVIDIA driver probing is
-// unavailable on non-Linux hosts.
-func HostDriverVersion() (string, error) {
-	return "", errors.New("nvproxy host driver is only supported on Linux")
+func nvproxyFilters(_ nvconf.DriverCaps) seccomp.SyscallRules {
+	panic("runsc/boot/filter/config: NVProxy filters require building with -tags nvproxy")
 }
