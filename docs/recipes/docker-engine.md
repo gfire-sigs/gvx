@@ -239,3 +239,5 @@ Because a Go program demands slightly above 1.0 CPU, a 1-CPU quota throttles it 
 ## 8. Troubleshooting
 
 If `docker info` fails, ports collide, or builds fail behind a proxy, consult [`../troubleshooting.md`](../troubleshooting.md#4-docker-engine-dockerdind-failures). Re-run `rungvx` with `GVX_DEBUG_LOG=1` to inspect Sentry kernel diagnostics for opaque crashes.
+
+For copy-paste scripts targeting restricted sandboxes, see the standalone Gists for [rootless Docker without user namespaces](https://gist.github.com/lemon-mint/e5683711a5b7ae45dadcca51b741ac71), [nested `docker:dind` inside gVisor](https://gist.github.com/lemon-mint/3b76be96d84101232041110e49b090ff), and [copy-on-write `ext4lite` RL episode resets](https://gist.github.com/lemon-mint/c1fa3755ee5da85954105993a947fda0).

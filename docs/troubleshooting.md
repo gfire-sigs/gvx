@@ -91,3 +91,15 @@ Consult this table when guest DNS fails, proxies reject HTTPS, or Android limits
 | Pull or HTTPS inside guest fails behind a proxy | Guest images omit host-installed root CA certificates by default. | Pass `--host-ca-certs` (and `SSL_CERT_FILE=/path/to/root.pem` if needed) to `rungvx run`. |
 | Android guest stops abruptly during builds | Android 12+ kills apps exceeding 32 system-wide children or background CPU caps. | Run from a foreground service, keep processes below 10, or disable restrictions (see [`cli.md`](cli.md#12-android-operation)). |
 | Hard link (`ln`) fails with `EACCES` on Android | Android SELinux denies `linkat` on app-data files under `hostfs`. | Store hard-link workloads in an `ext4lite` volume (`-v work:/work`). |
+
+## 7. Runnable Recovery Scripts and Community Q&A
+
+These standalone scripts pair common container errors with single-turn `rungvx` and Go SDK setups. Browse [GitHub Discussions Q&A](https://github.com/gfire-sigs/gvx/discussions/categories/q-a) for additional environment errors.
+
+| Scenario | Runnable Gist |
+| :--- | :--- |
+| Run `dockerd`, `docker build`, and `docker compose` without root, `CLONE_NEWUSER`, or `/dev/fuse` | [`gvx-rootless-docker.sh`](https://gist.github.com/lemon-mint/e5683711a5b7ae45dadcca51b741ac71) |
+| Run nested `docker:dind` inside `gVisor` (`runsc`) past `modprobe`, `iptables-nft`, and `EBUSY` | [`gvx-nested-dind-in-gvisor.sh`](https://gist.github.com/lemon-mint/3b76be96d84101232041110e49b090ff) |
+| Reset parallel `SWE-bench` and AI agent RL Docker episodes with `ext4lite` reflink clones | [`reset-episode.sh` and `rl_rollout_pool.go`](https://gist.github.com/lemon-mint/c1fa3755ee5da85954105993a947fda0) |
+| Boot an unmodified `rancher/k3s` node with `Calico` in one unprivileged process | [`gvx-k3s-cluster.sh`](https://gist.github.com/lemon-mint/c5791f97973ae9dac11686e88400a8a6) |
+| Embed Linux containers in pure Go (`z.gfire.dev/gvx/pkg/gvx`) without Docker Desktop or WSL2 | [`main.go`](https://gist.github.com/lemon-mint/68c6d2cabc5c98e2191475fb5b01b9dc) |

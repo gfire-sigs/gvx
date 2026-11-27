@@ -241,3 +241,5 @@ Consult [`../compatibility.md`](../compatibility.md) for host-wide limits; the i
 ## 6. Troubleshooting
 
 If a node stays `NotReady`, Calico pods crash, or ports conflict, consult [`../troubleshooting.md`](../troubleshooting.md#5-kubernetes-k3s-failures). Re-run `rungvx` with `GVX_DEBUG_LOG=1` to inspect Sentry kernel diagnostics alongside `k3s` logs.
+
+For a standalone copy-paste bootstrap script, see the [`gvx-k3s-cluster.sh` Gist](https://gist.github.com/lemon-mint/c5791f97973ae9dac11686e88400a8a6).
