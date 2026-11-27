@@ -114,6 +114,9 @@ type Sandbox struct {
 	activeKernel         *kernel.Kernel
 	runningKernel        *kernel.Kernel
 	activeWatchdog       *watchdog.Watchdog
+	kernelStartDone      chan struct{}
+	kernelExited         bool
+	stdioQuiescers       []saveQuiescer
 	checkpointStopped    atomic.Bool
 	restoredKernel       *kernel.Kernel
 	restoredStdio        *restoreStdioCollector

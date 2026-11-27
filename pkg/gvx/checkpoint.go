@@ -28,9 +28,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
@@ -530,11 +532,83 @@ func (s *Sandbox) AcceptCheckpointConn() (net.Conn, error) {
 	return ln.Accept()
 }
 
-// saveQuiescer is a host network component that stops its traffic into the
-// guest Netstack while the kernel saves its state.
+// saveQuiescer pauses host I/O sources (network backends, rpcfs mounts, and
+// stdio readers) while a checkpoint serializes kernel state.
 type saveQuiescer interface {
 	QuiesceForSave()
 	ResumeAfterSave() error
+}
+
+// addStdioQuiescer registers one stdin pump or TTY state so checkpoint saves
+// serialize against the goroutine reading host input. The returned function
+// removes the entry when stdio shuts down.
+func (s *Sandbox) addStdioQuiescer(q saveQuiescer) func() {
+	if q == nil {
+		return func() {}
+	}
+	s.mu.Lock()
+	s.stdioQuiescers = append(s.stdioQuiescers, q)
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			for i, existing := range s.stdioQuiescers {
+				if existing == q {
+					last := len(s.stdioQuiescers) - 1
+					s.stdioQuiescers[i] = s.stdioQuiescers[last]
+					s.stdioQuiescers[last] = nil
+					s.stdioQuiescers = s.stdioQuiescers[:last]
+					break
+				}
+			}
+			s.mu.Unlock()
+		})
+	}
+}
+
+// stdioSaveQuiescers snapshots the active host stdio readers of s.
+func (s *Sandbox) stdioSaveQuiescers() []saveQuiescer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.stdioQuiescers) == 0 {
+		return nil
+	}
+	out := make([]saveQuiescer, len(s.stdioQuiescers))
+	copy(out, s.stdioQuiescers)
+	return out
+}
+
+// saveKernelWithStdioQuiesce holds the save barrier on every active stdin pump
+// and TTY reader across k.SaveTo and always lifts it before returning.
+func (s *Sandbox) saveKernelWithStdioQuiesce(
+	k *kernel.Kernel,
+	kCtx gvcontext.Context,
+	stateWriter io.WriteCloser,
+	pagesMetaWriter io.WriteCloser,
+	pagesWriter stateio.AsyncWriter,
+	leaveRunning bool,
+) error {
+	stdioQuiescers := s.stdioSaveQuiescers()
+	for _, q := range stdioQuiescers {
+		q.QuiesceForSave()
+	}
+	defer func() {
+		for _, q := range stdioQuiescers {
+			_ = q.ResumeAfterSave()
+		}
+	}()
+	return k.SaveTo(
+		kCtx,
+		stateWriter,
+		pagesMetaWriter,
+		pagesWriter,
+		true,
+		leaveRunning,
+		nil,
+		vfs.PrepareSaveOptions{ValidateMetadata: true},
+		nil,
+	)
 }
 
 // saveQuiescersLocked returns the network components of s that must stop
@@ -747,16 +821,13 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	pagesMetaWriter := stateio.NewBufioWriteCloser(nopCloseWriter{files.pagesMeta})
 	pagesWriter := stateio.NewIOWriter(nopCloseWriter{files.pages}, 256<<10, 64, 4)
 
-	if saveErr := k.SaveTo(
+	if saveErr := s.saveKernelWithStdioQuiesce(
+		k,
 		kCtx,
 		stateWriter,
 		pagesMetaWriter,
 		pagesWriter,
-		true,
 		opts.LeaveRunning,
-		nil,
-		vfs.PrepareSaveOptions{ValidateMetadata: true},
-		nil,
 	); saveErr != nil {
 		return fmt.Errorf("gvx: save kernel state: %w", saveErr)
 	}
@@ -1027,16 +1098,13 @@ func (s *Sandbox) checkpointStreamRun(
 	pagesMetaWriter := stateio.NewBufioWriteCloser(&pagesMetaBuf)
 	pagesWriter := stateio.NewIOWriter(&pagesBuf, 256<<10, 64, 4)
 
-	if saveErr := k.SaveTo(
+	if saveErr := s.saveKernelWithStdioQuiesce(
+		k,
 		kCtx,
 		stateWriter,
 		pagesMetaWriter,
 		pagesWriter,
-		true,
 		opts.LeaveRunning,
-		nil,
-		vfs.PrepareSaveOptions{ValidateMetadata: true},
-		nil,
 	); saveErr != nil {
 		return fmt.Errorf("gvx: save kernel state: %w", saveErr)
 	}

@@ -87,12 +87,28 @@ func (p *stdinPump) startReadLocked(size int) {
 		defer close(done)
 		buf := make([]byte, size)
 		n, err := r.Read(buf)
+		p.deliverRead(r, buf[:n], err)
+	}()
+}
+
+// deliverRead commits one completed host read while obeying the checkpoint
+// save barrier. While QuiesceForSave holds saveResumed open, delivery parks
+// before mutating p.buf or notifying p.wq so StateSave reads a stable state.
+func (p *stdinPump) deliverRead(r io.Reader, data []byte, readErr error) {
+	for {
+		p.deliveryMu.Lock()
 		p.mu.Lock()
+		if resumed := p.saveResumed; resumed != nil {
+			p.mu.Unlock()
+			p.deliveryMu.Unlock()
+			<-resumed
+			continue
+		}
 		stopped := p.stopped
 		if !stopped {
-			p.buf = append(p.buf, buf[:n]...)
-			if err != nil {
-				p.err = err
+			p.buf = append(p.buf, data...)
+			if readErr != nil {
+				p.err = readErr
 			}
 		}
 		p.pending = false
@@ -103,12 +119,62 @@ func (p *stdinPump) startReadLocked(size int) {
 			}
 		}
 		p.mu.Unlock()
-		if stopped {
-			p.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
-			return
+		if !stopped {
+			p.wq.Notify(waiter.ReadableEvents)
 		}
+		p.deliveryMu.Unlock()
+		return
+	}
+}
+
+// QuiesceForSave blocks in-flight host read completions from mutating p.buf or
+// p.wq until ResumeAfterSave runs. The caller must have paused guest tasks.
+func (p *stdinPump) QuiesceForSave() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.saveResumed == nil {
+		p.saveResumed = make(chan struct{})
+	}
+	p.mu.Unlock()
+	// Wait for any delivery already past the saveResumed check to finish.
+	p.deliveryMu.Lock()
+	p.deliveryMu.Unlock()
+}
+
+// ResumeAfterSave lifts the checkpoint save barrier installed by QuiesceForSave.
+func (p *stdinPump) ResumeAfterSave() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	if p.saveResumed != nil {
+		close(p.saveResumed)
+		p.saveResumed = nil
+	}
+	p.mu.Unlock()
+	return nil
+}
+
+// activateRestored restarts host reads or notifies restored poll and epoll
+// waiters when a restored pump already holds buffered data or EOF.
+func (p *stdinPump) activateRestored() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.stopped || p.wq.IsEmpty() {
+		p.mu.Unlock()
+		return
+	}
+	if len(p.buf) > 0 || p.err != nil {
+		p.mu.Unlock()
 		p.wq.Notify(waiter.ReadableEvents)
-	}()
+		return
+	}
+	p.startReadLocked(4096)
+	p.mu.Unlock()
 }
 
 // stop ends the pump when a sandbox run finishes. For a reader that supports
@@ -128,6 +194,10 @@ func (p *stdinPump) stop() {
 	if !alreadyStopped {
 		p.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
 	}
+	// Drain any in-flight delivery that passed the stopped check before stop ran.
+	p.deliveryMu.Lock()
+	p.deliveryMu.Unlock()
+
 	if done == nil {
 		return
 	}
