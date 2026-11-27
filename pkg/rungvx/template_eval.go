@@ -342,6 +342,30 @@ func (s *templateEvalState) walkRange(dot reflect.Value, r *tmplparse.RangeNode)
 			}
 		}
 		return nil
+	case reflect.Chan:
+		if val.IsNil() {
+			break
+		}
+		if val.Type().ChanDir() == reflect.SendDir {
+			return fmt.Errorf("range over send-only channel %v", val.Type())
+		}
+		i := 0
+		for ; ; i++ {
+			elem, ok := val.Recv()
+			if !ok {
+				break
+			}
+			stop, err := oneIteration(reflect.ValueOf(i), elem)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
+		if i > 0 {
+			return nil
+		}
 	default:
 		return fmt.Errorf("range can't iterate over %v", val.Type())
 	}
