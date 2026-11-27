@@ -273,15 +273,14 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 }
 
 const (
-	// maxInstallSlotAttempts bounds retries inside installSlot across candidate
-	// slots and islands when encode or slotSeamSafe rejects a slot address.
-	maxInstallSlotAttempts = 20
+	// maxInstallSlotAttempts bounds retries across candidate slots and islands.
+	// Thirty attempts allow skipping two full rejected islands and retrying on a third.
+	maxInstallSlotAttempts = 30
 
-	// maxPerIslandRejects is the number of encode or seam rejections from one
-	// island before installSlot excludes that island for the remaining attempts.
-	// A single 256-byte (b1, b2) bad-displacement band spans at most 9
-	// consecutive 32-byte slots, so 10 rejections cross any partial band while
-	// excluding an unusable island in time to reclaim or create another.
+	// maxPerIslandRejects bounds encode or seam rejections from one island
+	// before installSlot excludes it. A 256-byte (b1, b2) bad-displacement band
+	// spans up to 8 consecutive 32-byte TLS slots or 4 consecutive 64-byte
+	// syscall slots. Ten rejections cross any partial band.
 	maxPerIslandRejects = 10
 )
 
@@ -337,6 +336,7 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 			continue
 		}
 		if !slotSeamSafe(isl.page.bytes(), off, size) {
+			initIslandBytes(slotBuf)
 			noteReject(ref)
 			lastErr = errors.New("island slot forms a raw kernel opcode")
 			continue

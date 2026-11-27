@@ -239,3 +239,97 @@ func TestInstallSlotExcludesUnusableIsland(t *testing.T) {
 		}
 	}
 }
+
+// TestInstallSlotExcludesTwoUnusableIslands verifies that installSlot can
+// reject two full islands and still succeed on a third island.
+func TestInstallSlotExcludesTwoUnusableIslands(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	if err := r.as.newIsland(r.rctx, r.mm, dataVA); err != nil {
+		t.Fatalf("newIsland #1: %v", err)
+	}
+	if err := r.as.newIsland(r.rctx, r.mm, dataVA); err != nil {
+		t.Fatalf("newIsland #2: %v", err)
+	}
+	r.as.mu.Lock()
+	badBases := make(map[uint64]*island, len(r.as.islands))
+	for base, isl := range r.as.islands {
+		badBases[base] = isl
+	}
+	r.as.mu.Unlock()
+	if len(badBases) != 2 {
+		t.Fatalf("initial islands = %d, want 2", len(badBases))
+	}
+
+	slotVA, ref, err := r.as.installSlot(r.rctx, r.mm, plainSlot(dataVA, winSlotSize), func(_ []byte, va uint64) error {
+		if _, bad := badBases[blockRound(va)]; bad {
+			return errors.New("synthetic island encoding rejection")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("installSlot across two rejected islands: %v", err)
+	}
+	if _, bad := badBases[blockRound(slotVA)]; bad || badBases[ref.isl.base] != nil {
+		t.Fatalf("installSlot returned slot %#x in one of the rejected islands", slotVA)
+	}
+	for base, isl := range badBases {
+		r.as.mu.Lock()
+		used := isl.used
+		r.as.mu.Unlock()
+		for i, word := range used {
+			if word != 0 {
+				t.Fatalf("rejected island %#x retained used bits[%d] = %#x", base, i, word)
+			}
+		}
+	}
+}
+
+// TestInstallSlotScrubsRejectedSeamBytes verifies that a slot rejected by
+// slotSeamSafe leaves no raw kernel-entry opcode bytes in the executable page.
+func TestInstallSlotScrubsRejectedSeamBytes(t *testing.T) {
+	probe := make([]byte, winSlotSize)
+	initIslandBytes(probe)
+	probe[0], probe[1] = 0x0f, 0x05
+	if slotSeamSafe(probe, 0, winSlotSize) {
+		t.Skip("host architecture has no amd64 raw-opcode seam filter")
+	}
+
+	r := newRig(t, newFastPlatform(t))
+	attempts := 0
+	var rejectedVA uint64
+	var rejectedIsl *island
+	slotVA, _, err := r.as.installSlot(r.rctx, r.mm, plainSlot(dataVA, winSlotSize), func(buf []byte, va uint64) error {
+		attempts++
+		if attempts == 1 {
+			rejectedVA = va
+			buf[0], buf[1] = 0x0f, 0x05
+			return nil
+		}
+		initIslandBytes(buf)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("installSlot after seam rejection: %v", err)
+	}
+	if attempts < 2 {
+		t.Fatalf("attempts = %d, want at least 2 after raw-opcode rejection", attempts)
+	}
+	if slotVA == rejectedVA {
+		t.Fatalf("second attempt reused rejected slot %#x", rejectedVA)
+	}
+	r.as.mu.Lock()
+	rejectedIsl = r.as.islands[blockRound(rejectedVA)]
+	r.as.mu.Unlock()
+	if rejectedIsl == nil {
+		t.Fatalf("missing island for rejected slot %#x", rejectedVA)
+	}
+	off := uint32(rejectedVA - rejectedIsl.base)
+	want := make([]byte, winSlotSize)
+	initIslandBytes(want)
+	got := rejectedIsl.page.bytes()[off : off+winSlotSize]
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rejected slot byte[%d] = %#02x, want %#02x", i, got[i], want[i])
+		}
+	}
+}
