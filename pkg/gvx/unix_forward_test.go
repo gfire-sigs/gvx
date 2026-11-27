@@ -467,8 +467,17 @@ func TestUnixForwardBootAndRuntimeControlRPC(t *testing.T) {
 		t.Fatalf("cross-client unix_accept err = %v, want NOT_FOUND", hijackErr)
 	}
 	// Other client attempts to reject connID on its own forward -> must be ignored.
-	_ = otherFwd.SendEvent(ctx, "unix.reject", control.UnixRejectEvent{ConnID: acc.ConnID, Error: "spoof"})
-	time.Sleep(50 * time.Millisecond)
+	// Closing the client event stream after sending unix.reject forces the server
+	// event loop to drain unix.reject before shutting down otherFwd.
+	if err := otherFwd.SendEvent(ctx, "unix.reject", control.UnixRejectEvent{ConnID: acc.ConnID, Error: "spoof"}); err != nil {
+		t.Fatalf("otherFwd SendEvent unix.reject: %v", err)
+	}
+	if err := otherFwd.CloseEvents(); err != nil {
+		t.Fatalf("otherFwd CloseEvents: %v", err)
+	}
+	if _, err := otherFwd.RecvEvent(ctx); !errors.Is(err, io.EOF) {
+		t.Fatalf("otherFwd RecvEvent after CloseEvents = %v, want io.EOF", err)
+	}
 
 	// Legitimate owner claims and completes the connection.
 	hc, err := net.Dial("unix", hostSock)

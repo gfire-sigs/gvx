@@ -447,7 +447,8 @@ func BuildGuestWriteFileELF64(targetArch, guestPath, content string) ([]byte, er
 // workspaceOutPath via SYS_openat/SYS_write, reads serveFilePath from the guest
 // rootfs via SYS_openat/SYS_read, binds a TCP listener on port via
 // SYS_socket/SYS_bind/SYS_listen, accepts one HTTP request via SYS_accept,
-// replies with an HTTP 200 response containing the file body, and exits 0.
+// replies with an HTTP 200 response containing the file body, shuts down its
+// write half, drains reads until peer close, and exits 0.
 func BuildGuestHTTPServerELF64(targetArch string, port uint16, serveFilePath string, workspaceOutPath string, workspaceOutContent string) ([]byte, error) {
 	return BuildGuestHTTPServerELF64At(targetArch, 0x400000, port, serveFilePath, workspaceOutPath, workspaceOutContent)
 }
@@ -573,6 +574,26 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 			0x91009aa2, // ADD X2, X21, #38 (httpHeaderLen)
 			0xd2800808, // MOVZ X8, #64 (SYS_write)
 			0xd4000001, // SVC #0
+			// SYS_shutdown(connFD, SHUT_WR=1) signals response EOF without tearing
+			// down the sandbox before the host relay flushes the response.
+			0xaa1403e0, // MOV X0, X20
+			0xd2800021, // MOVZ X1, #1 (SHUT_WR)
+			0xd2801a48, // MOVZ X8, #210 (SYS_shutdown)
+			0xd4000001, // SVC #0
+		)
+		// Drain peer data until EOF or reset (SYS_read <= 0) before exiting.
+		drainLoopStart := len(words)
+		words = append(words, 0xaa1403e0) // MOV X0, X20
+		loadAddr(1, baseVA+reqScratchOff)
+		words = append(words,
+			0xd2800802, // MOVZ X2, #64
+			0xd28007e8, // MOVZ X8, #63 (SYS_read)
+			0xd4000001, // SVC #0
+			0xf100001f, // CMP X0, #0
+		)
+		branchDelta := drainLoopStart - len(words)
+		words = append(words,
+			0x5400000c|((uint32(branchDelta)&0x7ffff)<<5), // B.GT drainLoopStart
 			// SYS_close(connFD) & SYS_close(listenFD) & SYS_exit_group(0)
 			0xaa1403e0, // MOV X0, X20
 			0xd2800728, // MOVZ X8, #57 (SYS_close)
@@ -677,6 +698,24 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 		movImm32(0x48, 0xc0, 1)                   // SYS_write
 		code = append(code, 0x0f, 0x05)
 
+		// SYS_shutdown(connFD, SHUT_WR=1) signals response EOF without tearing
+		// down the sandbox before the host relay flushes the response.
+		code = append(code, 0x4c, 0x89, 0xf7) // MOV RDI, R14
+		movImm32(0x48, 0xc6, 1)               // MOV RSI, 1 (SHUT_WR)
+		movImm32(0x48, 0xc0, 48)              // MOV RAX, 48 (SYS_shutdown)
+		code = append(code, 0x0f, 0x05)
+
+		// Drain peer data until EOF or reset (SYS_read <= 0) before exiting.
+		drainLoopStart := len(code)
+		code = append(code, 0x4c, 0x89, 0xf7) // MOV RDI, R14
+		movAddr(baseVA + reqScratchOff)
+		movImm32(0x48, 0xc2, 64)                          // MOV RDX, 64
+		code = append(code, 0x48, 0x31, 0xc0, 0x0f, 0x05) // XOR RAX, RAX; SYSCALL (SYS_read)
+		code = append(code, 0x48, 0x85, 0xc0)             // TEST RAX, RAX
+		code = append(code, 0x0f, 0x8f)                   // JG rel32
+		rel32 := int32(drainLoopStart - (len(code) + 4))
+		code = binary.LittleEndian.AppendUint32(code, uint32(rel32))
+
 		// Close connFD, listenFD, and exit(0).
 		code = append(code, 0x4c, 0x89, 0xf7)
 		movImm32(0x48, 0xc0, 3)
@@ -690,6 +729,10 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 
 	default:
 		return nil, fmt.Errorf("gvx: unsupported ELF64 target architecture %q", targetArch)
+	}
+
+	if len(code) > wsPathOff-codeOffset {
+		return nil, fmt.Errorf("testelf: HTTP server code (%d bytes) exceeds budget (%d)", len(code), wsPathOff-codeOffset)
 	}
 
 	img := makeSingleSegmentELF64(uint16(elf.ET_EXEC), machine, baseVA, uint32(elf.PF_R|elf.PF_W|elf.PF_X))

@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -219,13 +220,73 @@ func TestControlUnixSocketTokenFollowsHostOS(t *testing.T) {
 	}
 }
 
+type readNotifyingConn struct {
+	net.Conn
+	reading chan struct{}
+	once    sync.Once
+}
+
+func (c *readNotifyingConn) Read(p []byte) (int, error) {
+	c.once.Do(func() { close(c.reading) })
+	return c.Conn.Read(p)
+}
+
+type acceptNotifyingListener struct {
+	net.Listener
+	reading chan struct{}
+}
+
+func (l *acceptNotifyingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &readNotifyingConn{Conn: conn, reading: l.reading}, nil
+}
+
 func TestControlStopClosesIdleConnection(t *testing.T) {
 	sockPath := filepath.Join(shortSocketDir(t), "idle.sock")
-	_, stop := startFakeControl(t, sockPath, &fakeCheckpointer{}, 0)
+	ep, err := control.Listen(sockPath, control.ListenOptions{})
+	if err != nil {
+		t.Fatalf("control.Listen(%q): %v", sockPath, err)
+	}
+	t.Cleanup(ep.Cleanup)
+
+	reading := make(chan struct{})
+	ln := &acceptNotifyingListener{Listener: ep.Listener, reading: reading}
+	srv := control.NewServer(ln, control.ServerConfig{
+		SandboxID:    "fake-sbx",
+		Token:        ep.Token,
+		Capabilities: []string{control.CapPing, control.CapCheckpointLocal},
+		Handler:      &fakeControlHandler{cp: &fakeCheckpointer{}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = srv.Serve(ctx)
+	}()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = srv.Shutdown(drainCtx)
+			drainCancel()
+			cancel()
+			_ = srv.Close()
+			<-serveDone
+		})
+	}
+	t.Cleanup(stop)
 
 	idle := dialRaw(t, "unix", sockPath)
-	// Wait briefly for Accept before initiating shutdown.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until serveConn has registered the connection, set HandshakeTimeout,
+	// and entered its initial handshake Read before calling stop.
+	select {
+	case <-reading:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start reading idle control connection within 5s")
+	}
 
 	stopped := make(chan struct{})
 	go func() {

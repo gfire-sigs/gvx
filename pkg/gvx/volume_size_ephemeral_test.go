@@ -808,9 +808,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	if _, err := io.WriteString(rsDet.stdinW, "umount /mnt/umount\ncreate /mnt/cap/data.txt detach-test\nopen /mnt/cap/data.txt\n"); err != nil {
-		t.Fatal(err)
-	}
+	rsDet.writeStdin(t, "umount /mnt/umount\ncreate /mnt/cap/data.txt detach-test\nopen /mnt/cap/data.txt\n", 30*time.Second)
 	rsDet.stdout.waitForSubstring(t, "UMOUNTED\n", 15*time.Second)
 	rsDet.stdout.waitForSubstring(t, "OPENED:detach-test\n", 15*time.Second)
 	if err := rsDet.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
@@ -840,9 +838,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	if err != nil || stateInfoAfter.Size() != stateInfoBefore.Size() {
 		t.Fatalf("failed detached Checkpoint mutated state.img size: got %v, want %d", stateInfoAfter, stateInfoBefore.Size())
 	}
-	if _, err := io.WriteString(rsDet.stdinW, "close\n"); err != nil {
-		t.Fatal(err)
-	}
+	rsDet.writeStdin(t, "close\n", 30*time.Second)
 	rsDet.stdout.waitForSubstring(t, "CLOSED\n", 15*time.Second)
 	if err := rsDet.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
 		t.Fatalf("Checkpoint after closing last descriptor on detached capped volume: %v", err)
@@ -869,9 +865,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	})
 	rs.stdout.waitForSubstring(t, "READY\n", 15*time.Second)
 
-	if _, err := io.WriteString(rs.stdinW, "create /mnt/cap/data.txt hello-v3\nopen /mnt/cap/data.txt\n"); err != nil {
-		t.Fatal(err)
-	}
+	rs.writeStdin(t, "create /mnt/cap/data.txt hello-v3\nopen /mnt/cap/data.txt\n", 30*time.Second)
 	rs.stdout.waitForSubstring(t, "OPENED:hello-v3\n", 15*time.Second)
 
 	if err := rs.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: false}); err != nil {
@@ -1062,9 +1056,7 @@ func TestCheckpointAndRestoreCappedVolumesManifestV3AndPreflight(t *testing.T) {
 	if err := rs1.client.Call(ctx, control.MethodMountList, nil, &ml1); err != nil {
 		t.Fatalf("mount.list on restored sandbox: %v", err)
 	}
-	if _, err := io.WriteString(rs1.stdinW, "read\nfill /mnt/cap/overflow.bin 40\nunlink /mnt/cap/overflow.bin\nclose\n"); err != nil {
-		t.Fatal(err)
-	}
+	rs1.writeStdin(t, "read\nfill /mnt/cap/overflow.bin 40\nunlink /mnt/cap/overflow.bin\nclose\n", 30*time.Second)
 	rs1.stdout.waitForSubstring(t, "READ:hello-v3\n", 20*time.Second)
 	rs1.stdout.waitForSubstring(t, "ENOSPC\n", 20*time.Second)
 	rs1.stdout.waitForSubstring(t, "CLOSED\n", 20*time.Second)

@@ -67,6 +67,66 @@ type runningControlSandbox struct {
 	cancel  context.CancelFunc
 }
 
+func writePipeWithDeadline(t *testing.T, w io.WriteCloser, data string, timeout time.Duration, exited <-chan struct{}, diag func() string) {
+	t.Helper()
+	type writeDeadliner interface {
+		SetWriteDeadline(time.Time) error
+	}
+	wd, hasDeadline := w.(writeDeadliner)
+	if hasDeadline {
+		_ = wd.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	done := make(chan struct{})
+	var watcherDone chan struct{}
+	if hasDeadline && exited != nil {
+		watcherDone = make(chan struct{})
+		go func() {
+			defer close(watcherDone)
+			select {
+			case <-exited:
+				_ = wd.SetWriteDeadline(time.Unix(1, 0))
+			case <-done:
+			}
+		}()
+	}
+	_, err := io.WriteString(w, data)
+	close(done)
+	if watcherDone != nil {
+		<-watcherDone
+	}
+	if hasDeadline {
+		_ = wd.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		extra := ""
+		if diag != nil {
+			extra = "; " + diag()
+		}
+		t.Fatalf("write stdin %q failed: %v%s", data, err, extra)
+	}
+}
+
+func (rs *runningControlSandbox) writeStdin(t *testing.T, data string, timeout time.Duration) {
+	t.Helper()
+	writePipeWithDeadline(t, rs.stdinW, data, timeout, rs.runDone, func() string {
+		var stderrOut string
+		if rs.stderr != nil {
+			stderrOut = rs.stderr.String()
+		}
+		var stdoutOut string
+		if rs.stdout != nil {
+			stdoutOut = rs.stdout.String()
+		}
+		exited := false
+		select {
+		case <-rs.runDone:
+			exited = true
+		default:
+		}
+		return fmt.Sprintf("stdout=%q stderr=%q exited=%v", stdoutOut, stderrOut, exited)
+	})
+}
+
 func (rs *runningControlSandbox) waitStdout(t *testing.T, want string, timeout time.Duration) {
 	t.Helper()
 	matched, exited := rs.stdout.waitForSubstringResult(want, timeout, rs.runDone)
@@ -1308,30 +1368,38 @@ func TestControlEarlyRPCBeforeRunDoesNotDeadlock(t *testing.T) {
 	})
 
 	// Launch Pause and Exec RPCs BEFORE sb.Run starts; neither may deadlock
-	// executeActiveKernel (AB-BA opMu vs kernelReady).
+	// executeActiveKernel (AB-BA opMu vs kernelReady). Open both streams
+	// synchronously and follow with a Ping barrier on the same multiplexed
+	// connection so the server frame loop has read and dispatched both before
+	// sb.Run starts.
+	pauseSt, err := client.OpenStream(ctx, control.MethodPause, control.PauseRequest{})
+	if err != nil {
+		t.Fatalf("OpenStream Pause: %v", err)
+	}
+	execSt, err := client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{Argv: []string{"/bin/hello"}})
+	if err != nil {
+		pauseSt.Close()
+		t.Fatalf("OpenStream ExecStart: %v", err)
+	}
 	pauseErrCh := make(chan error, 1)
 	go func() {
-		pauseErrCh <- client.Call(ctx, control.MethodPause, control.PauseRequest{}, nil)
+		defer pauseSt.Close()
+		pauseErrCh <- pauseSt.WaitResponse(ctx, nil)
 	}()
 	execErrCh := make(chan error, 1)
 	go func() {
-		st, err := client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{Argv: []string{"/bin/hello"}})
-		if err != nil {
+		defer execSt.Close()
+		if err := execSt.WaitResponse(ctx, nil); err != nil {
 			execErrCh <- err
 			return
 		}
-		defer st.Close()
-		err = st.WaitResponse(ctx, nil)
-		if err != nil {
-			execErrCh <- err
-			return
-		}
-		_, rErr := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
+		_, rErr := io.ReadAll(execSt.ChannelReader(ctx, control.ChannelStdout))
 		execErrCh <- rErr
 	}()
 
-	// Give early RPCs time to block on kernelReady before starting Run.
-	time.Sleep(50 * time.Millisecond)
+	if err := client.Call(ctx, control.MethodPing, nil, nil); err != nil {
+		t.Fatalf("Ping barrier before sb.Run: %v", err)
+	}
 
 	go func() {
 		defer close(runDone)
@@ -2014,14 +2082,7 @@ func TestControlAutoPublishEventsAndDynamicPortAddrs(t *testing.T) {
 		t.Fatalf("DynamicPortAddrs with net=none err = %v, want ErrInvalidConfig", err)
 	}
 
-	// Reserve one free port and hold one busy port on the host.
-	freeLn, err := net.Listen("tcp4", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("Listen free: %v", err)
-	}
-	freePort := uint16(freeLn.Addr().(*net.TCPAddr).Port)
-	_ = freeLn.Close()
-
+	// Hold one busy port on the host for the negative bind_failed assertion.
 	busyLn, err := net.Listen("tcp4", "0.0.0.0:0")
 	if err != nil {
 		t.Fatalf("Listen busy: %v", err)
@@ -2033,153 +2094,187 @@ func TestControlAutoPublishEventsAndDynamicPortAddrs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildGuestCatELF64: %v", err)
 	}
-	freeHTTPELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, freePort, "/etc/ready.txt", "", "")
-	if err != nil {
-		t.Fatalf("BuildGuestHTTPServerELF64(free): %v", err)
-	}
 	busyHTTPELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, busyPort, "/etc/ready.txt", "", "")
 	if err != nil {
 		t.Fatalf("BuildGuestHTTPServerELF64(busy): %v", err)
 	}
-	layer, err := testimage.Tar(
-		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
-		testimage.File{Name: "bin/httpfree", Data: freeHTTPELF, Mode: 0o755},
-		testimage.File{Name: "bin/httpbusy", Data: busyHTTPELF, Mode: 0o755},
-		testimage.File{Name: "etc/ready.txt", Data: []byte("ap-events-ready\n"), Mode: 0o644},
-	)
-	if err != nil {
-		t.Fatalf("testimage.Tar: %v", err)
-	}
-	regURL := testimage.NewRegistry(t, "apev", "latest", testimage.Image{
-		Arch:       runtime.GOARCH,
-		Layers:     [][]byte{layer},
-		Entrypoint: []string{"/bin/cat"},
-		Cmd:        []string{"/etc/ready.txt", "/proc/self/fd/0"},
-	})
 
 	tv, err := (tuning.Values{}).Set("net.forward.dynamic_poll_interval", "50ms")
 	if err != nil {
 		t.Fatalf("tuning.Set: %v", err)
 	}
-	// Warnings is intentionally nil to prove control events emit without stderr warnings.
-	rs := startControlTestSandbox(t, Config{
-		Name:             "ctrl-apev",
-		OCIImage:         "apev:latest",
-		RegistryBaseURL:  regURL,
-		NetworkMode:      NetModeNAT,
-		AutoPublishPorts: true,
-		AutoPublishAddr:  "0.0.0.0",
-		DynamicPortAddrs: []string{"0.0.0.0"},
-		Tuning:           tv,
-	})
-	rs.stdout.waitForSubstring(t, "ap-events-ready\n", 15*time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Inspect and ping advertise port.dynamic_any and bind addresses.
-	var ping control.PingResponse
-	if err := rs.client.Call(ctx, control.MethodPing, nil, &ping); err != nil {
-		t.Fatalf("ping: %v", err)
-	}
-	if !slices.Contains(ping.Capabilities, control.CapPortDynamicAny) {
-		t.Fatalf("ping capabilities = %v, want %s", ping.Capabilities, control.CapPortDynamicAny)
-	}
-	var inspect control.InspectResponse
-	if err := rs.client.Call(ctx, control.MethodInspect, nil, &inspect); err != nil {
-		t.Fatalf("inspect: %v", err)
-	}
-	if !slices.Equal(inspect.DynamicBindAddrs, []string{"0.0.0.0"}) || inspect.AutoPublishAddr != "0.0.0.0" {
-		t.Fatalf("inspect bind addrs = (%v, %q), want ([0.0.0.0], 0.0.0.0)", inspect.DynamicBindAddrs, inspect.AutoPublishAddr)
-	}
-
-	// Subscribe to port events before starting guest listeners.
-	evStream, err := rs.client.OpenStream(ctx, control.MethodEvents, control.EventsRequest{
-		Filters: []string{"type=port"},
-	})
-	if err != nil {
-		t.Fatalf("events open: %v", err)
-	}
-	defer evStream.Close()
-	if err := evStream.WaitResponse(ctx, nil); err != nil {
-		t.Fatalf("events wait: %v", err)
-	}
-
-	eventsCh := make(chan control.SandboxEvent, 32)
-	go func() {
-		for {
-			ev, err := evStream.RecvEvent(ctx)
-			if err != nil {
-				return
+	const maxAttempts = 3
+	runAttempt := func(attempt int) bool {
+		var freePort uint16
+		for freePort == 0 || freePort == busyPort {
+			freeLn, lErr := net.Listen("tcp4", "0.0.0.0:0")
+			if lErr != nil {
+				t.Fatalf("Listen free: %v", lErr)
 			}
-			var se control.SandboxEvent
-			if json.Unmarshal(ev.Data, &se) == nil {
-				eventsCh <- se
-			}
+			freePort = uint16(freeLn.Addr().(*net.TCPAddr).Port)
+			_ = freeLn.Close()
 		}
-	}()
 
-	waitPortEvent := func(wantAction string, wantPort uint16) control.SandboxEvent {
-		t.Helper()
-		portStr := strconv.Itoa(int(wantPort))
-		deadline := time.After(10 * time.Second)
-		for {
-			select {
-			case se := <-eventsCh:
-				if se.Type == "port" && se.Action == wantAction &&
-					se.Attributes["source"] == "auto" &&
-					se.Attributes["guest_port"] == portStr {
-					return se
+		freeHTTPELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, freePort, "/etc/ready.txt", "", "")
+		if err != nil {
+			t.Fatalf("BuildGuestHTTPServerELF64(free): %v", err)
+		}
+		layer, err := testimage.Tar(
+			testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+			testimage.File{Name: "bin/httpfree", Data: freeHTTPELF, Mode: 0o755},
+			testimage.File{Name: "bin/httpbusy", Data: busyHTTPELF, Mode: 0o755},
+			testimage.File{Name: "etc/ready.txt", Data: []byte("ap-events-ready\n"), Mode: 0o644},
+		)
+		if err != nil {
+			t.Fatalf("testimage.Tar: %v", err)
+		}
+		regURL := testimage.NewRegistry(t, "apev", "latest", testimage.Image{
+			Arch:       runtime.GOARCH,
+			Layers:     [][]byte{layer},
+			Entrypoint: []string{"/bin/cat"},
+			Cmd:        []string{"/etc/ready.txt", "/proc/self/fd/0"},
+		})
+
+		// Warnings is intentionally nil to prove control events emit without stderr warnings.
+		rs := startControlTestSandbox(t, Config{
+			Name:             "ctrl-apev",
+			OCIImage:         "apev:latest",
+			RegistryBaseURL:  regURL,
+			NetworkMode:      NetModeNAT,
+			AutoPublishPorts: true,
+			AutoPublishAddr:  "0.0.0.0",
+			DynamicPortAddrs: []string{"0.0.0.0"},
+			Tuning:           tv,
+		})
+		rs.waitStdout(t, "ap-events-ready\n", 15*time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Inspect and ping advertise port.dynamic_any and bind addresses.
+		var ping control.PingResponse
+		if err := rs.client.Call(ctx, control.MethodPing, nil, &ping); err != nil {
+			t.Fatalf("ping: %v", err)
+		}
+		if !slices.Contains(ping.Capabilities, control.CapPortDynamicAny) {
+			t.Fatalf("ping capabilities = %v, want %s", ping.Capabilities, control.CapPortDynamicAny)
+		}
+		var inspect control.InspectResponse
+		if err := rs.client.Call(ctx, control.MethodInspect, nil, &inspect); err != nil {
+			t.Fatalf("inspect: %v", err)
+		}
+		if !slices.Equal(inspect.DynamicBindAddrs, []string{"0.0.0.0"}) || inspect.AutoPublishAddr != "0.0.0.0" {
+			t.Fatalf("inspect bind addrs = (%v, %q), want ([0.0.0.0], 0.0.0.0)", inspect.DynamicBindAddrs, inspect.AutoPublishAddr)
+		}
+
+		// Subscribe to port events before starting guest listeners.
+		evStream, err := rs.client.OpenStream(ctx, control.MethodEvents, control.EventsRequest{
+			Filters: []string{"type=port"},
+		})
+		if err != nil {
+			t.Fatalf("events open: %v", err)
+		}
+		defer evStream.Close()
+		if err := evStream.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("events wait: %v", err)
+		}
+
+		eventsCh := make(chan control.SandboxEvent, 32)
+		go func() {
+			for {
+				ev, err := evStream.RecvEvent(ctx)
+				if err != nil {
+					return
 				}
-			case <-deadline:
-				t.Fatalf("timed out waiting for auto port event action=%s port=%d", wantAction, wantPort)
+				var se control.SandboxEvent
+				if json.Unmarshal(ev.Data, &se) == nil {
+					select {
+					case eventsCh <- se:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+
+		waitAnyPortEvent := func(wantPort uint16, wantActions ...string) control.SandboxEvent {
+			t.Helper()
+			portStr := strconv.Itoa(int(wantPort))
+			deadline := time.After(10 * time.Second)
+			for {
+				select {
+				case se := <-eventsCh:
+					if se.Type == "port" && slices.Contains(wantActions, se.Action) &&
+						se.Attributes["source"] == "auto" &&
+						se.Attributes["guest_port"] == portStr {
+						return se
+					}
+				case <-deadline:
+					t.Fatalf("timed out waiting for auto port event actions=%v port=%d", wantActions, wantPort)
+				}
 			}
 		}
-	}
 
-	// 1. Start guest listener on freePort -> expect add(source=auto, host_ip=0.0.0.0).
-	freeExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
-		Argv: []string{"/bin/httpfree"},
-	})
-	if err != nil {
-		t.Fatalf("exec httpfree: %v", err)
-	}
-	var freeResp control.ExecStartResponse
-	if err := freeExec.WaitResponse(ctx, &freeResp); err != nil {
-		t.Fatalf("exec httpfree wait: %v", err)
-	}
-	addEv := waitPortEvent("add", freePort)
-	if addEv.Attributes["host_ip"] != "0.0.0.0" || addEv.Attributes["proto"] != "tcp" || addEv.Attributes["host_port"] != strconv.Itoa(int(freePort)) {
-		t.Fatalf("auto add event attrs = %+v", addEv.Attributes)
-	}
+		// 1. Start guest listener on freePort and expect add(source=auto, host_ip=0.0.0.0).
+		freeExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv: []string{"/bin/httpfree"},
+		})
+		if err != nil {
+			t.Fatalf("exec httpfree: %v", err)
+		}
+		defer freeExec.Close()
+		var freeResp control.ExecStartResponse
+		if err := freeExec.WaitResponse(ctx, &freeResp); err != nil {
+			t.Fatalf("exec httpfree wait: %v", err)
+		}
+		addEv := waitAnyPortEvent(freePort, "add", "bind_failed")
+		if addEv.Action == "bind_failed" && attempt < maxAttempts {
+			t.Logf("attempt %d hit host bind conflict on freePort=%d (%s); retrying", attempt, freePort, addEv.Attributes["error"])
+			_ = rs.client.Close()
+			_ = rs.stdinW.Close()
+			rs.cancel()
+			<-rs.runDone
+			_ = rs.sb.Close()
+			return true
+		}
+		if addEv.Action != "add" || addEv.Attributes["host_ip"] != "0.0.0.0" || addEv.Attributes["proto"] != "tcp" || addEv.Attributes["host_port"] != strconv.Itoa(int(freePort)) {
+			t.Fatalf("auto add event = %+v", addEv)
+		}
 
-	// 2. Kill guest listener on freePort -> expect remove(source=auto).
-	if err := rs.client.Call(ctx, control.MethodProcSignal, control.ProcSignalRequest{
-		PID:    freeResp.PID,
-		Signal: "SIGKILL",
-	}, nil); err != nil {
-		t.Fatalf("kill httpfree: %v", err)
-	}
-	freeExec.Close()
-	rmEv := waitPortEvent("remove", freePort)
-	if rmEv.Attributes["host_ip"] != "0.0.0.0" || rmEv.Attributes["proto"] != "tcp" {
-		t.Fatalf("auto remove event attrs = %+v", rmEv.Attributes)
-	}
+		// 2. Kill guest listener on freePort and expect remove(source=auto).
+		if err := rs.client.Call(ctx, control.MethodProcSignal, control.ProcSignalRequest{
+			PID:    freeResp.PID,
+			Signal: "SIGKILL",
+		}, nil); err != nil {
+			t.Fatalf("kill httpfree: %v", err)
+		}
+		rmEv := waitAnyPortEvent(freePort, "remove")
+		if rmEv.Attributes["host_ip"] != "0.0.0.0" || rmEv.Attributes["proto"] != "tcp" {
+			t.Fatalf("auto remove event attrs = %+v", rmEv.Attributes)
+		}
 
-	// 3. Start guest listener on busyPort -> expect bind_failed(source=auto, error!=empty).
-	busyExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
-		Argv: []string{"/bin/httpbusy"},
-	})
-	if err != nil {
-		t.Fatalf("exec httpbusy: %v", err)
+		// 3. Start guest listener on busyPort and expect bind_failed(source=auto, error!=empty).
+		busyExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv: []string{"/bin/httpbusy"},
+		})
+		if err != nil {
+			t.Fatalf("exec httpbusy: %v", err)
+		}
+		defer busyExec.Close()
+		if err := busyExec.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("exec httpbusy wait: %v", err)
+		}
+		failEv := waitAnyPortEvent(busyPort, "bind_failed")
+		if failEv.Attributes["host_ip"] != "0.0.0.0" || failEv.Attributes["proto"] != "tcp" || failEv.Attributes["error"] == "" {
+			t.Fatalf("auto bind_failed event attrs = %+v", failEv.Attributes)
+		}
+		return false
 	}
-	defer busyExec.Close()
-	if err := busyExec.WaitResponse(ctx, nil); err != nil {
-		t.Fatalf("exec httpbusy wait: %v", err)
-	}
-	failEv := waitPortEvent("bind_failed", busyPort)
-	if failEv.Attributes["host_ip"] != "0.0.0.0" || failEv.Attributes["proto"] != "tcp" || failEv.Attributes["error"] == "" {
-		t.Fatalf("auto bind_failed event attrs = %+v", failEv.Attributes)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if !runAttempt(attempt) {
+			return
+		}
 	}
 }
 

@@ -391,9 +391,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	}()
 
 	// Have guest open /mnt/proj/data.txt and advance its FD offset to 6.
-	if _, err := io.WriteString(rs.stdinW, "open /mnt/proj/data.txt\n"); err != nil {
-		t.Fatalf("write open cmd: %v", err)
-	}
+	rs.writeStdin(t, "open /mnt/proj/data.txt\n", 30*time.Second)
 	rs.waitStdout(t, "OPENED:012345\n", 30*time.Second)
 
 	// 1. Checkpoint with LeaveRunning=true while rpcfs and dynamic tmpfs are active.
@@ -424,9 +422,7 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 	}
 
 	// Original running guest must still read seamlessly from the open FD after LeaveRunning checkpoint.
-	if _, err := io.WriteString(rs.stdinW, "read\n"); err != nil {
-		t.Fatalf("write read cmd: %v", err)
-	}
+	rs.writeStdin(t, "read\n", 30*time.Second)
 	rs.waitStdout(t, "READ:6789\n", 30*time.Second)
 
 	// 2. Stopping checkpoint (LeaveRunning=false) must notify serving clients with rpcfs.detached
@@ -474,13 +470,9 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 		},
 	}, ckptAt6)
 
-	if _, err := io.WriteString(rsA.stdinW, "read\n"); err != nil {
-		t.Fatalf("write read to restored A: %v", err)
-	}
+	rsA.writeStdin(t, "read\n", 30*time.Second)
 	rsA.waitStdout(t, "READ:ABCD\n", 30*time.Second)
-	if _, err := io.WriteString(rsA.stdinW, "write XY\n"); err != nil {
-		t.Fatalf("write payload to restored A: %v", err)
-	}
+	rsA.writeStdin(t, "write XY\n", 30*time.Second)
 	rsA.waitStdout(t, "WRITTEN\n", 30*time.Second)
 	diskA, err := os.ReadFile(filepath.Join(restoreDirA, "data.txt"))
 	if err != nil || string(diskA) != "012345ABCDXYcdef" {
@@ -528,17 +520,13 @@ func TestCheckpointRestoreWithLiveRPCFSAndDynamicMounts(t *testing.T) {
 		OCICacheDir: cacheDir,
 	}, ckptAt6)
 
-	if _, err := io.WriteString(rsB.stdinW, "read\n"); err != nil {
-		t.Fatalf("write detached read to restored B: %v", err)
-	}
+	rsB.writeStdin(t, "read\n", 30*time.Second)
 	rsB.waitStdout(t, "ERR:", 30*time.Second)
 
 	// Reconnect /mnt/proj at runtime via mount.serve.
 	_, cancelB, doneB := startTestRPCFSServer(t, ctx, rsB.client, restoreDirB, "/mnt/proj", false, false)
 
-	if _, err := io.WriteString(rsB.stdinW, "read\n"); err != nil {
-		t.Fatalf("write reconnected read to restored B: %v", err)
-	}
+	rsB.writeStdin(t, "read\n", 30*time.Second)
 	rsB.waitStdout(t, "READ:WXYZ\n", 30*time.Second)
 	cancelB()
 	<-doneB
@@ -747,9 +735,7 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 
 	// Serve /mnt/proj rw, open a file, then checkpoint #1 (rw).
 	detCh, cancelServe, doneServe := startTestRPCFSServer(t, ctx, rs.client, serveDir, "/mnt/proj", false, false)
-	if _, err := io.WriteString(rs.stdinW, "open /mnt/proj/data.txt\n"); err != nil {
-		t.Fatal(err)
-	}
+	rs.writeStdin(t, "open /mnt/proj/data.txt\n", 30*time.Second)
 	rs.waitStdout(t, "OPENED:012345\n", 30*time.Second)
 
 	if err := rs.sb.Checkpoint(ctx, CheckpointOptions{LeaveRunning: true}); err != nil {
@@ -893,9 +879,7 @@ func TestCheckpointRestoreChainedROPolicyRemountAndLazyUnmount(t *testing.T) {
 	}, ckptLazy)
 	defer closeLazy()
 	// Old open FD from lazy-unmounted fs1 returns EIO, while live replacement mount at /mnt/proj stays healthy.
-	if _, err := io.WriteString(rsLazy.stdinW, "read\n"); err != nil {
-		t.Fatal(err)
-	}
+	rsLazy.writeStdin(t, "read\n", 30*time.Second)
 	rsLazy.waitStdout(t, "ERR:", 30*time.Second)
 	var mlLazy control.MountListResponse
 	if err := rsLazy.client.Call(ctx, control.MethodMountList, nil, &mlLazy); err != nil {

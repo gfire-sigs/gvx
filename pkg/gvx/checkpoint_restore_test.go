@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -321,7 +320,9 @@ func TestCheckpointLeaveRunningAndRestore(t *testing.T) {
 		err  error
 	}
 	runCh := make(chan runResult, 1)
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		code, rErr := sb.Run(context.Background())
 		runCh <- runResult{code: code, err: rErr}
 	}()
@@ -332,12 +333,17 @@ func TestCheckpointLeaveRunningAndRestore(t *testing.T) {
 		t.Fatalf("Checkpoint(LeaveRunning=true): %v", err)
 	}
 
-	go func() {
-		_, _ = io.WriteString(stdinW, "original-continues\n")
-		_ = stdinW.Close()
-	}()
+	writePipeWithDeadline(t, stdinW, "original-continues\n", 30*time.Second, runDone, func() string {
+		return fmt.Sprintf("stdout=%q stderr=%q", stdout1.String(), stderr1.String())
+	})
+	_ = stdinW.Close()
 
-	res1 := <-runCh
+	var res1 runResult
+	select {
+	case res1 = <-runCh:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("original sandbox Run hung after LeaveRunning checkpoint; stdout=%q stderr=%q", stdout1.String(), stderr1.String())
+	}
 	if res1.err != nil || res1.code != 0 {
 		t.Fatalf("original sandbox Run = (%d, %v), want (0, nil); stderr=%q", res1.code, res1.err, stderr1.String())
 	}
@@ -663,14 +669,16 @@ func runFailedCheckpoint(t *testing.T, tc failedCheckpointCase) {
 		err  error
 	}
 	runCh := make(chan runResult, 1)
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		code, rErr := sb.Run(context.Background())
 		runCh <- runResult{code, rErr}
 	}()
 
-	go func() {
-		_, _ = io.WriteString(stdinW, "line-one\n")
-	}()
+	writePipeWithDeadline(t, stdinW, "line-one\n", 30*time.Second, runDone, func() string {
+		return fmt.Sprintf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	})
 	stdout.waitForSubstring(t, "line-one\n", 15*time.Second)
 
 	injected := errors.New("injected post-save failure")
@@ -696,10 +704,10 @@ func runFailedCheckpoint(t *testing.T, tc failedCheckpointCase) {
 	}
 
 	// The guest must run again after the failed checkpoint.
-	go func() {
-		_, _ = io.WriteString(stdinW, "line-two\n")
-		_ = stdinW.Close()
-	}()
+	writePipeWithDeadline(t, stdinW, "line-two\n", 30*time.Second, runDone, func() string {
+		return fmt.Sprintf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	})
+	_ = stdinW.Close()
 	select {
 	case res := <-runCh:
 		if res.err != nil || res.code != 0 {
