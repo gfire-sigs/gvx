@@ -401,7 +401,7 @@ Rules evaluate first-match, unreadable fields fail closed, and `-isolate-lan` ov
 
 ### 4.15 GPU Extension (`-tags ext_gpu`)
 
-Build `ext/cmd/rungvx` with `-tags ext_gpu` (or `-tags ext_all`) to include `-gpu=venus` and `-gpu=virgl`. Both active modes require Apple Silicon (`darwin/arm64`), macOS 26 or later, the `hvf` backend, and `gvx-gpu-renderer`. Confirm support with `rungvx version -V`, which prints `extension gpu: modes=venus,virgl`.
+Download the prebuilt `rungvx-<VERSION>-darwin-arm64-ext.tar.gz` archive (alongside `gvx-gpu-renderer-<VERSION>-darwin-arm64.tar.gz`) from GitHub Releases, or build `ext/cmd/rungvx` with `-tags ext_gpu` (or `-tags ext_all`), to include `-gpu=venus` and `-gpu=virgl`. Both active modes require Apple Silicon (`darwin/arm64`), macOS 26 or later, the `hvf` backend, and `gvx-gpu-renderer`. Confirm support with `rungvx version -V`, which prints `extension gpu: modes=venus,virgl`.
 
 | Rule | Behavior |
 | :--- | :--- |

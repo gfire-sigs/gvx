@@ -1,11 +1,14 @@
 name: release
 
-# A tag v* builds rungvx for all supported targets and the linux/arm64v8.2 LSE
-# variant. It also builds the GPU renderer archive for darwin/arm64. It then
-# publishes a GitHub release with notes from CHANGELOG.md. A tag with a hyphen,
-# such as v0.1.0-rc.1, publishes a pre-release. Each release carries a SLSA v1
-# build provenance attestation for every archive. A pull request that changes
-# this file, and a manual run, execute every step except the publication.
+# A tag v* builds rungvx for all supported targets, the linux/arm64v8.2 LSE
+# variant, and the darwin/arm64-ext archive with compiled ext/ plugins. It also
+# builds the GPU renderer archive for darwin/arm64. It then publishes a GitHub
+# release with notes from CHANGELOG.md. Push the matching ext/<tag> tag to the
+# same commit before pushing <tag> so Go stamps <tag> into the ext submodule
+# binary. A tag with a hyphen, such as v0.1.0-rc.1, publishes a pre-release.
+# Each release carries a SLSA v1 build provenance attestation for every archive.
+# A pull request that changes this file, and a manual run, execute every step
+# except the publication.
 on:
   push:
     tags: ["v*"]
@@ -37,6 +40,7 @@ jobs:
           - { goos: linux, goarch: arm64, arch_suffix: v8.2, goarm64: v8.2, want_arch: "GOARM64=v8.2", runner: ubuntu-24.04 }
           # The hypervisor entitlement needs codesign, which only macOS has.
           - { goos: darwin, goarch: arm64, arch_suffix: "", want_arch: "GOARM64=v8.4", runner: macos-26 }
+          - { goos: darwin, goarch: arm64, arch_suffix: "-ext", want_arch: "GOARM64=v8.4", pkg: "./ext/cmd/rungvx", build_tags: "ext_all", runner: macos-26 }
           - { goos: windows, goarch: amd64, arch_suffix: "", want_arch: "GOAMD64=v2", runner: ubuntu-24.04 }
           - { goos: windows, goarch: arm64, arch_suffix: "", want_arch: "GOARM64=v8.1", runner: ubuntu-24.04 }
     env:
@@ -45,6 +49,8 @@ jobs:
       GOARM64: ${{ matrix.goarm64 }}
       ARCH_SUFFIX: ${{ matrix.arch_suffix }}
       WANT_ARCH: ${{ matrix.want_arch }}
+      BUILD_PKG: ${{ matrix.pkg }}
+      GVX_BUILD_TAGS: ${{ matrix.build_tags }}
       # A binary without cgo needs no C library on the host.
       CGO_ENABLED: "0"
     steps:
@@ -65,10 +71,11 @@ jobs:
           target="${GOOS}-${GOARCH}${ARCH_SUFFIX}"
           name="rungvx-${GITHUB_REF_NAME}-${target}"
           [ "$GITHUB_REF_TYPE" = tag ] || name="rungvx-dryrun-${target}"
+          pkg="${BUILD_PKG:-./cmd/rungvx}"
           exe=rungvx
           [ "$GOOS" = windows ] && exe=rungvx.exe
           mkdir -p "dist/$name"
-          ./scripts/slim-build.sh "dist/$name/$exe" ./cmd/rungvx
+          ./scripts/slim-build.sh "dist/$name/$exe" "$pkg"
           if [ "$GOOS" = darwin ]; then
             codesign --sign - --entitlements entitlements.plist --force "dist/$name/$exe"
             codesign --display --entitlements - "dist/$name/$exe" | grep -q com.apple.security.hypervisor
@@ -82,11 +89,18 @@ jobs:
             exit 1
           fi
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "$GITHUB_REF_NAME" ]; then
-            echo "module version $version differs from tag $GITHUB_REF_NAME" >&2
+            echo "module version $version differs from tag $GITHUB_REF_NAME (for ./ext builds, push ext/$GITHUB_REF_NAME on the same commit before $GITHUB_REF_NAME)" >&2
             exit 1
           fi
           if [ "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" = "$GOOS/$GOARCH" ]; then
-            "dist/$name/$exe" version -V
+            ver_out=$("dist/$name/$exe" version -V)
+            printf '%s\n' "$ver_out"
+            if [ -n "$GVX_BUILD_TAGS" ]; then
+              printf '%s\n' "$ver_out" | grep -q "build options: cgo=0 tags=${GVX_BUILD_TAGS} extensions=gpu"
+              printf '%s\n' "$ver_out" | grep -q "extension gpu: modes=venus,virgl"
+            else
+              printf '%s\n' "$ver_out" | grep -q "build options: cgo=0 tags=none extensions=none"
+            fi
           fi
           cp LICENSE README.md pkg/rungvx/licenses/THIRD_PARTY_LICENSES.txt "dist/$name/"
           cd dist

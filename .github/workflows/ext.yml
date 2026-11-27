@@ -15,6 +15,7 @@ on:
       - "pkg/sentry/vfs/**"
       - "pkg/sentry/memmap/**"
       - "scripts/repro-build.sh"
+      - "scripts/slim-build.sh"
       - "UPSTREAM_COMMIT"
       - ".github/workflows/ext.yml"
   pull_request:
@@ -27,6 +28,7 @@ on:
       - "pkg/sentry/vfs/**"
       - "pkg/sentry/memmap/**"
       - "scripts/repro-build.sh"
+      - "scripts/slim-build.sh"
       - "UPSTREAM_COMMIT"
       - ".github/workflows/ext.yml"
   workflow_dispatch:
@@ -89,6 +91,36 @@ jobs:
           ./scripts/repro-build.sh /tmp/rungvx-pure ./cmd/rungvx
           /tmp/rungvx-pure version -V | tee /tmp/pure-version.txt
           grep -q "build options: cgo=0 tags=none extensions=none" /tmp/pure-version.txt
+      - name: Verify deterministic ext slim-build and zero ReflectMethod under slimlink
+        run: |
+          GVX_BUILD_TAGS=ext_all ./scripts/slim-build.sh /tmp/rungvx-ext-slim-1 ./ext/cmd/rungvx
+          GVX_BUILD_TAGS=ext_all ./scripts/slim-build.sh /tmp/rungvx-ext-slim-2 ./ext/cmd/rungvx
+          sha1=$(sha256sum /tmp/rungvx-ext-slim-1 | awk '{ print $1 }')
+          sha2=$(sha256sum /tmp/rungvx-ext-slim-2 | awk '{ print $1 }')
+          echo "ext slim sha256: $sha1"
+          test "$sha1" = "$sha2"
+          /tmp/rungvx-ext-slim-1 version -V | tee /tmp/ext-slim-version.txt
+          grep -q "build options: cgo=0 tags=ext_all extensions=gpu" /tmp/ext-slim-version.txt
+          grep -q "extension gpu: modes=venus,virgl" /tmp/ext-slim-version.txt
+
+          go build -o /tmp/gvx-slimlink ./tools/slimlink
+          if ! CGO_ENABLED=0 GOWORK="$PWD/ext/go.work" /tmp/gvx-slimlink -- -C ext -trimpath -tags=ext_all -ldflags='-s -w -dumpdep' -o /tmp/rungvx-ext-dumpdep ./cmd/rungvx 2> /tmp/ext-dumpdep.log; then
+            cat /tmp/ext-dumpdep.log >&2
+            rm -f /tmp/gvx-slimlink /tmp/rungvx-ext-dumpdep /tmp/ext-dumpdep.log
+            exit 1
+          fi
+          rm -f /tmp/gvx-slimlink /tmp/rungvx-ext-dumpdep
+          if ! grep -q ' -> ' /tmp/ext-dumpdep.log; then
+            echo "ext dumpdep log is unexpectedly empty" >&2
+            rm -f /tmp/ext-dumpdep.log
+            exit 1
+          fi
+          if grep -Fn '<ReflectMethod>' /tmp/ext-dumpdep.log; then
+            echo "ext/cmd/rungvx pulled in <ReflectMethod> symbols and disabled linker DCE" >&2
+            rm -f /tmp/ext-dumpdep.log
+            exit 1
+          fi
+          rm -f /tmp/ext-dumpdep.log
       - name: Audit boundaries including ext
         run: go run ./tools/upstream -mode=audit -max-ratio=0.045
       - name: Check license notices including renderer manifest

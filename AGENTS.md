@@ -179,8 +179,9 @@ Execute this procedure on `main` after CI passes on the release commit. `release
 1. Compute the next version tag using Section 5.2.
 2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [<tag>] - <YYYY-MM-DD>`.
 3. Commit as `docs(changelog): release <tag>` and push `main`.
-4. Create an annotated Git tag `<tag>` on that commit and push the tag.
-5. Verify that `release.yml` publishes all archives, checksums, and SLSA attestations.
+4. Create annotated Git tags `ext/<tag>` and `<tag>` on that commit.
+5. Push `ext/<tag>` first, then push `<tag>` so `release.yml` stamps `<tag>` into `ext/` builds.
+6. Verify that `release.yml` publishes all archives, checksums, and SLSA attestations.
 
 ### 5.4 Slim Linker and Dead-Method Elimination Rules
 
@@ -190,7 +191,7 @@ Release binaries build through `scripts/slim-build.sh` and `tools/slimlink`. The
 > Never strip `pclntab` (`funcnametab`, `filetab`, or `InlTree`) in production releases. Go runtime internals (`isSystemGoroutine`, `panicwrap`, `gorecover`, `isAsyncSafePoint`, and `reflect.makeFuncStub`) depend on undocumented `pclntab` invariants across Go versions.
 
 1. Run `go test -race ./tools/slimlink/...` after every `go.mod` Go upgrade to verify `deadcode.go` patch anchors.
-2. Keep `cmd/rungvx` free of `<ReflectMethod>` symbols, enforced in CI via `-ldflags=-dumpdep`.
+2. Keep `cmd/rungvx` and `ext/cmd/rungvx` (`-tags ext_all`) free of `<ReflectMethod>` symbols, enforced in CI via `-ldflags=-dumpdep`.
 3. Avoid adding `reflect.Type.Method`, `reflect.Value.Method`, or non-constant `MethodByName` calls under `cmd/rungvx` dependencies.
 4. Never call `reflect.Type.Methods` or `reflect.Value.Methods` solely through a generic interface constraint or `MethodByName("Methods")`.
 5. Keep `pkg/rungvx/template_eval.go` free of reflection method dispatch; expose new `--format` values as struct fields or explicit builtins.

@@ -23,7 +23,7 @@ rungvx run alpine:3.20 uname -a
 
 ### Prebuilt Binary (macOS and Linux)
 
-Download the latest release from [GitHub Releases](https://github.com/gfire-sigs/gvx/releases). Replace `darwin-arm64` with `linux-amd64`, `linux-arm64`, or `linux-arm64v8.2` on Linux.
+Download the latest release from [GitHub Releases](https://github.com/gfire-sigs/gvx/releases). Replace `darwin-arm64` with `darwin-arm64-ext` (for compiled extensions such as macOS GPU support), `linux-amd64`, `linux-arm64`, or `linux-arm64v8.2`.
 
 ```sh
 VERSION=$(curl -fsSL https://api.github.com/repos/gfire-sigs/gvx/releases/latest | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
@@ -73,7 +73,7 @@ CGO_ENABLED=0 go install z.gfire.dev/gvx/cmd/rungvx@latest
 <details>
 <summary>Verify checksums and SLSA provenance</summary>
 
-Each release publishes eight archives (seven `rungvx` targets plus `gvx-gpu-renderer` for macOS), `SHA256SUMS`, and a Sigstore attestation bundle (`rungvx-<VERSION>.sigstore.json`).
+Each release publishes nine archives (seven core `rungvx` targets, `rungvx-<VERSION>-darwin-arm64-ext.tar.gz` with compiled extensions, plus `gvx-gpu-renderer` for macOS), `SHA256SUMS`, and a Sigstore attestation bundle (`rungvx-<VERSION>.sigstore.json`).
 
 ```sh
 BASE="https://github.com/gfire-sigs/gvx/releases/download/${VERSION}"
