@@ -2,6 +2,25 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.28.10002026112300] - 2026-11-27
+
+This release adds a prebuilt `darwin/arm64-ext` archive shipping `rungvx` with compiled `ext/` extensions (including macOS GPU support for `-gpu=venus` and `-gpu=virgl`), extends deterministic `slimlink` dead-method elimination checks to `ext/cmd/rungvx`, and adds troubleshooting links to standalone recovery Gists and community Q&A discussions.
+
+### Packaging and Release Pipeline
+
+- **Prebuilt `darwin/arm64-ext` release archive (`.github/workflows/release.yml`, `README.md`, `docs/cli.md`, `AGENTS.md`)**:
+  - Adds `rungvx-<tag>-darwin-arm64-ext.tar.gz` built from `./ext/cmd/rungvx` with `CGO_ENABLED=0`, `GOARM64=v8.4`, `-tags ext_all`, `scripts/slim-build.sh`, and the `com.apple.security.hypervisor` entitlement.
+  - Preserves the single `rungvx` binary name inside the archive and verifies `build options: cgo=0 tags=ext_all extensions=gpu` and `extension gpu: modes=venus,virgl` on the macOS release runner.
+  - Pairs the archive with the existing `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz` bundle under `SHA256SUMS` and SLSA v1 Sigstore provenance attestations while keeping core `rungvx` release archives free of extensions (`extensions=none`).
+  - Publishes matching `ext/<tag>` tags alongside `<tag>` so `go version -m` and `rungvx version` record `<tag>` cleanly for `z.gfire.dev/gvx/ext` builds.
+- **Extension `slimlink` reproducibility and `<ReflectMethod>` CI gate (`.github/workflows/ext.yml`)**:
+  - Verifies deterministic SHA-256 parity across repeated `scripts/slim-build.sh` runs of `./ext/cmd/rungvx` (`-tags ext_all`) and enforces zero `<ReflectMethod>` symbols via `-ldflags=-dumpdep`.
+
+### Documentation
+
+- **Troubleshooting recovery scripts and Q&A references (`docs/troubleshooting.md`, `docs/recipes/docker-engine.md`, `docs/recipes/kubernetes.md`)**:
+  - Links runnable standalone recovery Gists for rootless Docker, nested `docker:dind` inside gVisor, `ext4lite` RL episode resets, `k3s`, and embedded Go sandboxes alongside GitHub Discussions Q&A.
+
 ## [v0.27.10012026112300] - 2026-11-27
 
 This release fixes checkpoint and control-plane concurrency races, hardens island-slot allocation in Windows `systrap`, and eliminates flaky tests across the suite.
