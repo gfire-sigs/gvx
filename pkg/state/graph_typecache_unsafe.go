@@ -226,20 +226,12 @@ func hashTypeSig(h uint64, t reflect.Type, depth int, seen []reflect.Type) uint6
 		}
 		return h
 	case reflect.Interface:
-		n := t.NumMethod()
-		h = hashUint(h, uint64(n))
-		if depth >= 31 {
-			return h
-		}
-		for i := 0; i < n; i++ {
-			m := t.Method(i)
-			h = hashStr(h, m.PkgPath)
-			h = hashStr(h, m.Name)
-			if m.Type != nil {
-				h = hashTypeSig(h, m.Type, max(depth+1, 30), seen)
-			}
-		}
-		return h
+		// Avoid reflect.Type.Method, which sets cmd/link reflectSeen and
+		// disables dead-method elimination across the binary. Named interfaces
+		// contribute their package path, type name, and method count here, and
+		// itabFor still verifies concrete interface satisfaction on restore.
+		h = hashUint(h, uint64(t.NumMethod()))
+		return hashStr(h, t.String())
 	case reflect.Func:
 		var variadic uint64
 		if t.IsVariadic() {

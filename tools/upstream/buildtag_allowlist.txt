@@ -429,3 +429,7 @@ seam pkg/sentry/fsimpl/devpts/replica.go
 expr pkg/sentry/fsimpl/proc/nvproxy.go linux && nvproxy
 expr pkg/sentry/devices/nvproxy/nvconf/hostdriver_unsafe.go linux && nvproxy
 seam runsc/boot/filter/config/config.go
+
+# Content seam: hashTypeSig hashes interface types with NumMethod and String rather than
+# reflect.Type.Method, keeping cmd/link dead-method elimination active across the binary.
+seam pkg/state/graph_typecache_unsafe.go
