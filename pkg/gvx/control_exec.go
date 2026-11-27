@@ -325,10 +325,12 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 				cols = 80
 			}
 			tty = newTTYState(inReader, outWriter, true, rows, cols)
-			cleanups = append(cleanups, tty.stop)
+			removeTTY := s.addStdioQuiescer(tty)
+			cleanups = append(cleanups, removeTTY, tty.stop)
 		} else if inReader != nil {
 			pump = newStdinPump(inReader)
-			cleanups = append(cleanups, pump.stop)
+			removePump := s.addStdioQuiescer(pump)
+			cleanups = append(cleanups, removePump, pump.stop)
 		}
 	}
 
@@ -407,11 +409,11 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	unlockOp()
 
 	finishSession := sync.OnceFunc(func() {
+		execCancel()
+		runCleanup()
 		s.execMu.Lock()
 		delete(s.execSessions, pid)
 		s.execMu.Unlock()
-		execCancel()
-		runCleanup()
 		close(sessDone)
 	})
 
@@ -463,7 +465,7 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 				if tty != nil {
 					var r control.ExecResizeEvent
 					if json.Unmarshal(ev.Data, &r) == nil && r.Rows > 0 && r.Cols > 0 {
-						tty.setWinsize(linux.Winsize{Row: r.Rows, Col: r.Cols})
+						tty.deliverWinsize(linux.Winsize{Row: r.Rows, Col: r.Cols})
 					}
 				}
 			case "exec.signal":

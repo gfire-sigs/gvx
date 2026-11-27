@@ -121,21 +121,115 @@ func (t *ttyState) startPump() {
 		buf := make([]byte, 4096)
 		for {
 			n, err := in.Read(buf)
-			if n > 0 {
-				if !t.consumeInput(buf[:n]) {
-					return
-				}
-			}
-			if err != nil {
-				t.finishInput(err)
+			if !t.deliverInput(buf[:n], err) {
 				return
 			}
 		}
 	}()
 }
 
+// deliverInput commits one host terminal read while obeying the checkpoint
+// save barrier so StateSave never races with ttyState buffer or waiter writes.
+func (t *ttyState) deliverInput(chunk []byte, readErr error) bool {
+	for {
+		t.deliveryMu.Lock()
+		t.mu.Lock()
+		if resumed := t.saveResumed; resumed != nil {
+			t.mu.Unlock()
+			t.deliveryMu.Unlock()
+			<-resumed
+			continue
+		}
+		if t.stopped {
+			t.mu.Unlock()
+			t.deliveryMu.Unlock()
+			return false
+		}
+		t.mu.Unlock()
+		var (
+			keepGoing = true
+			out       io.Writer
+			echo      []byte
+		)
+		if len(chunk) > 0 {
+			keepGoing, out, echo = t.consumeInputState(chunk)
+		}
+		if keepGoing && readErr != nil {
+			t.finishInput(readErr)
+			keepGoing = false
+		}
+		t.deliveryMu.Unlock()
+		// Write echoed bytes after releasing deliveryMu so a blocked host
+		// stdout stream cannot deadlock QuiesceForSave or stop.
+		if len(echo) > 0 && out != nil {
+			t.outMu.Lock()
+			_, _ = out.Write(echo)
+			t.outMu.Unlock()
+		}
+		return keepGoing
+	}
+}
+
+// deliverWinsize applies a host terminal resize while obeying the checkpoint
+// save barrier so StateSave never races with winsize or foreground signals.
+func (t *ttyState) deliverWinsize(ws linux.Winsize) {
+	for {
+		t.deliveryMu.Lock()
+		t.mu.Lock()
+		if resumed := t.saveResumed; resumed != nil {
+			t.mu.Unlock()
+			t.deliveryMu.Unlock()
+			<-resumed
+			continue
+		}
+		if t.stopped {
+			t.mu.Unlock()
+			t.deliveryMu.Unlock()
+			return
+		}
+		changed := t.winsize.Row != ws.Row || t.winsize.Col != ws.Col
+		t.winsize = ws
+		t.mu.Unlock()
+		if changed {
+			t.signalForeground(linux.SIGWINCH)
+		}
+		t.deliveryMu.Unlock()
+		return
+	}
+}
+
+// QuiesceForSave blocks delivery of host terminal input and resizes from
+// mutating ttyState buffers, waiters, winsize, or signals until ResumeAfterSave.
+func (t *ttyState) QuiesceForSave() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	if t.saveResumed == nil {
+		t.saveResumed = make(chan struct{})
+	}
+	t.mu.Unlock()
+	t.deliveryMu.Lock()
+	t.deliveryMu.Unlock()
+}
+
+// ResumeAfterSave lifts the checkpoint save barrier installed by QuiesceForSave.
+func (t *ttyState) ResumeAfterSave() error {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	if t.saveResumed != nil {
+		close(t.saveResumed)
+		t.saveResumed = nil
+	}
+	t.mu.Unlock()
+	return nil
+}
+
 func (t *ttyState) stop() {
 	t.mu.Lock()
+	alreadyStopped := t.stopped
 	t.stopped = true
 	t.hostEOF = true
 	in := t.in
@@ -143,7 +237,12 @@ func (t *ttyState) stop() {
 	if d, ok := in.(interface{ SetReadDeadline(time.Time) error }); ok {
 		_ = d.SetReadDeadline(time.Now())
 	}
-	t.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
+	if !alreadyStopped {
+		t.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
+	}
+	// Drain any in-flight input or resize delivery before returning.
+	t.deliveryMu.Lock()
+	t.deliveryMu.Unlock()
 }
 
 func (t *ttyState) finishInput(err error) {
@@ -266,16 +365,28 @@ func (t *ttyState) eraseLineLocked(echo *[]byte) {
 }
 
 func (t *ttyState) consumeInput(chunk []byte) bool {
+	keepGoing, out, echo := t.consumeInputState(chunk)
+	if len(echo) > 0 && out != nil {
+		t.outMu.Lock()
+		_, _ = out.Write(echo)
+		t.outMu.Unlock()
+	}
+	return keepGoing
+}
+
+// consumeInputState updates ttyState buffers, delivers foreground signals, and
+// notifies waiters, returning any echoed bytes to write after releasing locks.
+func (t *ttyState) consumeInputState(chunk []byte) (bool, io.Writer, []byte) {
 	t.mu.Lock()
 	if t.stopped {
 		t.mu.Unlock()
-		return false
+		return false, nil, nil
 	}
 	if !t.rawHost {
 		t.readBuf = append(t.readBuf, chunk...)
 		t.mu.Unlock()
 		t.wq.Notify(waiter.ReadableEvents)
-		return true
+		return true, nil, nil
 	}
 
 	var (
@@ -308,18 +419,13 @@ func (t *ttyState) consumeInput(chunk []byte) bool {
 	out := t.out
 	t.mu.Unlock()
 
-	if len(echo) > 0 && out != nil {
-		t.outMu.Lock()
-		_, _ = out.Write(echo)
-		t.outMu.Unlock()
-	}
 	for _, sig := range sigs {
 		t.signalForeground(sig)
 	}
 	if notifyRead {
 		t.wq.Notify(waiter.ReadableEvents)
 	}
-	return true
+	return true, out, echo
 }
 
 func (t *ttyState) translateInputByteLocked(b byte) (byte, bool) {
@@ -869,15 +975,18 @@ func (s *Sandbox) setupKernelStdio(ctx context.Context, sctx gvcontext.Context, 
 		rows, cols, _ := hostTerminalSize(s.cfg.Stdin, s.cfg.Stdout)
 		tty = newTTYState(s.cfg.Stdin, s.cfg.Stdout, rawHost, rows, cols)
 		stopWinch := watchHostWinch(ctx, s.cfg.Stdin, s.cfg.Stdout, func(r, c uint16) {
-			tty.setWinsize(linux.Winsize{Row: r, Col: c})
+			tty.deliverWinsize(linux.Winsize{Row: r, Col: c})
 		})
-		cleanups = append(cleanups, stopWinch, tty.stop)
+		removeTTY := s.addStdioQuiescer(tty)
+		// LIFO cleanup stops the TTY and drains deliveryMu before unregistering.
+		cleanups = append(cleanups, stopWinch, removeTTY, tty.stop)
 	}
 
 	var pump *stdinPump
 	if s.cfg.Stdin != nil && tty == nil {
 		pump = newStdinPump(s.cfg.Stdin)
-		cleanups = append(cleanups, pump.stop)
+		removePump := s.addStdioQuiescer(pump)
+		cleanups = append(cleanups, removePump, pump.stop)
 	}
 
 	stdio, err := openStdioFDs(sctx, vfsObj, creds, s.cfg.Stdin, s.cfg.Stdout, s.cfg.Stderr, tty, pump)
@@ -929,7 +1038,7 @@ func (s *Sandbox) activateRestoredStdio(ctx context.Context, tg *kernel.ThreadGr
 		if len(restoredTTYs) > 0 {
 			stopWinch := watchHostWinch(ctx, s.cfg.Stdin, s.cfg.Stdout, func(r, c uint16) {
 				for _, ts := range restoredTTYs {
-					ts.setWinsize(linux.Winsize{Row: r, Col: c})
+					ts.deliverWinsize(linux.Winsize{Row: r, Col: c})
 				}
 			})
 			cleanups = append(cleanups, stopWinch)
@@ -937,10 +1046,13 @@ func (s *Sandbox) activateRestoredStdio(ctx context.Context, tg *kernel.ThreadGr
 	}
 	for _, ts := range restoredTTYs {
 		ts.ActivateRestoredTTY()
-		cleanups = append(cleanups, ts.stop)
+		removeTTY := s.addStdioQuiescer(ts)
+		cleanups = append(cleanups, removeTTY, ts.stop)
 	}
 	for _, p := range restoredPumps {
-		cleanups = append(cleanups, p.stop)
+		p.activateRestored()
+		removePump := s.addStdioQuiescer(p)
+		cleanups = append(cleanups, removePump, p.stop)
 	}
 	return func() {
 		for i := len(cleanups) - 1; i >= 0; i-- {

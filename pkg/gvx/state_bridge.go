@@ -145,7 +145,10 @@ func resolveStdioStreams(stream stdioStreamKind, sharedOutErr, isTTY bool, stdio
 //
 // +stateify savable
 type ttyState struct {
-	mu          sync.Mutex `state:"nosave"`
+	// Lock order: deliveryMu before mu, then wq.
+	deliveryMu  sync.Mutex    `state:"nosave"`
+	mu          sync.Mutex    `state:"nosave"`
+	saveResumed chan struct{} `state:"nosave"`
 	termios     linux.KernelTermios
 	winsize     linux.Winsize
 	fgPgrp      int32
@@ -210,7 +213,10 @@ type stdinPump struct {
 	r  io.Reader `state:"nosave"`
 	wq waiter.Queue
 
-	mu sync.Mutex `state:"nosave"`
+	// Lock order: deliveryMu before mu, then wq.
+	deliveryMu  sync.Mutex    `state:"nosave"`
+	mu          sync.Mutex    `state:"nosave"`
+	saveResumed chan struct{} `state:"nosave"`
 	// buf holds bytes returned by the host reader that the guest has not consumed yet.
 	buf []byte
 	// err records the terminal error returned by the host reader.

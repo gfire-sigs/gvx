@@ -224,6 +224,7 @@ func (s *Sandbox) clearActiveKernel() {
 	s.mu.Lock()
 	s.activeKernel = nil
 	s.activeWatchdog = nil
+	s.kernelExited = true
 	s.mu.Unlock()
 }
 
@@ -583,23 +584,36 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	// long time. GVX_DEBUG_LOG shows the log.
 	dog := watchdog.New(k, watchdog.DefaultOpts)
 
-	// Publish activeKernel before k.Start() while holding opMu so that guest
-	// stdout observed immediately after startup never races ahead of control
-	// state ("running"), while mutating RPCs (exec, pause, checkpoint, mounts)
-	// wait until k.Start() and dog.Start() finish.
-	s.opMu.Lock()
-	s.mu.Lock()
-	s.startedAt = time.Now()
-	s.mu.Unlock()
-	s.setActiveKernel(k, dog)
-	if err := k.Start(); err != nil {
-		s.clearActiveKernel()
-		s.clearRunningKernel()
-		s.opMu.Unlock()
-		return 1, fmt.Errorf("%s: %w", startErrPrefix, err)
+	// Publish activeKernel before k.Start() while holding opMu so guest stdout
+	// never races ahead of control state. Closing kernelStartDone after k.Start()
+	// and dog.Start() keeps sandboxStateString from reporting "running" early.
+	startErr := func() error {
+		s.opMu.Lock()
+		defer s.opMu.Unlock()
+		startDone := make(chan struct{})
+		started := false
+		defer func() {
+			if !started {
+				s.clearActiveKernel()
+				s.clearRunningKernel()
+			}
+			close(startDone)
+		}()
+		s.mu.Lock()
+		s.startedAt = time.Now()
+		s.kernelStartDone = startDone
+		s.mu.Unlock()
+		s.setActiveKernel(k, dog)
+		if err := k.Start(); err != nil {
+			return fmt.Errorf("%s: %w", startErrPrefix, err)
+		}
+		dog.Start()
+		started = true
+		return nil
+	}()
+	if startErr != nil {
+		return 1, startErr
 	}
-	dog.Start()
-	s.opMu.Unlock()
 	defer dog.Stop()
 	defer s.clearRunningKernel()
 	defer s.clearActiveKernel()

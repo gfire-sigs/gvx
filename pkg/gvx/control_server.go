@@ -403,23 +403,40 @@ func withGuestVFS(sctx gvcontext.Context, root vfs.VirtualDentry, mntns *vfs.Mou
 }
 
 func (s *Sandbox) sandboxStateString() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return "exited"
-	}
-	if s.activeKernel == nil {
-		select {
-		case <-s.runDone:
+	for {
+		s.mu.Lock()
+		if s.closed || s.kernelExited {
+			s.mu.Unlock()
 			return "exited"
-		default:
+		}
+		if s.activeKernel == nil {
+			runDone := s.runDone
+			s.mu.Unlock()
+			if runDone != nil {
+				select {
+				case <-runDone:
+					return "exited"
+				default:
+				}
+			}
 			return "starting"
 		}
+		if startDone := s.kernelStartDone; startDone != nil {
+			select {
+			case <-startDone:
+			default:
+				s.mu.Unlock()
+				<-startDone
+				continue
+			}
+		}
+		if s.userPaused {
+			s.mu.Unlock()
+			return "paused"
+		}
+		s.mu.Unlock()
+		return "running"
 	}
-	if s.userPaused {
-		return "paused"
-	}
-	return "running"
 }
 
 func mapControlErr(err error) error {
