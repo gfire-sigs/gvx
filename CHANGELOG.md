@@ -2,6 +2,27 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.27.10012026112300] - 2026-11-27
+
+This release fixes checkpoint and control-plane concurrency races, hardens island-slot allocation in Windows `systrap`, and eliminates flaky tests across the suite.
+
+### Reliability and Runtime Fixes
+
+- **Stdio quiesce barrier across checkpoints and serialized kernel startup state (`pkg/gvx`)** (#283):
+  - Quiesces host `stdinPump` and `ttyState` readers (including `SIGWINCH` resize handlers) before `Kernel.SaveTo` in `Checkpoint` and `CheckpointStream`, avoiding concurrent `waiter.Queue` mutations during state serialization.
+  - Moves `ttyState` echo writes outside `deliveryMu`, drains `deliveryMu` in `stop()`, cancels `exec` helpers before deleting sessions, and notifies restored `stdin` readers cleanly.
+  - Serializes `Sandbox.kernelStartDone` and `Sandbox.kernelExited` so `sandboxStateString` reports `"starting"`, `"running"`, and `"exited"` accurately across startup and teardown.
+- **Windows `systrap` island-slot scrubbing and retry budget (`pkg/sentry/platform/systrap`)** (#284):
+  - Makes `slotSeamSafe` a pure predicate and makes `installSlot` the sole owner of scrubbing seam-rejected slot buffers before advancing.
+  - Raises `maxInstallSlotAttempts` from 20 to 30 so trampolines tolerate up to two quarantined islands under adversarial page layouts.
+
+### Test Stability
+
+- **Deterministic synchronization and port isolation across test suites (`internal/testelf`, `pkg/sentry/fsimpl/hostfs`, `pkg/gvx`, `pkg/rungvx`, `pkg/netbackend`, `e2e`)** (#285):
+  - Updates `BuildGuestHTTPServerELF64At` on `arm64` and `amd64` to call `SYS_shutdown(SHUT_WR)` and drain peer reads before closing sockets, avoiding response truncation during teardown.
+  - Probes `hostfs` capabilities once in `TestOpenMakesNoHostCallForEachRecord`, binds ephemeral `:0` host ports in dynamic-port tests, and retries bind collisions in auto-publish tests.
+  - Guards `net.Pipe` stdin writes with deadlines, drains volume CLI sandboxes before `TempDir` removal, and replaces fixed `50ms` sleeps with causal barriers.
+
 ## [v0.27.10002026112300] - 2026-11-27
 
 This release lowers `rungvx` binary sizes across all targets while keeping standard Go stack traces and runtime metadata. It gates `nvproxy` behind a build tag, removes reflection method lookups in `pkg/state` and `pkg/rungvx`, and enables linker dead-method elimination.
