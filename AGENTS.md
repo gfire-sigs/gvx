@@ -35,7 +35,7 @@ Execute these steps before editing repository files.
 
 | Isolation Tier | Packages and Files | Architectural Rule |
 | :--- | :--- | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungvx`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/rungvx`, `pkg/gvx`, `pkg/gvx/control`, `pkg/gvx/shm`, `pkg/gvx/exttest`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/blockdev`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/fsimpl/fsutilx`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/tcpip/link/wgtun`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/rpcfs`, `ext/`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; absent from `upstream/go` (0.0% merge conflict rate). |
+| **Tier 1: Additive Packages** | `cmd/rungvx`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/rungvx`, `pkg/gvx`, `pkg/gvx/control`, `pkg/gvx/shm`, `pkg/gvx/exttest`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/blockdev`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/fsimpl/fsutilx`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/tcpip/link/wgtun`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/rpcfs`, `ext/`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `tools/slimlink`, `android`, `docs/` | Owned exclusively by `gvx`; absent from `upstream/go` (0.0% merge conflict rate). |
 | **Tier 2: Sibling `_windows`, `_darwin`, and `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | Placed beside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
 | **Tier 3: Build-Tag and Seam Patches** | Pure-Go files in `pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,tmpfs,overlay}`, `pkg/tcpip`, `pkg/sentry/platform/systrap/{usertrap,sysmsg}` (`amd64` files) | Register every build-tag change (`linux \|\| windows \|\| darwin`) in `tools/upstream/buildtag_allowlist.txt`; keep modified upstream files below 5.0%. Name additive helpers in shared packages `*_xplat.go` or `*_darwin*.go` so the audit counts them as Tier 2 siblings. |
 
@@ -181,6 +181,19 @@ Execute this procedure on `main` after CI passes on the release commit. `release
 3. Commit as `docs(changelog): release <tag>` and push `main`.
 4. Create an annotated Git tag `<tag>` on that commit and push the tag.
 5. Verify that `release.yml` publishes all archives, checksums, and SLSA attestations.
+
+### 5.4 Slim Linker and Dead-Method Elimination Rules
+
+Release binaries build through `scripts/slim-build.sh` and `tools/slimlink`. The wrapper patches `cmd/link/internal/ld/deadcode.go` from the active `GOROOT` via `-overlay` and preserves stock `pclntab`, stack traces, `runtime.Caller`, GC maps, and `pprof`.
+
+> [!CAUTION]
+> Never strip `pclntab` (`funcnametab`, `filetab`, or `InlTree`) in production releases. Go runtime internals (`isSystemGoroutine`, `panicwrap`, `gorecover`, `isAsyncSafePoint`, and `reflect.makeFuncStub`) depend on undocumented `pclntab` invariants across Go versions.
+
+1. Run `go test -race ./tools/slimlink/...` after every `go.mod` Go upgrade to verify `deadcode.go` patch anchors.
+2. Keep `cmd/rungvx` free of `<ReflectMethod>` symbols, enforced in CI via `-ldflags=-dumpdep`.
+3. Avoid adding `reflect.Type.Method`, `reflect.Value.Method`, or non-constant `MethodByName` calls under `cmd/rungvx` dependencies.
+4. Never call `reflect.Type.Methods` or `reflect.Value.Methods` solely through a generic interface constraint or `MethodByName("Methods")`.
+5. Keep `pkg/rungvx/template_eval.go` free of reflection method dispatch; expose new `--format` values as struct fields or explicit builtins.
 
 ---
 

@@ -21,6 +21,7 @@ PROTECT tools/upstream/**
 PROTECT tools/shiminterop/**
 PROTECT tools/gvisorlint/**
 PROTECT tools/licenses/**
+PROTECT tools/slimlink/**
 PROTECT tools/androidprobe/**
 PROTECT tools/gostateify/**
 PROTECT internal/xsys/**

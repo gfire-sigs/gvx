@@ -68,7 +68,7 @@ jobs:
           exe=rungvx
           [ "$GOOS" = windows ] && exe=rungvx.exe
           mkdir -p "dist/$name"
-          ./scripts/repro-build.sh "dist/$name/$exe" ./cmd/rungvx
+          ./scripts/slim-build.sh "dist/$name/$exe" ./cmd/rungvx
           if [ "$GOOS" = darwin ]; then
             codesign --sign - --entitlements entitlements.plist --force "dist/$name/$exe"
             codesign --display --entitlements - "dist/$name/$exe" | grep -q com.apple.security.hypervisor

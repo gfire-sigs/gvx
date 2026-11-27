@@ -494,6 +494,12 @@ var boundaryRules = []importRule{
 		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "scripts/*", "runsc/*", "shim/*"},
 	},
 	{
+		pkg:       "tools/slimlink",
+		tier:      Tier1Additive,
+		subtree:   true,
+		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "scripts/*", "runsc/*", "shim/*"},
+	},
+	{
 		pkg:       "tools/gvisorlint",
 		tier:      Tier1Additive,
 		subtree:   true,
