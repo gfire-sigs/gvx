@@ -1308,13 +1308,7 @@ func slotSeamSafe(page []byte, off, size uint32) bool {
 		lo--
 	}
 	hi := min(len(page), int(off+size)+1)
-	if hasRawKernelExit(page[lo:hi]) {
-		for i := off; i < off+size && int(i) < len(page); i++ {
-			page[i] = amd64INT3
-		}
-		return false
-	}
-	return true
+	return !hasRawKernelExit(page[lo:hi])
 }
 
 // preWindowPatch describes a pre-window patch that patchJumpBefore installed.
