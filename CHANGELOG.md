@@ -2,6 +2,26 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.27.10002026112300] - 2026-11-27
+
+This release lowers `rungvx` binary sizes across all targets while keeping standard Go stack traces and runtime metadata. It gates `nvproxy` behind a build tag, removes reflection method lookups in `pkg/state` and `pkg/rungvx`, and enables linker dead-method elimination.
+
+### Packaging and Binary Size
+
+- **DCE-only overlay Go linker for release builds (`tools/slimlink`, `scripts/slim-build.sh`, `.github/workflows/release.yml`, `.github/workflows/ci.yml`)** (#282):
+  - Adds `tools/slimlink`, which patches `cmd/link/internal/ld/deadcode.go` via `-overlay` so Go 1.27's `reflect.Type.Methods` iterator does not pin every exported method.
+  - Preserves standard `pclntab`, stack traces, `runtime.Caller`, garbage-collection maps, and `pprof` metadata in production binaries.
+  - Builds desktop, server, and Android `rungvx` archives through `scripts/slim-build.sh`, lowering compressed release archive sizes by 13% to 14%.
+  - Verifies zero `<ReflectMethod>` symbols in `cmd/rungvx` during CI audits and confirms reproducible `scripts/slim-build.sh` builds inside `gvx`.
+- **Opt-in `nvproxy` build tag across all platforms (`pkg/sentry/fsimpl/proc`, `pkg/sentry/devices/nvproxy`, `runsc/boot/filter/config`)** (#279):
+  - Excludes proxy code for NVIDIA GPU ioctls from default builds on all platforms; pass `-tags nvproxy` on Linux to include it.
+  - Fails fast when `opt.NVProxy` is enabled in a build compiled without `-tags nvproxy`.
+- **Zero-`MethodByName` `--format` template evaluator (`pkg/rungvx`)** (#281):
+  - Replaces `text/template` execution in `pkg/rungvx` with `template_eval.go`, a parser-backed evaluator that omits `reflect.Value.MethodByName` and `reflect.Value.Method`.
+  - Preserves Go template actions, pipelines, builtins, channel iteration, and `--format` output parity, verified by differential unit and fuzz tests against `text/template`.
+- **Method-reflection-free type hashing (`pkg/state`)** (#280):
+  - Updates `hashTypeSig` in `pkg/state` to hash type signatures without calling `reflect.Type.Method`, unblocking linker dead-method elimination across `pkg/state` callers.
+
 ## [v0.26.10002026112300] - 2026-11-26
 
 This release adds opt-in contained host symbolic links for `hostfs` bind mounts, enforces symlink containment across mutating directory and link operations, and adds APIs to inspect virtual symbolic links.
