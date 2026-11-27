@@ -421,3 +421,11 @@ seam pkg/sentry/kernel/shm/shm_state_autogen.go
 # ioctls to pkg/sentry/fsimpl/devpts/vmin_xplat.go.
 seam pkg/sentry/fsimpl/devpts/master.go
 seam pkg/sentry/fsimpl/devpts/replica.go
+
+# Host NVIDIA GPU proxy code is unused by gvx sandboxes on all platforms.
+# Gate it behind linux && nvproxy with Tier 2 xplat helpers in proc, nvconf,
+# and runsc/boot/filter/config (nvproxy_stub_xplat.go, hostdriver_stub_xplat.go,
+# and nvproxy_filters_xplat.go) so default builds exclude nvproxy and abi/nvgpu.
+expr pkg/sentry/fsimpl/proc/nvproxy.go linux && nvproxy
+expr pkg/sentry/devices/nvproxy/nvconf/hostdriver_unsafe.go linux && nvproxy
+seam runsc/boot/filter/config/config.go

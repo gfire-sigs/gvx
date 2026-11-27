@@ -708,6 +708,11 @@ var boundaryRules = []importRule{
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
+		pkg:       "pkg/sentry/devices/nvproxy/nvconf",
+		tier:      Tier2Sibling,
+		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
+	},
+	{
 		pkg:           "pkg/sentry/fsimpl/cgroup2fs",
 		tier:          Tier2Sibling,
 		allowed:       []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/context", "pkg/errors/linuxerr", "pkg/sentry/blockdev", "pkg/sentry/kernel", "pkg/sentry/usage", "pkg/sentry/vfs", "pkg/usermem"},
@@ -886,6 +891,14 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/vfs",
 		tier:      Tier2Sibling,
 		allowed:   []string{"pkg/state"},
+		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
+	},
+
+	// Linux runsc Tier 2 packages.
+	{
+		pkg:       "runsc/boot/filter/config",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/seccomp", "pkg/sentry/devices/nvproxy", "pkg/sentry/devices/nvproxy/nvconf"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 }

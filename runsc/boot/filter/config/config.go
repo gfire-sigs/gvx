@@ -27,7 +27,6 @@ import (
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/seccomp/precompiledseccomp"
-	"z.gfire.dev/gvx/pkg/sentry/devices/nvproxy"
 	"z.gfire.dev/gvx/pkg/sentry/devices/nvproxy/nvconf"
 	"z.gfire.dev/gvx/pkg/sentry/devices/rdmaproxy"
 	"z.gfire.dev/gvx/pkg/sentry/devices/tpuproxy"
@@ -211,7 +210,7 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 		s.Merge(hostFilesystemFilters(vars))
 	}
 	if opt.NVProxy {
-		s.Merge(nvproxy.Filters(opt.NVProxyCaps))
+		s.Merge(nvproxyFilters(opt.NVProxyCaps))
 	}
 	if opt.TPUProxy {
 		s.Merge(tpuproxy.Filters())
