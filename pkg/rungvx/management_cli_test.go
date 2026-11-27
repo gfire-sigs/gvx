@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,6 +98,27 @@ func TestVolumeCLICommands(t *testing.T) {
 	}
 }
 
+func waitCLIStdoutOrExit(t *testing.T, stdout, stderr *syncNotifyBuffer, runDone <-chan struct{}, exitCode *atomic.Int32, sub string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		if strings.Contains(stdout.String(), sub) {
+			return
+		}
+		select {
+		case <-stdout.ch:
+		case <-runDone:
+			if strings.Contains(stdout.String(), sub) {
+				return
+			}
+			t.Fatalf("sandbox exited early with code %d before emitting %q; stdout=%q stderr=%q", exitCode.Load(), sub, stdout.String(), stderr.String())
+		case <-deadline.C:
+			t.Fatalf("timed out after %v waiting for %q; stdout=%q stderr=%q", timeout, sub, stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestVolumeCLIRefusesRemovingMountedSandboxVolume(t *testing.T) {
 	platform := requireCheckpointCLIPlatform(t)
 
@@ -116,16 +138,38 @@ func TestVolumeCLIRefusesRemovingMountedSandboxVolume(t *testing.T) {
 	}
 	runCLIArgs(t, nil, "volume", "create", "dbdata", "-cache-dir", env.cacheDir).mustSucceed(t, "volume create dbdata")
 
+	ctx, cancel := context.WithCancel(context.Background())
 	stdinR, stdinW := net.Pipe()
-	defer stdinR.Close()
-	defer stdinW.Close()
 	stdout := newSyncNotifyBuffer()
 	stderr := newSyncNotifyBuffer()
-	done := make(chan int, 1)
+	runDone := make(chan struct{})
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	waitSandbox := func() int {
+		select {
+		case <-runDone:
+			return int(exitCode.Load())
+		case <-time.After(15 * time.Second):
+			cancel()
+			select {
+			case <-runDone:
+				return int(exitCode.Load())
+			case <-time.After(10 * time.Second):
+				return -1
+			}
+		}
+	}
+	t.Cleanup(func() {
+		_ = stdinW.Close()
+		cancel()
+		_ = waitSandbox()
+		_ = stdinR.Close()
+	})
 
 	go func() {
-		done <- executeCLI(
-			context.Background(),
+		defer close(runDone)
+		exitCode.Store(int32(executeCLI(
+			ctx,
 			[]string{
 				"run",
 				"-lockdown=false",
@@ -142,10 +186,10 @@ func TestVolumeCLIRefusesRemovingMountedSandboxVolume(t *testing.T) {
 			stdinR,
 			stdout,
 			stderr,
-		)
+		)))
 	}()
 
-	stdout.waitForSubstring(t, "mounted-ok\n", 15*time.Second)
+	waitCLIStdoutOrExit(t, stdout, stderr, runDone, &exitCode, "mounted-ok\n", 15*time.Second)
 
 	inUseOut := runCLIArgs(t, nil, "volume", "inspect", "dbdata", "-cache-dir", env.cacheDir, "-f", "{{.InUse}}").mustSucceed(t, "volume inspect InUse")
 	if strings.TrimSpace(inUseOut.stdout) != "true" {
@@ -158,7 +202,7 @@ func TestVolumeCLIRefusesRemovingMountedSandboxVolume(t *testing.T) {
 	}
 
 	_ = stdinW.Close()
-	if code := <-done; code != 0 {
+	if code := waitSandbox(); code != 0 {
 		t.Fatalf("sandbox exited with %d: %s", code, stderr.String())
 	}
 	runCLIArgs(t, nil, "volume", "rm", "dbdata", "-cache-dir", env.cacheDir).mustSucceed(t, "volume rm after sandbox exit")
@@ -244,16 +288,38 @@ func TestRootfsVolumeWithVolumeAndSystemCLICommands(t *testing.T) {
 	imageRef := parsedURL.Host + "/gvx/rootcat:v1"
 
 	env := newCLIEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
 	stdinR, stdinW := net.Pipe()
-	defer stdinR.Close()
-	defer stdinW.Close()
 	stdout := newSyncNotifyBuffer()
 	stderr := newSyncNotifyBuffer()
-	done := make(chan int, 1)
+	runDone := make(chan struct{})
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	waitSandbox := func() int {
+		select {
+		case <-runDone:
+			return int(exitCode.Load())
+		case <-time.After(15 * time.Second):
+			cancel()
+			select {
+			case <-runDone:
+				return int(exitCode.Load())
+			case <-time.After(10 * time.Second):
+				return -1
+			}
+		}
+	}
+	t.Cleanup(func() {
+		_ = stdinW.Close()
+		cancel()
+		_ = waitSandbox()
+		_ = stdinR.Close()
+	})
 
 	go func() {
-		done <- executeCLI(
-			context.Background(),
+		defer close(runDone)
+		exitCode.Store(int32(executeCLI(
+			ctx,
 			[]string{
 				"run",
 				"-lockdown=false",
@@ -269,10 +335,10 @@ func TestRootfsVolumeWithVolumeAndSystemCLICommands(t *testing.T) {
 			stdinR,
 			stdout,
 			stderr,
-		)
+		)))
 	}()
 
-	stdout.waitForSubstring(t, "rootfs-ready\n", 45*time.Second)
+	waitCLIStdoutOrExit(t, stdout, stderr, runDone, &exitCode, "rootfs-ready\n", 45*time.Second)
 
 	lsOut := runCLIArgs(t, nil, "volume", "ls", "-q", "-cache-dir", env.cacheDir).mustSucceed(t, "volume ls -q")
 	if strings.TrimSpace(lsOut.stdout) != "rootcli" {
@@ -295,7 +361,7 @@ func TestRootfsVolumeWithVolumeAndSystemCLICommands(t *testing.T) {
 	}
 
 	_ = stdinW.Close()
-	if code := <-done; code != 0 {
+	if code := waitSandbox(); code != 0 {
 		t.Fatalf("sandbox exited with %d: %s", code, stderr.String())
 	}
 

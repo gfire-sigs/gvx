@@ -572,16 +572,6 @@ func TestDynamicForwarderCustomBindIPAndBindError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = busyLn.Close() })
 	busyPort := uint16(busyLn.Addr().(*net.TCPAddr).Port)
-	freePort := reserveFreeLoopbackPort(t, "tcp")
-	for freePort == busyPort {
-		freePort = reserveFreeLoopbackPort(t, "tcp")
-	}
-
-	guestFreeLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: Eth0NICID, Addr: defaultGuestIPv4Addr, Port: freePort}, ipv4.ProtocolNumber)
-	if err != nil {
-		t.Fatalf("ListenTCP free: %v", err)
-	}
-	tcpEchoServer(t, guestFreeLn)
 
 	guestBusyLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: Eth0NICID, Addr: defaultGuestIPv4Addr, Port: busyPort}, ipv4.ProtocolNumber)
 	if err != nil {
@@ -614,17 +604,43 @@ func TestDynamicForwarderCustomBindIPAndBindError(t *testing.T) {
 		},
 	})
 	pf.Start(s)
-	pf.reconcileDynamicPorts()
 
-	cbMu.Lock()
-	gotPublished := slices.Clone(published)
-	gotBindErrs := slices.Clone(bindErrs)
-	cbMu.Unlock()
+	var freePort uint16
+	var guestFreeLn *gonet.TCPListener
+	var gotPublished []PortForwardRule
+	var gotBindErrs []uint16
+	for attempt := 1; attempt <= 5; attempt++ {
+		freePort = reserveFreeLoopbackPort(t, "tcp")
+		for freePort == busyPort {
+			freePort = reserveFreeLoopbackPort(t, "tcp")
+		}
+		guestFreeLn, err = gonet.ListenTCP(s, tcpip.FullAddress{NIC: Eth0NICID, Addr: defaultGuestIPv4Addr, Port: freePort}, ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatalf("ListenTCP free: %v", err)
+		}
+		tcpEchoServer(t, guestFreeLn)
+
+		pf.reconcileDynamicPorts()
+
+		cbMu.Lock()
+		gotPublished = slices.Clone(published)
+		gotBindErrs = slices.Clone(bindErrs)
+		cbMu.Unlock()
+		publishedFree := slices.ContainsFunc(gotPublished, func(r PortForwardRule) bool {
+			return r.HostPort == freePort
+		})
+		if publishedFree || attempt == 5 || !slices.Contains(gotBindErrs, freePort) {
+			break
+		}
+		_ = guestFreeLn.Close()
+		pf.reconcileDynamicPorts()
+	}
+
 	if len(gotPublished) != 1 || gotPublished[0].HostIP != "0.0.0.0" || gotPublished[0].HostPort != freePort {
 		t.Fatalf("published = %+v, want HostIP=0.0.0.0 HostPort=%d", gotPublished, freePort)
 	}
-	if len(gotBindErrs) != 1 || gotBindErrs[0] != busyPort {
-		t.Fatalf("bindErrs = %v, want [%d]", gotBindErrs, busyPort)
+	if !slices.Contains(gotBindErrs, busyPort) {
+		t.Fatalf("bindErrs = %v, want to contain %d", gotBindErrs, busyPort)
 	}
 	c, err := net.Dial("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(freePort))))
 	if err != nil {

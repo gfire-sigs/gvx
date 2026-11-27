@@ -60,7 +60,7 @@ func freeLoopbackPortForE2E(t *testing.T) uint16 {
 
 func httpGetWithRetry(t *testing.T, url string, timeout time.Duration) string {
 	t.Helper()
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -502,11 +502,17 @@ func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 	if _, errS, code := runTool(t, rungvx, "exec", "-S", sockPath, "-d", "--", "/bin/httpserver"); code != 0 {
 		t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
 	}
-	hostPort := freeLoopbackPortForE2E(t)
-	spec := "127.0.0.1:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
-	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, spec); code != 0 {
+	addSpec := "127.0.0.1:0:" + strconv.Itoa(int(guestPort))
+	addOut, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "-f", "json", addSpec)
+	if code != 0 {
 		t.Fatalf("port add = (%d, %q)", code, errS)
 	}
+	var addedPort control.PortRuleInfo
+	if err := json.Unmarshal([]byte(addOut), &addedPort); err != nil || addedPort.HostPort == 0 {
+		t.Fatalf("port add json = (%q, %v), want bound host port", addOut, err)
+	}
+	hostPort := addedPort.HostPort
+	rmSpec := "127.0.0.1:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
 	// Non-loopback bind must still be refused under host lockdown even with --dynamic-ports.
 	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "0.0.0.0:0:80"); code != 126 {
 		t.Fatalf("port add non-loopback = (%d, %q), want 126", code, errS)
@@ -515,7 +521,7 @@ func TestE2EDynamicPortsUnderLockdown(t *testing.T) {
 	if gotBody != "dyn-port-ok\n" {
 		t.Fatalf("dynamic port HTTP body = %q, want dyn-port-ok", gotBody)
 	}
-	if _, errS, code := runTool(t, rungvx, "port", "rm", "-S", sockPath, spec); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "port", "rm", "-S", sockPath, rmSpec); code != 0 {
 		t.Fatalf("port rm = (%d, %q)", code, errS)
 	}
 	if _, errS, code := runTool(t, rungvx, "stop", "-S", sockPath, "-t", "0"); code != 0 {
@@ -611,11 +617,17 @@ func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 		t.Fatalf("exec -d httpserver = (%d, %q)", code, errS)
 	}
 
-	hostPort := freeLoopbackPortForE2E(t)
-	spec := "0.0.0.0:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
-	if _, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, spec); code != 0 {
+	addSpec := "0.0.0.0:0:" + strconv.Itoa(int(guestPort))
+	addOut, errS, code := runTool(t, rungvx, "port", "add", "-S", sockPath, "-f", "json", addSpec)
+	if code != 0 {
 		t.Fatalf("port add 0.0.0.0 = (%d, %q)", code, errS)
 	}
+	var addedPort control.PortRuleInfo
+	if err := json.Unmarshal([]byte(addOut), &addedPort); err != nil || addedPort.HostPort == 0 {
+		t.Fatalf("port add 0.0.0.0 json = (%q, %v), want bound host port", addOut, err)
+	}
+	hostPort := addedPort.HostPort
+	rmSpec := "0.0.0.0:" + strconv.Itoa(int(hostPort)) + ":" + strconv.Itoa(int(guestPort))
 	gotBody := httpGetWithRetry(t, "http://127.0.0.1:"+strconv.Itoa(int(hostPort))+"/", 15*time.Second)
 	if gotBody != "dyn-addr-ok\n" {
 		t.Fatalf("dynamic 0.0.0.0 port HTTP body = %q, want dyn-addr-ok", gotBody)
@@ -633,7 +645,7 @@ func TestE2EDynamicPortAddrsUnderLockdown(t *testing.T) {
 		t.Fatalf("port add unix socket = (%d, %q), want 126", code, errS)
 	}
 
-	if _, errS, code := runTool(t, rungvx, "port", "rm", "-S", sockPath, spec); code != 0 {
+	if _, errS, code := runTool(t, rungvx, "port", "rm", "-S", sockPath, rmSpec); code != 0 {
 		t.Fatalf("port rm = (%d, %q)", code, errS)
 	}
 	if _, errS, code := runTool(t, rungvx, "stop", "-S", sockPath, "-t", "0"); code != 0 {

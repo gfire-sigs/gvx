@@ -847,9 +847,12 @@ func TestListingCostDoesNotGrowWithTheTable(t *testing.T) {
 }
 
 func TestOpenMakesNoHostCallForEachRecord(t *testing.T) {
+	// Probe capabilities once so timestamp-tick variance in probeWorkspaceCaps
+	// does not perturb the reopen host-call count.
+	caps := probedCaps(t)
 	cost := func(records int) int {
 		dir := resolvedTempDir(t)
-		ws := plainWS(t, dir, workspaceOptions{})
+		ws := plainWS(t, dir, workspaceOptions{caps: &caps})
 		for i := range records {
 			mustWriteFile(t, ws, fmt.Sprintf("f%d", i), 0o644)
 		}
@@ -858,10 +861,13 @@ func TestOpenMakesNoHostCallForEachRecord(t *testing.T) {
 			t.Fatal(err)
 		}
 		ch := &countingHost{}
-		reopened := plainWS(t, dir, workspaceOptions{wrapHost: func(b hostBackend) hostBackend {
-			ch.hostBackend = b
-			return ch
-		}})
+		reopened := plainWS(t, dir, workspaceOptions{
+			caps: &caps,
+			wrapHost: func(b hostBackend) hostBackend {
+				ch.hostBackend = b
+				return ch
+			},
+		})
 		_ = reopened
 		return ch.total()
 	}

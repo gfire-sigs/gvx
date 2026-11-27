@@ -15,9 +15,9 @@
 package gvx
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -103,7 +103,7 @@ func TestCheckpointPropagatesTaskStateCaptureError(t *testing.T) {
 	defer stdinW.Close()
 
 	stdout := newNotifyBuffer()
-	var stderr bytes.Buffer
+	var stderr syncBuffer
 	cfg := newCheckpointTestConfig(t, cacheDir)
 	cfg.OCILayerTars = [][]byte{layer}
 	cfg.CheckpointDir = ckptDir
@@ -130,7 +130,9 @@ func TestCheckpointPropagatesTaskStateCaptureError(t *testing.T) {
 		err  error
 	}
 	runCh := make(chan runOutcome, 1)
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		code, rErr := sb.Run(context.Background())
 		runCh <- runOutcome{code: code, err: rErr}
 	}()
@@ -155,12 +157,17 @@ func TestCheckpointPropagatesTaskStateCaptureError(t *testing.T) {
 		t.Fatalf("Restore from aborted checkpoint = %v, want %v", rErr, ErrCheckpointManifest)
 	}
 
-	if _, err := stdinW.Write([]byte("after-failed-ckpt\n")); err != nil {
-		t.Fatalf("write stdin after failed checkpoint: %v", err)
-	}
+	writePipeWithDeadline(t, stdinW, "after-failed-ckpt\n", 30*time.Second, runDone, func() string {
+		return fmt.Sprintf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	})
 	_ = stdinW.Close()
 
-	out := <-runCh
+	var out runOutcome
+	select {
+	case out = <-runCh:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("guest Run hung after failed checkpoint; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
 	if out.err != nil || out.code != 0 {
 		t.Fatalf("guest Run after failed checkpoint = (%d, %v), stderr=%q", out.code, out.err, stderr.String())
 	}

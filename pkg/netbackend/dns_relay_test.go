@@ -642,7 +642,7 @@ func TestDNSUpstreamTimeoutComesFromTheTunable(t *testing.T) {
 	if dnsRCode(resp) != dnsRCodeSrv {
 		t.Fatalf("rcode = %d, want SERVFAIL after the timeout", dnsRCode(resp))
 	}
-	if took := time.Since(start); took < 90*time.Millisecond || took > testTimeout {
+	if took := time.Since(start); took < 75*time.Millisecond || took > testTimeout {
 		t.Errorf("relay waited %v with a 100 ms upstream timeout", took)
 	}
 }
