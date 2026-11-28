@@ -37,10 +37,39 @@ Consult this table when `rungvx` fails Gatekeeper, SmartScreen, entitlement chec
 | macOS Gatekeeper blocks downloaded `rungvx` | Prebuilt macOS binaries carry an ad-hoc signature rather than Apple notarization. | Clear quarantine: `xattr -d com.apple.quarantine ./rungvx`. |
 | `hv_vm_create` fails or reports missing entitlement | The binary was built with `go install` or `go build` without signing. | Sign with `codesign --sign - --entitlements entitlements.plist --force ./rungvx`. |
 | `hvf` fails inside a macOS VM or CI runner | Apple Silicon VMs lack nested virtualization, and macOS offers no `systrap` backend. | Run `gvx` directly on a physical Apple Silicon Mac. |
+| Linux container fails with `initialize systrap: wait failed: ptrace status unexpected: got 139, wanted stopped (subprocess died)` | The default container AppArmor profile (`cri-containerd.apparmor.d` or `docker-default`) denies the `ptrace` calls of `systrap`. | Run the container with AppArmor unconfined; see [Section 2.1](#21-running-rungvx-in-a-linux-container). |
 | Windows SmartScreen warns on `rungvx.exe` | Prebuilt Windows binaries are not Authenticode-signed. | Verify `SHA256SUMS` and provenance, then run `Unblock-File .\rungvx.exe`. |
 | `--backend=auto` fails on Windows with WHP unavailable | Windows Hypervisor Platform is disabled, and `auto` fails closed. | Enable `HypervisorPlatform` in elevated PowerShell and restart. For trusted guests without WHP, pass `-allow-unconfined-systrap`. |
 | `whpx` fails on Windows ARM64 | ARM64 `whpx` requires Windows 11 24H2 (Build 26100.3915 or later). | Update Windows or pass `--backend=systrap` for trusted workloads only. |
 | Guest architecture mismatch error | Requested `--platform linux/ARCH` differs from the host CPU architecture. | Pull and run the matching architecture (`linux/arm64` or `linux/amd64`). |
+
+
+### 2.1 Running `rungvx` in a Linux Container
+
+On Linux hosts that enable AppArmor (Ubuntu, Debian), the runtime applies a default profile to each container. That profile denies the `ptrace` requests that `systrap` sends to its stub processes. `rungvx` then stops during backend startup with the `ptrace status unexpected` error above.
+
+The table lists the settings verified on k3s `v1.36` with containerd `2.3` on Ubuntu 26.04 (`amd64`). Only AppArmor needs relaxing; `gvx` still confines each guest with its own `seccomp` and Landlock rules.
+
+| Setting | Required Value |
+| :--- | :--- |
+| AppArmor | `Unconfined` (Kubernetes `securityContext.appArmorProfile.type`, Docker `--security-opt apparmor=unconfined`) |
+| `seccomp` | `RuntimeDefault` works; `Unconfined` is not required. |
+| User | Non-root works (for example UID `65532`) when `HOME` or `XDG_CACHE_HOME` points to a writable directory. |
+| Capabilities | None; `drop: [ALL]` and `allowPrivilegeEscalation: false` work. |
+| Devices and `privileged` | Not required. |
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+  appArmorProfile:
+    type: Unconfined
+```
 
 ## 3. Mounts, Ports, Flags, and Exit Code 137
 
