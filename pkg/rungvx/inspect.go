@@ -130,18 +130,25 @@ func runInspectCommand(_ context.Context, cmdName string, args []string, stdout,
 			return imageUsageError(stderr, cmdName, "invalid --format %q: table requires a Go template expression", format)
 		}
 	}
-	cache, arch, err := cacheFlags.open()
+	cache, arch, exists, err := cacheFlags.openExisting()
 	if err != nil {
 		return imageFail(stderr, cmdName, err)
 	}
-	all, err := cache.ListImages(arch)
-	if err != nil {
-		return imageFail(stderr, cmdName, err)
+	var all []oci.Image
+	if exists {
+		all, err = cache.ListImages(arch)
+		if err != nil {
+			return imageFail(stderr, cmdName, err)
+		}
 	}
 
 	code := 0
 	outputs := []inspectOutput{}
 	for _, query := range fs.Args() {
+		if !exists {
+			code = imageFail(stderr, cmdName, imageNotFound(query, oci.ErrNotCached))
+			continue
+		}
 		sel, err := cache.Select(query, arch)
 		if err != nil {
 			code = imageFail(stderr, cmdName, imageNotFound(query, err))

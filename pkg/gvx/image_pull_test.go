@@ -298,6 +298,174 @@ func TestLoadCachedReferenceLeavesAMissingDefaultCacheAlone(t *testing.T) {
 	}
 }
 
+// TestLoadCachedReferenceTreatsUnreadableDefaultCacheAsMiss verifies that an
+// existing default cache directory without read permissions does not break
+// PullMissing when OCICacheDir is writable.
+func TestLoadCachedReferenceTreatsUnreadableDefaultCacheAsMiss(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("POSIX directory permission test requires non-root Unix")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	defaultDir, err := oci.DefaultCacheDir()
+	if err != nil {
+		t.Fatalf("DefaultCacheDir failed: %v", err)
+	}
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q) failed: %v", defaultDir, err)
+	}
+	if err := os.Chmod(defaultDir, 0o000); err != nil {
+		t.Fatalf("Chmod(%q, 0000) failed: %v", defaultDir, err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(defaultDir, 0o700) })
+
+	f := newPullPolicyFixture(t, false)
+	req := f.request()
+	req.explicitRegistry = false
+
+	_, err = loadCachedReference(f.cache, req)
+	if !errors.Is(err, oci.ErrNotCached) {
+		t.Fatalf("loadCachedReference err = %v, want oci.ErrNotCached", err)
+	}
+	img, err := resolveRegistryImage(context.Background(), f.cache, req, pullOrder{policy: PullMissing}, oci.PullRegistryImage)
+	if err != nil {
+		t.Fatalf("resolveRegistryImage with PullMissing failed: %v", err)
+	}
+	defer img.Close()
+}
+
+// TestLoadCachedReferenceTreatsUnreadableDefaultCacheRecordsAsMiss verifies
+// that a non-traversable (0444) default cache directory or an unreadable tag
+// record inside an openable default cache counts as a miss for PullMissing.
+func TestLoadCachedReferenceTreatsUnreadableDefaultCacheRecordsAsMiss(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("POSIX directory permission test requires non-root Unix")
+	}
+
+	t.Run("non-traversable 0444 default dir", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+		defaultDir, err := oci.DefaultCacheDir()
+		if err != nil {
+			t.Fatalf("DefaultCacheDir failed: %v", err)
+		}
+		if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+			t.Fatalf("MkdirAll(%q) failed: %v", defaultDir, err)
+		}
+		if err := os.Chmod(defaultDir, 0o444); err != nil {
+			t.Fatalf("Chmod(%q, 0444) failed: %v", defaultDir, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(defaultDir, 0o700) })
+
+		f := newPullPolicyFixture(t, false)
+		req := f.request()
+		req.explicitRegistry = false
+
+		if _, err := loadCachedReference(f.cache, req); !errors.Is(err, oci.ErrNotCached) {
+			t.Fatalf("loadCachedReference err = %v, want oci.ErrNotCached", err)
+		}
+	})
+
+	t.Run("unreadable tag record in openable default dir", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+		defaultDir, err := oci.DefaultCacheDir()
+		if err != nil {
+			t.Fatalf("DefaultCacheDir failed: %v", err)
+		}
+		defaultCache, err := NewLayerCache(defaultDir)
+		if err != nil {
+			t.Fatalf("NewLayerCache(%q) failed: %v", defaultDir, err)
+		}
+		f := newPullPolicyFixture(t, false)
+		req := f.request()
+		req.explicitRegistry = false
+
+		pulled, err := oci.PullRegistryImage(context.Background(), nil, req.baseURL, req.repo, req.tag, req.arch, defaultCache)
+		if err != nil {
+			t.Fatalf("seed default cache failed: %v", err)
+		}
+		_ = pulled.Close()
+
+		entries, err := os.ReadDir(defaultDir)
+		if err != nil {
+			t.Fatalf("ReadDir(%q) failed: %v", defaultDir, err)
+		}
+		chmodCount := 0
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "tag-") && strings.HasSuffix(e.Name(), ".json") {
+				p := filepath.Join(defaultDir, e.Name())
+				if err := os.Chmod(p, 0o000); err != nil {
+					t.Fatalf("Chmod(%q, 0000) failed: %v", p, err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(p, 0o600) })
+				chmodCount++
+			}
+		}
+		if chmodCount == 0 {
+			t.Fatalf("no tag-*.json found in %q", defaultDir)
+		}
+
+		if _, err := loadCachedReference(f.cache, req); !errors.Is(err, oci.ErrNotCached) {
+			t.Fatalf("loadCachedReference err = %v, want oci.ErrNotCached", err)
+		}
+		img, err := resolveRegistryImage(context.Background(), f.cache, req, pullOrder{policy: PullMissing}, oci.PullRegistryImage)
+		if err != nil {
+			t.Fatalf("resolveRegistryImage with PullMissing failed: %v", err)
+		}
+		defer img.Close()
+	})
+}
+
+// TestLoadCachedReferenceImportsFromReadOnlyDefaultCache verifies that a
+// readable, read-only default cache still seeds OCICacheDir offline.
+func TestLoadCachedReferenceImportsFromReadOnlyDefaultCache(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("POSIX directory permission test requires non-root Unix")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	defaultDir, err := oci.DefaultCacheDir()
+	if err != nil {
+		t.Fatalf("DefaultCacheDir failed: %v", err)
+	}
+	defaultCache, err := NewLayerCache(defaultDir)
+	if err != nil {
+		t.Fatalf("NewLayerCache(%q) failed: %v", defaultDir, err)
+	}
+	f := newPullPolicyFixture(t, false)
+	req := f.request()
+	req.explicitRegistry = false
+
+	pulled, err := oci.PullRegistryImage(context.Background(), nil, req.baseURL, req.repo, req.tag, req.arch, defaultCache)
+	if err != nil {
+		t.Fatalf("seed default cache failed: %v", err)
+	}
+	_ = pulled.Close()
+
+	if err := os.Chmod(defaultDir, 0o555); err != nil {
+		t.Fatalf("Chmod(%q, 0555) failed: %v", defaultDir, err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(defaultDir, 0o700) })
+
+	img, err := loadCachedReference(f.cache, req)
+	if err != nil {
+		t.Fatalf("loadCachedReference from read-only default cache failed: %v", err)
+	}
+	defer img.Close()
+	if _, err := f.cache.LoadCachedImage(req.baseURL, req.repo, req.tag, req.arch); err != nil {
+		t.Errorf("OCICacheDir lacks the imported image: %v", err)
+	}
+}
+
 func TestResolveImageWithPolicyRejectsAnUnknownPolicy(t *testing.T) {
 	cache, err := NewLayerCache(t.TempDir())
 	if err != nil {

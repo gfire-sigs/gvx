@@ -364,8 +364,9 @@ type Config struct {
 	// may be read-only.
 	LayerCache *oci.LayerCache
 
-	// VolumeDir overrides the host directory storing named volumes. It takes
-	// precedence over OCICacheDir and VolumeDirEnv (GVX_VOLUME_DIR).
+	// VolumeDir overrides the host directory storing named volumes (and
+	// private ephemeral scratch images under <VolumeDir>/.ephemeral-volumes).
+	// It takes precedence over OCICacheDir and VolumeDirEnv (GVX_VOLUME_DIR).
 	VolumeDir string
 
 	// OCIKeepBlobs retains original image blobs in the layer cache when pulling

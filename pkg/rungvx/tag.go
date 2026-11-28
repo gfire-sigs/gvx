@@ -50,9 +50,12 @@ func tagSubcommand(_ context.Context, args []string, stderr io.Writer) int {
 		return imageUsageError(stderr, "tag", "the target %q must not have a digest", targetName)
 	}
 
-	cache, arch, err := cacheFlags.open()
+	cache, arch, exists, err := cacheFlags.openExisting()
 	if err != nil {
 		return imageFail(stderr, "tag", err)
+	}
+	if !exists {
+		return imageFail(stderr, "tag", imageNotFound(source, oci.ErrNotCached))
 	}
 	sel, err := cache.Select(source, arch)
 	if err != nil {

@@ -141,7 +141,16 @@ func loadCachedReference(cache *oci.LayerCache, req registryRequest) (*oci.Resol
 	if err != nil {
 		return nil, oci.ErrNotCached
 	}
-	if info, err := os.Stat(defaultDir); err != nil || !info.IsDir() {
+	dirFile, err := os.Open(defaultDir)
+	if err != nil {
+		return nil, oci.ErrNotCached
+	}
+	defaultInfo, statErr := dirFile.Stat()
+	_ = dirFile.Close()
+	if statErr != nil || !defaultInfo.IsDir() {
+		return nil, oci.ErrNotCached
+	}
+	if cacheInfo, err := os.Stat(cache.Dir()); err == nil && os.SameFile(defaultInfo, cacheInfo) {
 		return nil, oci.ErrNotCached
 	}
 	defaultCache, err := NewLayerCacheWithOptions(defaultDir, oci.CacheOptions{
@@ -149,11 +158,22 @@ func loadCachedReference(cache *oci.LayerCache, req registryRequest) (*oci.Resol
 		AlwaysVerify: cache.AlwaysVerify(),
 	}, tuning.Values{})
 	if err != nil {
-		return nil, err
+		return nil, oci.ErrNotCached
 	}
 	if defaultCache.Dir() == cache.Dir() {
 		return nil, oci.ErrNotCached
 	}
+	// Probe the default cache before importing so a non-traversable directory
+	// (for example mode 0444) or unreadable record inside the default cache
+	// counts as a miss without masking destination cache write errors.
+	probed, err := defaultCache.LoadCachedImage(req.baseURL, req.repo, req.tag, req.arch)
+	if err != nil {
+		if errors.Is(err, oci.ErrNotCached) || errors.Is(err, os.ErrPermission) {
+			return nil, oci.ErrNotCached
+		}
+		return nil, err
+	}
+	_ = probed.Close()
 	return cache.ImportCachedImage(defaultCache, req.baseURL, req.repo, req.tag, req.arch)
 }
 

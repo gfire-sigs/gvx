@@ -54,9 +54,12 @@ func saveSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	if output == "" && oci.IsTerminal(stdout) {
 		return imageUsageError(stderr, "save", "refusing to write an archive to a terminal: use -o FILE or redirect standard output")
 	}
-	cache, arch, err := cacheFlags.openPullCache(*hostDNS)
+	cache, arch, exists, err := cacheFlags.openExistingPullCache(*hostDNS)
 	if err != nil {
 		return imageFail(stderr, "save", err)
+	}
+	if !exists {
+		return imageFail(stderr, "save", imageNotFound(fs.Arg(0), oci.ErrNotCached))
 	}
 
 	var targets []oci.SaveTarget

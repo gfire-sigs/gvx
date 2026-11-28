@@ -19,7 +19,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/oci"
@@ -38,10 +40,31 @@ const (
 var forceEphemeralStagingFallback atomic.Bool
 
 // ephemeralVolumeRoot returns the directory holding private ephemeral ext4lite
-// scratch images under the configured cache base.
+// scratch images. Precedence matches volumeRoot: VolumeDir
+// ("<dir>/.ephemeral-volumes"), OCICacheDir ("<dir>/ephemeral-volumes"),
+// VolumeDirEnv ("<dir>/.ephemeral-volumes"), and finally the cache-adjacent
+// platform default.
 func (c Config) ephemeralVolumeRoot() (string, error) {
-	if c.OCICacheDir != "" {
-		return filepath.Join(c.OCICacheDir, ephemeralVolumesDirName), nil
+	if dir := strings.TrimSpace(c.VolumeDir); dir != "" {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", fmt.Errorf("gvx: resolve VolumeDir %q: %w", dir, err)
+		}
+		return filepath.Join(abs, "."+ephemeralVolumesDirName), nil
+	}
+	if dir := strings.TrimSpace(c.OCICacheDir); dir != "" {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", fmt.Errorf("gvx: resolve OCICacheDir %q: %w", dir, err)
+		}
+		return filepath.Join(abs, ephemeralVolumesDirName), nil
+	}
+	if dir := strings.TrimSpace(os.Getenv(VolumeDirEnv)); dir != "" {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", fmt.Errorf("gvx: resolve %s %q: %w", VolumeDirEnv, dir, err)
+		}
+		return filepath.Join(abs, "."+ephemeralVolumesDirName), nil
 	}
 	layers, err := oci.DefaultCacheDir()
 	if err != nil {

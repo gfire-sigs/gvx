@@ -76,13 +76,16 @@ func pushSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		return imageFail(stderr, "push", readErr)
 	}
 
-	cache, arch, err := cacheFlags.openPullCache(*hostDNS)
+	cache, arch, exists, err := cacheFlags.openExistingPullCache(*hostDNS)
 	if err != nil {
 		return imageFail(stderr, "push", err)
 	}
 
 	registryURL := strings.TrimSpace(*registryURLFlag)
 	imageArg := fs.Arg(0)
+	if !exists {
+		return imageFail(stderr, "push", imageNotFound(imageArg, oci.ErrNotCached))
+	}
 	sel, err := cache.Select(imageArg, arch)
 	if err != nil && errors.Is(err, oci.ErrNotCached) && registryURL != "" {
 		if altRef, refErr := oci.ParseReferenceAt(imageArg, registryURL); refErr == nil {

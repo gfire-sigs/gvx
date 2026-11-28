@@ -149,13 +149,16 @@ func runImagesCommand(_ context.Context, cmdName string, args []string, stdout, 
 		filter = &f
 	}
 
-	cache, arch, err := cacheFlags.open()
+	cache, arch, exists, err := cacheFlags.openExisting()
 	if err != nil {
 		return imageFail(stderr, cmdName, err)
 	}
-	images, err := cache.ListImages(arch)
-	if err != nil {
-		return imageFail(stderr, cmdName, err)
+	var images []oci.Image
+	if exists {
+		images, err = cache.ListImages(arch)
+		if err != nil {
+			return imageFail(stderr, cmdName, err)
+		}
 	}
 	rows := imageRows(images, all, filter)
 
