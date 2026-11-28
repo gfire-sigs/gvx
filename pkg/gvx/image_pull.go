@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
@@ -124,14 +125,26 @@ func resolveRegistryImage(ctx context.Context, cache *oci.LayerCache, req regist
 
 // loadCachedReference returns the cached image of a reference without network
 // access. It looks in cache first. Without a registry override, it then
-// imports the image from the default host layer cache. It returns
-// oci.ErrNotCached when neither holds the image.
+// imports the image from the default host layer cache when that cache already
+// exists. It returns oci.ErrNotCached when neither holds the image.
+//
+// The default cache is only read here. A caller that sets OCICacheDir may run
+// where the default cache directory cannot be created (for example, an
+// unwritable HOME in a container), so a missing or unreachable default cache
+// counts as a cache miss and is never created.
 func loadCachedReference(cache *oci.LayerCache, req registryRequest) (*oci.ResolvedImage, error) {
 	cached, err := cache.LoadCachedImage(req.baseURL, req.repo, req.tag, req.arch)
 	if !errors.Is(err, oci.ErrNotCached) || req.explicitRegistry {
 		return cached, err
 	}
-	defaultCache, err := NewLayerCacheWithOptions("", oci.CacheOptions{
+	defaultDir, err := oci.DefaultCacheDir()
+	if err != nil {
+		return nil, oci.ErrNotCached
+	}
+	if info, err := os.Stat(defaultDir); err != nil || !info.IsDir() {
+		return nil, oci.ErrNotCached
+	}
+	defaultCache, err := NewLayerCacheWithOptions(defaultDir, oci.CacheOptions{
 		BlockSize:    cache.BlockSize(),
 		AlwaysVerify: cache.AlwaysVerify(),
 	}, tuning.Values{})

@@ -24,6 +24,8 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -260,6 +262,39 @@ func TestResolveImageWithPolicyUsesALoadedImageWhenTheRegistryDeniesIt(t *testin
 				t.Errorf("ResolveImageWithPolicy without a cached image succeeded, want an error")
 			}
 		})
+	}
+}
+
+// TestLoadCachedReferenceLeavesAMissingDefaultCacheAlone covers a run with
+// OCICacheDir on a host where the default cache directory does not exist and
+// cannot be created, such as a container with an unwritable HOME. The lookup
+// must report a cache miss so the pull can fill OCICacheDir, and it must not
+// create the default cache directory.
+func TestLoadCachedReferenceLeavesAMissingDefaultCacheAlone(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-home")
+	t.Setenv("HOME", missing)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(missing, ".cache"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(missing, "AppData", "Local"))
+
+	f := newPullPolicyFixture(t, false)
+	req := f.request()
+	req.explicitRegistry = false
+
+	_, err := loadCachedReference(f.cache, req)
+	if !errors.Is(err, oci.ErrNotCached) {
+		t.Fatalf("loadCachedReference err = %v, want oci.ErrNotCached", err)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("default cache parent %q exists after the lookup (stat err = %v), want it untouched", missing, err)
+	}
+
+	img, err := resolveRegistryImage(context.Background(), f.cache, req, pullOrder{policy: PullMissing}, oci.PullRegistryImage)
+	if err != nil {
+		t.Fatalf("resolveRegistryImage with PullMissing failed: %v", err)
+	}
+	defer img.Close()
+	if _, err := f.cache.LoadCachedImage(req.baseURL, req.repo, req.tag, req.arch); err != nil {
+		t.Errorf("OCICacheDir lacks the pulled image: %v", err)
 	}
 }
 
