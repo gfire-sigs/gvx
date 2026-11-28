@@ -669,6 +669,11 @@ const (
 	IDAA64PFR0Hide  uint64 = 0xf<<32 | 0xff<<40
 	IDAA64PFR1Hide  uint64 = 0xf<<8 | 0xf<<16 | 0xf<<24 | 0xf<<40
 	IDAA64ISAR1Hide uint64 = 0xf<<4 | 0xf<<8 | 0xf<<24 | 0xf<<28
+	// IDAA64MMFR0Hide clears ASIDBits (bits 7:4), which Linux hides from EL0.
+	// A guest that sees 16-bit ASID support may go on to read TCR_EL1, which
+	// faults at EL0. The gVisor ring0 package does this at init, so a nested
+	// linux/arm64 rungvx or runsc died with SIGILL before main.
+	IDAA64MMFR0Hide uint64 = 0xf << 4
 )
 
 // Baseline architectural register values used when a backend does not query
@@ -733,7 +738,7 @@ func (ids IDRegisters) EmulateSysRegRead(iss SysRegISS) (uint64, bool) {
 	case KeyIDAA64ISAR1:
 		return ids.ISAR1 &^ IDAA64ISAR1Hide, true
 	case KeyIDAA64MMFR0:
-		return ids.MMFR0, true
+		return ids.MMFR0 &^ IDAA64MMFR0Hide, true
 	case KeyIDAA64MMFR1:
 		return ids.MMFR1, true
 	case KeyIDAA64MMFR2:

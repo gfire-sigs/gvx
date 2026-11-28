@@ -327,6 +327,11 @@ func TestEmulateSysRegReadAndDefaults(t *testing.T) {
 	if got, ok := custom.EmulateSysRegRead(read(3, 0, 0, 6, 1)); !ok || got != 0x11100211002 {
 		t.Errorf("ID_AA64ISAR1_EL1 masking = (%#x, %v)", got, ok)
 	}
+	// Apple M4 Pro under Hypervisor.framework reports 16-bit ASIDs.
+	apple := &IDRegisters{MMFR0: 0x10000f100022}
+	if got, ok := apple.EmulateSysRegRead(read(3, 0, 0, 7, 0)); !ok || got != 0x10000f100002 {
+		t.Errorf("ID_AA64MMFR0_EL1 masking = (%#x, %v), want ASIDBits hidden", got, ok)
+	}
 	if got, ok := custom.EmulateSysRegRead(read(3, 3, 14, 0, 1)); !ok || got != 0x1234 {
 		t.Errorf("CNTPCT_EL0 = (%#x, %v)", got, ok)
 	}
