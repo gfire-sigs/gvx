@@ -59,13 +59,17 @@ func rmiSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if fs.NArg() == 0 {
 		return imageUsageError(stderr, "rmi", "missing IMAGE argument")
 	}
-	cache, arch, err := cacheFlags.open()
+	cache, arch, exists, err := cacheFlags.openExisting()
 	if err != nil {
 		return imageFail(stderr, "rmi", err)
 	}
 
 	code := 0
 	for _, query := range fs.Args() {
+		if !exists {
+			code = imageFail(stderr, "rmi", imageNotFound(query, oci.ErrNotCached))
+			continue
+		}
 		report, err := removeImage(cache, query, arch, force)
 		for _, name := range report.Untagged {
 			_, _ = fmt.Fprintf(stdout, "Untagged: %s\n", name)

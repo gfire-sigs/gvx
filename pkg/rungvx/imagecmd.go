@@ -100,6 +100,52 @@ func (f imageCacheFlags) open() (*oci.LayerCache, string, error) {
 	return cache, strings.TrimSpace(*f.arch), nil
 }
 
+// resolveCacheDir returns the explicit -cache-dir or the default host layer
+// cache path without creating it.
+func (f imageCacheFlags) resolveCacheDir() (string, error) {
+	if dir := strings.TrimSpace(*f.cacheDir); dir != "" {
+		return dir, nil
+	}
+	return oci.DefaultCacheDir()
+}
+
+// openExisting opens the layer cache when its directory already exists. When
+// the directory is absent, it returns (nil, arch, false, nil) without creating
+// the directory.
+func (f imageCacheFlags) openExisting() (*oci.LayerCache, string, bool, error) {
+	tuned, err := f.tune.values()
+	if err != nil {
+		return nil, "", false, err
+	}
+	dir, err := f.resolveCacheDir()
+	if err != nil {
+		return nil, "", false, err
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil, strings.TrimSpace(*f.arch), false, nil
+	}
+	cache, err := gvx.NewLayerCacheWithTuning(dir, tuned)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return cache, strings.TrimSpace(*f.arch), true, nil
+}
+
+// openExistingPullCache validates hostDNS and opens an existing layer cache
+// without creating a missing cache directory.
+func (f imageCacheFlags) openExistingPullCache(hostDNS []string) (*oci.LayerCache, string, bool, error) {
+	servers, err := gvx.ParseHostDNSServers(hostDNS)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("--host-dns: %w", err)
+	}
+	cache, arch, ok, err := f.openExisting()
+	if err != nil || !ok {
+		return nil, arch, ok, err
+	}
+	cache.SetDNSServers(servers)
+	return cache, arch, true, nil
+}
+
 // newImageFlagSet creates the flag set of an image command. The flag package
 // prints its errors to stderr.
 func newImageFlagSet(name string, stderr io.Writer) *flag.FlagSet {

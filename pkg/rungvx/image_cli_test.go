@@ -554,3 +554,104 @@ func TestHelpListsTheImageCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestReadOnlyImageCommandsDoNotCreateMissingCacheDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent-cache")
+	archive := filepath.Join(t.TempDir(), "out.tar")
+
+	assertUntouched := func(t *testing.T, cmd string) {
+		t.Helper()
+		if _, err := os.Stat(missing); !os.IsNotExist(err) {
+			t.Errorf("%s created missing cache dir %q (stat err = %v)", cmd, missing, err)
+		}
+	}
+
+	t.Run("images", func(t *testing.T) {
+		res := runCLIArgs(t, nil, "images", "-cache-dir", missing)
+		if res.code != 0 || !strings.Contains(res.stdout, "REPOSITORY") {
+			t.Fatalf("images = (%d, %q, %q), want exit 0 with table header", res.code, res.stdout, res.stderr)
+		}
+		assertUntouched(t, "images")
+	})
+	t.Run("inspect", func(t *testing.T) {
+		res := runCLIArgs(t, nil, "inspect", "-cache-dir", missing, "alpine:3.20")
+		if res.code != 1 || !strings.Contains(res.stderr, "no such image: alpine:3.20") || strings.TrimSpace(res.stdout) != "[]" {
+			t.Fatalf("inspect = (%d, %q, %q), want exit 1, [] stdout, and no-such-image error", res.code, res.stdout, res.stderr)
+		}
+		assertUntouched(t, "inspect")
+	})
+	t.Run("rmi", func(t *testing.T) {
+		res := runCLIArgs(t, nil, "rmi", "-cache-dir", missing, "alpine:3.20")
+		if res.code != 1 || !strings.Contains(res.stderr, "no such image: alpine:3.20") {
+			t.Fatalf("rmi = (%d, %q, %q), want exit 1 and no-such-image error", res.code, res.stdout, res.stderr)
+		}
+		assertUntouched(t, "rmi")
+	})
+	t.Run("tag", func(t *testing.T) {
+		res := runCLIArgs(t, nil, "tag", "-cache-dir", missing, "alpine:3.20", "mine:dev")
+		if res.code != 1 || !strings.Contains(res.stderr, "no such image: alpine:3.20") {
+			t.Fatalf("tag = (%d, %q, %q), want exit 1 and no-such-image error", res.code, res.stdout, res.stderr)
+		}
+		assertUntouched(t, "tag")
+	})
+	t.Run("save", func(t *testing.T) {
+		res := runCLIArgs(t, nil, "save", "-cache-dir", missing, "-o", archive, "alpine:3.20")
+		if res.code != 1 || !strings.Contains(res.stderr, "no such image: alpine:3.20") {
+			t.Fatalf("save = (%d, %q, %q), want exit 1 and no-such-image error", res.code, res.stdout, res.stderr)
+		}
+		assertUntouched(t, "save")
+	})
+	t.Run("push", func(t *testing.T) {
+		res := runCLIArgs(t, nil, "push", "-cache-dir", missing, "alpine:3.20")
+		if res.code != 1 || !strings.Contains(res.stderr, "no such image: alpine:3.20") {
+			t.Fatalf("push = (%d, %q, %q), want exit 1 and no-such-image error", res.code, res.stdout, res.stderr)
+		}
+		assertUntouched(t, "push")
+	})
+	t.Run("multi-arg inspect and rmi", func(t *testing.T) {
+		res := runCLIArgs(t, nil, "inspect", "-cache-dir", missing, "a:1", "b:2")
+		if res.code != 1 || !strings.Contains(res.stderr, "no such image: a:1") || !strings.Contains(res.stderr, "no such image: b:2") || strings.TrimSpace(res.stdout) != "[]" {
+			t.Fatalf("multi-arg inspect = (%d, %q, %q), want both missing errors and []", res.code, res.stdout, res.stderr)
+		}
+		res = runCLIArgs(t, nil, "rmi", "-cache-dir", missing, "a:1", "b:2")
+		if res.code != 1 || !strings.Contains(res.stderr, "no such image: a:1") || !strings.Contains(res.stderr, "no such image: b:2") {
+			t.Fatalf("multi-arg rmi = (%d, %q, %q), want both missing errors", res.code, res.stdout, res.stderr)
+		}
+		assertUntouched(t, "multi-arg inspect/rmi")
+	})
+	t.Run("regular file at cache-dir fails", func(t *testing.T) {
+		filePath := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		res := runCLIArgs(t, nil, "images", "-cache-dir", filePath)
+		if res.code != 1 || res.stderr == "" {
+			t.Fatalf("images with file cache-dir = (%d, %q, %q), want exit 1 error", res.code, res.stdout, res.stderr)
+		}
+	})
+	t.Run("invalid host-dns still rejected before missing cache short-circuit", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"save", "-cache-dir", missing, "--host-dns", "not-an-ip", "-o", archive, "alpine:3.20"},
+			{"push", "-cache-dir", missing, "--host-dns", "not-an-ip", "alpine:3.20"},
+		} {
+			res := runCLIArgs(t, nil, args...)
+			if res.code != 1 || !strings.Contains(res.stderr, "--host-dns") {
+				t.Fatalf("%v = (%d, %q, %q), want --host-dns error", args, res.code, res.stdout, res.stderr)
+			}
+		}
+		assertUntouched(t, "invalid host-dns")
+	})
+	t.Run("default HOME cache dir stays untouched", func(t *testing.T) {
+		absentHome := filepath.Join(t.TempDir(), "absent-home")
+		t.Setenv("HOME", absentHome)
+		t.Setenv("XDG_CACHE_HOME", filepath.Join(absentHome, ".cache"))
+		t.Setenv("LOCALAPPDATA", filepath.Join(absentHome, "AppData", "Local"))
+		res := runCLIArgs(t, nil, "images")
+		if res.code != 0 || !strings.Contains(res.stdout, "REPOSITORY") {
+			t.Fatalf("images with absent HOME = (%d, %q, %q), want exit 0 with table header", res.code, res.stdout, res.stderr)
+		}
+		if _, err := os.Stat(absentHome); !os.IsNotExist(err) {
+			t.Errorf("images created absent HOME %q (stat err = %v)", absentHome, err)
+		}
+	})
+}
