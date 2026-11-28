@@ -166,6 +166,9 @@ func probeExecutionBackends(info *SystemInfo) {
 			info.BackendDetails[string(PlatformSystrap)] = "available"
 		} else {
 			info.BackendDetails[string(PlatformSystrap)] = err.Error()
+			if hint := platformFailureHint(runtime.GOOS, err); hint != "" {
+				info.BackendWarnings = append(info.BackendWarnings, hint)
+			}
 		}
 	}
 	if info.DefaultBackend == "" {

@@ -30,14 +30,14 @@ GVX_DEBUG_LOG=1 rungvx run alpine:3.20 uname -a
 
 ## 2. Installation, Signing, and Backend Startup
 
-Consult this table when `rungvx` fails Gatekeeper, SmartScreen, entitlement checks, or hypervisor creation at startup.
+Consult this table when `rungvx` fails Gatekeeper, SmartScreen, entitlement checks, hypervisor creation, or backend startup.
 
 | Symptom | Cause | Remedy |
 | :--- | :--- | :--- |
 | macOS Gatekeeper blocks downloaded `rungvx` | Prebuilt macOS binaries carry an ad-hoc signature rather than Apple notarization. | Clear quarantine: `xattr -d com.apple.quarantine ./rungvx`. |
 | `hv_vm_create` fails or reports missing entitlement | The binary was built with `go install` or `go build` without signing. | Sign with `codesign --sign - --entitlements entitlements.plist --force ./rungvx`. |
 | `hvf` fails inside a macOS VM or CI runner | Apple Silicon VMs lack nested virtualization, and macOS offers no `systrap` backend. | Run `gvx` directly on a physical Apple Silicon Mac. |
-| Linux container fails with `initialize systrap: wait failed: ptrace status unexpected: got 139, wanted stopped (subprocess died)` | Stacked AppArmor profiles (such as `cri-containerd.apparmor.d//&unconfined`), custom AppArmor profiles, or `yama.ptrace_scope >= 2` deny `systrap` signals or `ptrace`. | Upgrade `containerd` or Docker to support stacked profiles, or run with AppArmor `Unconfined`; see [Section 2.1](#21-running-rungvx-in-a-linux-container). |
+| Linux container fails with `initialize systrap: wait failed: ptrace status unexpected: got 139, wanted stopped (subprocess died)` or `unable to attach: operation not permitted` | Stacked AppArmor profiles (such as `cri-containerd.apparmor.d//&unconfined`) or custom profiles deny `systrap` signals or `ptrace`; `kernel.yama.ptrace_scope >= 2` denies `ptrace` attach. | Upgrade `containerd` or Docker for stacked profiles, confirm `yama.ptrace_scope <= 1`, or run with AppArmor `Unconfined`; see [Section 2.1](#21-running-rungvx-in-a-linux-container). |
 | Windows SmartScreen warns on `rungvx.exe` | Prebuilt Windows binaries are not Authenticode-signed. | Verify `SHA256SUMS` and provenance, then run `Unblock-File .\rungvx.exe`. |
 | `--backend=auto` fails on Windows with WHP unavailable | Windows Hypervisor Platform is disabled, and `auto` fails closed. | Enable `HypervisorPlatform` in elevated PowerShell and restart. For trusted guests without WHP, pass `-allow-unconfined-systrap`. |
 | `whpx` fails on Windows ARM64 | ARM64 `whpx` requires Windows 11 24H2 (Build 26100.3915 or later). | Update Windows or pass `--backend=systrap` for trusted workloads only. |
@@ -47,7 +47,7 @@ Consult this table when `rungvx` fails Gatekeeper, SmartScreen, entitlement chec
 
 Default `containerd` and Docker AppArmor templates already allow same-profile signals and `ptrace`. On kernels with `kernel.apparmor_restrict_unprivileged_unconfined=1` (such as Ubuntu 26.04 `7.0.0-44`), unprivileged runtimes apply stacked profiles like `cri-containerd.apparmor.d//&unconfined` or `docker-default//&unconfined`. Unpatched `containerd` (`<= 2.3.2`) and older Docker profiles match only literal `peer=<profile>`. The kernel then denies intra-container signals (`SIGSTOP`, `SIGURG`) and `ptrace`.
 
-When AppArmor denies `SIGSTOP` inside the `systrap` stub, the stub hits an early trap instruction before its signal stack is ready. It then dies with `SIGSEGV` (`status 139`). Custom AppArmor profiles without intra-container signal and `ptrace` rules, or `kernel.yama.ptrace_scope` values of `2` or higher, cause the same startup failure.
+When AppArmor denies `SIGSTOP` inside the `systrap` stub, the stub hits an early trap instruction before its signal stack is ready. It then dies with `SIGSEGV` (`status 139`). When `kernel.yama.ptrace_scope` is `2` or higher, or AppArmor denies only `ptrace`, `systrap` fails during attach with `operation not permitted`.
 
 Prefer upgrading the container runtime so AppArmor stays enforced:
 
@@ -61,9 +61,11 @@ The table lists the container settings verified on `k3s` `v1.36` with `container
 | :--- | :--- |
 | AppArmor | Default profile with stacked-peer support, or `Unconfined` on older `containerd` (`<= 2.3.2`) and Docker runtimes. |
 | `seccomp` | `RuntimeDefault` works; `Unconfined` is not required. |
-| User | Non-root works (for example UID `65532`) when `-cache-dir`, `HOME`, or `XDG_CACHE_HOME` points to a writable directory. |
+| User | Non-root works (for example UID `65532`) when `-cache-dir`, `HOME`, or `XDG_CACHE_HOME` is writable; named volumes also require writable `-volume-dir`, `GVX_VOLUME_DIR`, or `XDG_DATA_HOME`. |
 | Capabilities | None; `drop: [ALL]` and `allowPrivilegeEscalation: false` work. |
 | Devices and `privileged` | Not required. |
+
+This Kubernetes snippet shows the temporary `Unconfined` workaround for unpatched runtimes. Omit `appArmorProfile` after upgrading `containerd` or Docker:
 
 ```yaml
 securityContext:
