@@ -632,9 +632,11 @@ func (s SysRegISS) Key() uint32 {
 // backends emulate.
 const (
 	KeyMIDR        = 3<<14 | 0<<11 | 0<<7 | 0<<3 | 0
+	KeyMPIDR       = 3<<14 | 0<<11 | 0<<7 | 0<<3 | 5
 	KeyREVIDR      = 3<<14 | 0<<11 | 0<<7 | 0<<3 | 6
 	KeyIDAA64PFR0  = 3<<14 | 0<<11 | 0<<7 | 4<<3 | 0
 	KeyIDAA64PFR1  = 3<<14 | 0<<11 | 0<<7 | 4<<3 | 1
+	KeyIDAA64DFR0  = 3<<14 | 0<<11 | 0<<7 | 5<<3 | 0
 	KeyIDAA64ISAR0 = 3<<14 | 0<<11 | 0<<7 | 6<<3 | 0
 	KeyIDAA64ISAR1 = 3<<14 | 0<<11 | 0<<7 | 6<<3 | 1
 	KeyIDAA64MMFR0 = 3<<14 | 0<<11 | 0<<7 | 7<<3 | 0
@@ -663,27 +665,50 @@ func DecodeMRSSysRegISS(insn uint32) (SysRegISS, bool) {
 	}, true
 }
 
-// ID register fields hidden from the guest when the backend does not
-// virtualize scalable vectors, memory tagging, or pointer authentication.
+// EL0 ID register allowlist masks and architectural safe values. These follow
+// Linux arch/arm64/kernel/cpufeature.c (FTR_VISIBLE / arm64_ftr_reg_user_value)
+// restricted to features that gvx virtualizes and advertises in AT_HWCAP.
+// Using an allowlist guarantees that unvirtualized or EL1-only fields on newer
+// silicon (such as ASIDBits, GCS, BTI, SPECRES, LS64, or RNDR) never leak to
+// EL0 and trigger unexpected SIGILL faults.
 const (
-	IDAA64PFR0Hide  uint64 = 0xf<<32 | 0xff<<40
-	IDAA64PFR1Hide  uint64 = 0xf<<8 | 0xf<<16 | 0xf<<24 | 0xf<<40
-	IDAA64ISAR1Hide uint64 = 0xf<<4 | 0xf<<8 | 0xf<<24 | 0xf<<28
-	// IDAA64MMFR0Hide clears ASIDBits (bits 7:4), which Linux hides from EL0.
-	// A guest that sees 16-bit ASID support may go on to read TCR_EL1, which
-	// faults at EL0. The gVisor ring0 package does this at init, so a nested
-	// linux/arm64 rungvx or runsc died with SIGILL before main.
-	IDAA64MMFR0Hide uint64 = 0xf << 4
+	// IDAA64PFR0Visible exposes FP (19:16), AdvSIMD (23:20), and DIT (51:48).
+	IDAA64PFR0Visible uint64 = 0xf<<16 | 0xf<<20 | 0xf<<48
+	// IDAA64PFR0SafeVal reports AArch64-only EL0 and EL1 (EL0=1, EL1=1).
+	IDAA64PFR0SafeVal uint64 = 0x0000_0000_0000_0011
+
+	// IDAA64ISAR0Visible exposes AES, SHA1, SHA2, CRC32, ATOMIC, RDM, SHA3,
+	// SM3, SM4, DP, FHM, and TS while hiding TME, TLB, and RNDR.
+	IDAA64ISAR0Visible uint64 = 0x00ff_ffff_f0ff_fff0
+
+	// IDAA64ISAR1Visible exposes DPB, JSCVT, FCMA, LRCPC, FRINTTS, SB, BF16,
+	// DGH, and I8MM while hiding PAC (APA/API/GPA/GPI), SPECRES, XS, and LS64.
+	IDAA64ISAR1Visible uint64 = 0x00ff_f0ff_00ff_f00f
+
+	// IDAA64MMFR0SafeVal matches Linux EL0 ID_AA64MMFR0_EL1 with all hidden
+	// fields at safe values (ASIDBits=0, PARange=0, TGran4=0xf, TGran64=0xf,
+	// TGran16=0, TGran{16,64,4}_2=1). Hiding ASIDBits prevents guests such as
+	// gVisor ring0 from executing MRS TCR_EL1 at EL0.
+	IDAA64MMFR0SafeVal uint64 = 0x0000_0111_ff00_0000
+
+	// IDAA64MMFR2Visible exposes AT (FEAT_LSE2 / HWCAP_USCAT, bits 35:32).
+	IDAA64MMFR2Visible uint64 = 0xf << 32
+
+	// IDAA64DFR0SafeVal matches Linux EL0 ID_AA64DFR0_EL1 (DebugVer=0x6).
+	IDAA64DFR0SafeVal uint64 = 0x0000_0000_0000_0006
+
+	// MPIDRSafeVal matches Linux SYS_MPIDR_SAFE_VAL (RES1 bit 31 set).
+	MPIDRSafeVal uint64 = 0x0000_0000_8000_0000
 )
 
 // Baseline architectural register values used when a backend does not query
 // host hardware ID registers directly.
 const (
 	DefaultMIDREL1        uint64 = 0x410fd030
-	DefaultIDAA64PFR0EL1  uint64 = 0x00000011
+	DefaultIDAA64PFR0EL1  uint64 = IDAA64PFR0SafeVal
 	DefaultIDAA64ISAR0EL1 uint64 = 0x00211120
 	DefaultIDAA64ISAR1EL1 uint64 = 0x00100001
-	DefaultIDAA64MMFR0EL1 uint64 = 0x00100005
+	DefaultIDAA64MMFR0EL1 uint64 = IDAA64MMFR0SafeVal
 	DefaultCTREL0         uint64 = 0x8444c004
 	DefaultDCZIDEL0       uint64 = 0x00000004
 )
@@ -718,8 +743,17 @@ func DefaultIDRegisters() IDRegisters {
 	}
 }
 
-// EmulateSysRegRead returns the value a trapped MRS must produce. It reports
-// false for writes and for registers that must raise SIGILL at EL0.
+// isEmulatedIDReg reports whether iss addresses the AArch64 EL0 emulated ID
+// register range (Op0=3, Op1=0, CRn=0, CRm=2..7), matching Linux is_emulated
+// in arch/arm64/kernel/cpufeature.c.
+func isEmulatedIDReg(iss SysRegISS) bool {
+	return iss.Op0 == 3 && iss.Op1 == 0 && iss.CRn == 0 && iss.CRm >= 2 && iss.CRm <= 7
+}
+
+// EmulateSysRegRead returns the sanitized value a trapped EL0 MRS must produce.
+// Untracked registers in the Op0=3, Op1=0, CRn=0, CRm=2..7 ID space return 0
+// (RAZ), matching Linux emulate_sys_reg. Writes and non-emulated registers
+// return false so the caller delivers SIGILL.
 func (ids IDRegisters) EmulateSysRegRead(iss SysRegISS) (uint64, bool) {
 	if !iss.Read {
 		return 0, false
@@ -727,22 +761,26 @@ func (ids IDRegisters) EmulateSysRegRead(iss SysRegISS) (uint64, bool) {
 	switch iss.Key() {
 	case KeyMIDR:
 		return ids.MIDR, true
+	case KeyMPIDR:
+		return MPIDRSafeVal, true
 	case KeyREVIDR:
 		return 0, true
 	case KeyIDAA64PFR0:
-		return ids.PFR0 &^ IDAA64PFR0Hide, true
+		return IDAA64PFR0SafeVal | (ids.PFR0 & IDAA64PFR0Visible), true
 	case KeyIDAA64PFR1:
-		return ids.PFR1 &^ IDAA64PFR1Hide, true
+		return 0, true
+	case KeyIDAA64DFR0:
+		return IDAA64DFR0SafeVal, true
 	case KeyIDAA64ISAR0:
-		return ids.ISAR0, true
+		return ids.ISAR0 & IDAA64ISAR0Visible, true
 	case KeyIDAA64ISAR1:
-		return ids.ISAR1 &^ IDAA64ISAR1Hide, true
+		return ids.ISAR1 & IDAA64ISAR1Visible, true
 	case KeyIDAA64MMFR0:
-		return ids.MMFR0 &^ IDAA64MMFR0Hide, true
+		return IDAA64MMFR0SafeVal, true
 	case KeyIDAA64MMFR1:
-		return ids.MMFR1, true
+		return 0, true
 	case KeyIDAA64MMFR2:
-		return ids.MMFR2, true
+		return ids.MMFR2 & IDAA64MMFR2Visible, true
 	case KeyCTREL0:
 		if ids.CTR != 0 {
 			return ids.CTR, true
@@ -754,6 +792,10 @@ func (ids IDRegisters) EmulateSysRegRead(iss SysRegISS) (uint64, bool) {
 		if ids.Counter != nil {
 			return ids.Counter(), true
 		}
+		return 0, false
+	}
+	if isEmulatedIDReg(iss) {
+		return 0, true
 	}
 	return 0, false
 }

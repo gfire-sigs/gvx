@@ -314,26 +314,54 @@ func TestEmulateSysRegReadAndDefaults(t *testing.T) {
 	}
 
 	custom := &IDRegisters{
-		PFR0: 0x1101_0000_1011_0011 | 0xf<<32, PFR1: 0xff00,
-		ISAR1:   0x11110211202 | 0xf<<4,
+		PFR0:    ^uint64(0),
+		PFR1:    ^uint64(0),
+		ISAR0:   ^uint64(0),
+		ISAR1:   ^uint64(0),
+		MMFR0:   ^uint64(0),
+		MMFR1:   ^uint64(0),
+		MMFR2:   ^uint64(0),
 		Counter: func() uint64 { return 0x1234 },
 	}
-	if got, ok := custom.EmulateSysRegRead(read(3, 0, 0, 4, 0)); !ok || got != custom.PFR0&^(0xf<<32) {
-		t.Errorf("ID_AA64PFR0_EL1 masking = (%#x, %v)", got, ok)
+	for _, tc := range []struct {
+		name string
+		iss  SysRegISS
+		want uint64
+		ok   bool
+	}{
+		{"MPIDR_EL1", read(3, 0, 0, 0, 5), MPIDRSafeVal, true},
+		{"ID_AA64PFR0_EL1 allowlist", read(3, 0, 0, 4, 0), IDAA64PFR0SafeVal | IDAA64PFR0Visible, true},
+		{"ID_AA64PFR1_EL1 hidden", read(3, 0, 0, 4, 1), 0, true},
+		{"ID_AA64PFR2_EL1 RAZ", read(3, 0, 0, 4, 2), 0, true},
+		{"ID_AA64ZFR0_EL1 RAZ", read(3, 0, 0, 4, 4), 0, true},
+		{"ID_AA64SMFR0_EL1 RAZ", read(3, 0, 0, 4, 5), 0, true},
+		{"ID_AA64DFR0_EL1 safe", read(3, 0, 0, 5, 0), IDAA64DFR0SafeVal, true},
+		{"ID_AA64DFR1_EL1 RAZ", read(3, 0, 0, 5, 1), 0, true},
+		{"ID_AA64ISAR0_EL1 allowlist", read(3, 0, 0, 6, 0), IDAA64ISAR0Visible, true},
+		{"ID_AA64ISAR1_EL1 allowlist", read(3, 0, 0, 6, 1), IDAA64ISAR1Visible, true},
+		{"ID_AA64ISAR2_EL1 RAZ", read(3, 0, 0, 6, 2), 0, true},
+		{"ID_AA64MMFR0_EL1 safe", read(3, 0, 0, 7, 0), IDAA64MMFR0SafeVal, true},
+		{"ID_AA64MMFR1_EL1 hidden", read(3, 0, 0, 7, 1), 0, true},
+		{"ID_AA64MMFR2_EL1 allowlist", read(3, 0, 0, 7, 2), IDAA64MMFR2Visible, true},
+		{"ID_AA64MMFR3_EL1 RAZ", read(3, 0, 0, 7, 3), 0, true},
+		{"CRm=2 lower boundary RAZ", read(3, 0, 0, 2, 0), 0, true},
+		{"CRm=8 upper boundary rejected", read(3, 0, 0, 8, 0), 0, false},
+		{"Op0=2 CRm=4 rejected", read(2, 0, 0, 4, 0), 0, false},
+		{"MSR write CRm=4 rejected", SysRegISS{Read: false, Op0: 3, Op1: 0, CRn: 0, CRm: 4, Op2: 0}, 0, false},
+		{"CRm=0 unknown rejected", read(3, 0, 0, 0, 1), 0, false},
+		{"AArch32 ID_PFR0_EL1 rejected", read(3, 0, 0, 1, 0), 0, false},
+		{"TCR_EL1 rejected", read(3, 0, 2, 0, 2), 0, false},
+		{"CNTPCT_EL0", read(3, 3, 14, 0, 1), 0x1234, true},
+	} {
+		got, ok := custom.EmulateSysRegRead(tc.iss)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("%s = (%#x, %v), want (%#x, %v)", tc.name, got, ok, tc.want, tc.ok)
+		}
 	}
-	if got, ok := custom.EmulateSysRegRead(read(3, 0, 0, 4, 1)); !ok || got != 0xf000 {
-		t.Errorf("ID_AA64PFR1_EL1 masking = (%#x, %v)", got, ok)
-	}
-	if got, ok := custom.EmulateSysRegRead(read(3, 0, 0, 6, 1)); !ok || got != 0x11100211002 {
-		t.Errorf("ID_AA64ISAR1_EL1 masking = (%#x, %v)", got, ok)
-	}
-	// Apple M4 Pro under Hypervisor.framework reports 16-bit ASIDs.
+	// Apple M4 Pro under Hypervisor.framework reports 16-bit ASIDs in MMFR0.
 	apple := &IDRegisters{MMFR0: 0x10000f100022}
-	if got, ok := apple.EmulateSysRegRead(read(3, 0, 0, 7, 0)); !ok || got != 0x10000f100002 {
-		t.Errorf("ID_AA64MMFR0_EL1 masking = (%#x, %v), want ASIDBits hidden", got, ok)
-	}
-	if got, ok := custom.EmulateSysRegRead(read(3, 3, 14, 0, 1)); !ok || got != 0x1234 {
-		t.Errorf("CNTPCT_EL0 = (%#x, %v)", got, ok)
+	if got, ok := apple.EmulateSysRegRead(read(3, 0, 0, 7, 0)); !ok || got != IDAA64MMFR0SafeVal || got&(0xf<<4) != 0 {
+		t.Errorf("ID_AA64MMFR0_EL1 masking = (%#x, %v), want %#x with ASIDBits=0", got, ok, IDAA64MMFR0SafeVal)
 	}
 	iss := DecodeSysRegISS(uint64(ECSysReg)<<ESRECShift | 3<<20 | 7<<5 | 1)
 	if !iss.Read || iss.Rt != 7 || iss.Key() != KeyMIDR {

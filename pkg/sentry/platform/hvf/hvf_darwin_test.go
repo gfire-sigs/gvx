@@ -629,8 +629,7 @@ func TestIDRegisterReadsAreEmulatedWithoutLeakingHiddenFeatures(t *testing.T) {
 	if got := g.regs().Regs[0]; got>>24 != 0x61 {
 		t.Errorf("MIDR_EL1 = %#x, want the Apple implementer 0x61", got)
 	}
-	g.setProgram(insnMrsPFR0, insnSVC0)
-	g.ac.SetIP(uintptr(guestCodeAddr))
+	g = newGuest(t, plat, insnMrsPFR0, insnSVC0)
 	if sig, _, err := g.switchOnce(); sig != nil || err != nil {
 		t.Fatalf("MRS ID_AA64PFR0_EL1: Switch = (%v, %v)", sig, err)
 	}

@@ -23,10 +23,10 @@ import (
 // platformHWCap derives AT_HWCAP and AT_HWCAP2 from the hw.optional sysctl
 // keys that the Darwin kernel publishes for each Arm feature.
 //
-// The guest reads its ID registers through hvf, which returns the host values
-// with the PAC, SVE, MTE, SME, and MPAM fields hidden. None of the features in
-// the HWCAP tables uses those fields, so the host bits are a subset of what
-// the guest reads.
+// The guest reads its ID registers through hvf and hvcommon.IDRegisters, which
+// sanitize host registers with an EL0 allowlist matching Linux FTR_VISIBLE.
+// Every feature in the HWCAP tables falls inside that allowlist, so the host
+// bits match what the guest reads.
 func platformHWCap() (hwCap, error) {
 	features := make(map[string]bool)
 	for _, entries := range [][]hwcapEntry{hwcap1Entries, hwcap2Entries} {
