@@ -30,9 +30,10 @@ import (
 // Design notes for the vCPU state that this backend does not virtualize.
 //
 // ASIDs: every user translation uses ASID 0, and a vCPU flushes its TLB through
-// the stub when the address space or its generation changes. Apple cores
+// the stub when the address space or its generation changes. Apple M1 cores
 // implement 8-bit ASIDs (ID_AA64MMFR0_EL1.ASIDBits is 0), so 255 live address
-// spaces would exhaust them and force a global flush protocol. TTBR1 already
+// spaces would exhaust them and force a global flush protocol. Later cores may
+// report 16-bit ASIDs; EL0 never sees the field (hvcommon.IDAA64MMFR0Hide). TTBR1 already
 // removes the walk-cache hazard that motivated ASIDs, and the generation check
 // already removes the per-return TLBI, so ASIDs would add cost without a gain.
 //
