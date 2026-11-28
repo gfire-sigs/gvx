@@ -33,7 +33,7 @@ import (
 // the stub when the address space or its generation changes. Apple M1 cores
 // implement 8-bit ASIDs (ID_AA64MMFR0_EL1.ASIDBits is 0), so 255 live address
 // spaces would exhaust them and force a global flush protocol. Later cores may
-// report 16-bit ASIDs; EL0 never sees the field (hvcommon.IDAA64MMFR0Hide). TTBR1 already
+// report 16-bit ASIDs; EL0 receives the Linux safe value (hvcommon.IDAA64MMFR0SafeVal). TTBR1 already
 // removes the walk-cache hazard that motivated ASIDs, and the generation check
 // already removes the per-return TLBI, so ASIDs would add cost without a gain.
 //
@@ -130,7 +130,8 @@ func (w *vcpuWorker) configure() error {
 	return nil
 }
 
-// readIDRegisters caches the values that EL0 reads of the ID registers.
+// readIDRegisters caches the host ID registers that hvcommon.IDRegisters
+// exposes through its EL0 allowlist masks.
 func (w *vcpuWorker) readIDRegisters() error {
 	for _, f := range []struct {
 		reg uint32
@@ -138,11 +139,8 @@ func (w *vcpuWorker) readIDRegisters() error {
 	}{
 		{hvSysRegMIDR, &w.ids.MIDR},
 		{hvSysRegIDAA64PFR0, &w.ids.PFR0},
-		{hvSysRegIDAA64PFR1, &w.ids.PFR1},
 		{hvSysRegIDAA64ISAR0, &w.ids.ISAR0},
 		{hvSysRegIDAA64ISAR1, &w.ids.ISAR1},
-		{hvSysRegIDAA64MMFR0, &w.ids.MMFR0},
-		{hvSysRegIDAA64MMFR1, &w.ids.MMFR1},
 		{hvSysRegIDAA64MMFR2, &w.ids.MMFR2},
 	} {
 		v, err := hvGetSysReg(w.id, f.reg)
