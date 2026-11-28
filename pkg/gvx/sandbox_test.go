@@ -518,3 +518,161 @@ func TestPlatformFailureHintNamesTheFix(t *testing.T) {
 		})
 	}
 }
+
+func TestLinuxSystrapFailureHint(t *testing.T) {
+	status139 := errors.New("gvx: systrap backend: initialize systrap: wait failed: ptrace status unexpected: got 139, wanted stopped (subprocess died)")
+	eperm := errors.New("gvx: systrap backend: operation not permitted")
+
+	for _, tc := range []struct {
+		name        string
+		err         error
+		apparmor    string
+		ptraceScope int
+		wantAll     []string
+		wantAbsent  []string
+	}{
+		{
+			name:        "stacked containerd AppArmor profile",
+			err:         status139,
+			apparmor:    "cri-containerd.apparmor.d//&unconfined (enforce)\n",
+			ptraceScope: 1,
+			wantAll:     []string{"stacked AppArmor profile", "cri-containerd.apparmor.d//&unconfined", "PR #14487", "unconfined"},
+			wantAbsent:  []string{"ptrace_scope"},
+		},
+		{
+			name:        "stacked docker AppArmor profile with trailing NUL",
+			err:         eperm,
+			apparmor:    "docker-default//&unconfined (enforce)\x00",
+			ptraceScope: 0,
+			wantAll:     []string{"stacked AppArmor profile", "docker-default//&unconfined", "Docker Engine"},
+		},
+		{
+			name:        "non-stacked enforcing AppArmor profile",
+			err:         status139,
+			apparmor:    "custom-profile (enforce)",
+			ptraceScope: 1,
+			wantAll:     []string{"AppArmor profile", "custom-profile", "unconfined"},
+			wantAbsent:  []string{"stacked", "PR #14487"},
+		},
+		{
+			name:        "complain mode AppArmor is not blamed",
+			err:         status139,
+			apparmor:    "cri-containerd.apparmor.d//&unconfined (complain)",
+			ptraceScope: 1,
+		},
+		{
+			name:        "AppArmor 4.0 unconfined mode profile is not blamed",
+			err:         status139,
+			apparmor:    "runc (unconfined)\n",
+			ptraceScope: 1,
+		},
+		{
+			name:        "SELinux context without mode suffix is ignored",
+			err:         status139,
+			apparmor:    "system_u:system_r:container_t:s0:c123,c456\n",
+			ptraceScope: 1,
+		},
+		{
+			name:        "custom non-unconfined stack omits containerd upgrade advice",
+			err:         status139,
+			apparmor:    "parent//&child (enforce)",
+			ptraceScope: 1,
+			wantAll:     []string{"stacked AppArmor profile", "parent//&child", "unconfined"},
+			wantAbsent:  []string{"PR #14487", "Docker Engine"},
+		},
+		{
+			name:        "mixed-mode stack with enforcing component still emits hint",
+			err:         status139,
+			apparmor:    "foo (enforce)//&bar (complain)",
+			ptraceScope: 1,
+			wantAll:     []string{"stacked AppArmor profile", "foo//&bar", "unconfined"},
+			wantAbsent:  []string{"PR #14487"},
+		},
+		{
+			name:        "mixed-mode stack with only complain and unconfined is not blamed",
+			err:         status139,
+			apparmor:    "foo (complain)//&unconfined",
+			ptraceScope: 1,
+		},
+		{
+			name:        "unconfined with yama ptrace_scope=1 returns empty",
+			err:         status139,
+			apparmor:    "unconfined\n",
+			ptraceScope: 1,
+		},
+		{
+			name:        "unconfined with yama ptrace_scope=2",
+			err:         status139,
+			apparmor:    "unconfined",
+			ptraceScope: 2,
+			wantAll:     []string{"kernel.yama.ptrace_scope=2", "0 or 1"},
+			wantAbsent:  []string{"AppArmor"},
+		},
+		{
+			name:        "both stacked AppArmor and yama ptrace_scope=3",
+			err:         status139,
+			apparmor:    "cri-containerd.apparmor.d//&unconfined (enforce)",
+			ptraceScope: 3,
+			wantAll:     []string{"stacked AppArmor profile", "kernel.yama.ptrace_scope=3"},
+		},
+		{
+			name:        "unrelated error ignores AppArmor and ptrace_scope",
+			err:         errors.New("out of memory"),
+			apparmor:    "cri-containerd.apparmor.d//&unconfined (enforce)",
+			ptraceScope: 3,
+		},
+		{
+			name:        "nil error returns empty",
+			err:         nil,
+			apparmor:    "cri-containerd.apparmor.d//&unconfined (enforce)",
+			ptraceScope: 3,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := linuxSystrapFailureHint(tc.err, tc.apparmor, tc.ptraceScope)
+			if len(tc.wantAll) == 0 {
+				if got != "" {
+					t.Fatalf("linuxSystrapFailureHint = %q, want empty", got)
+				}
+				return
+			}
+			for _, want := range tc.wantAll {
+				if !strings.Contains(got, want) {
+					t.Errorf("hint = %q, want substring %q", got, want)
+				}
+			}
+			for _, bad := range tc.wantAbsent {
+				if strings.Contains(got, bad) {
+					t.Errorf("hint = %q, must not contain %q", got, bad)
+				}
+			}
+		})
+	}
+
+	t.Run("openAutoForOS attaches Linux fallback hint once and preserves errors.Is", func(t *testing.T) {
+		hwErr := fmt.Errorf("%w: no hypervisor backend for linux", ErrPlatformUnavailable)
+		fbErr := fmt.Errorf("gvx: systrap backend: %w", status139)
+		hintFn := func(goos string, err error) string {
+			if goos != "linux" {
+				return ""
+			}
+			return linuxSystrapFailureHint(err, "cri-containerd.apparmor.d//&unconfined (enforce)", 1)
+		}
+		_, err := openAutoForOSWithHint(
+			"linux",
+			func() (platform.Platform, string, error) { return nil, "", hwErr },
+			func() (platform.Platform, string, error) { return nil, "", fbErr },
+			true,
+			hintFn,
+		)
+		if err == nil {
+			t.Fatal("openAutoForOSWithHint succeeded, want error")
+		}
+		if !errors.Is(err, ErrPlatformUnavailable) || !errors.Is(err, status139) {
+			t.Fatalf("error = %v, want wrapped ErrPlatformUnavailable and status139", err)
+		}
+		if count := strings.Count(err.Error(), "stacked AppArmor profile"); count != 1 {
+			t.Errorf("stacked AppArmor hint count = %d in %q, want 1", count, err.Error())
+		}
+	})
+}

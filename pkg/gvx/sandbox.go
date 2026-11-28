@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -359,7 +360,13 @@ func openPlatform(requested PlatformType, lockdown, allowUnconfinedSystrap bool)
 	case PlatformHVF:
 		return single(openHVF)
 	case PlatformSystrap:
-		return single(openSystrap)
+		p, err := single(openSystrap)
+		if err != nil {
+			if hint := platformFailureHint(runtime.GOOS, err); hint != "" {
+				return openedPlatform{}, fmt.Errorf("%w (%s)", err, hint)
+			}
+		}
+		return p, err
 	case PlatformAuto:
 		return openAutoForOS(runtime.GOOS, hardware, openSystrap, allowUnconfinedSystrap)
 	default:
@@ -377,13 +384,17 @@ func openAuto(hardware, fallback opener) (openedPlatform, error) {
 // systrap requires allowUnconfinedSystrap because Windows offers no kernel
 // syscall trap for stub processes.
 func openAutoForOS(goos string, hardware, fallback opener, allowUnconfinedSystrap bool) (openedPlatform, error) {
+	return openAutoForOSWithHint(goos, hardware, fallback, allowUnconfinedSystrap, platformFailureHint)
+}
+
+func openAutoForOSWithHint(goos string, hardware, fallback opener, allowUnconfinedSystrap bool, hintFn func(string, error) string) (openedPlatform, error) {
 	p, name, hwErr := hardware()
 	if hwErr == nil {
 		return openedPlatform{plat: p, name: name}, nil
 	}
 	if goos == "windows" && !allowUnconfinedSystrap {
 		msg := "gvx: Windows Hypervisor Platform (whpx) is unavailable and Windows systrap lacks hardware or kernel syscall isolation; enable whpx or set Config.AllowUnconfinedSystrap (-allow-unconfined-systrap)"
-		if hint := platformFailureHint(goos, hwErr); hint != "" {
+		if hint := hintFn(goos, hwErr); hint != "" {
 			msg += " (" + hint + ")"
 		}
 		return openedPlatform{}, fmt.Errorf("%s: %w", msg, errors.Join(ErrPlatformUnavailable, hwErr))
@@ -391,6 +402,9 @@ func openAutoForOS(goos string, hardware, fallback opener, allowUnconfinedSystra
 	p, name, fbErr := fallback()
 	if fbErr == nil {
 		return openedPlatform{plat: p, name: name, fallbackFrom: hwErr}, nil
+	}
+	if hint := hintFn(goos, fbErr); hint != "" {
+		return openedPlatform{}, fmt.Errorf("gvx: no execution backend available (%s): %w", hint, errors.Join(hwErr, fbErr))
 	}
 	return openedPlatform{}, fmt.Errorf("gvx: no execution backend available: %w", errors.Join(hwErr, fbErr))
 }
@@ -488,9 +502,12 @@ func (s *Sandbox) FallbackReason() string {
 	return reason
 }
 
-// platformFailureHint returns the step that fixes a failure of the hardware
+// platformFailureHint returns the step that fixes a failure of an execution
 // backend, or an empty string when the cause is not one that gvx can name.
 func platformFailureHint(goos string, err error) string {
+	if err == nil {
+		return ""
+	}
 	text := err.Error()
 	switch goos {
 	case "windows":
@@ -504,8 +521,181 @@ func platformFailureHint(goos string, err error) string {
 		case strings.Contains(text, "HV_UNSUPPORTED"), strings.Contains(text, "HV_NO_DEVICE"):
 			return "this host has no hypervisor, which is the case in a virtual machine without nested virtualization"
 		}
+	case "linux":
+		if !isLinuxSystrapPermissionError(err) {
+			return ""
+		}
+		apparmor, ptraceScope := readLinuxSystrapContext()
+		return linuxSystrapFailureHint(err, apparmor, ptraceScope)
 	}
 	return ""
+}
+
+// isLinuxSystrapPermissionError reports whether err looks like a Linux systrap
+// startup failure caused by signal or ptrace confinement.
+func isLinuxSystrapPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "ptrace") ||
+		strings.Contains(lower, "subprocess died") ||
+		strings.Contains(lower, "operation not permitted") ||
+		strings.Contains(lower, "permission denied")
+}
+
+// linuxSystrapFailureHint translates the active Linux AppArmor label and
+// kernel.yama.ptrace_scope value into a remediation hint when systrap startup
+// fails due to signal or ptrace denial.
+func linuxSystrapFailureHint(err error, apparmorLabel string, ptraceScope int) string {
+	if !isLinuxSystrapPermissionError(err) {
+		return ""
+	}
+	var hints []string
+	if profile, stackedUnconfined, enforcing := parseEnforcingAppArmorLabel(apparmorLabel); enforcing {
+		switch {
+		case stackedUnconfined:
+			hints = append(hints, fmt.Sprintf(
+				"stacked AppArmor profile %q may deny intra-container signals and ptrace; upgrade containerd (PR #14487) or Docker Engine, or run with AppArmor unconfined",
+				profile,
+			))
+		case strings.Contains(profile, "//&"):
+			hints = append(hints, fmt.Sprintf(
+				"stacked AppArmor profile %q may deny systrap signals or ptrace; allow intra-container signal/ptrace or run with AppArmor unconfined",
+				profile,
+			))
+		default:
+			hints = append(hints, fmt.Sprintf(
+				"AppArmor profile %q may deny systrap signals or ptrace; allow intra-container signal/ptrace or run with AppArmor unconfined",
+				profile,
+			))
+		}
+	}
+	if ptraceScope >= 2 {
+		hints = append(hints, fmt.Sprintf(
+			"kernel.yama.ptrace_scope=%d blocks unprivileged systrap ptrace; set it to 0 or 1",
+			ptraceScope,
+		))
+	}
+	return strings.Join(hints, "; ")
+}
+
+// splitAppArmorMode splits a single AppArmor label or stack component of the
+// form "<name> (<mode>)" into name and mode. It returns ok=false when no
+// trailing mode suffix exists.
+func splitAppArmorMode(s string) (name, mode string, ok bool) {
+	if !strings.HasSuffix(s, ")") {
+		return s, "", false
+	}
+	idx := strings.LastIndex(s, " (")
+	if idx <= 0 {
+		return s, "", false
+	}
+	return strings.TrimSpace(s[:idx]), strings.TrimSpace(s[idx+2 : len(s)-1]), true
+}
+
+// isNonEnforcingAppArmorMode reports whether mode is an AppArmor mode that
+// does not block signals or ptrace.
+func isNonEnforcingAppArmorMode(mode string) bool {
+	return mode == "complain" || mode == "unconfined"
+}
+
+// parseEnforcingAppArmorLabel parses a Linux /proc/self/attr/apparmor/current
+// label and reports whether at least one profile component is enforcing.
+// Confined labels from aa_getprocattr always include a trailing "(<mode>)";
+// labels without a mode suffix (such as "unconfined" or SELinux contexts)
+// report enforcing=false.
+func parseEnforcingAppArmorLabel(raw string) (profile string, stackedUnconfined, enforcing bool) {
+	s := strings.Trim(raw, " \t\r\n\x00")
+	if s == "" || s == "unconfined" {
+		return "", false, false
+	}
+	// Uniform label-wide mode: "<profile> (<mode>)" or "<p1>//&<p2> (<mode>)".
+	// Only treat trailing "(<mode>)" as label-wide when no earlier stack
+	// component carries its own "(<mode>)".
+	lastStack := strings.LastIndex(s, "//&")
+	if strings.HasSuffix(s, ")") {
+		if idx := strings.LastIndex(s, " ("); idx > 0 && idx > lastStack {
+			name := strings.TrimSpace(s[:idx])
+			if lastStack < 0 || !strings.Contains(name, " (") {
+				mode := strings.TrimSpace(s[idx+2 : len(s)-1])
+				if name == "" || name == "unconfined" || isNonEnforcingAppArmorMode(mode) {
+					return "", false, false
+				}
+				return name, hasStackedUnconfined(name), true
+			}
+		}
+	}
+	if lastStack < 0 {
+		return "", false, false
+	}
+	// Mixed-mode stack: "<p1> (<m1>)//&<p2> (<m2>)".
+	parts := strings.Split(s, "//&")
+	names := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if part == "unconfined" {
+			names = append(names, part)
+			continue
+		}
+		name, mode, ok := splitAppArmorMode(part)
+		if !ok {
+			return "", false, false
+		}
+		names = append(names, name)
+		if name != "unconfined" && !isNonEnforcingAppArmorMode(mode) {
+			enforcing = true
+		}
+	}
+	if !enforcing {
+		return "", false, false
+	}
+	joined := strings.Join(names, "//&")
+	return joined, hasStackedUnconfined(joined), true
+}
+
+func hasStackedUnconfined(profile string) bool {
+	if !strings.Contains(profile, "//&") {
+		return false
+	}
+	for _, part := range strings.Split(profile, "//&") {
+		if strings.TrimSpace(part) == "unconfined" {
+			return true
+		}
+	}
+	return false
+}
+
+// readLinuxSystrapContext inspects the host AppArmor profile and Yama
+// ptrace_scope before lockdown. Non-Linux hosts (including Android) and
+// already locked-down processes return empty/unknown values without opening
+// procfs.
+func readLinuxSystrapContext() (apparmorLabel string, ptraceScope int) {
+	ptraceScope = -1
+	if runtime.GOOS != "linux" || hostlockdown.IsLockedDown() {
+		return "", ptraceScope
+	}
+	if raw, err := os.ReadFile("/proc/self/attr/apparmor/current"); err == nil {
+		apparmorLabel = strings.Trim(string(raw), " \t\r\n\x00")
+	} else if errors.Is(err, os.ErrNotExist) {
+		if enabled, err := os.ReadFile("/sys/module/apparmor/parameters/enabled"); err == nil && strings.HasPrefix(strings.TrimSpace(string(enabled)), "Y") {
+			if raw, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+				apparmorLabel = strings.Trim(string(raw), " \t\r\n\x00")
+			}
+		}
+	}
+	if raw, err := os.ReadFile("/proc/sys/kernel/yama/ptrace_scope"); err == nil {
+		if v, err := strconv.Atoi(strings.Trim(string(raw), " \t\r\n\x00")); err == nil {
+			ptraceScope = v
+		}
+	}
+	return apparmorLabel, ptraceScope
 }
 
 // SyscallIsolationMode classifies how the active backend intercepts guest
