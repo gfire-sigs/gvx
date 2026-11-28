@@ -58,7 +58,7 @@ func TestDefaultVolumeDirForUsesTheDataDirectory(t *testing.T) {
 		{goos: "linux", env: map[string]string{"XDG_DATA_HOME": dataHome}, want: filepath.Join(dataHome, "gvx", "volumes")},
 		{goos: "linux", env: map[string]string{"XDG_DATA_HOME": "relative"}, want: filepath.Join(home, ".local", "share", "gvx", "volumes")},
 		{goos: "android", want: filepath.Join(home, ".local", "share", "gvx", "volumes")},
-		{goos: "windows", env: map[string]string{"LOCALAPPDATA": localAppData}, want: filepath.Join(localAppData, "gvx", "cache", "volumes")},
+		{goos: "windows", env: map[string]string{"LOCALAPPDATA": localAppData}, want: filepath.Join(localAppData, "gvx", "volumes")},
 	}
 	for _, tc := range tests {
 		got, err := defaultVolumeDirFor(tc.goos, envOf(tc.env), homeDir)
@@ -137,10 +137,14 @@ func TestPruneVolumesWithExplicitCacheDirDoesNotTouchVolumeDirEnv(t *testing.T) 
 	}
 }
 
-func TestConfigNormalizeDoesNotMigrateLegacyVolumeDir(t *testing.T) {
+func isLegacyVolumeLink(st os.FileInfo) bool {
 	if runtime.GOOS == "windows" {
-		t.Skip("the Windows default stays beside the layer cache")
+		return st.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0
 	}
+	return st.Mode()&os.ModeSymlink != 0
+}
+
+func TestConfigNormalizeDoesNotMigrateLegacyVolumeDir(t *testing.T) {
 	isolateUserDirs(t)
 	layers, err := oci.DefaultCacheDir()
 	if err != nil {
@@ -164,7 +168,7 @@ func TestConfigNormalizeDoesNotMigrateLegacyVolumeDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lstat(%q): %v", legacy, err)
 	}
-	if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+	if !st.IsDir() || isLegacyVolumeLink(st) {
 		t.Fatalf("normalize() migrated legacy directory %q: mode %v", legacy, st.Mode())
 	}
 	root, err := defaultVolumeDirFor(runtime.GOOS, os.Getenv, os.UserHomeDir)
@@ -180,9 +184,6 @@ func TestConfigNormalizeDoesNotMigrateLegacyVolumeDir(t *testing.T) {
 // release, which lie beside the default layer cache, move to the new default
 // directory on first use, and that the legacy path still reaches them.
 func TestVolumeRootMovesTheLegacyDirectory(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the Windows default stays beside the layer cache")
-	}
 	isolateUserDirs(t)
 	layers, err := oci.DefaultCacheDir()
 	if err != nil {
@@ -215,8 +216,8 @@ func TestVolumeRootMovesTheLegacyDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lstat(%q): %v", legacy, err)
 	}
-	if st.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("legacy path is not a symbolic link: mode %v", st.Mode())
+	if !isLegacyVolumeLink(st) {
+		t.Fatalf("legacy path is not a link or junction: mode %v", st.Mode())
 	}
 	if again, err := (Config{}).volumeRoot(); err != nil || again != root {
 		t.Fatalf("second volumeRoot() = (%q, %v), want %q", again, err, root)
@@ -312,9 +313,6 @@ func TestMigrateVolumeRoot(t *testing.T) {
 		}
 	})
 	t.Run("concurrent callers all observe root after migration", func(t *testing.T) {
-		if runtime.GOOS == "windows" {
-			t.Skip("Windows default stays beside the layer cache and symlinks may require privilege")
-		}
 		dir := t.TempDir()
 		legacy := filepath.Join(dir, "legacy")
 		root := filepath.Join(dir, "data", "volumes")
@@ -352,8 +350,8 @@ func TestMigrateVolumeRoot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Lstat(%q): %v", legacy, err)
 		}
-		if st.Mode()&os.ModeSymlink == 0 {
-			t.Fatalf("legacy path is not a symlink after concurrent migration: mode %v", st.Mode())
+		if !isLegacyVolumeLink(st) {
+			t.Fatalf("legacy path is not a link or junction after concurrent migration: mode %v", st.Mode())
 		}
 	})
 	t.Run("switches to root when rename fails on an empty legacy directory", func(t *testing.T) {

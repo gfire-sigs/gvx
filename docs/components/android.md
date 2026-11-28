@@ -29,7 +29,7 @@ Android packaging spans three layers: NDK compilation into a native library, Jav
 
 `Gvx.start(Context ctx, List<String> args)` builds a `ProcessBuilder` targeting `<nativeLibraryDir>/librungvx.so`:
 
-- **App-private storage env**: Sets `HOME` to `ctx.getFilesDir()` and sets `XDG_CACHE_HOME` and `TMPDIR` to `ctx.getCacheDir()`.
+- **App-private storage env**: Sets `HOME` to `ctx.getFilesDir()` and sets `XDG_CACHE_HOME` and `TMPDIR` to `ctx.getCacheDir()`. Named volumes default to `ctx.getFilesDir()/.local/share/gvx/volumes`, and named control sockets resolve under `TMPDIR/gvx-run` because Android lacks `/tmp`. Set `XDG_DATA_HOME` or `GVX_VOLUME_DIR` to `ctx.getNoBackupFilesDir()` to exclude large volumes from Android Auto Backup.
 - **Active DNS injection**: For `run` and `pull`, reads `LinkProperties.getDnsServers()`, skips link-local IPv6 addresses, and prepends `--host-dns <ip>`.
 - **Process streaming**: Returns `java.lang.Process` so callers consume stdout, stderr, and exit codes while `librungvx.so` applies host lockdown.
 

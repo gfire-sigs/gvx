@@ -787,6 +787,113 @@ func TestControlEndpointsTokensAndValidation(t *testing.T) {
 		t.Fatal("NamedSocketPath accepted traversal name")
 	}
 
+	// Verify platform runtime socket directory selection, including Android
+	// where /tmp does not exist and os.TempDir() defaults to /data/local/tmp
+	// when TMPDIR is unset.
+	noCache := func() (string, error) { return "", errors.New("unavailable") }
+	for _, tc := range []struct {
+		name     string
+		goos     string
+		xdgRun   string
+		tmpEnv   string
+		cacheDir func() (string, error)
+		tempDir  string
+		uid      int
+		want     string
+	}{
+		{
+			name:     "windows uses UserCacheDir",
+			goos:     "windows",
+			cacheDir: func() (string, error) { return "/localappdata", nil },
+			tempDir:  "/temp",
+			want:     filepath.Join("/localappdata", "gvx", "run"),
+		},
+		{
+			name:     "windows falls back to tempDir",
+			goos:     "windows",
+			cacheDir: noCache,
+			tempDir:  "/temp",
+			want:     filepath.Join("/temp", "gvx-run"),
+		},
+		{
+			name:     "linux prefers XDG_RUNTIME_DIR",
+			goos:     "linux",
+			xdgRun:   "/run/user/1000",
+			cacheDir: noCache,
+			tempDir:  "/tmp",
+			uid:      1000,
+			want:     filepath.Join("/run/user/1000", "gvx"),
+		},
+		{
+			name:     "linux falls back to /tmp uid dir",
+			goos:     "linux",
+			cacheDir: noCache,
+			tempDir:  "/tmp",
+			uid:      1000,
+			want:     filepath.Join("/tmp", "gvx-run-1000"),
+		},
+		{
+			name:     "android prefers explicit TMPDIR",
+			goos:     "android",
+			tmpEnv:   "/data/user/0/app/cache",
+			cacheDir: func() (string, error) { return "/data/user/0/app/other-cache", nil },
+			tempDir:  "/data/user/0/app/cache",
+			uid:      10234,
+			want:     filepath.Join("/data/user/0/app/cache", "gvx-run"),
+		},
+		{
+			name:     "android uses UserCacheDir when TMPDIR is unset and os.TempDir is /data/local/tmp",
+			goos:     "android",
+			cacheDir: func() (string, error) { return "/data/user/0/app/cache", nil },
+			tempDir:  "/data/local/tmp",
+			uid:      10234,
+			want:     filepath.Join("/data/user/0/app/cache", "gvx-run"),
+		},
+		{
+			name:     "android falls back to shorter UserCacheDir when TMPDIR exceeds sun_path budget",
+			goos:     "android",
+			tmpEnv:   "/data/user/0/com.example.very.long.android.application.package.identifier.segment/cache",
+			cacheDir: func() (string, error) { return "/data/user/0/app/cache", nil },
+			tempDir:  "/data/local/tmp",
+			uid:      10234,
+			want:     filepath.Join("/data/user/0/app/cache", "gvx-run"),
+		},
+		{
+			name:     "android adb shell falls back to uid-scoped /data/local/tmp",
+			goos:     "android",
+			cacheDir: noCache,
+			tempDir:  "/data/local/tmp",
+			uid:      2000,
+			want:     filepath.Join("/data/local/tmp", "gvx-run-2000"),
+		},
+		{
+			name:     "darwin uses short /tmp uid dir",
+			goos:     "darwin",
+			xdgRun:   "/ignored",
+			cacheDir: func() (string, error) { return "/Users/u/Library/Caches", nil },
+			tempDir:  "/var/folders/long",
+			uid:      501,
+			want:     filepath.Join("/tmp", "gvx-run-501"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			getenv := func(k string) string {
+				switch k {
+				case "XDG_RUNTIME_DIR":
+					return tc.xdgRun
+				case "TMPDIR":
+					return tc.tmpEnv
+				default:
+					return ""
+				}
+			}
+			got, err := runtimeSocketDirFor(tc.goos, getenv, tc.cacheDir, func() string { return tc.tempDir }, func() int { return tc.uid })
+			if err != nil || got != tc.want {
+				t.Fatalf("runtimeSocketDirFor(%s) = (%q, %v), want %q", tc.goos, got, err, tc.want)
+			}
+		})
+	}
+
 	// IPv4 and IPv6 loopback tokens on the same port must use distinct token files.
 	p4, err := DefaultTokenPath("tcp", "127.0.0.1:4567")
 	if err != nil {

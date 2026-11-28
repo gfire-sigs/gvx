@@ -460,7 +460,7 @@ The layer cache lives under `%LOCALAPPDATA%\gvx\cache\layers` (Windows), `~/Libr
 
 `rungvx volume` inspects `ext4lite` host file locks (`ProbeVolumeLock`) and refuses to compact or delete any mounted volume.
 
-On macOS, Linux, and Android, named volumes live in the user data directory, because a host can purge its cache directory. macOS deletes the content of `~/Library/Caches` when the disk runs low. `rungvx system info` prints the active directory as `Volume Dir`.
+On every host, named volumes live outside the layer cache directory so cache cleanups and backup exclusions do not delete persistent data. macOS deletes the content of `~/Library/Caches` when the disk runs low. `rungvx system info` prints the active directory as `Volume Dir`.
 
 | Source | Volume directory |
 | :--- | :--- |
@@ -469,9 +469,9 @@ On macOS, Linux, and Android, named volumes live in the user data directory, bec
 | `GVX_VOLUME_DIR` | The given directory when neither `-volume-dir` nor `-cache-dir` is set. |
 | Default on macOS | `~/Library/Application Support/gvx/volumes`. |
 | Default on Linux and Android | `$XDG_DATA_HOME/gvx/volumes`, or `~/.local/share/gvx/volumes` when `XDG_DATA_HOME` is unset or relative. |
-| Default on Windows | `%LOCALAPPDATA%\gvx\cache\volumes`. Windows does not purge this directory. |
+| Default on Windows | `%LOCALAPPDATA%\gvx\volumes`. It stays outside `%LOCALAPPDATA%\gvx\cache` and out of `%APPDATA%` roaming profiles. |
 
-Earlier releases kept the default volume directory on macOS, Linux, and Android beside the layer cache, for example `~/Library/Caches/gvx/volumes`. The first command that uses the default directory renames that directory to the new location. It leaves a symbolic link at the earlier path, so an earlier release finds the same volumes. When the rename fails, `gvx` keeps the volumes at the earlier location.
+Earlier releases kept the default volume directory beside the layer cache (such as `~/Library/Caches/gvx/volumes` or `%LOCALAPPDATA%\gvx\cache\volumes`). The first command using the default directory renames it to the new location. It then leaves a symbolic link on Unix or an NTFS directory junction on Windows at the earlier path. When the rename fails, `gvx` keeps the volumes at the earlier location.
 
 | Command | Behavior |
 | :--- | :--- |
