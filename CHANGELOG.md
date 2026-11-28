@@ -2,6 +2,35 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.29.10002026112300] - 2026-11-28
+
+This release moves Windows default named volumes out of the layer cache and hardens unwritable-`HOME` cache paths. It also switches ARM64 EL0 ID register emulation to Linux-aligned allowlists and adds Linux `systrap` AppArmor diagnostics.
+
+### Storage and Host Directories
+
+- **Windows default named volumes outside cache (`pkg/gvx`, `docs/cli.md`)** (#305):
+  - Moves Windows default named volumes from `%LOCALAPPDATA%\gvx\cache\volumes` to `%LOCALAPPDATA%\gvx\volumes`. This keeps persistent volumes safe from cache cleanups, backup exclusions, and `%APPDATA%` roaming profiles.
+  - Migrates legacy `%LOCALAPPDATA%\gvx\cache\volumes` on first default use and stages an unprivileged NTFS directory junction via `MoveFileEx` for older releases, falling back to `os.Symlink` for UNC targets.
+- **Unwritable-`HOME` and read-only cache hardening (`pkg/gvx`, `pkg/rungvx`)** (#297, #302):
+  - Skips creating the default host layer cache in `loadCachedReference` when `OCICacheDir` is set and the default cache is absent or unreadable.
+  - Aligns `ephemeralVolumeRoot` precedence with `volumeRoot` (`VolumeDir`, `OCICacheDir`, `GVX_VOLUME_DIR`, platform default) and stores ephemeral images under `<VolumeDir>/.ephemeral-volumes`.
+  - Adds `openExisting` and `openExistingPullCache` so `rungvx images`, `inspect`, `rmi`, `tag`, `save`, and `push` do not create an empty cache directory when absent.
+- **Android named control socket fallback (`pkg/gvx/control`, `docs/components/android.md`)** (#305):
+  - Resolves Android named control sockets under explicit `TMPDIR` (within `sockaddr_un.sun_path` limits), `os.UserCacheDir()`, or uid-scoped `os.TempDir()` (`/data/local/tmp`) instead of non-existent `/tmp`.
+
+### ARM64 Hypervisor Emulation
+
+- **Allowlist sanitization and RAZ emulation for EL0 ARM64 ID registers (`pkg/sentry/platform/hvcommon`, `pkg/sentry/platform/hvf`, `pkg/cpuid`)** (#298, #303):
+  - Replaces partial ID register hide masks with Linux `FTR_VISIBLE` allowlist masks and safe values (including hiding `ID_AA64MMFR0_EL1.ASIDBits`). This prevents nested `linux/arm64` `rungvx` and `runsc` `SIGILL` faults on Apple M4 Pro.
+  - Emulates `MPIDR_EL1`, `ID_AA64DFR0_EL1`, and read-as-zero for untracked `Op0=3, Op1=0, CRn=0, CRm=2..7` ID registers while keeping `SIGILL` for `TCR_EL1` and writes.
+  - Adds a live `hvf` guest test verifying real EL0 `MRS` reads against all 31 `cpuid.HostFeatureSet()` `AT_HWCAP` and `AT_HWCAP2` features.
+
+### Linux Container Diagnostics and Documentation
+
+- **Stacked AppArmor and Yama `ptrace_scope` hints (`pkg/gvx`, `docs/troubleshooting.md`)** (#299, #304):
+  - Reads `/proc/self/attr/apparmor/current` and `/proc/sys/kernel/yama/ptrace_scope` before lockdown when Linux `systrap` fails. Surfaces actionable hints in backend errors and `SystemInfo.BackendWarnings`.
+  - Documents stacked AppArmor profiles (`cri-containerd.apparmor.d//&unconfined` under `kernel.apparmor_restrict_unprivileged_unconfined=1`), runtime upgrades (`containerd/containerd#14487` and `moby/profiles`), `yama.ptrace_scope`, and temporary `Unconfined` container settings.
+
 ## [v0.28.10002026112300] - 2026-11-27
 
 This release adds a prebuilt `darwin/arm64-ext` archive shipping `rungvx` with compiled `ext/` extensions (including macOS GPU support for `-gpu=venus` and `-gpu=virgl`), extends deterministic `slimlink` dead-method elimination checks to `ext/cmd/rungvx`, and adds troubleshooting links to standalone recovery Gists and community Q&A discussions.
