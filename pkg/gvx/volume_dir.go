@@ -76,18 +76,19 @@ func (c Config) volumeRootWithMigrate(migrate bool) (string, error) {
 }
 
 // defaultVolumeDirFor returns the default directory of the named volumes on
-// goos. On macOS, Linux, and Android it lies in the user data directory and
-// not in the user cache directory, because a host can purge the cache
-// directory. macOS deletes the content of ~/Library/Caches when the disk runs
-// low on space. Windows does not purge %LOCALAPPDATA%, so the directory there
-// stays beside the layer cache.
+// goos. Every host keeps named volumes out of the cache directory: macOS
+// purges ~/Library/Caches under disk pressure, Linux and Android cache
+// directories are disposable, and Windows caches under %LOCALAPPDATA%\gvx\cache
+// may be wiped or excluded from backups. Windows keeps volumes under
+// %LOCALAPPDATA%\gvx\volumes rather than %APPDATA% so large ext4 images stay
+// out of roaming profiles.
 func defaultVolumeDirFor(goos string, getenv func(string) string, userHomeDir func() (string, error)) (string, error) {
 	if goos == "windows" {
 		localAppData := getenv("LOCALAPPDATA")
 		if localAppData == "" {
 			return "", errors.New("gvx: %LOCALAPPDATA% is not set, so the volume directory is unknown")
 		}
-		return filepath.Join(localAppData, "gvx", "cache", "volumes"), nil
+		return filepath.Join(localAppData, "gvx", "volumes"), nil
 	}
 	if goos != "darwin" && goos != "ios" {
 		if dataHome := getenv("XDG_DATA_HOME"); filepath.IsAbs(dataHome) {
@@ -120,12 +121,13 @@ func existingVolumeRoot(legacy, root string) string {
 }
 
 // migrateVolumeRoot moves the volume directory of an earlier release, legacy,
-// to root when root does not exist yet. It then leaves a symbolic link at
-// legacy, so an earlier release that runs beside this one finds the same
-// volumes and does not create empty ones. It returns the directory that holds
-// the volumes: root, or legacy when the move fails. A failed move leaves the
-// volumes where they were. Another process that moves the directory first
-// makes the move fail, and root then exists.
+// to root when root does not exist yet. It then leaves a link at legacy (a
+// symbolic link on Unix, or an NTFS directory junction on Windows), so an
+// earlier release that runs beside this one finds the same volumes and does
+// not create empty ones. It returns the directory that holds the volumes:
+// root, or legacy when the move fails. A failed move leaves the volumes where
+// they were. Another process that moves the directory first makes the move
+// fail, and root then exists.
 func migrateVolumeRoot(legacy, root string) string {
 	if legacy == root {
 		return root
@@ -139,7 +141,7 @@ func migrateVolumeRoot(legacy, root string) string {
 	if err := os.MkdirAll(filepath.Dir(root), 0o700); err == nil {
 		if err := os.Rename(legacy, root); err == nil {
 			// A missing link costs an earlier release the volumes, not this one.
-			_ = os.Symlink(root, legacy)
+			_ = createLegacyVolumeLink(legacy, root)
 			return root
 		}
 		// When rename fails (for example EXDEV across filesystems) and legacy
@@ -147,7 +149,7 @@ func migrateVolumeRoot(legacy, root string) string {
 		if entries, readErr := os.ReadDir(legacy); readErr == nil && len(entries) == 0 {
 			if err := os.Mkdir(root, 0o700); err == nil {
 				if os.Remove(legacy) == nil {
-					_ = os.Symlink(root, legacy)
+					_ = createLegacyVolumeLink(legacy, root)
 				}
 				return root
 			}

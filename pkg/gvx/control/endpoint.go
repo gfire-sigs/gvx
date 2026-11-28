@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -128,24 +129,62 @@ func NamedSocketPath(name string) (string, error) {
 }
 
 func runtimeSocketDir() (string, error) {
-	if runtime.GOOS == "windows" {
-		base, err := os.UserCacheDir()
+	return runtimeSocketDirFor(runtime.GOOS, os.Getenv, os.UserCacheDir, os.TempDir, os.Geteuid)
+}
+
+func runtimeSocketDirFor(
+	goos string,
+	getenv func(string) string,
+	userCacheDir func() (string, error),
+	tempDir func() string,
+	geteuid func() int,
+) (string, error) {
+	if goos == "windows" {
+		base, err := userCacheDir()
 		if err != nil || base == "" {
-			return filepath.Join(os.TempDir(), "gvx-run"), nil
+			return filepath.Join(tempDir(), "gvx-run"), nil
 		}
 		return filepath.Join(base, "gvx", "run"), nil
 	}
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		if xdg := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); xdg != "" {
+	if goos == "linux" || goos == "android" {
+		if xdg := strings.TrimSpace(getenv("XDG_RUNTIME_DIR")); xdg != "" {
 			cand := filepath.Join(xdg, "gvx")
 			if len(cand)+40 <= maxUnixSunPath {
 				return cand, nil
 			}
 		}
 	}
+	if goos == "android" {
+		// Android has no /tmp; Gvx.start sets TMPDIR and XDG_CACHE_HOME to
+		// ctx.getCacheDir(). Check explicit TMPDIR before userCacheDir because
+		// Go's os.TempDir() defaults to /data/local/tmp when TMPDIR is unset,
+		// which unprivileged Android apps cannot write under SELinux. Use POSIX
+		// path helpers so cross-OS unit tests on Windows parse Android paths.
+		if tmp := strings.TrimSpace(getenv("TMPDIR")); path.IsAbs(tmp) {
+			clean := path.Clean(tmp)
+			if clean != "/tmp" {
+				cand := filepath.Join(clean, "gvx-run")
+				if len(cand)+16 <= maxUnixSunPath {
+					return cand, nil
+				}
+			}
+		}
+		if base, err := userCacheDir(); err == nil {
+			base = strings.TrimSpace(base)
+			if path.IsAbs(base) {
+				return filepath.Join(path.Clean(base), "gvx-run"), nil
+			}
+		}
+		if tmp := strings.TrimSpace(tempDir()); path.IsAbs(tmp) {
+			clean := path.Clean(tmp)
+			if clean != "/tmp" {
+				return filepath.Join(clean, "gvx-run-"+strconv.Itoa(geteuid())), nil
+			}
+		}
+	}
 	// macOS sockaddr_un.sun_path is limited to 104 bytes; use a short uid-scoped
 	// directory under /tmp rather than ~/Library/Caches.
-	return filepath.Join("/tmp", "gvx-run-"+strconv.Itoa(os.Geteuid())), nil
+	return filepath.Join("/tmp", "gvx-run-"+strconv.Itoa(geteuid())), nil
 }
 
 // TokenRequired reports whether a listener on network requires a per-run token
